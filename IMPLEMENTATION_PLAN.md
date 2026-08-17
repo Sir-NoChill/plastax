@@ -144,13 +144,50 @@ If a stub signature proves wrong during implementation, record the change
 in this file under this heading (date, module, old -> new, one-line reason)
 and update the design doc if the change is semantic. Do not silently drift.
 
+### Recorded
+
+Tooling / infrastructure (2026-08-17, scaffolding handoff):
+
+- pyproject (build): `requires-python` `>=3.11` -> `>=3.12`. jax 0.11 requires
+  >=3.12, so uv's universal resolver has no solution at 3.11. Interpreter
+  pinned to 3.13 via `.python-version`.
+- pyproject (build): dev dependencies moved from the
+  `[project.optional-dependencies].dev` extra to a PEP 735
+  `[dependency-groups].dev` table so the bare `uv run` hook entries resolve
+  them by default; setup is now `uv sync`. Added PyPI metadata (MIT license,
+  author, classifiers, keywords, `py.typed`).
+- scripts/git-agent-commit (repo): added zero-config signing — auto-resolve
+  the secret key by $AGENT_GIT_EMAIL when $AGENT_SIGNING_KEY is unset, since
+  env vars do not persist across agent tool calls. Agent identity is
+  "Agent (claude)" <ai@blobfish.icu> (per user, 2026-08-17).
+
+Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
+
+- All modules: converted to PEP 695 generics (`class Foo[T]`, `def f[T]`)
+  under the new 3.12 floor, as ruff UP046/UP047 require. Behaviour-preserving
+  (generics erase at runtime); the module-level `TypeVar`/`Generic` forms are
+  gone. Revert by ignoring UP046/UP047 in ruff if the explicit-TypeVar style
+  is preferred.
+- _types.py: `UnitIdx`/`ConnIdx` NewType base `Int32[Array, ""]` -> `object`.
+  Under `follow_imports="skip"` for jax.*/jaxtyping.*, `jax.Array` resolves to
+  `Any`, which NewType rejects (valid-newtype); `object` is subclassable and
+  still yields two distinct, non-interchangeable index types (the invariant).
+  Revisit if policy code must compute on raw indices rather than via views.
+- traits.py: private `_validate_traits` param `type[Network[object]]` ->
+  `type[Network[Any]]`; protocol variance is inferred per-class under PEP 695.
+- topology.py: `dense`/`conv2d` `init=` default is now a module-level
+  initializer singleton (ruff B008), the same initializer object as before.
+- 18 `# noqa: F722` (3 also `# type: ignore[name-defined]` in monoid.py) for
+  jaxtyping shape-string annotations misparsed as forward refs — the friction
+  TOOLING.md sanctions silencing with rule-scoped ignores.
+
 ## Handoff conventions
 
 - Commits: follow the repository's agent-commit protocol (the
   `agent-commit` skill: `git agent-commit`, Conventional Commits with
   mandatory scope, hooks must run and pass). One commit per milestone
   minimum; more is fine at coherent boundaries.
-- GPG identity, if signing is configured: "Claude (agent)"
+- GPG identity, if signing is configured: "Agent (claude)"
   <ai@blobfish.icu>.
 - Keep this plan, `tests/README.md`, and the README current as part of
   each milestone's definition of done.

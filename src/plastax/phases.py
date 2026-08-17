@@ -23,6 +23,8 @@ from plastax.sweep import (
     build_forward_accumulate,
     build_forward_apply,
     build_forward_sweep,
+    build_incoming_conn_update,
+    build_outgoing_conn_update,
     identity_accumulator,
     unit_id_mask,
 )
@@ -69,25 +71,25 @@ def build_phases[GS](
     the trace. Topological forward walks buckets 1..L (Python loop, static
     slices); backward walks L..1; pipeline is the 1-bucket flat sweep.
 
-    M3 scope: PIPELINE and TOPOLOGICAL, among {forward, loss, backward,
-    reset_global}; update_conn/prune_conn/add_conn are M3b/M4 and still
-    raise. Presence is a Python-level `if`, so an absent phase is never
-    traced -- zero equations, never lax.cond [D:2], which is exactly what
+    M3b scope: PIPELINE and TOPOLOGICAL, among {forward, loss, backward,
+    update_conn, reset_global}; prune_conn/add_conn are M4 and still raise.
+    Presence is a Python-level `if`, so an absent phase is never traced --
+    zero equations, never lax.cond [D:2], which is exactly what
     test_phases_elision checks. Phase order (module docstring): forward,
     loss, backward, update_conn, prune_conn, add_conn, reset_global.
     """
-    if net.update_conn is not None:
-        raise NotImplementedError("update_conn: M3b/M4")
     if net.prune_conn is not None:
-        raise NotImplementedError("prune_conn: M3b/M4")
+        raise NotImplementedError("prune_conn: M4")
     if net.add_conn is not None:
-        raise NotImplementedError("add_conn: M3b/M4")
+        raise NotImplementedError("add_conn: M4")
 
     phases: list[Phase[GS]] = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
     if net.backward_pass is not None:
         phases.append(_build_backward_phase(net, static))
+    if net.update_conn is not None:
+        phases.append(build_update_conn_phase(net, static))
     if net.reset_global is not None:
         phases.append(_build_reset_global_phase(net))
     return tuple(phases)
@@ -294,6 +296,46 @@ def _build_reset_global_phase[GS](net: type[Network[GS]]) -> Phase[GS]:
         return dataclasses.replace(state, globals_=new_globals), jnp.float32(0.0)
 
     return reset_global_phase
+
+
+def build_update_conn_phase[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Phase[GS]:
+    """Two full passes over every live conn in every bucket -- incoming
+    then outgoing (dispatch_cpu.hpp:450-469). `state.conns` is swept
+    unconditionally bucket-by-bucket for each pass (a 1-tuple in PIPELINE,
+    one per source level in TOPOLOGICAL): unlike forward/backward,
+    DoUpdateConn takes no Ranges/NumLevels -- it has no level structure of
+    its own, it just walks every live conn twice.
+
+    The two passes are sequenced across ALL buckets (every bucket's
+    incoming write is merged before any bucket's outgoing pass reads conn
+    state) so an edge's `outgoing` call observes that same edge's
+    `incoming` write already landed, matching the oracle's single flat
+    two-loop sweep over its one unbucketed conn arena. UpdateConn writes
+    only ConnWrite (never a UnitWrite, traits.py's Protocol), so no edge's
+    write is ever visible to a DIFFERENT edge's callback regardless of
+    bucketing -- the cross-bucket sequencing only matters for an edge
+    observing its own prior write, which per-bucket sequencing alone would
+    already guarantee; kept global (all incoming buckets, then all
+    outgoing buckets) for a literal 1:1 shape with the oracle's two loops.
+    """
+    uc = net.update_conn
+    assert uc is not None  # build_phases only calls this when set
+    incoming = build_incoming_conn_update(uc.incoming)
+    outgoing = build_outgoing_conn_update(uc.outgoing)
+
+    def update_conn_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        conns = tuple(
+            incoming(state.units, bucket, state.globals_) for bucket in state.conns
+        )
+        conns = tuple(outgoing(state.units, bucket, state.globals_) for bucket in conns)
+        return dataclasses.replace(state, conns=conns), jnp.float32(0.0)
+
+    return update_conn_phase
 
 
 def build_add_conn_phase[GS](

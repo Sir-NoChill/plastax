@@ -69,7 +69,7 @@ class Monoid[Acc]:
         num_segments: int,
         *,
         indices_are_sorted: bool,
-    ) -> Shaped[Array, " num_segments"]:  # type: ignore[name-defined]  # noqa: F722
+    ) -> Shaped[Array, " num_segments"]:
         """Named-monoid lowering via jax.ops.segment_* (scatter.py:221).
 
         `num_segments` static and `mode` left at its default (FILL_OR_DROP,
@@ -92,9 +92,9 @@ class Monoid[Acc]:
 
     def combine_pairwise(
         self,
-        a: Shaped[Array, " n"],  # type: ignore[name-defined]  # noqa: F722
-        b: Shaped[Array, " n"],  # type: ignore[name-defined]  # noqa: F722
-    ) -> Shaped[Array, " n"]:  # type: ignore[name-defined]  # noqa: F722
+        a: Shaped[Array, " n"],
+        b: Shaped[Array, " n"],
+    ) -> Shaped[Array, " n"]:
         """Elementwise associative combine, the binary op segment_reduce
         folds over a whole segment (scatter.py:221) applied to just two
         values. M3 uses this to fold a bucket's segment_reduce result into

@@ -43,15 +43,13 @@ GS = TypeVar("GS")
 BucketSweep = Callable[[Columns, Columns, GS], Columns]
 # (units, bucket_conns, acc, globals) -> acc combined with this bucket's edges
 AccumulateFn = Callable[[Columns, Columns, Any, GS], Any]
-type FinalizeMask = (
-    Bool[Array, " num_units"]  # type: ignore[name-defined]  # noqa: F722
-)
+type FinalizeMask = Bool[Array, " num_units"]
 # (units, acc, globals, finalize_mask) -> (updated units, acc with finalized
 # units reset to identity)
 ApplyFn = Callable[[Columns, Any, GS, FinalizeMask], tuple[Columns, Any]]
 
 
-def unit_id_mask(ids: tuple[int, ...], num_units: int) -> Bool[Array, " num_units"]:  # type: ignore[name-defined]  # noqa: F722
+def unit_id_mask(ids: tuple[int, ...], num_units: int) -> Bool[Array, " num_units"]:
     """Static unit-id tuple -> (num_units,) boolean mask via scatter, never
     a shape-changing gather. Shared by forward's input-skip and
     topological backward's input-skip (dispatch_cpu.hpp:59/250 both bound

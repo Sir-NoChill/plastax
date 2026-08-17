@@ -269,7 +269,10 @@ def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phas
         # small and static, so no vmap machinery is needed.
         for k, unit_id in enumerate(output_ids):
             value, write = loss.per_output(
-                u_view, UnitIdx(unit_id), inputs.targets[k], state.globals_
+                u_view,
+                UnitIdx(jnp.asarray(unit_id, dtype=jnp.int32)),
+                inputs.targets[k],
+                state.globals_,
             )
             total = total + value
             for name, field_value in write.fields.items():

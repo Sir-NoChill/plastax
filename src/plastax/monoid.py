@@ -38,6 +38,16 @@ _NAMED_IDENTITY: dict[_Named, float] = {
     _Named.MIN: math.inf,
 }
 
+# Elementwise binary op underlying each named monoid's segment_reduce (M3:
+# folds a persisted accumulator across topological-mode buckets, rung0
+# design section 4 level walk -- segment_sum's pairwise op is `+`, etc.).
+_NAMED_PAIRWISE: dict[_Named, Callable[[Array, Array], Array]] = {
+    _Named.SUM: jnp.add,
+    _Named.PROD: jnp.multiply,
+    _Named.MAX: jnp.maximum,
+    _Named.MIN: jnp.minimum,
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class Monoid[Acc]:
@@ -79,6 +89,26 @@ class Monoid[Acc]:
             num_segments=num_segments,
             indices_are_sorted=indices_are_sorted,
         )
+
+    def combine_pairwise(
+        self,
+        a: Shaped[Array, " n"],  # type: ignore[name-defined]  # noqa: F722
+        b: Shaped[Array, " n"],  # type: ignore[name-defined]  # noqa: F722
+    ) -> Shaped[Array, " n"]:  # type: ignore[name-defined]  # noqa: F722
+        """Elementwise associative combine, the binary op segment_reduce
+        folds over a whole segment (scatter.py:221) applied to just two
+        values. M3 uses this to fold a bucket's segment_reduce result into
+        an accumulator persisted across topological-mode buckets, the JAX
+        analogue of `UAcc = Combine(UAcc, Map(...))`
+        (dispatch_cpu.hpp:55-56, :246-247) run once per bucket rather than
+        once per edge.
+        """
+        if self.named is None:
+            raise UnsupportedMonoidError(
+                "generic Monoid(op, identity) has no v1 lowering (rung0 design "
+                "section 3); only named monoids (sum/prod/max/min) are supported"
+            )
+        return _NAMED_PAIRWISE[self.named](a, b)
 
     def identity_for(self, dtype: DTypeLike) -> Shaped[Array, ""]:  # noqa: F722
         """Concrete 0-d identity element at `dtype` (sweep.py's

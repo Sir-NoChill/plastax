@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "plastax"
+version = "0.1.0.dev0"
+description = "Declarative plastic-network traits for JAX"
+requires-python = ">=3.11"
+dependencies = [
+  "jax>=0.11.0",
+  "jaxtyping>=0.2.36",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-xdist",
+  "numpy",
+  "beartype",
+  "mypy>=1.14",
+  "ty",
+  "ruff",
+  "pre-commit",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/plastax"]
+
+# ty is the fast pre-commit checker; mypy --strict is the authoritative
+# CI/pre-push gate (TOOLING.md).
+[tool.mypy]
+strict = true
+files = ["src"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr"]
+
+[[tool.mypy.overrides]]
+module = ["jaxtyping.*", "jax.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ANN"]
+ignore = ["ANN401"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# jaxtyping+beartype: annotated signatures become runtime contracts in tests
+addopts = "--jaxtyping-packages=plastax,beartype.beartype"
+markers = ["slow: excluded from the pre-push fast suite"]
+filterwarnings = [
+  # donation failure must be an error, rung0 design section 6
+  "error:.*Some donated buffers were not usable.*",
+]

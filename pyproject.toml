@@ -59,17 +59,14 @@ dev = [
 packages = ["src/plastax"]
 
 # ty is the fast pre-commit checker; mypy --strict is the authoritative
-# CI/pre-push gate (TOOLING.md).
+# CI/pre-push gate (TOOLING.md). jax and jaxtyping ship py.typed, so mypy
+# resolves jax.Array to the real class and erases jaxtyping's dtype[array,shape]
+# to `array` (docs.kidger.site/jaxtyping/faq) -- no follow_imports skip needed.
 [tool.mypy]
 strict = true
 files = ["src"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr"]
-
-[[tool.mypy.overrides]]
-module = ["jaxtyping.*", "jax.*"]
-follow_imports = "skip"
-ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 88
@@ -77,7 +74,11 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ANN"]
-ignore = ["ANN401"]
+# F722/F821: jaxtyping shape strings (e.g. `Float[Array, " n"]`) read as broken
+# forward references to the linter; jaxtyping recommends disabling them globally
+# (docs.kidger.site/jaxtyping/faq). Type-checkers still erase the shape to
+# `Array` via py.typed, so no real type information is lost.
+ignore = ["ANN401", "F722", "F821"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

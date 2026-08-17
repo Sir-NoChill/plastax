@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import math
 from collections.abc import Callable
 
-from jaxtyping import Array, Int32, Shaped
+import jax.numpy as jnp
+import jax.ops
+from jaxtyping import Array, DTypeLike, Int32, Shaped
 
 
 class _Named(enum.Enum):
@@ -18,6 +21,22 @@ class _Named(enum.Enum):
     PROD = "prod"
     MAX = "max"
     MIN = "min"
+
+
+# jax.ops.segment_* dispatch table and each op's pre-fill identity (mirrors
+# jax's own table, jax/_src/ops/scatter.py:153-172 _get_identity).
+_SEGMENT_REDUCERS: dict[_Named, Callable[..., Array]] = {
+    _Named.SUM: jax.ops.segment_sum,
+    _Named.PROD: jax.ops.segment_prod,
+    _Named.MAX: jax.ops.segment_max,
+    _Named.MIN: jax.ops.segment_min,
+}
+_NAMED_IDENTITY: dict[_Named, float] = {
+    _Named.SUM: 0.0,
+    _Named.PROD: 1.0,
+    _Named.MAX: -math.inf,
+    _Named.MIN: math.inf,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -40,9 +59,39 @@ class Monoid[Acc]:
         num_segments: int,
         *,
         indices_are_sorted: bool,
-    ) -> Shaped[Array, " num_segments"]:
-        """Named-monoid lowering via jax.ops.segment_* (scatter.py:221)."""
-        raise NotImplementedError
+    ) -> Shaped[Array, " num_segments"]:  # type: ignore[name-defined]  # noqa: F722
+        """Named-monoid lowering via jax.ops.segment_* (scatter.py:221).
+
+        `num_segments` static and `mode` left at its default (FILL_OR_DROP,
+        scatter.py:187) is exactly the null-slot trick: a dead conn's
+        segment_id set to num_units (one past the end, by the caller) falls
+        outside [0, num_segments) and is dropped rather than accumulated.
+        """
+        if self.named is None:
+            raise UnsupportedMonoidError(
+                "generic Monoid(op, identity) has no v1 lowering (rung0 design "
+                "section 3); only named monoids (sum/prod/max/min) are supported"
+            )
+        segment_fn = _SEGMENT_REDUCERS[self.named]
+        return segment_fn(
+            data,
+            segment_ids,
+            num_segments=num_segments,
+            indices_are_sorted=indices_are_sorted,
+        )
+
+    def identity_for(self, dtype: DTypeLike) -> Shaped[Array, ""]:  # noqa: F722
+        """Concrete 0-d identity element at `dtype` (sweep.py's
+        materialize_acc_columns: `UAcc = Acc{}` analogue,
+        dispatch_cpu.hpp:41-67)."""
+        if self.named is None:
+            if self.identity is None:
+                raise UnsupportedMonoidError(
+                    "generic Monoid(op, identity) has no v1 lowering (rung0 "
+                    "design section 3)"
+                )
+            return jnp.asarray(self.identity, dtype=dtype)
+        return jnp.asarray(_NAMED_IDENTITY[self.named], dtype=dtype)
 
 
 sum_: Monoid[Array] = Monoid(_Named.SUM)

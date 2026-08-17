@@ -1,18 +1,49 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]  # PEP 639 SPDX license metadata support
 build-backend = "hatchling.build"
 
 [project]
 name = "plastax"
 version = "0.1.0.dev0"
 description = "Declarative plastic-network traits for JAX"
-requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ayrton Chilibeck", email = "aa@chilibeck.com" }]
+keywords = [
+  "jax",
+  "plasticity",
+  "neural-networks",
+  "continual-learning",
+  "sparse-networks",
+  "dynamic-networks",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Typing :: Typed",
+]
+# jax>=0.11 requires >=3.12 (uv universal resolver fails on 3.11); Deviation
+# 2026-08-17. TOOLING.md pins the concrete interpreter via .python-version.
+requires-python = ">=3.12"
 dependencies = [
   "jax>=0.11.0",
   "jaxtyping>=0.2.36",
 ]
 
-[project.optional-dependencies]
+# Repository URLs land once the remote is provisioned (pending, per handoff).
+# [project.urls]
+# Homepage = "https://github.com/<owner>/plastax"
+# Repository = "https://github.com/<owner>/plastax"
+# Issues = "https://github.com/<owner>/plastax/issues"
+
+# PEP 735 dependency group (not an extra): `uv sync` / `uv run` install this
+# by default, so the bare `uv run ty|mypy|pytest` hook entries resolve it.
+[dependency-groups]
 dev = [
   "pytest>=8",
   "pytest-xdist",

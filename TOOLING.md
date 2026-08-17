@@ -5,13 +5,16 @@ Short reference for the toolchain. All commands run from `plastax/`.
 ## Environment: uv
 
 ```
-uv venv                      # .venv, python >= 3.11
-uv pip install -e ".[dev]"   # editable install + dev tools
+uv sync                      # .venv + editable install + dev group (default)
 uv run pytest                # run anything inside the venv
 ```
 
-`uv lock`/`uv sync` may replace the pip-style flow once the dependency set
-stabilizes; until then the editable install is the workflow.
+Interpreter is pinned by `.python-version` (3.13); `requires-python` is
+`>=3.12` (jax 0.11's floor). Dev tools live in the PEP 735
+`[dependency-groups].dev` table, which `uv sync`/`uv run` install by default —
+so the bare `uv run ty|mypy|pytest` hook entries resolve them without extra
+flags. `uv.lock` is gitignored (library convention: CI resolves against the
+current dependency floor).
 
 ## Lint + format: ruff
 
@@ -71,8 +74,12 @@ scripts/git-agent-commit            # or symlink onto PATH as git-agent-commit
 git agent-commit -m "feat(sweep): add named-monoid segment reduce"
 ```
 
-The wrapper injects the agent identity (Claude (agent)
-<ai@blobfish.icu>), signs with $AGENT_SIGNING_KEY when set (set
-AGENT_REQUIRE_SIGNING=1 to hard-fail without it), refuses --no-verify,
-and otherwise forwards to `git commit` so hooks run normally. Humans use
-plain `git commit`; the wrapper exists to keep agent work auditable.
+The wrapper injects the agent identity (Agent (claude) <ai@blobfish.icu>)
+and signs the commit. If $AGENT_SIGNING_KEY is unset it auto-resolves the
+agent's secret key by email ($AGENT_GIT_EMAIL), so signing works with zero
+per-shell setup (env vars do not persist across agent tool calls); set
+AGENT_REQUIRE_SIGNING=1 to hard-fail when no key is found. It refuses
+--no-verify and forwards to `git commit` so hooks run normally. Invoke it by
+path (`scripts/git-agent-commit ...`) to use this repo's identity and guards
+rather than any `git-agent-commit` earlier on PATH. Humans use plain
+`git commit`; the wrapper keeps agent work auditable.

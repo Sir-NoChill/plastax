@@ -156,10 +156,12 @@ Tooling / infrastructure (2026-08-17, scaffolding handoff):
   `[dependency-groups].dev` table so the bare `uv run` hook entries resolve
   them by default; setup is now `uv sync`. Added PyPI metadata (MIT license,
   author, classifiers, keywords, `py.typed`).
-- scripts/git-agent-commit (repo): added zero-config signing — auto-resolve
-  the secret key by $AGENT_GIT_EMAIL when $AGENT_SIGNING_KEY is unset, since
-  env vars do not persist across agent tool calls. Agent identity is
-  "Agent (claude)" <ai@blobfish.icu> (per user, 2026-08-17).
+- pyproject (build): dropped the `follow_imports="skip"` override for
+  jax.*/jaxtyping.* — both ship py.typed, so mypy resolves `jax.Array` and
+  erases jaxtyping's `dtype[array, shape]` to `array`; F722/F821 ignored
+  globally (jaxtyping shape strings read as forward refs to ruff only).
+- repo: no repo-local commit wrapper — contributors attribute and sign with
+  their own agents (per user, review 2026-08-17).
 
 Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
@@ -168,11 +170,10 @@ Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
   (generics erase at runtime); the module-level `TypeVar`/`Generic` forms are
   gone. Revert by ignoring UP046/UP047 in ruff if the explicit-TypeVar style
   is preferred.
-- _types.py: `UnitIdx`/`ConnIdx` NewType base `Int32[Array, ""]` -> `object`.
-  Under `follow_imports="skip"` for jax.*/jaxtyping.*, `jax.Array` resolves to
-  `Any`, which NewType rejects (valid-newtype); `object` is subclassable and
-  still yields two distinct, non-interchangeable index types (the invariant).
-  Revisit if policy code must compute on raw indices rather than via views.
+- _types.py: `UnitIdx`/`ConnIdx` are `NewType(_, Int32[Array, ""])` — scalar
+  int32, distinct index types. (The interim `object` base, used while
+  follow_imports=skip made jax.Array resolve to Any, is reverted now that the
+  skip is gone and jaxtyping erases the shape to a real subclassable `array`.)
 - traits.py: private `_validate_traits` param `type[Network[object]]` ->
   `type[Network[Any]]`; protocol variance is inferred per-class under PEP 695.
 - topology.py: `dense`/`conv2d` `init=` default is now a module-level
@@ -183,12 +184,11 @@ Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
 ## Handoff conventions
 
-- Commits: follow the repository's agent-commit protocol (the
-  `agent-commit` skill: `git agent-commit`, Conventional Commits with
-  mandatory scope, hooks must run and pass). One commit per milestone
-  minimum; more is fine at coherent boundaries.
-- GPG identity, if signing is configured: "Agent (claude)"
-  <ai@blobfish.icu>.
+- Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),
+  one scope per commit, hooks must run and pass, never `--no-verify`. One
+  commit per milestone minimum; more is fine at coherent boundaries.
+- Contributors and their agents commit under their own identity and sign as
+  they choose; the repo ships no signing wrapper or keys.
 - Keep this plan, `tests/README.md`, and the README current as part of
   each milestone's definition of done.
 - Do not add dependencies beyond pyproject without recording a Deviation.

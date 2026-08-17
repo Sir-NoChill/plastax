@@ -5,18 +5,15 @@ reads needs_resort/overflow on host, calls topo.resort or
 state.grow_bucket, and swaps in the new (static, step). Retrace count is
 observable for tests via jax.test_util.assert_num_jit_and_pmap_compilations.
 """
-from __future__ import annotations
 
-from typing import Generic, TypeVar
+from __future__ import annotations
 
 from plastax.phases import StepInputs
 from plastax.state import NetworkState, NetworkStatic
 from plastax.traits import Network
 
-GS = TypeVar("GS")
 
-
-class Driver(Generic[GS]):
+class Driver[GS]:
     def __init__(
         self,
         net: type[Network[GS]],

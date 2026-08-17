@@ -5,21 +5,25 @@ scalar type so view access returns correctly-typed arrays; unit and conn
 indices are distinct NewTypes so they cannot be interchanged; array shapes
 are expressed with jaxtyping annotations.
 """
+
 from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Generic, NewType, TypeVar
+from typing import NewType
 
 import numpy as np
-from jaxtyping import Array, Bool, Int32
-
-DT = TypeVar("DT", bound=np.generic)
+from jaxtyping import Array, Bool
 
 # Distinct index spaces; a UnitIdx must never index a conn column and vice
 # versa. Traced values: 0-d/1-d int32 arrays wrapped at the view boundary.
-UnitIdx = NewType("UnitIdx", Int32[Array, ""])
-ConnIdx = NewType("ConnIdx", Int32[Array, ""])
+# NewType's 2nd arg must be a real subclassable type (mypy valid-newtype);
+# jax.Array/jaxtyping shapes resolve to Any here since pyproject pins
+# follow_imports="skip" for jax.*/jaxtyping.*, so Any is rejected. `object`
+# is a static-only placeholder -- NewType is an identity fn at runtime, so
+# the wrapped value is still the traced int32 array described above.
+UnitIdx = NewType("UnitIdx", object)
+ConnIdx = NewType("ConnIdx", object)
 Level = NewType("Level", int)
 
 
@@ -29,7 +33,7 @@ class Propagation(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
-class FieldSpec(Generic[DT]):
+class FieldSpec[DT: np.generic]:
     """One SOA column: analogue of plastix::alloc::SOAField<Tag, T>.
 
     The generic parameter is the numpy scalar type of the column; it flows

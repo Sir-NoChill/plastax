@@ -5,21 +5,25 @@ sweep are both compositions of this (rung0 design sections 3-4). Dead
 slots use the null-slot trick: destination index replaced by num_units,
 dropped by scatter mode FILL_OR_DROP (jax/_src/ops/scatter.py:187).
 """
+
 from __future__ import annotations
 
-from typing import Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
 from plastax.monoid import MonoidTree
-from plastax.state import Columns, NetworkState
+from plastax.state import Columns
 from plastax.traits import BackwardPass, ForwardPass
 
+# Module-scoped (not PEP 695) so it stays free inside the BucketSweep alias;
+# the two builders below shadow it with their own PEP 695 [GS] locally.
 GS = TypeVar("GS")
 
 # (units, bucket_conns, globals) -> updated units
 BucketSweep = Callable[[Columns, Columns, GS], Columns]
 
 
-def build_forward_sweep(
+def build_forward_sweep[GS](
     fp: ForwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
 ) -> BucketSweep[GS]:
     """Accumulates into TO_ID targets, then applies over destination units
@@ -27,7 +31,7 @@ def build_forward_sweep(
     raise NotImplementedError
 
 
-def build_backward_sweep(
+def build_backward_sweep[GS](
     bp: BackwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
 ) -> BucketSweep[GS]:
     """Accumulates into FROM_ID sources; apply runs on sources

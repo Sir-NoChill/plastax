@@ -4,17 +4,19 @@ design section 2). Phase order matches plastix.hpp's 11-phase step for the
 v1 subset: forward, loss, backward, update_conn, prune_conn, add_conn,
 reset_global.
 """
+
 from __future__ import annotations
 
-from typing import Callable, TypeAlias, TypeVar
+from collections.abc import Callable
 
 from jaxtyping import Array, Float
 
 from plastax.state import NetworkState, NetworkStatic
 from plastax.traits import Network
 
-GS = TypeVar("GS")
-Phase: TypeAlias = Callable[["NetworkState[GS]", "StepInputs"], "NetworkState[GS]"]
+# PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
+# forward references need no quoting.
+type Phase[GS] = Callable[[NetworkState[GS], StepInputs], NetworkState[GS]]
 
 
 class StepInputs:
@@ -24,11 +26,11 @@ class StepInputs:
     targets: (num_outputs,) for the loss phase, or None when loss is absent
     """
 
-    inputs: Float[Array, " num_inputs"]
-    targets: Float[Array, " num_outputs"] | None
+    inputs: Float[Array, " num_inputs"]  # noqa: F722  jaxtyping named-axis string
+    targets: Float[Array, " num_outputs"] | None  # noqa: F722  jaxtyping named-axis
 
 
-def build_phases(
+def build_phases[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> tuple[Phase[GS], ...]:
     """Assemble only the present phases; absent slots contribute nothing to
@@ -37,7 +39,7 @@ def build_phases(
     raise NotImplementedError
 
 
-def build_add_conn_phase(
+def build_add_conn_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
     """K-bounded candidates from the neighbourhood window; lax.top_k

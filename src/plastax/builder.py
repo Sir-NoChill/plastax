@@ -3,9 +3,10 @@
 Mirrors the manual construction path of the C++ examples: add units and
 connections imperatively, then finalize into (NetworkStatic, NetworkState).
 """
+
 from __future__ import annotations
 
-from typing import Callable, Generic, TypeVar
+from collections.abc import Callable
 
 from jaxtyping import PRNGKeyArray
 
@@ -13,10 +14,8 @@ from plastax.state import NetworkState, NetworkStatic
 from plastax.topology import Topology
 from plastax.traits import Network
 
-GS = TypeVar("GS")
 
-
-class NetworkBuilder(Generic[GS]):
+class NetworkBuilder[GS]:
     def __init__(self, net: type[Network[GS]], globals_: GS) -> None:
         raise NotImplementedError
 
@@ -24,8 +23,8 @@ class NetworkBuilder(Generic[GS]):
     def from_topology(
         cls,
         net: type[Network[GS]],
-        topology_fn: "Callable[[PRNGKeyArray], Topology]",
-        key: "PRNGKeyArray",
+        topology_fn: Callable[[PRNGKeyArray], Topology],
+        key: PRNGKeyArray,
         *,
         globals_: GS,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
@@ -38,9 +37,7 @@ class NetworkBuilder(Generic[GS]):
         """Returns the new unit's global id (dense, 0-based)."""
         raise NotImplementedError
 
-    def add_conn(
-        self, src: int, dst: int, **field_values: float | int | bool
-    ) -> None:
+    def add_conn(self, src: int, dst: int, **field_values: float | int | bool) -> None:
         raise NotImplementedError
 
     def mark_input(self, unit_id: int) -> None:

@@ -19,8 +19,16 @@ et al.). Required modules, mapped to plan milestones (IMPLEMENTATION_PLAN.md):
 - `test_backward.py` (M3): direction reversal (accumulate into source).
 - `test_phases_elision.py` (M2): absent phases produce identical jaxprs to
   a hand-assembled subset (compare jax.make_jaxpr output structure).
-- `test_update_prune.py` (M4): UpdateConn incoming/outgoing two-pass
-  ordering; PruneConn tombstoning; derived live counts.
+- `test_update_conn.py` (M3b): UpdateConn incoming/outgoing two-pass
+  ordering (a combined-in-one-pass implementation would fail); dst/src
+  endpoint-binding convention for each direction; dead conns never
+  updated; every bucket swept in topological mode; wired into
+  build_phases via make_step.
+- `test_mlp_xor.py` (M3b): the milestone's end-to-end acceptance --
+  examples/mlp_xor.py's XorNet (forward+loss+backward+update_conn, SGD)
+  trains the 4 XOR patterns to a low loss and classifies all 4 correctly;
+  deterministic for a fixed seed.
+- `test_update_prune.py` (M4): PruneConn tombstoning; derived live counts.
 - `test_add_conn.py` (M4): K-bounded candidates, top_k selection,
   prefix-sum slot claim, overflow flag, level-preserving adds do not set
   needs_resort.

@@ -3,35 +3,33 @@
 Deletion never resorts. Level-preserving adds never resort. Resort runs
 only on level reassignment; bucket growth is handled by state.grow_bucket.
 """
-from __future__ import annotations
 
-from typing import TypeVar
+from __future__ import annotations
 
 import numpy as np
 from jaxtyping import Array, Int32
 
 from plastax.state import NetworkState, NetworkStatic
 
-GS = TypeVar("GS")
-
 
 def initial_levels(
-    num_units: int, edges: np.ndarray  # (E, 2) int32 host array, from builder
+    num_units: int,
+    edges: np.ndarray,  # (E, 2) int32 host array, from builder
 ) -> np.ndarray:
     """Host-side Kahn/BFS for initial construction (pre-jit, plain numpy)."""
     raise NotImplementedError
 
 
-def recompute_levels(
+def recompute_levels[GS](
     static: NetworkStatic, state: NetworkState[GS]
-) -> Int32[Array, " num_units"]:
+) -> Int32[Array, " num_units"]:  # noqa: F722  jaxtyping named-axis string
     """On-device Kahn relaxation: lax.fori_loop bounded by
     static.kahn_max_depth or num_units (both static). Carry is
     fixed-capacity (loops.py:545-619 constraints)."""
     raise NotImplementedError
 
 
-def resort(
+def resort[GS](
     static: NetworkStatic, state: NetworkState[GS]
 ) -> tuple[NetworkStatic, NetworkState[GS]]:
     """Host-driven: recompute levels, redistribute conns into new buckets

@@ -11,25 +11,33 @@ is an initialization prior on structure, not a maintained constraint.
 Initial weights reuse jax.nn.initializers: any (key, shape) -> array
 callable is accepted.
 """
+
 from __future__ import annotations
 
 import dataclasses
-from typing import Callable, Protocol, TypeAlias
+from collections.abc import Callable
+from typing import Protocol
 
 import jax
 import numpy as np
 from jaxtyping import Array, Float, PRNGKeyArray
 
-Initializer: TypeAlias = Callable[[PRNGKeyArray, tuple[int, ...]], Float[Array, "..."]]
+type Initializer = Callable[[PRNGKeyArray, tuple[int, ...]], Float[Array, "..."]]
+
+# Module-level singletons, not calls in argument defaults (ruff B008): a
+# default evaluated in the signature is a single object either way, but a
+# named singleton makes the one-time construction explicit.
+_GLOROT_UNIFORM: Initializer = jax.nn.initializers.glorot_uniform()
+_HE_NORMAL: Initializer = jax.nn.initializers.he_normal()
 
 
 @dataclasses.dataclass(frozen=True)
 class EdgeSet:
     """Host-side edge list: the sole output currency of all generators."""
 
-    from_ids: np.ndarray      # (E,) int32, block-local unit ids
-    to_ids: np.ndarray        # (E,) int32
-    weights: np.ndarray       # (E,) float32, already initialized
+    from_ids: np.ndarray  # (E,) int32, block-local unit ids
+    to_ids: np.ndarray  # (E,) int32
+    weights: np.ndarray  # (E,) float32, already initialized
 
 
 class Block(Protocol):
@@ -59,18 +67,18 @@ def dense(
     n_in: int,
     n_out: int,
     *,
-    init: Initializer = jax.nn.initializers.glorot_uniform(),
+    init: Initializer = _GLOROT_UNIFORM,
 ) -> Block:
     """Fully connected bipartite block: n_in * n_out edges."""
     raise NotImplementedError
 
 
 def conv2d(
-    in_shape: tuple[int, int, int],       # (H, W, C_in)
-    kernel: tuple[int, int, int],         # (kH, kW, C_out)
+    in_shape: tuple[int, int, int],  # (H, W, C_in)
+    kernel: tuple[int, int, int],  # (kH, kW, C_out)
     *,
     stride: int = 1,
-    init: Initializer = jax.nn.initializers.he_normal(),
+    init: Initializer = _HE_NORMAL,
 ) -> Block:
     """Receptive-field edge enumeration with unrolled (non-shared) weights;
     index arithmetic mirrors lax.conv_general_dilated shape logic."""

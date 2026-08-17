@@ -13,17 +13,14 @@ import enum
 from typing import NewType
 
 import numpy as np
-from jaxtyping import Array, Bool
+from jaxtyping import Array, Bool, Int32
 
 # Distinct index spaces; a UnitIdx must never index a conn column and vice
-# versa. Traced values: 0-d/1-d int32 arrays wrapped at the view boundary.
-# NewType's 2nd arg must be a real subclassable type (mypy valid-newtype);
-# jax.Array/jaxtyping shapes resolve to Any here since pyproject pins
-# follow_imports="skip" for jax.*/jaxtyping.*, so Any is rejected. `object`
-# is a static-only placeholder -- NewType is an identity fn at runtime, so
-# the wrapped value is still the traced int32 array described above.
-UnitIdx = NewType("UnitIdx", object)
-ConnIdx = NewType("ConnIdx", object)
+# versa. Scalar int32 arrays, wrapped at the view boundary: jaxtyping erases
+# the shape to jax.Array for the static checker, a subclassable base NewType
+# accepts (mypy resolves it now that the follow_imports skip is gone).
+UnitIdx = NewType("UnitIdx", Int32[Array, ""])
+ConnIdx = NewType("ConnIdx", Int32[Array, ""])
 Level = NewType("Level", int)
 
 

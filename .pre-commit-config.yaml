@@ -1,0 +1,39 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-toml
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.12.7
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check (experimental; mypy in CI is authoritative)
+        entry: uv run ty check src
+        language: system
+        types: [python]
+        pass_filenames: false
+
+      - id: mypy-strict
+        name: mypy --strict
+        entry: uv run mypy --strict src
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: pytest-fast
+        name: pytest (fast suite)
+        entry: uv run pytest -m "not slow" -q
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

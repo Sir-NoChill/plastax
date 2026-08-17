@@ -32,10 +32,10 @@ jobs:
         run: uv sync
 
       - name: Ruff lint
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests examples/mlp_xor.py
 
       - name: Ruff format check
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check src tests examples/mlp_xor.py
 
       - name: ty (fast type check)
         run: uv run ty check src

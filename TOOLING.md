@@ -61,25 +61,16 @@ The JAX-specific test infrastructure, beyond plain pytest:
 ty check, and hygiene basics on pre-commit; mypy --strict and the fast
 pytest suite (`-m "not slow"`) on pre-push. Install with
 `uv run pre-commit install --hook-type pre-commit --hook-type pre-push`.
-The agent-commit protocol requires these hooks to run and pass — never
-commit with `--no-verify` (the wrapper rejects it outright).
+These hooks must run and pass — never commit or push with `--no-verify`.
 
-## Commit workflow (agent-commit protocol)
+## Commit conventions
 
 Commit metadata contracts live at the repo root: TAGS.md (types) and
-SCOPES.md (mandatory scopes). Agent commits go through the wrapper:
+SCOPES.md (mandatory scopes). Every commit is `type(scope): subject` with a
+mandatory scope, one scope per commit; the hooks above are the gate (never
+`--no-verify`).
 
-```
-scripts/git-agent-commit            # or symlink onto PATH as git-agent-commit
-git agent-commit -m "feat(sweep): add named-monoid segment reduce"
-```
-
-The wrapper injects the agent identity (Agent (claude) <ai@blobfish.icu>)
-and signs the commit. If $AGENT_SIGNING_KEY is unset it auto-resolves the
-agent's secret key by email ($AGENT_GIT_EMAIL), so signing works with zero
-per-shell setup (env vars do not persist across agent tool calls); set
-AGENT_REQUIRE_SIGNING=1 to hard-fail when no key is found. It refuses
---no-verify and forwards to `git commit` so hooks run normally. Invoke it by
-path (`scripts/git-agent-commit ...`) to use this repo's identity and guards
-rather than any `git-agent-commit` earlier on PATH. Humans use plain
-`git commit`; the wrapper keeps agent work auditable.
+The repository ships no signing wrapper or keys. Contributors — and their
+coding agents — commit under their own identity and attribute or sign their
+work as they see fit; configure your agent's author identity and optional GPG
+key in your own environment.

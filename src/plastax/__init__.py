@@ -15,6 +15,7 @@ from plastax._types import (
 )
 from plastax.builder import NetworkBuilder
 from plastax.driver import Driver
+from plastax.phases import StepInputs
 from plastax.state import NetworkState, NetworkStatic, make_empty_state
 from plastax.step import StepResult, make_step
 from plastax.traits import (
@@ -52,6 +53,7 @@ __all__ = [
     "Propagation",
     "PruneConn",
     "ResetGlobal",
+    "StepInputs",
     "StepResult",
     "UnitIdx",
     "UnitView",

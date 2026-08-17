@@ -18,6 +18,19 @@ unit). `build_forward_sweep`/`build_backward_sweep` keep their original
 signatures and behaviour as one-shot compositions of these two primitives
 (identity accumulator in, finalize every live unit); phases.py's
 topological walk composes them directly across the bucket loop instead.
+
+M3b (Deviation, IMPLEMENTATION_PLAN.md M3b): `_build_conn_update` +
+`build_incoming_conn_update`/`build_outgoing_conn_update` are a new pair of
+primitives for `UpdateConn` (dispatch_cpu.hpp:450-469), mirroring
+`_accumulate_into` + `build_forward_accumulate`/`build_backward_accumulate`'s
+private-core-plus-two-directional-wrappers shape. Unlike the forward/
+backward accumulate, a `ConnWrite` targets only the writing edge's own row
+(never an aggregation across edges into a shared unit-indexed accumulator),
+so there is no segment_reduce and no out-of-bounds null-slot scatter to
+perform; the dead-conn "drop" is a plain masked keep-old-if-dead merge over
+the bucket's own columns, the degenerate case of the same discipline
+(`_apply_masked`'s `jnp.where(mask, written, old)` shape, applied to conn
+columns instead of unit columns).
 """
 
 from __future__ import annotations
@@ -33,7 +46,7 @@ from plastax._types import DEAD, FROM_ID, TO_ID, ConnIdx, FieldSpec, UnitIdx
 from plastax.monoid import Monoid, MonoidTree
 from plastax.state import Columns
 from plastax.traits import BackwardPass, ForwardPass
-from plastax.views import ConnView, UnitView, UnitWrite
+from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 # Module-scoped (not PEP 695) so it stays free inside the type aliases below;
 # the builders each shadow it with their own PEP 695 [GS] locally.
@@ -47,6 +60,10 @@ type FinalizeMask = Bool[Array, " num_units"]
 # (units, acc, globals, finalize_mask) -> (updated units, acc with finalized
 # units reset to identity)
 ApplyFn = Callable[[Columns, Any, GS, FinalizeMask], tuple[Columns, Any]]
+# (u, first_id, second_id, c, cid, globals) -> that edge's conn field writes
+ConnUpdateFn = Callable[[UnitView, UnitIdx, UnitIdx, ConnView, ConnIdx, GS], ConnWrite]
+# (units, bucket_conns, globals) -> that bucket's conns, live rows updated
+ConnUpdateSweep = Callable[[Columns, Columns, GS], Columns]
 
 
 def unit_id_mask(ids: tuple[int, ...], num_units: int) -> Bool[Array, " num_units"]:
@@ -315,3 +332,70 @@ def materialize_acc_columns(combine: MonoidTree, num_units: int) -> Columns:
             (num_units,), monoid.identity_for(jnp.float32), dtype=jnp.float32
         )
     return columns
+
+
+def _build_conn_update[GS](
+    update_fn: ConnUpdateFn[GS],
+    *,
+    first_col: FieldSpec[Any],
+    second_col: FieldSpec[Any],
+) -> ConnUpdateSweep[GS]:
+    """Shared by UpdateConn.incoming (first_col=TO_ID, second_col=FROM_ID)
+    and .outgoing (first_col=FROM_ID, second_col=TO_ID): every conn in the
+    bucket gets one vmapped `update_fn` call, live rows merged back into
+    this bucket's own columns. `update_fn`'s first unit-id argument matches
+    the oracle's own calling convention for each direction
+    (`UC::UpdateIncomingConnection(UnitAlloc, ToId, FromId, ...)` at
+    dispatch_cpu.hpp:458 vs `UC::UpdateOutgoingConnection(UnitAlloc,
+    FromId, ToId, ...)` at :466).
+
+    No segment_reduce: a `ConnWrite` targets only the writing edge's own
+    row (never a cross-edge aggregation into a unit-indexed accumulator,
+    unlike `_accumulate_into`), so a dead conn's write is dropped by a
+    plain `jnp.where(dead, old, written)` keep-old merge rather than an
+    out-of-bounds null-slot scatter -- the degenerate case of the same
+    discipline (module docstring, M3b).
+    """
+
+    def update_bucket(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
+        u_view = UnitView(units)
+        c_view = ConnView(bucket_conns)
+        first_id = bucket_conns[first_col.name]
+        second_id = bucket_conns[second_col.name]
+        dead = bucket_conns[DEAD.name]
+        conn_ids = jnp.arange(first_id.shape[0])
+
+        def per_edge(
+            first: jax.Array, second: jax.Array, cid: jax.Array
+        ) -> dict[str, jax.Array]:
+            write = update_fn(
+                u_view, UnitIdx(first), UnitIdx(second), c_view, ConnIdx(cid), g
+            )
+            return dict(write.fields)
+
+        batched_writes = jax.vmap(per_edge)(first_id, second_id, conn_ids)
+
+        new_conns: Columns = dict(bucket_conns)
+        for name, written in batched_writes.items():
+            new_conns[name] = jnp.where(dead, bucket_conns[name], written)
+        return new_conns
+
+    return update_bucket
+
+
+def build_incoming_conn_update[GS](
+    update_fn: ConnUpdateFn[GS],
+) -> ConnUpdateSweep[GS]:
+    """One bucket's `UpdateConn.incoming` pass (dispatch_cpu.hpp:453-459's
+    first loop): first id arg is the edge's destination, second its
+    source."""
+    return _build_conn_update(update_fn, first_col=TO_ID, second_col=FROM_ID)
+
+
+def build_outgoing_conn_update[GS](
+    update_fn: ConnUpdateFn[GS],
+) -> ConnUpdateSweep[GS]:
+    """One bucket's `UpdateConn.outgoing` pass (dispatch_cpu.hpp:461-467's
+    second loop): first id arg is the edge's source, second its
+    destination."""
+    return _build_conn_update(update_fn, first_col=FROM_ID, second_col=TO_ID)

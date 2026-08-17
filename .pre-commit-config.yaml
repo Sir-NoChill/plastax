@@ -10,9 +10,13 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.12.7
     hooks:
+      # examples/ are unimplemented stubs until M3 (mlp_xor) / M5 (ipc). Drop
+      # these excludes and add examples/ to the CI ruff args once they land.
       - id: ruff
         args: [--fix]
+        exclude: '^examples/'
       - id: ruff-format
+        exclude: '^examples/'
 
   - repo: local
     hooks:

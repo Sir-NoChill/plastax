@@ -27,7 +27,8 @@ class UnitView:
     # jaxtyping scalar-shape strings below read as broken forward refs to
     # ruff's F722 (TOOLING.md: jaxtyping friction).
     def __getitem__(self, key: tuple[FieldSpec[DT], UnitIdx]) -> Shaped[Array, ""]:  # noqa: F722
-        raise NotImplementedError
+        spec, idx = key
+        return self._cols[spec.name][idx]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,7 +36,8 @@ class ConnView:
     _cols: Columns
 
     def __getitem__(self, key: tuple[FieldSpec[DT], ConnIdx]) -> Shaped[Array, ""]:  # noqa: F722
-        raise NotImplementedError
+        spec, idx = key
+        return self._cols[spec.name][idx]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,7 +48,7 @@ class UnitWrite:
 
     @staticmethod
     def of(*pairs: tuple[FieldSpec[DT], Shaped[Array, ""]]) -> UnitWrite:  # noqa: F722
-        raise NotImplementedError
+        return UnitWrite({spec.name: value for spec, value in pairs})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,4 +57,4 @@ class ConnWrite:
 
     @staticmethod
     def of(*pairs: tuple[FieldSpec[DT], Shaped[Array, ""]]) -> ConnWrite:  # noqa: F722
-        raise NotImplementedError
+        return ConnWrite({spec.name: value for spec, value in pairs})

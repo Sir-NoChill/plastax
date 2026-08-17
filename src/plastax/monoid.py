@@ -35,15 +35,12 @@ class Monoid[Acc]:
 
     def segment_reduce(
         self,
-        # named-axis strings; mypy resolves bare " n" as a forward ref to an
-        # undefined name "n" (jaxtyping friction -- TOOLING.md), ruff's F722
-        # flags the same quoted shapes as broken forward-annotation syntax.
-        data: Shaped[Array, " n"],  # type: ignore[name-defined]  # noqa: F722
-        segment_ids: Int32[Array, " n"],  # type: ignore[name-defined]  # noqa: F722
+        data: Shaped[Array, " n"],
+        segment_ids: Int32[Array, " n"],
         num_segments: int,
         *,
         indices_are_sorted: bool,
-    ) -> Shaped[Array, " num_segments"]:  # type: ignore[name-defined]  # noqa: F722
+    ) -> Shaped[Array, " num_segments"]:
         """Named-monoid lowering via jax.ops.segment_* (scatter.py:221)."""
         raise NotImplementedError
 

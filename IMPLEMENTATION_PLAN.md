@@ -201,6 +201,31 @@ M1 (2026-08-17, host-side construction + state + topology + validation):
   `@jax.tree_util.register_dataclass` correctly reads
   `field(metadata=dict(static=True))` to split meta vs data fields in jax 0.11.
 
+M2 (2026-08-17, pipeline forward sweep + step assembly):
+
+- step.py / StepResult: registered as a pytree dataclass (jit cannot return
+  an unregistered dataclass) and gains `loss: Float[Array, ""]`. "Loss reduced
+  into globals_" is not implementable with an opaque user `GS` (`Network[None]`
+  is exercised), so the summed `per_output` loss lands in `StepResult.loss`,
+  sibling to `overflow` (0.0 when `net.loss is None`).
+- phases.py / Phase: return type `state` -> `(state, loss_contribution)` so
+  make_step folds loss into StepResult.loss without any phase touching
+  globals_; non-loss phases return 0.0. `StepInputs` is now a registered
+  pytree dataclass (inputs leaf; targets leaf or None).
+- sweep.build_forward_sweep: added `input_ids` param. dispatch_cpu.hpp:217-222
+  Applies only over [NumInput, NumUnits); plastax input ids are an arbitrary
+  tuple, so input units are skipped via a static boolean mask at merge (else
+  each step overwrites the scattered inputs with their identity accumulator).
+- step.py: cache via `functools.cache`, not `jax.util.weakref_lru_cache` (not
+  importable off jax==0.11.0). Same hash/eq reuse on (net, static); strong
+  refs, benign for v1.
+- __init__.py: export `StepInputs` (was omitted; needed to call any StepFn).
+- monoid.py: added `Monoid.identity_for(dtype)`; `materialize_acc_columns` is
+  a correct utility but not on the forward hot path (jax.ops.segment_* supplies
+  identity-at-rest for named monoids).
+- step.py: one `# type: ignore[arg-type]` for a mypy Hashable false positive on
+  `type[Network[GS]]` (parameterized generic base); `net` is hashable.
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

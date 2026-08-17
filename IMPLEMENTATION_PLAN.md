@@ -182,6 +182,25 @@ Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
   jaxtyping shape-string annotations misparsed as forward refs — the friction
   TOOLING.md sanctions silencing with rule-scoped ignores.
 
+M1 (2026-08-17, host-side construction + state + topology + validation):
+
+- state.py / NetworkStatic: added `input_ids: tuple[int, ...]` and
+  `output_ids: tuple[int, ...]` static meta fields. The rung0 sketch had no
+  field for the builder-recorded input/output units that M2's loss (clamp to
+  outputs) and StepInputs (scatter onto inputs) consume.
+- topology.py: `Block` Protocol gains `@runtime_checkable`. Without it,
+  pytest's jaxtyping+beartype instrumentation cannot build a checker for the
+  bare Protocol where it appears in `input_units`/`dense`/`conv2d`/`sequential`
+  signatures, and the package fails to import under pytest. (Scaffold bug.)
+- topology.py: the concrete `Block` impl `_EdgeBlock` is a non-frozen
+  dataclass — a frozen field is read-only and does not structurally satisfy
+  `Block.num_units: int`.
+- state.grow_bucket imports `topo.capacity_policy` function-locally (topo
+  imports state at module level; a top-level back-import would cycle).
+- register_dataclass: verified NO change needed — the bare
+  `@jax.tree_util.register_dataclass` correctly reads
+  `field(metadata=dict(static=True))` to split meta vs data fields in jax 0.11.
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

@@ -226,6 +226,59 @@ M2 (2026-08-17, pipeline forward sweep + step assembly):
 - step.py: one `# type: ignore[arg-type]` for a mypy Hashable false positive on
   `type[Network[GS]]` (parameterized generic base); `net` is hashable.
 
+M3b (2026-08-17, update_conn phase + mlp_xor XOR training):
+
+- sweep.py: new primitives `_build_conn_update` (private core) plus
+  `build_incoming_conn_update`/`build_outgoing_conn_update` (public
+  directional wrappers), mirroring `_accumulate_into` plus
+  `build_forward_accumulate`/`build_backward_accumulate`'s shape. No
+  segment_reduce: a `ConnWrite` targets only the writing edge's own row
+  (never a cross-edge aggregation), so the dead-conn "drop" is a plain
+  `jnp.where(dead, old, written)` keep-old merge rather than an
+  out-of-bounds null-slot scatter -- the degenerate case of the same
+  discipline.
+- phases.py: `build_update_conn_phase` (public, matching
+  `build_add_conn_phase`'s naming -- not the private `_build_*_phase`
+  convention forward/backward/loss/reset_global use -- so it stays
+  independently unit-testable, per tests/test_update_conn.py). Two full
+  passes over EVERY bucket in `state.conns` (PIPELINE's 1-tuple or
+  TOPOLOGICAL's per-level tuple): all buckets' incoming pass completes and
+  is merged before any bucket's outgoing pass runs, matching
+  dispatch_cpu.hpp:450-469's two flat loops over its single (unbucketed)
+  conn arena. `build_phases`' update_conn guard-raise is removed;
+  prune_conn/add_conn guards stay (M4).
+- examples/mlp_xor.py: implemented per mlp_xor.cpp's traits
+  (SigmoidForwardPass, SigmoidBackwardPass, MSELoss, GradientDescentConn).
+  New extra unit field `loss_grad`, beyond the stub's `grad_pre_act`:
+  dispatch_cpu.hpp stages Loss's dL/dActivation into BackwardAcc, a
+  framework-internal per-unit column that is always fresh (zeroed right
+  after the Apply that consumes it); plastax's backward accumulator is
+  instead a value local to `backward_phase`'s own trace closure
+  (phases.py), with no channel for an earlier, separate phase function to
+  write into it. Reusing `grad_pre_act` itself for the seed (additive
+  apply, `u[GradPreAct, i] + acc`) is unsafe across more than one training
+  step: `grad_pre_act` is written every step for every non-input unit, so a
+  hidden unit's stale PREVIOUS-step value would be added into its NEW
+  gradient. `loss_grad` is written only for `output_ids`, every step (never
+  stale), and permanently 0.0 for every other unit (never written at all),
+  which is what makes `(acc + u[LossGrad, i]) * a * (1-a)` safe as a
+  REPLACE (matching the oracle's Apply exactly) across arbitrarily many
+  steps. Topology: 3 input-slot units (x1, x2, a constant-1.0 "bias", fed
+  as `StepInputs.inputs[2]` every call, exactly mirroring mlp_xor.cpp's
+  `Inputs[.][2]`) -> 4 hidden -> 1 output, via topology.sequential/dense
+  (not the oracle's exact RandomUniformWeight seeds/API -- exact oracle
+  parity is M5). `XorNetEval`: a forward-only sibling `Network` sharing
+  XorNet's exact field set, used for final inference against the SAME
+  (static, state) with no side effects (mirrors mlp_xor.cpp's separate
+  `Net.DoForwardPass` vs. `Net.DoStep`, and doubles as a phase-elision
+  example). Trains to loss ~9e-4 and classifies all 4 patterns correctly in
+  ~2.7s wall-clock (`uv run python examples/mlp_xor.py`).
+- .pre-commit-config.yaml / .github/workflows/ci.yml: ruff's `examples/`
+  exclude narrowed to `^examples/ipc_multilayer\.py$`; CI's ruff
+  check/format invocations gained `examples/mlp_xor.py` explicitly (mypy's
+  `files=["src"]` is unchanged -- examples/ correctness is enforced by
+  tests/test_mlp_xor.py actually training and asserting XOR, not by mypy).
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

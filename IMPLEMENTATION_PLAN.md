@@ -373,6 +373,153 @@ stubs):
   PruneConn/AddConn; `test_resort` (recompute_levels/resort/retrace-count)
   stays skipped pending M4b, per the task's explicit scope boundary.
 
+M4b (2026-08-17, topo.recompute_levels/resort, driver.Driver, the widened
+AddConn window, the retrace-count contract):
+
+- pyproject.toml: added `absl-py` to `[dependency-groups].dev`.
+  `jax._src.test_util` (`jax.test_util.assert_num_jit_and_pmap_compilations`,
+  the tool both this task and the rung0 design section 4 cite by name) imports
+  `absl.testing.parameterized`; jax declares `absl-py` as an optional test
+  extra, not a runtime dependency, so it is not pulled in by `jax>=0.11.0`
+  alone. Also noted: the PUBLIC `jax.test_util` shim (`jax/test_util.py`) does
+  NOT re-export `assert_num_jit_and_pmap_compilations`/
+  `count_jit_and_pmap_lowerings` at all (only `check_grads`/`check_jvp`/
+  `check_vjp`) -- both the design doc's own `test_util.py:342` line citation
+  and this milestone's tests therefore import `jax._src.test_util` directly,
+  not `jax.test_util`.
+- phases.py `build_add_conn_phase`'s candidate window: widened from M4a's
+  `0 < level[dst] - level[src] <= neighbourhood` to the oracle-faithful
+  `abs(level[dst] - level[src]) <= neighbourhood` (self-loops excluded via a
+  new `not_self` mask) -- dispatch_cpu.hpp:811-822's rolling window visits
+  every unordered level pair `{La, Lb}` with `|Lb - La| <= Neighbourhood`,
+  INCLUDING `La == Lb`, and tries both edge directions between them; per
+  ordered `(src, dst)` pair that collapses to exactly `abs(gap) <=
+  neighbourhood`. `needs_resort`'s formula (`level_preserving = level[dst] >
+  level[src]`, OR'd across committed candidates) is unchanged code -- it was
+  already computed for real under M4a, just never observed to fire. Verified
+  empirically (not just by inspection) that all 6 of M4a's `test_add_conn.py`
+  tests still pass UNCHANGED under the wider window (each test's engineered
+  `_SRC_BONUS` dominates the ranking enough that the wider window's newly
+  eligible candidates never crack the top-k); only 2 docstrings/comments were
+  updated (`test_level_preserving_add_does_not_set_needs_resort` and
+  `test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort`) since
+  their ORIGINAL reasoning ("this window can only ever propose level-
+  preserving candidates") is no longer true, even though their ASSERTIONS
+  still hold for a different reason (documented in place). No assertion in
+  that file changed.
+- topo.py `recompute_levels`: a fixed-trip-count (`kahn_max_depth` or
+  `num_units`) Bellman-Ford-style longest-path relaxation via
+  `jax.lax.fori_loop`, not a literal port of the C++ oracle's frontier-BFS
+  (`dispatch_cpu.hpp:1407-1474`, which is a data-dependent `while` loop,
+  incompatible with `fori_loop`'s static trip count) -- each round gathers
+  `level[from_id] + 1` per LIVE conn (dead routed to the out-of-range null
+  slot `num_units`, dropped by `segment_max`'s FILL_OR_DROP) via
+  `monoid.max_.segment_reduce`, and re-pins every declared input to level 0
+  at the end of every round. This is INPUT-ANCHORED (mirrors the oracle's
+  `RecomputeLevels`, which seeds its frontier from exactly `[0, NumInput)`
+  and never even visits an input's Level), which is a NARROWER root set than
+  M1's `initial_levels` (host reference, seeds from ALL structurally
+  in-degree-0 units, generic topological sort, raises on a cycle). The two
+  agree exactly whenever a graph's in-degree-0 units coincide with its
+  declared inputs -- true for every M1 topology and this milestone's own
+  test graphs (the task's stated acceptance bar) -- but they are NOT the
+  same algorithm on an arbitrary graph (e.g. a non-input unit that has lost
+  every live incoming conn to pruning stays at level 0 under
+  `recompute_levels` without being treated as a new "root" the way
+  `initial_levels` would); flagging this per the task's ambiguity callout,
+  since "must agree with M1's host initial_levels" could be read as a
+  stronger, general-graph claim than what is implemented or (given
+  `fori_loop` cannot raise on a data-dependent cycle) implementable on
+  device.
+- topo.py `resort`: redistribution is two device-side passes per NEW bucket,
+  both reusing `build_add_conn_phase`'s prefix-sum null-slot idiom -- (1) a
+  cumsum-rank COMPACTING scatter of every old conn (concatenated across
+  every OLD bucket) whose (live, new source level) matches this bucket, into
+  a fresh `capacity_b`-sized column; (2) a stable `lax.sort_key_val` over a
+  single combined `dead * num_units + to_id` key (to_id < num_units always,
+  so the two key ranges never collide), since step (1) preserves each
+  match's OLD relative order, not to_id order. PIPELINE mode keeps exactly
+  one bucket (mirrors `NetworkBuilder.finalize`); TOPOLOGICAL's new bucket
+  COUNT is `max(new_level.max(), 1)` (finalize's own "highest level ever
+  used as a source is max(levels) - 1" derivation) and can move in EITHER
+  direction versus the old static (AddConn can deepen the graph, PruneConn
+  can orphan a formerly-deep subtree) -- not just have its per-bucket
+  CAPACITIES adjusted. Host transfer count: the design doc's section 4 says
+  "per-level live counts are the only host transfer"; the actual
+  implementation needs TWO small transfers in TOPOLOGICAL mode -- the live-
+  count histogram AND, separately, `int(new_level.max())` -- because the
+  bucket COUNT is not always recoverable from the live-conn histogram alone
+  (a level can legitimately have zero live OUTGOING conns this round without
+  ceasing to be a real unit level that needs its own bucket, since deeper
+  units still address it). Flagging this as a place the design doc's
+  phrasing undercounts what host-side information resort actually needs.
+- driver.py `Driver.step`'s overflow retry does NOT replay from a pristine
+  pre-attempt state, contrary to the literal "retry the same inputs"
+  reading test_add_conn.py's own docstrings assume when just calling
+  `build_add_conn_phase` directly. `self._step` donates its `state` argument
+  (`donate_argnums=0`); confirmed empirically that XLA invalidates that
+  argument's buffers the moment the (successful OR overflowing) call
+  returns -- reusing `self._state` for a retry raised "INVALID_ARGUMENT:
+  Buffer has been deleted or donated" the first time this method tried it.
+  Preserving a pristine copy would need an unconditional defensive copy on
+  EVERY call (since overflow is only known AFTER the donating call has
+  already run), which would defeat the donation-based in-place update the
+  whole framework is built on [D:6] for the common, non-overflowing case.
+  Instead, "retry" grows the bucket(s) from -- and replays against -- the
+  FAILED attempt's own valid output (`result.state`): forward/backward/
+  update_conn/prune_conn genuinely run an additional time on an overflow
+  retry (not idempotent in general, e.g. a decaying UpdateConn -- a real,
+  if rare, behavioral cost, since growing a bucket already means the network
+  was configured below its live working set, an event `capacity_policy`'s
+  headroom is meant to make rare in the first place). Flagging this
+  prominently per the task's ambiguity callout: it is the one place this
+  milestone's behavior does not match the most literal reading of its own
+  docstring, forced by jax's donation semantics rather than chosen freely.
+- tests/test_resort.py's retrace-count assertions: confirmed empirically
+  (`jax._src.test_util.count_jit_and_pmap_lowerings`) that ordinary EAGER
+  (non-`jax.jit`-wrapped) jax ops -- `jax.lax.fori_loop`, `jax.ops.
+  segment_sum`, `jax.lax.sort_key_val`, even plain `jnp.asarray`/`jnp.bool_`
+  construction -- each independently trigger their own `lower_jaxpr_to_
+  module` event(s), the SAME counter `assert_num_jit_and_pmap_compilations`
+  uses. `make_step`'s own eager prelude (`build_phases` precomputing masks
+  like `unit_id_mask` before the traced `step` closure exists, plus the
+  overflow sink / `input_ids` array) costs 12 such events for a small test
+  network, BEFORE the compiled step is ever actually called; `topo.resort`'s
+  own eager device work costs a further, similarly unspecified amount.
+  Neither is the thing rung0 design section 4 describes ("a new NetworkStatic
+  ... is a new jit PyTreeDef, so it [the step FUNCTION] recompiles") -- the
+  step closure's OWN first-ever invocation, isolated from its surrounding
+  prelude, was confirmed to cost EXACTLY 1 lowering event per fresh (net,
+  static) pair and exactly 0 for every repeat call. Every retrace-count
+  test therefore keeps `Driver`/`make_step` CONSTRUCTION, and (for the
+  one-resort test) the resort-triggering call itself, OUTSIDE the counted
+  `with jtu.assert_num_jit_and_pmap_compilations(...)` window, so only the
+  jitted step closure's own calls are ever counted. Concretely observed:
+  the pure add/prune workload (20 Driver.step calls) costs exactly 1 total
+  lowering event; the one-resort workload's first post-resort call costs
+  exactly 1, and 8 further calls cost exactly 0.
+- tests/test_resort.py's one-resort retrace-count test manufactures
+  `needs_resort=True` directly (pruning a chain's deepest edge, then setting
+  the flag by hand) rather than triggering it through a genuine AddConn
+  commit, per M4a's OWN deviation note's sanctioned fallback ("trigger the
+  resort test via a directly-constructed needs_resort state + topo.resort,
+  and record that choice"). Reason: `build_add_conn_phase`'s window only
+  ever proposes a candidate sourced at a level that ALREADY has a bucket
+  (`src_ok = src_level == bucket_idx`, true only for `bucket_idx <
+  num_buckets`), and Kahn's `level(dst) = max(incoming src levels) + 1`
+  bounds any such commit's resulting level by the CURRENT max level -- so on
+  a small from-scratch test graph, a real widened-window commit can shrink
+  or hold the bucket count but not provably GROW it without either a much
+  larger seed graph or an actual cycle (attempted and rejected: a cycle
+  makes `recompute_levels`'s bounded relaxation never converge, since it
+  cannot raise on a data-dependent cycle the way host `initial_levels`
+  does). A SEPARATE, un-Driver'd test
+  (`test_widened_window_lets_a_same_level_add_actually_set_needs_resort`,
+  PIPELINE mode, whose single bucket has no such reachability constraint)
+  gives direct evidence the window widening itself works via a genuine
+  commit; the retrace-count test's job is `make_step`'s cache behaviour
+  specifically, which does not care what set the flag.
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

@@ -18,8 +18,38 @@ current dependency floor).
 
 ## Lint + format: ruff
 
-One tool for both. `ruff check` (rules pinned in pyproject: E/F/I/UP/B/ANN)
+One tool for both. `ruff check` (rules pinned in pyproject: E/F/I/UP/B/ANN/D)
 and `ruff format`. Formatting is not a style debate; it is a hook.
+
+## Docstrings: Google style, gated by ruff D + pydoclint
+
+The library surface (`src/plastax`) ships **Google-style docstrings**. Two
+tools enforce this, both wired into pre-commit:
+
+- **ruff `D`** (pydocstyle, `convention = "google"`) — checks presence and
+  shape. Scoped to `src/plastax` via `per-file-ignores` (tests and examples
+  are exempt). `D107` is ignored: `__init__` docstrings are intentionally
+  omitted — constructors are documented on the class.
+- **pydoclint** (`--style=google`) — checks that `Args:`/`Returns:`/`Raises:`
+  match the actual signature. Types stay in the signature, never duplicated in
+  the docstring, so it runs with `--arg-type-hints-in-docstring=False
+  --check-return-types=False`; `--check-class-attributes=True` guards
+  `Attributes:` completeness; `--skip-checking-private-functions=True` limits
+  the contract to the public surface (so a private validator may document a
+  delegated exception without tripping DOC503). pydoclint's default `DOC301`
+  is kept, which forbids a redundant `__init__` docstring — the other half of
+  the D107 decision above.
+
+Conventions in the docstrings themselves: PEP 695 type parameters go in a
+`Type Args:` section; public dataclass fields go in `Attributes:` (description
+only — the generator, e.g. mkdocstrings/griffe, sources types from the
+signature). Run the pydoclint check directly with:
+
+```
+uv run pydoclint --style=google --arg-type-hints-in-docstring=False \
+  --check-return-types=False --check-class-attributes=True \
+  --skip-checking-private-functions=True src/plastax
+```
 
 ## Types: ty first, mypy strict as fallback
 

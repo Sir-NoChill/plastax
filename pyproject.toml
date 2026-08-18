@@ -52,6 +52,7 @@ dev = [
   "mypy>=1.14",
   "ty",
   "ruff",
+  "pydoclint",
   "pre-commit",
   # jax.test_util (jax._src.test_util) imports absl.testing.parameterized;
   # jax itself only declares this as an optional test extra, not a runtime
@@ -79,12 +80,25 @@ line-length = 88
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ANN"]
+# D (pydocstyle): the library ships Google-style docstrings; see TOOLING.md.
+select = ["E", "F", "I", "UP", "B", "ANN", "D"]
 # F722/F821: jaxtyping shape strings (e.g. `Float[Array, " n"]`) read as broken
 # forward references to the linter; jaxtyping recommends disabling them globally
 # (docs.kidger.site/jaxtyping/faq). Type-checkers still erase the shape to
 # `Array` via py.typed, so no real type information is lost.
-ignore = ["ANN401", "F722", "F821"]
+# D107: `__init__` docstrings are intentionally omitted -- constructors are
+# documented on the class (Google style), and pydoclint's DOC301 guards the
+# other direction (no `__init__` docstring when the class already has one).
+ignore = ["ANN401", "F722", "F821", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Docstring (D) rules apply to the library surface only; tests and examples
+# are exempt from the docstring gate.
+"tests/**" = ["D"]
+"examples/**" = ["D"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

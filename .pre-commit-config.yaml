@@ -16,6 +16,19 @@ repos:
 
   - repo: local
     hooks:
+      - id: pydoclint
+        name: pydoclint (google docstring contract)
+        entry: uv run pydoclint
+        language: system
+        types: [python]
+        files: ^src/plastax/.*\.py$
+        args:
+          - --style=google
+          - --arg-type-hints-in-docstring=False
+          - --check-return-types=False
+          - --check-class-attributes=True
+          - --skip-checking-private-functions=True
+
       - id: ty
         name: ty check (experimental; mypy in CI is authoritative)
         entry: uv run ty check src

@@ -1,7 +1,8 @@
-"""Network state: static config (jit cache key) and arena leaves.
+"""Network state: static config (jit cache key)
 
-See rung0 design sections 1 and 4. NetworkStatic meta fields must stay
-hashable primitives (jaxlib/pytree.cc:295-313 enforces lazily).
+NetworkStatic meta fields must stay hashable primitives, so the SoA fields
+need to be of known size before the jit. These are only checked once, when
+jax traces the function/network.
 """
 
 from __future__ import annotations
@@ -19,6 +20,22 @@ from plastax._types import FieldSpec, Propagation
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class NetworkStatic:
+    """Static network configuration.
+
+    Attributes:
+        num_units: total number of units in the network.
+        propagation: propagation mode used to advance the network.
+        unit_fields: field specs defining the unit column layout.
+        conn_fields: field specs defining the connection column layout.
+        level_capacities: bucket capacities. PIPELINE uses a 1-tuple;
+            TOPOLOGICAL uses one bucket per source level.
+        kahn_max_depth: Kahn-order depth bound, or None to derive it as
+            num_units.
+        input_ids: builder-recorded unit ids that StepInputs scatters onto.
+        output_ids: builder-recorded unit ids that the loss clamps targets
+            to.
+    """
+
     num_units: int = dataclasses.field(metadata=dict(static=True))
     propagation: Propagation = dataclasses.field(metadata=dict(static=True))
     unit_fields: tuple[FieldSpec[np.generic], ...] = dataclasses.field(
@@ -27,13 +44,8 @@ class NetworkStatic:
     conn_fields: tuple[FieldSpec[np.generic], ...] = dataclasses.field(
         metadata=dict(static=True)
     )
-    # PIPELINE: 1-tuple. TOPOLOGICAL: one bucket per source level.
     level_capacities: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
-    # None -> Kahn bound derived as num_units (static in v1).
     kahn_max_depth: int | None = dataclasses.field(metadata=dict(static=True))
-    # Builder-recorded unit ids consumed by M2 (loss clamps targets to
-    # output_ids; StepInputs scatters onto input_ids). Not in the rung0
-    # design's NetworkStatic sketch -- Deviation, IMPLEMENTATION_PLAN.md.
     input_ids: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
     output_ids: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
 
@@ -44,10 +56,24 @@ Columns = dict[str, Array]  # keyed by FieldSpec.name; one array per SOA tag
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass
 class NetworkState[GS]:
-    units: Columns  # each (num_units,)
-    conns: tuple[Columns, ...]  # conns[i] columns sized level_capacities[i]
+    """Mutable arena state: unit/conn columns plus user-defined globals.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Attributes:
+        units: per-unit columns, each array shaped (num_units,).
+        conns: per-level connection columns; conns[i] is sized to
+            level_capacities[i].
+        globals_: user-defined global state, opaque to the framework.
+        needs_resort: scalar flag marking whether a topological resort is
+            due; checked host-side by the driver between steps.
+    """
+
+    units: Columns
+    conns: tuple[Columns, ...]
     globals_: GS
-    needs_resort: Bool[Array, ""]  # noqa: F722  jaxtyping scalar-shape string
+    needs_resort: Bool[Array, ""]
 
 
 def _filled_columns(specs: tuple[FieldSpec[np.generic], ...], capacity: int) -> Columns:
@@ -61,7 +87,18 @@ def _filled_columns(specs: tuple[FieldSpec[np.generic], ...], capacity: int) -> 
 
 
 def make_empty_state[GS](static: NetworkStatic, globals_: GS) -> NetworkState[GS]:
-    """Allocate arenas at capacity; all conn slots dead (tombstoned)."""
+    """Allocate arenas at capacity, with all conn slots dead (tombstoned).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        static: static network configuration giving the arena sizes.
+        globals_: initial user-defined global state.
+
+    Returns:
+        A freshly allocated NetworkState with no live connections.
+    """
     units = _filled_columns(static.unit_fields, static.num_units)
     conns = tuple(
         _filled_columns(static.conn_fields, capacity)
@@ -76,7 +113,18 @@ def make_empty_state[GS](static: NetworkStatic, globals_: GS) -> NetworkState[GS
 
 
 def live_conn_count[GS](state: NetworkState[GS], level: int | None = None) -> Array:
-    """Derived, never stored: sum(~dead) per bucket or total (traced)."""
+    """Count live connections.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        state: network state to count connections in.
+        level: bucket to count, or None to sum across all buckets.
+
+    Returns:
+        Scalar array with the live connection count.
+    """
     if level is not None:
         return jnp.sum(~state.conns[level]["dead"])
     total = jnp.asarray(0, dtype=jnp.int32)
@@ -88,8 +136,22 @@ def live_conn_count[GS](state: NetworkState[GS], level: int | None = None) -> Ar
 def grow_bucket[GS](
     static: NetworkStatic, state: NetworkState[GS], level: int
 ) -> tuple[NetworkStatic, NetworkState[GS]]:
-    """Host-side reallocation: pad one bucket's columns, new static, one
-    retrace. Pure old-state -> new-state (rung0 design section 5)."""
+    """Pad one bucket's columns, host-side, and produce a new static/state.
+
+    Pure old-state -> new-state; the caller retraces once against the new
+    static config and host-side reallocation.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        static: current static config, whose level_capacities is grown.
+        state: current network state, whose bucket columns are padded.
+        level: bucket index to grow.
+
+    Returns:
+        The new (static, state) pair with the bucket at `level` grown.
+    """
     # Local import: topo.py imports NetworkState/NetworkStatic from this
     # module at top level, so a module-level import here would cycle.
     from plastax.topo import capacity_policy

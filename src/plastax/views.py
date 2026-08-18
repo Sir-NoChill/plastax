@@ -1,8 +1,9 @@
 """Typed read views and write records over the SOA arenas.
 
-Policies never touch raw columns: reads go through views (GetField<Tag>
-analogue), writes are returned as records so policy code stays pure and
-vectorizable (rung0 design section 2).
+User policies interact with the underlying data via views, rather
+than directly indexing a column in user code. Writes are returned
+as the associated record so that policies remain functionally
+pure and 'vmap'-able.
 """
 
 from __future__ import annotations
@@ -22,39 +23,83 @@ DT = TypeVar("DT", bound=np.generic)
 
 @dataclasses.dataclass(frozen=True)
 class UnitView:
+    """A typed read view over the unit SOA columns."""
+
     _cols: Columns
 
-    # jaxtyping scalar-shape strings below read as broken forward refs to
-    # ruff's F722 (TOOLING.md: jaxtyping friction).
-    def __getitem__(self, key: tuple[FieldSpec[DT], UnitIdx]) -> Shaped[Array, ""]:  # noqa: F722
+    def __getitem__(self, key: tuple[FieldSpec[DT], UnitIdx]) -> Shaped[Array, ""]:
+        """Return the scalar value for a field at a unit index.
+
+        Args:
+            key: Field spec and unit index to look up.
+
+        Returns:
+            The scalar value at that field and index.
+        """
         spec, idx = key
         return self._cols[spec.name][idx]
 
 
 @dataclasses.dataclass(frozen=True)
 class ConnView:
+    """A typed read view over the connection SOA columns."""
+
     _cols: Columns
 
-    def __getitem__(self, key: tuple[FieldSpec[DT], ConnIdx]) -> Shaped[Array, ""]:  # noqa: F722
+    def __getitem__(self, key: tuple[FieldSpec[DT], ConnIdx]) -> Shaped[Array, ""]:
+        """Return the scalar value for a field at a connection index.
+
+        Args:
+            key: Field spec and connection index to look up.
+
+        Returns:
+            The scalar value at that field and index.
+        """
         spec, idx = key
         return self._cols[spec.name][idx]
 
 
 @dataclasses.dataclass(frozen=True)
 class UnitWrite:
-    """Per-unit field writes returned by apply/update policies."""
+    """Per-unit field writes returned by apply/update policies.
 
-    fields: Mapping[str, Shaped[Array, ""]]  # noqa: F722
+    Attributes:
+        fields: Mapping from field name to the scalar value to write.
+    """
+
+    fields: Mapping[str, Shaped[Array, ""]]
 
     @staticmethod
-    def of(*pairs: tuple[FieldSpec[DT], Shaped[Array, ""]]) -> UnitWrite:  # noqa: F722
+    def of(*pairs: tuple[FieldSpec[DT], Shaped[Array, ""]]) -> UnitWrite:
+        """Build a UnitWrite from field-spec/value pairs.
+
+        Args:
+            *pairs: Field spec and value pairs to write.
+
+        Returns:
+            A UnitWrite mapping field names to values.
+        """
         return UnitWrite({spec.name: value for spec, value in pairs})
 
 
 @dataclasses.dataclass(frozen=True)
 class ConnWrite:
-    fields: Mapping[str, Shaped[Array, ""]]  # noqa: F722
+    """Per-connection field writes returned by apply/update policies.
+
+    Attributes:
+        fields: Mapping from field name to the scalar value to write.
+    """
+
+    fields: Mapping[str, Shaped[Array, ""]]
 
     @staticmethod
-    def of(*pairs: tuple[FieldSpec[DT], Shaped[Array, ""]]) -> ConnWrite:  # noqa: F722
+    def of(*pairs: tuple[FieldSpec[DT], Shaped[Array, ""]]) -> ConnWrite:
+        """Build a ConnWrite from field-spec/value pairs.
+
+        Args:
+            *pairs: Field spec and value pairs to write.
+
+        Returns:
+            A ConnWrite mapping field names to values.
+        """
         return ConnWrite({spec.name: value for spec, value in pairs})

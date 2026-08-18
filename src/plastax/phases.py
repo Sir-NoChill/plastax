@@ -413,22 +413,23 @@ def build_add_conn_phase[GS](
     overflow -> dropped scatter + flag; level-preserving adds must NOT set
     needs_resort (rung0 design section 5).
 
-    Candidate window (Deviation, IMPLEMENTATION_PLAN.md M4a -- narrower
-    than dispatch_cpu.hpp:811-822's rolling window, which also visits
-    same-source-level pairs La==Lb): only dst strictly AHEAD of src, i.e.
-    `0 < level[dst] - level[src] <= net.neighbourhood`. A same-level pair
-    is the only way an accepted edge could ever force a Kahn relevel (an
-    edge into a unit at its OWN source level, or behind it, needs that
-    destination bumped to source_level + 1); M4a ships AddConn/PruneConn
-    but `topo.recompute_levels`/`topo.resort` stay `NotImplementedError`
-    (M4b), so there is no host mechanism yet to ACT on a relevel request.
-    Restricting the window to strictly-ahead pairs makes every accepted
-    candidate provably level-preserving by construction: dst's level
-    already exceeds src's, so Kahn's `level(dst) = max(incoming src
-    levels) + 1` cannot increase. `needs_resort` below is real, general
-    code (not a hardcoded constant) -- it is simply never observed to fire
-    given this window; a future window that admits same-level pairs would
-    exercise it without changing this mechanism.
+    Candidate window (M4b Deviation, IMPLEMENTATION_PLAN.md -- supersedes
+    M4a's narrower one): matches dispatch_cpu.hpp:811-822's rolling
+    level-PAIR window in full, `abs(level[dst] - level[src]) <=
+    net.neighbourhood` with self-loops excluded (see the `window_ok`
+    comment below for the unordered-level-pair derivation that makes this
+    the oracle-faithful per-ordered-pair form -- dispatch_cpu.hpp's window
+    visits every unordered pair {La, Lb} with `|Lb - La| <= Neighbourhood`,
+    INCLUDING La == Lb, trying both edge directions between them). M4a
+    restricted this to `0 < gap <= neighbourhood` (dst strictly ahead)
+    because `topo.recompute_levels`/`topo.resort` were still
+    `NotImplementedError` then, so there was no host mechanism to react to
+    a relevel request; M4b implements both, so a same-level or
+    behind-src candidate can now be genuinely accepted, letting
+    `needs_resort` (below) actually fire -- the natural resort trigger the
+    retrace-count tests exercise. `needs_resort` was already real, general
+    code under M4a (not a hardcoded constant), so this widening is a pure
+    enabling change to `window_ok`, not to the reassignment logic itself.
 
     One bucket is one top_k + prefix-sum claim, independent of every other
     bucket (no cross-bucket sequencing, unlike UpdateConn): in TOPOLOGICAL
@@ -440,8 +441,14 @@ def build_add_conn_phase[GS](
     the level WINDOW itself is still consulted in both modes (native's
     AddConnections has no Pipeline/Topological distinction at all,
     dispatch_cpu.hpp:699-762 is driven purely by Kahn levels; only the
-    destination BUCKET differs here, which is exactly why PIPELINE mode
-    can never resort -- there is only the one bucket to land in).
+    destination BUCKET differs here). Design section 5's "in pipeline mode
+    adds never resort at all" described a CONSEQUENCE of M4a's
+    strictly-ahead window (every accepted candidate was level-preserving
+    by construction, in either mode), not a mode-specific carve-out of
+    `reassigning`'s formula below -- under this wider window a
+    pipeline-mode commit can set `needs_resort` exactly like a
+    topological-mode one; `topo.resort` keeps PIPELINE at a single bucket
+    (its own docstring), so this stays correct, just no longer vacuous.
     """
     ac = net.add_conn
     assert ac is not None  # build_phases only calls this when set
@@ -461,6 +468,7 @@ def build_add_conn_phase[GS](
     unit_ids = jnp.arange(num_units, dtype=jnp.int32)
     flat_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
     flat_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
+    not_self = flat_src != flat_dst
 
     def add_conn_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -473,9 +481,18 @@ def build_add_conn_phase[GS](
         src_level = unit_level[flat_src]
         dst_level = unit_level[flat_dst]
         level_gap = dst_level - src_level
-        # "dst at levels ahead of src" (module docstring above): excludes
-        # the same-level (La==Lb) pairs of dispatch_cpu.hpp's full window.
-        window_ok = (level_gap >= 1) & (level_gap <= neighbourhood)
+        # Oracle-faithful window (module docstring above): dispatch_cpu.hpp
+        # :811-822's rolling window visits every unordered level pair {La,
+        # Lb} with |Lb - La| <= Neighbourhood -- INCLUDING La == Lb -- and
+        # tries both edge directions between them (TryPair's own `if (La !=
+        # Lb)` branch adds the reverse-direction perspective; when La == Lb
+        # the (Ai, Bi) double loop over that one level already visits both
+        # orderings on its own). Per ordered (src, dst) pair that collapses
+        # to exactly this: `abs(gap) <= neighbourhood`, self-loops excluded
+        # (TryPair's own `if (U == V) return` -- gap == 0 no longer implies
+        # src == dst now that same-level pairs are admitted, so `not_self`
+        # must be checked explicitly here).
+        window_ok = (jnp.abs(level_gap) <= neighbourhood) & not_self
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
@@ -539,9 +556,11 @@ def build_add_conn_phase[GS](
             overflow = overflow | jnp.any(top_valid & ~has_room)
             target_slot = jnp.where(committed, free_slot, jnp.int32(capacity_b))
 
-            # needs_resort (module docstring above): always False given
-            # this window's construction, computed for real rather than
-            # hardcoded so a future wider window is correct for free.
+            # needs_resort (module docstring above): under M4a's
+            # strictly-ahead window this was always False by construction;
+            # the wider M4b window can now genuinely commit a same-level or
+            # behind-src candidate, so this fires for real -- unchanged
+            # code, since it was already computed rather than hardcoded.
             level_preserving = unit_level[top_dst] > unit_level[top_src]
             reassigning = reassigning | jnp.any(committed & ~level_preserving)
 

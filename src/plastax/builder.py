@@ -28,12 +28,21 @@ from plastax.topology import Topology
 from plastax.traits import Network
 
 # Values a caller may pass into add_unit/add_conn **kwargs, widened with the
-# numpy-scalar FieldSpec.default that fills in unset fields (rung0 design
-# doesn't type this; kept private to the module).
+# numpy-scalar FieldSpec.default that fills in unset fields (kept private to
+# the module).
 FieldValue = float | int | bool | np.generic
 
 
 class NetworkBuilder[GS]:
+    """Construct a network host-side, unit by unit and connection by connection.
+
+    Callers add units and connections imperatively, then call finalize() to
+    freeze the result into a (NetworkStatic, NetworkState) pair.
+
+    Type Args:
+        GS: The network's globals type.
+    """
+
     def __init__(self, net: type[Network[GS]], globals_: GS) -> None:
         self.net = net
         self.globals_ = globals_
@@ -76,9 +85,20 @@ class NetworkBuilder[GS]:
         *,
         globals_: GS,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
-        """Expand a plastax.topology spec into arenas: add units, mark the
-        first/last blocks as inputs/outputs, bulk add_conn the edge set,
-        finalize."""
+        """Expand a plastax.topology spec into arenas.
+
+        Adds units, marks the first/last blocks as inputs/outputs, bulk
+        add_conn's the edge set, then finalizes.
+
+        Args:
+            net: The network type to build.
+            topology_fn: Draws a topology spec from a PRNG key.
+            key: PRNG key passed to topology_fn.
+            globals_: The network's globals value.
+
+        Returns:
+            The finalized (NetworkStatic, NetworkState) pair.
+        """
         spec = topology_fn(key)
         builder = cls(net, globals_)
         for _ in range(spec.num_units):
@@ -98,7 +118,17 @@ class NetworkBuilder[GS]:
         return builder.finalize()
 
     def add_unit(self, **field_values: float | int | bool) -> int:
-        """Returns the new unit's global id (dense, 0-based)."""
+        """Add a unit, filling unset fields with their defaults.
+
+        Args:
+            **field_values: Settable unit field values, keyed by field name.
+
+        Returns:
+            The new unit's global id (dense, 0-based).
+
+        Raises:
+            ValueError: A field name is unknown or not settable.
+        """
         for name in field_values:
             if name not in self._settable_unit_fields:
                 raise ValueError(
@@ -112,6 +142,16 @@ class NetworkBuilder[GS]:
         return len(self._units) - 1
 
     def add_conn(self, src: int, dst: int, **field_values: float | int | bool) -> None:
+        """Add a connection, filling unset fields with their defaults.
+
+        Args:
+            src: Source unit id.
+            dst: Destination unit id.
+            **field_values: Settable conn field values, keyed by field name.
+
+        Raises:
+            ValueError: A field name is unknown or not settable.
+        """
         for name in field_values:
             if name not in self._settable_conn_fields:
                 raise ValueError(
@@ -126,15 +166,26 @@ class NetworkBuilder[GS]:
         self._conn_values.append(row)
 
     def mark_input(self, unit_id: int) -> None:
+        """Mark a unit id as a network input."""
         self._input_ids.append(unit_id)
 
     def mark_output(self, unit_id: int) -> None:
+        """Mark a unit id as a network output."""
         self._output_ids.append(unit_id)
 
     def finalize(self) -> tuple[NetworkStatic, NetworkState[GS]]:
-        """Computes initial levels (topo.initial_levels), buckets conns by
+        """Freeze the accumulated units and connections into arenas.
+
+        Computes initial levels (topo.initial_levels), buckets conns by
         source level with capacity_policy headroom, allocates arenas, and
-        freezes the static config."""
+        freezes the static config.
+
+        Returns:
+            The (NetworkStatic, NetworkState) pair for the built network.
+
+        Raises:
+            ValueError: A referenced unit id is out of range.
+        """
         num_units = len(self._units)
         for unit_id in (
             *self._input_ids,
@@ -170,7 +221,7 @@ class NetworkBuilder[GS]:
 
         if self.net.propagation is Propagation.PIPELINE:
             # Single flat arena: every conn lands in bucket 0 regardless of
-            # source level (rung0 design section 3).
+            # source level.
             bucket_of_conn = np.zeros_like(src_arr)
             num_buckets = 1
         else:

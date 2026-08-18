@@ -1,8 +1,8 @@
-"""Step assembly: the monomorphization point (rung0 design section 2).
+"""Step assembly: the monomorphization point.
 
 One jit cache entry per (Network subclass, NetworkStatic); donation on the
 whole state pytree (donate_argnums=0). Cached with the weakref_lru_cache
-pattern of jax/_src/pjit.py:612.
+pattern.
 """
 
 from __future__ import annotations
@@ -29,65 +29,58 @@ GS = TypeVar("GS")
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class StepResult[GS]:
-    """Registered as a dataclass pytree (Deviation, IMPLEMENTATION_PLAN.md
-    M2): the stub's plain @dataclasses.dataclass cannot cross a jit boundary
-    as a return value (confirmed empirically: unregistered dataclasses trace
-    fine but jit raises "not a valid JAX type" on return); make_step's
-    jitted `step` returns StepResult directly, so it must be registered.
+    """One step's output: the new state plus framework-computed signals.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Attributes:
+        state: The network state after the step.
+        overflow: AddConn overflow flag for the step.
+        loss: Reduced per-output loss for the step; 0.0 when the net has no
+            loss phase.
     """
 
     state: NetworkState[GS]
-    overflow: Bool[Array, ""]  # noqa: F722  AddConn overflow flag, jaxtyping shape
-    # Reduced (summed) per_output loss -- Deviation, IMPLEMENTATION_PLAN.md
-    # M2 loss-target question (phases.py's Phase docstring has the full
-    # reasoning): globals_ is a fully opaque user pytree with no framework-
-    # known "loss slot" (Network[None] is a valid, exercised instantiation),
-    # so the reduced scalar lands here instead, sibling to `overflow`.
-    # jnp.float32(0.0) when net.loss is None, mirroring overflow's "always a
-    # constant in M2" convention.
-    loss: Float[Array, ""]  # noqa: F722  jaxtyping scalar shape
+    overflow: Bool[Array, ""]
+    loss: Float[Array, ""]
 
 
 StepFn = Callable[[NetworkState[GS], StepInputs], StepResult[GS]]
 
 
 def make_step[GS](net: type[Network[GS]], static: NetworkStatic) -> StepFn[GS]:
-    """Assemble present phases, jit with donate_argnums=0. The returned
-    callable must be shape-preserving on the state pytree so every leaf
-    donates (CI promotes the donation warning to an error)."""
-    # mypy false positive (confirmed via a minimal repro isolated from this
-    # module): `type[Network[GS]]` -- a parameterized GENERIC base class --
-    # fails mypy's structural Hashable check on object.__hash__'s synthesized
-    # self-type ("def __hash__(self: object)" vs the Hashable protocol's
-    # "def __hash__()"), even though the identical check passes for a
-    # concrete (non-generic-parameterized) Network subclass, and NetworkStatic
-    # -- itself frozen/hashable -- already proves value-equal-instances collapse
-    # to one cache entry (test_pytree.py's
-    # test_networkstatic_value_equality_drives_cache_reuse). `net` is in fact
-    # always hashable (a class, by default object identity).
+    """Assemble the present phases and jit them with donate_argnums=0.
+
+    The returned callable must be shape-preserving on the state pytree so
+    every leaf donates (CI promotes the donation warning to an error).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network subclass to assemble phases for.
+        static: The network's static configuration.
+
+    Returns:
+        A jitted step function for the given network and static config.
+    """
+    # mypy false positive: a parameterized generic base class fails the
+    # structural Hashable check, though a class is always hashable by
+    # identity; hence the cast.
     return cast(StepFn[GS], _cached_make_step(net, static))  # type: ignore[arg-type]
 
 
-# jax.util.weakref_lru_cache is not cleanly importable off the pinned floor
-# (Deviation, IMPLEMENTATION_PLAN.md M2, per the module docstring's citation
-# of jax/_src/pjit.py:612): confirmed empirically against jax==0.11.0
-# (pyproject `jax>=0.11.0`) -- `jax.util` raises AttributeError (the
-# compatibility shim the rung0 design's citation assumes is gone) and
-# `import jax.util` raises ModuleNotFoundError. `jax._src.util.weakref_lru_cache`
-# is reachable, but reaching into `_src` is exactly the fragility the task's
-# "if not cleanly importable" clause is guarding against, not a substitute
-# for it. functools.cache (an unbounded functools.lru_cache, ruff UP033)
-# gives the same hash/eq-keyed reuse -- proven against NetworkStatic by
-# test_pytree.py's test_networkstatic_value_equality_drives_cache_reuse --
-# at the cost of strong (not weak) references to (net, static) and the
-# cached StepFn; benign for v1's process-lifetime, low-cardinality (net,
-# static) pairs.
+# jax.util.weakref_lru_cache is not cleanly importable off the pinned jax
+# floor, so functools.cache is used instead: it gives the same hash/eq-keyed
+# reuse, at the cost of strong (rather than weak) references to (net,
+# static) and the cached StepFn -- benign for v1's low-cardinality,
+# process-lifetime pairs.
 @functools.cache
 def _cached_make_step(net: type[Network[Any]], static: NetworkStatic) -> StepFn[Any]:
-    # overflow_sink (phases.py's build_phases docstring, IMPLEMENTATION_PLAN.md
-    # M4a Deviation): a length-1 out-parameter build_add_conn_phase (when
-    # net.add_conn is set) overwrites on every call; stays [False] otherwise,
-    # matching the pre-M4a constant. Created once here (mirrors `phases`
+    # overflow_sink (see build_phases): a length-1 out-parameter
+    # build_add_conn_phase (when net.add_conn is set) overwrites on every
+    # call; stays [False] otherwise. Created once here (mirrors `phases`
     # itself), mutated once at trace time, read below into StepResult --
     # jax.jit traces step's body exactly once, so this is an ordinary data
     # dependency in the resulting jaxpr, not a stale Python-side read.
@@ -96,8 +89,8 @@ def _cached_make_step(net: type[Network[Any]], static: NetworkStatic) -> StepFn[
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
-        # Step input scatter (IMPLEMENTATION_PLAN.md M2), before any phase:
-        # StepInputs.inputs onto units[ACTIVATION] at the static input_ids.
+        # Step input scatter, before any phase: StepInputs.inputs onto
+        # units[ACTIVATION] at the static input_ids.
         activation = state.units[ACTIVATION.name].at[input_ids].set(inputs.inputs)
         state = dataclasses.replace(
             state, units={**state.units, ACTIVATION.name: activation}

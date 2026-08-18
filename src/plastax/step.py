@@ -84,7 +84,15 @@ def make_step[GS](net: type[Network[GS]], static: NetworkStatic) -> StepFn[GS]:
 # static) pairs.
 @functools.cache
 def _cached_make_step(net: type[Network[Any]], static: NetworkStatic) -> StepFn[Any]:
-    phases = build_phases(net, static)
+    # overflow_sink (phases.py's build_phases docstring, IMPLEMENTATION_PLAN.md
+    # M4a Deviation): a length-1 out-parameter build_add_conn_phase (when
+    # net.add_conn is set) overwrites on every call; stays [False] otherwise,
+    # matching the pre-M4a constant. Created once here (mirrors `phases`
+    # itself), mutated once at trace time, read below into StepResult --
+    # jax.jit traces step's body exactly once, so this is an ordinary data
+    # dependency in the resulting jaxpr, not a stale Python-side read.
+    overflow_sink: list[Bool[Array, ""]] = [jnp.bool_(False)]
+    phases = build_phases(net, static, overflow_sink=overflow_sink)
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
@@ -100,7 +108,7 @@ def _cached_make_step(net: type[Network[Any]], static: NetworkStatic) -> StepFn[
             state, contribution = phase(state, inputs)
             total_loss = total_loss + contribution
 
-        return StepResult(state=state, overflow=jnp.bool_(False), loss=total_loss)
+        return StepResult(state=state, overflow=overflow_sink[0], loss=total_loss)
 
     # jax.jit's return type is opaque under follow_imports="skip" (pyproject,
     # jax.* -> Any); step's own signature is the true (and already checked)

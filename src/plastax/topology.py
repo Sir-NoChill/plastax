@@ -1,7 +1,9 @@
-"""Initial-structure front end: layer specs expand to explicit edge lists
-at builder time (host-side, numpy). No lowering is involved: an FC layer
-is a dense bipartite edge set, a conv layer a sparse structured one, and
-the existing sweep is their forward pass once they land in the arenas.
+"""Expand layer specs into explicit edge lists at build time.
+
+Building happens host-side, using numpy; no lowering is involved. An FC
+layer is a dense bipartite edge set, a conv layer a sparse structured
+one, and the existing sweep is their forward pass once they land in the
+arenas.
 
 Weight sharing decision (2026-08-17): conv kernels are UNROLLED — each
 (position, tap) pair is its own edge initialized from the shared kernel
@@ -33,33 +35,59 @@ _HE_NORMAL: Initializer = jax.nn.initializers.he_normal()
 
 @dataclasses.dataclass(frozen=True)
 class EdgeSet:
-    """Host-side edge list: the sole output currency of all generators."""
+    """Host-side edge list: the sole output currency of all generators.
 
-    from_ids: np.ndarray  # (E,) int32, global unit ids (offsets applied by block)
-    to_ids: np.ndarray  # (E,) int32
-    weights: np.ndarray  # (E,) float32, already initialized
+    Attributes:
+        from_ids: (E,) int32 global source unit ids (offsets applied by block).
+        to_ids: (E,) int32 global destination unit ids.
+        weights: (E,) float32 initial edge weights.
+    """
+
+    from_ids: np.ndarray
+    to_ids: np.ndarray
+    weights: np.ndarray
 
 
 @runtime_checkable
 class Block(Protocol):
-    """A unit block plus the edges it contributes; blocks compose by
-    concatenating unit id spaces (sequential offsets them).
+    """A unit block plus the edges it contributes.
 
-    @runtime_checkable (Deviation, IMPLEMENTATION_PLAN.md): the stub omitted
-    it, but pytest's jaxtyping+beartype instrumentation (pyproject addopts)
-    wraps every function in this module, including ones returning/accepting
-    `Block`, and beartype cannot build a return-type checker for a plain
-    (non-runtime_checkable) Protocol -- it raises at import time.
+    Blocks compose by concatenating unit id spaces; `sequential` offsets
+    them accordingly.
+
+    `@runtime_checkable` is required because pytest's jaxtyping+beartype
+    instrumentation wraps every function in this module, including ones
+    returning or accepting `Block`, and beartype cannot build a checker
+    for a Protocol that isn't runtime-checkable — it would raise at
+    import time.
     """
 
     num_units: int
 
-    def edges(self, key: PRNGKeyArray, offset_in: int, offset_out: int) -> EdgeSet: ...
+    def edges(self, key: PRNGKeyArray, offset_in: int, offset_out: int) -> EdgeSet:
+        """Compute this block's contributed edges, offset into global ids.
+
+        Args:
+            key: PRNG key for weight initialization.
+            offset_in: Global unit id offset for this block's source units.
+            offset_out: Global unit id offset for this block's output units.
+
+        Returns:
+            The edge set wiring into this block, with globally-offset ids.
+        """
+        ...
 
 
 @dataclasses.dataclass(frozen=True)
 class Topology:
-    """Finalized structure handed to NetworkBuilder.from_topology."""
+    """Finalized structure handed to NetworkBuilder.from_topology.
+
+    Attributes:
+        num_units: Total unit count across all blocks.
+        input_ids: Global ids of the input units (the first block).
+        output_ids: Global ids of the output units (the last block).
+        edges: The full host-side edge list.
+    """
 
     num_units: int
     input_ids: tuple[int, ...]
@@ -70,18 +98,39 @@ class Topology:
 @dataclasses.dataclass  # not frozen: Block.num_units is a plain (writable) attribute,
 # and a frozen dataclass's fields are structurally read-only against that Protocol.
 class _EdgeBlock:
-    """Concrete Block: a fixed unit count plus a closure computing its
-    (already globally-offset) edges. dense/conv2d/input_units all return
-    one of these; `sequential` is the only caller of `.edges`."""
+    """Concrete Block: a fixed unit count plus an edge-computing closure.
+
+    `dense`, `conv2d`, and `input_units` all return one of these;
+    `sequential` is the only caller of `.edges`.
+    """
 
     num_units: int
     _make_edges: Callable[[PRNGKeyArray, int, int], EdgeSet]
 
     def edges(self, key: PRNGKeyArray, offset_in: int, offset_out: int) -> EdgeSet:
+        """Delegate to the stored edge-computing closure.
+
+        Args:
+            key: PRNG key for weight initialization.
+            offset_in: Global unit id offset for this block's source units.
+            offset_out: Global unit id offset for this block's output units.
+
+        Returns:
+            The edge set wiring into this block, with globally-offset ids.
+        """
         return self._make_edges(key, offset_in, offset_out)
 
 
 def input_units(n: int) -> Block:
+    """Build a block of n input units that contributes no edges.
+
+    Args:
+        n: Number of input units.
+
+    Returns:
+        A Block of n input units with an empty edge set.
+    """
+
     def make_edges(key: PRNGKeyArray, offset_in: int, offset_out: int) -> EdgeSet:
         del key, offset_in, offset_out
         return EdgeSet(
@@ -99,7 +148,16 @@ def dense(
     *,
     init: Initializer = _GLOROT_UNIFORM,
 ) -> Block:
-    """Fully connected bipartite block: n_in * n_out edges."""
+    """Build a fully connected bipartite block with n_in * n_out edges.
+
+    Args:
+        n_in: Number of source units.
+        n_out: Number of output units.
+        init: Weight initializer, called as init(key, (n_in, n_out)).
+
+    Returns:
+        A Block wiring every input unit to every output unit.
+    """
 
     def make_edges(key: PRNGKeyArray, offset_in: int, offset_out: int) -> EdgeSet:
         # fan_in/fan_out convention for a (n_in, n_out) weight matrix, per
@@ -126,8 +184,20 @@ def conv2d(
     stride: int = 1,
     init: Initializer = _HE_NORMAL,
 ) -> Block:
-    """Receptive-field edge enumeration with unrolled (non-shared) weights;
-    index arithmetic mirrors lax.conv_general_dilated shape logic."""
+    """Enumerate receptive-field edges with unrolled (non-shared) weights.
+
+    Index arithmetic mirrors lax.conv_general_dilated's shape logic.
+
+    Args:
+        in_shape: Input shape (H, W, C_in).
+        kernel: Kernel shape (kH, kW, C_out).
+        stride: Convolution stride.
+        init: Weight initializer, called as init(key, (kH, kW, C_in, C_out)).
+
+    Returns:
+        A Block wiring each output unit to its receptive field, with one
+        edge per (position, tap) pair.
+    """
     h, w, c_in = in_shape
     kh, kw, c_out = kernel
     # VALID padding, no dilation: matches lax.conv_general_dilated's output
@@ -163,13 +233,21 @@ def conv2d(
 
 
 def sequential(*blocks: Block) -> Callable[[PRNGKeyArray], Topology]:
-    """Compose blocks by offsetting unit id spaces; first block's units are
-    inputs, last block's are outputs.
+    """Compose blocks by offsetting unit id spaces into one topology.
 
-    The first block contributes no edges of its own (it is the input
-    layer); each later block's `.edges` is called with offset_in fixed at
-    the previous block's base id and offset_out at its own, so it wires
-    directly to its predecessor -- "connects consecutive blocks".
+    The first block's units are inputs and the last block's are outputs;
+    it contributes no edges of its own. Each later block's `.edges` is
+    called with offset_in fixed at the previous block's base id and
+    offset_out at its own, wiring it directly to its predecessor.
+
+    Args:
+        *blocks: Blocks to connect in sequence, first to last.
+
+    Returns:
+        A callable that takes a PRNG key and builds the finalized Topology.
+
+    Raises:
+        ValueError: If no blocks are given.
     """
     if not blocks:
         raise ValueError("sequential: at least one block is required")

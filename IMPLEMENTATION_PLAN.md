@@ -146,6 +146,21 @@ and update the design doc if the change is semantic. Do not silently drift.
 
 ### Recorded
 
+API / docstrings (2026-08-18, docstring sweep):
+
+- _types (types): `FieldSpec.f32`/`FieldSpec.i32` -> `FieldSpec.float32`/
+  `FieldSpec.int32`, plus a new generic `FieldSpec.field(name, dtype, default)`
+  factory the per-type helpers now delegate to. BREAKING: public constructor
+  names changed; call sites in `examples/` and `tests/` updated in the same
+  commit. Reason: legible dtype names and one generic construction path in
+  place of near-duplicate per-type methods.
+- Project-wide port to Google-style docstrings under way (Args/Returns/Raises,
+  `Type Args:` for PEP 695 params, `Attributes:` for public dataclasses);
+  source-location/oracle citations stripped from docstrings, redundant per-line
+  `# noqa: F722` removed. The ruff `D` (google) + pydoclint gate
+  (`--arg-type-hints-in-docstring=False --check-return-types=False`) is wired
+  after the sweep completes so the tree goes green in one pass.
+
 Tooling / infrastructure (2026-08-17, scaffolding handoff):
 
 - pyproject (build): `requires-python` `>=3.11` -> `>=3.12`. jax 0.11 requires

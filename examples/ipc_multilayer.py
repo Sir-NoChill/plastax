@@ -37,9 +37,9 @@ import numpy as np
 
 import plastax as px
 
-ValueNode = px.FieldSpec.f32("value_node")  # persistent predictive-coding state x
-Error = px.FieldSpec.f32("error")  # eps = ValueNode - mu, written by forward apply
-BottomUp = px.FieldSpec.f32(
+ValueNode = px.FieldSpec.float32("value_node")  # persistent predictive-coding state x
+Error = px.FieldSpec.float32("error")  # eps = ValueNode - mu, written by forward apply
+BottomUp = px.FieldSpec.float32(
     "bottom_up"
 )  # f'(x) * theta^T eps, written by backward apply
 

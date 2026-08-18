@@ -13,7 +13,7 @@ import jax.numpy as jnp
 
 import plastax as px
 
-GradPreAct = px.FieldSpec.f32("grad_pre_act")
+GradPreAct = px.FieldSpec.float32("grad_pre_act")
 # dL/dActivation, staged by MSELoss for output units only and consumed by
 # SigmoidBackward.apply at the output level. dispatch_cpu.hpp stages this
 # into BackwardAcc, a framework-internal per-unit column that is always
@@ -25,7 +25,7 @@ GradPreAct = px.FieldSpec.f32("grad_pre_act")
 # always fresh), permanently 0.0 for every other unit since nothing else
 # ever touches it, so -- unlike reusing GradPreAct itself -- it can never
 # carry a stale value from a previous step into a hidden unit's gradient.
-LossGrad = px.FieldSpec.f32("loss_grad")
+LossGrad = px.FieldSpec.float32("loss_grad")
 
 LEARNING_RATE = 0.5
 NUM_EPOCHS = 5000

@@ -279,6 +279,100 @@ M3b (2026-08-17, update_conn phase + mlp_xor XOR training):
   `files=["src"]` is unchanged -- examples/ correctness is enforced by
   tests/test_mlp_xor.py actually training and asserting XOR, not by mypy).
 
+M4a (2026-08-17, PruneConn tombstoning + K-bounded AddConn; M4b's
+topo.recompute_levels/resort/driver.py stay untouched NotImplementedError
+stubs):
+
+- phases.py: new `build_prune_conn_phase` (vmaps `prune_conn.predicate`
+  over every row of every bucket -- including already-dead rows, since
+  vmap cannot skip them the way dispatch_cpu.hpp:541-542's `continue` does;
+  harmless, as `dead | predicate(...)` is `True` regardless of a
+  meaningless predicate result on an already-dead row -- and ORs the result
+  into that bucket's `dead` column; never touches `needs_resort`).
+  `build_phases`' prune_conn/add_conn guard-raises are removed and both are
+  wired in at their documented phase-order position (forward, loss,
+  backward, update_conn, prune_conn, add_conn, reset_global).
+- phases.py: `build_add_conn_phase(net, static) -> Phase[GS]` ->
+  `build_add_conn_phase(net, static, *, overflow_sink: list[Bool[Array,
+  ""]] | None = None) -> Phase[GS]`; `build_phases` gained the same keyword
+  -only `overflow_sink` parameter (default `None`, so every existing caller
+  -- test_phases_elision.py, test_update_conn.py -- is unaffected). This is
+  the overflow-surfacing mechanism (task deviation slot 2): `Phase[GS]`'s
+  2-tuple return `(state, loss_contribution)` has no channel for a THIRD,
+  add_conn-only signal, and widening it to a 3-tuple would have rippled
+  into every phase builder plus both of those existing test files' direct
+  `phase(...)` call sites. A length-1 mutable list threaded only to
+  `build_add_conn_phase`, which overwrites its single element with the
+  computed overflow flag on every call, keeps `Phase` and `build_phases`'
+  own return type unchanged for every other caller. `step.py`'s
+  `_cached_make_step` creates the sink once (alongside `phases`), passes it
+  through, and reads `overflow_sink[0]` into `StepResult.overflow` in place
+  of the old hardcoded `jnp.bool_(False)`; the mutation happens once, at
+  `jax.jit`'s single trace of `step`'s body, so it is an ordinary jaxpr
+  data dependency, not a stale Python-side read. Considered and rejected: a
+  new `NetworkState.overflow` field (breaks test_pytree.py's explicit
+  leaf-count formula) and a 3-tuple `Phase` (ripples into the two test
+  files above); both are viable but strictly more invasive than the sink.
+- phases.py `build_add_conn_phase`'s candidate window is narrower than
+  dispatch_cpu.hpp:811-822's full rolling window: only dst strictly AHEAD
+  of src, `0 < level[dst] - level[src] <= net.neighbourhood` (excludes the
+  oracle's same-source-level La==Lb pairs). A same-level pair is the only
+  way an accepted edge could ever force a Kahn relevel (an edge into a unit
+  at or behind its own source's level needs that destination bumped to
+  source_level + 1); since M4b's `topo.recompute_levels`/`resort` are not
+  implemented yet, there is no host mechanism to act on a relevel request
+  this milestone. Restricting the window to strictly-ahead pairs makes
+  every accepted candidate provably level-preserving by construction (dst's
+  level already exceeds src's, so Kahn's `level(dst) = max(incoming src
+  levels) + 1` cannot increase) -- `needs_resort` is computed for real
+  (`unit_level[dst] > unit_level[src]` per accepted candidate, ORed across
+  buckets), not hardcoded, so a future wider window is correct without
+  touching this mechanism; it is simply never observed to fire given this
+  window. Flagging for review per the task's ambiguity callout: this is a
+  deliberate narrowing of the oracle's window, not a bug, but it does mean
+  M4a's AddConn can never itself be the trigger for M4b's resort path --
+  only a later, wider window (or PruneConn-then-AddConn level churn, still
+  excluded here) would exercise it.
+- phases.py `build_add_conn_phase`: per source-level bucket, candidates are
+  the full (num_units, num_units) unit-id grid (masked by the level window
+  and, in TOPOLOGICAL mode, by `level[src] == bucket_idx`; in PIPELINE mode
+  every unit is a source-level candidate, since the single bucket holds
+  every live conn regardless of source level), scored via `ac.score`
+  (invalid pairs forced to -inf), reduced via `lax.top_k(..., k=min(
+  ac.max_candidates, num_units**2))`. Slot claim: a prefix-sum
+  (`cumsum(dead) - 1`) over the bucket's OWN dead mask gives each dead
+  position's 0-based rank among free slots; scattering `arange(capacity)`
+  by that rank (dropping live positions via an always-out-of-bounds
+  `sink_len = max(capacity, k)` index) inverts it into "the position of the
+  j-th free slot" for j in `[0, k)`, with `capacity` itself standing in for
+  "no such free slot" -- a top-k'd candidate commits only if it is both a
+  real (in-window) candidate and has room; the rest -- invalid, or valid
+  but out of room -- scatter to `capacity` (one past the bucket's own valid
+  range) and vanish under `.at[...].set(..., mode="drop")`'s default
+  FILL_OR_DROP. `overflow` is "a real, top-k-selected candidate had no
+  room"; distinct from `needs_resort` (see above), matching the driver.py
+  docstring's two separate escalation paths (grow-and-retry vs.
+  resort-between-steps) even though M4b's Driver does not exist yet to
+  consume either.
+- phases.py `build_add_conn_phase`: a newly-committed slot's conn fields
+  NOT covered by `ac.init`'s `ConnWrite` (e.g. an unset extra field) are
+  reset to that field's `FieldSpec.default` rather than inheriting
+  whatever a previous tenant left there -- a real, not hypothetical,
+  concern given prune_conn runs immediately before add_conn in the same
+  step, so a slot freed by THIS step's own pruning can be reclaimed by
+  add_conn before its stale weight would ever be read. Mirrors native
+  `SOAAllocator::Allocate()`'s placement-new default-construction on claim
+  (alloc.hpp:171-188), applied to plastax's dead-slot recycling in place of
+  native's bump allocation (plastax intentionally diverges from native's
+  allocator here per rung0 design section 5 -- recycling dead slots via a
+  prefix-sum claim rather than bump-allocating and periodically
+  compacting -- so this is carrying over the SAFETY property of Allocate(),
+  not its mechanism).
+- IMPLEMENTATION_PLAN.md M4 section's `test_add_conn`/`test_update_prune`
+  acceptance is split: this dispatch (M4a) implements and tests
+  PruneConn/AddConn; `test_resort` (recompute_levels/resort/retrace-count)
+  stays skipped pending M4b, per the task's explicit scope boundary.
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

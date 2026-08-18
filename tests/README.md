@@ -36,7 +36,17 @@ et al.). Required modules, mapped to plan milestones (IMPLEMENTATION_PLAN.md):
   sorted compacted buckets; retrace count == 1 per resort via
   jax.test_util.assert_num_jit_and_pmap_compilations; pure add/prune
   workload compiles exactly once.
-- `test_donation.py` (M5): donation warning promoted to error (pytest
-  filterwarnings); step is shape-preserving on every leaf.
-- `test_oracle_cpp.py` (M5): golden-file parity vs the C++ examples
-  (tolerance-based; see plan section "Oracle harness").
+- `test_ipc_multilayer.py` (M5): streaming-iPC acceptance --
+  examples/ipc_multilayer.py beats the predict-previous baseline (2x
+  margin), is seed-deterministic, and uses Pipeline propagation.
+- `test_donation.py` (M5): donate_argnums=0 contract -- every input state
+  buffer is deleted after the call (donation happens), pytree structure and
+  every leaf shape/dtype survive it, and chaining the donated output into
+  the next step raises nothing under a filter promoting the donation-failure
+  warning to an error.
+- `test_oracle_cpp.py` (M5): bit-level C++ parity via the deterministic
+  manual-fcc example (fixed weights, tanh forward, fixed inputs), reproduced
+  with from_topology + constant initialisers and driven through the host
+  Driver; output activations pinned to golden values from the native binary
+  at rtol=1e-4. (The PRNG-seeded flagship examples cannot match std::mt19937
+  bit-for-bit; their parity is aggregate, in their own acceptance tests.)

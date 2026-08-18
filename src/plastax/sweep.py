@@ -1,36 +1,36 @@
 """Edge-sweep core: gather -> vmapped map -> segment reduce -> apply.
 
 One bucket at a time; the topological level loop and the pipeline flat
-sweep are both compositions of this (rung0 design sections 3-4). Dead
-slots use the null-slot trick: destination index replaced by num_units,
-dropped by scatter mode FILL_OR_DROP (jax/_src/ops/scatter.py:187).
+sweep are both compositions of this. Dead slots use the null-slot trick:
+destination index replaced by num_units, dropped by scatter mode
+FILL_OR_DROP.
 
-M3 (Deviation, IMPLEMENTATION_PLAN.md M3): `build_forward_sweep` was
-originally a single monolithic accumulate-then-apply pass, correct only for
-a one-bucket sweep (pipeline). The topological level walk needs the
-accumulator to persist across several buckets before a unit's own level is
-reached (a level-l unit's incoming edges may sit in any bucket < l, not
-just l-1 -- e.g. a skip connection), so the sweep is split into two
-composable primitives: `*_accumulate` (gather + map + segment_reduce,
-combined into a carried-in accumulator via `Monoid.combine_pairwise`) and
-`*_apply` (vmapped apply, masked merge + accumulator reset per finalized
-unit). `build_forward_sweep`/`build_backward_sweep` keep their original
-signatures and behaviour as one-shot compositions of these two primitives
-(identity accumulator in, finalize every live unit); phases.py's
-topological walk composes them directly across the bucket loop instead.
+`build_forward_sweep` was originally a single monolithic accumulate-then-
+apply pass, correct only for a one-bucket sweep (pipeline). The
+topological level walk needs the accumulator to persist across several
+buckets before a unit's own level is reached (a level-l unit's incoming
+edges may sit in any bucket < l, not just l-1 -- e.g. a skip connection),
+so the sweep is split into two composable primitives: `*_accumulate`
+(gather + map + segment_reduce, combined into a carried-in accumulator via
+`Monoid.combine_pairwise`) and `*_apply` (vmapped apply, masked merge +
+accumulator reset per finalized unit). `build_forward_sweep`/
+`build_backward_sweep` keep their original signatures and behaviour as
+one-shot compositions of these two primitives (identity accumulator in,
+finalize every live unit); phases.py's topological walk composes them
+directly across the bucket loop instead.
 
-M3b (Deviation, IMPLEMENTATION_PLAN.md M3b): `_build_conn_update` +
-`build_incoming_conn_update`/`build_outgoing_conn_update` are a new pair of
-primitives for `UpdateConn` (dispatch_cpu.hpp:450-469), mirroring
-`_accumulate_into` + `build_forward_accumulate`/`build_backward_accumulate`'s
-private-core-plus-two-directional-wrappers shape. Unlike the forward/
-backward accumulate, a `ConnWrite` targets only the writing edge's own row
-(never an aggregation across edges into a shared unit-indexed accumulator),
-so there is no segment_reduce and no out-of-bounds null-slot scatter to
-perform; the dead-conn "drop" is a plain masked keep-old-if-dead merge over
-the bucket's own columns, the degenerate case of the same discipline
-(`_apply_masked`'s `jnp.where(mask, written, old)` shape, applied to conn
-columns instead of unit columns).
+`_build_conn_update` and `build_incoming_conn_update`/
+`build_outgoing_conn_update` are a pair of primitives for connection
+updates, mirroring `_accumulate_into` + `build_forward_accumulate`/
+`build_backward_accumulate`'s private-core-plus-two-directional-wrappers
+shape. Unlike the forward/backward accumulate, a connection write targets
+only the writing edge's own row (never an aggregation across edges into a
+shared unit-indexed accumulator), so there is no segment_reduce and no
+out-of-bounds null-slot scatter to perform; the dead-conn "drop" is a
+plain masked keep-old-if-dead merge over the bucket's own columns, the
+degenerate case of the same discipline (`_apply_masked`'s
+`jnp.where(mask, written, old)` shape, applied to conn columns instead of
+unit columns).
 """
 
 from __future__ import annotations
@@ -67,11 +67,21 @@ ConnUpdateSweep = Callable[[Columns, Columns, GS], Columns]
 
 
 def unit_id_mask(ids: tuple[int, ...], num_units: int) -> Bool[Array, " num_units"]:
-    """Static unit-id tuple -> (num_units,) boolean mask via scatter, never
-    a shape-changing gather. Shared by forward's input-skip and
-    topological backward's input-skip (dispatch_cpu.hpp:59/250 both bound
-    their Apply loop at `NumInput`; plastax generalizes the assumed
-    `[0, NumInput)` prefix to an arbitrary id tuple, M2 Deviation)."""
+    """Build a boolean mask over units selecting the given static id tuple.
+
+    Uses a scatter rather than a shape-changing gather. Shared by
+    forward's input-skip and topological backward's input-skip, both of
+    which need to bound their apply loop by a set of unit ids; this
+    generalizes the assumption that such units form a `[0, n)` prefix to
+    an arbitrary id tuple.
+
+    Args:
+        ids: Static tuple of unit ids to mark True.
+        num_units: Total number of units; the mask's length.
+
+    Returns:
+        Boolean mask of shape (num_units,), True at the given ids.
+    """
     return (
         jnp.zeros((num_units,), dtype=jnp.bool_)
         .at[jnp.asarray(ids, dtype=jnp.int32)]
@@ -80,12 +90,21 @@ def unit_id_mask(ids: tuple[int, ...], num_units: int) -> Bool[Array, " num_unit
 
 
 def identity_accumulator(combine: MonoidTree, num_units: int) -> Any:
-    """(num_units,)-per-leaf accumulator tree matching `combine`'s
-    structure, filled with each leaf's identity -- the JAX analogue of
-    `UAcc = Acc{}` (dispatch_cpu.hpp:41-67) as a carried-in starting value
-    rather than a struct field. Leaves are float32 (matches
-    materialize_acc_columns; v1's Acc leaves are always float, per the
-    ForwardPass/BackwardPass usages in tests and the design)."""
+    """Build a per-unit accumulator tree filled with each leaf's identity.
+
+    Matches `combine`'s structure; serves as the carried-in starting value
+    for a bucket-sweep accumulation. Leaves are float32 (matches
+    `materialize_acc_columns`; accumulator leaves are always float).
+
+    Args:
+        combine: Monoid or MonoidTree describing the accumulator's
+            structure and each leaf's identity/dtype behavior.
+        num_units: Number of units; each leaf has shape (num_units,).
+
+    Returns:
+        A pytree matching `combine`'s structure, each leaf an (num_units,)
+        array filled with that leaf's identity value.
+    """
     return jax.tree_util.tree_map(
         lambda m: jnp.full((num_units,), m.identity_for(jnp.float32)), combine
     )
@@ -100,17 +119,18 @@ def _accumulate_into[GS](
     target_col: FieldSpec[Any],
     other_col: FieldSpec[Any],
 ) -> AccumulateFn[GS]:
-    """Shared by forward (target=TO_ID, other=FROM_ID) and backward
-    (target=FROM_ID, other=TO_ID, dispatch_cpu.hpp:232-258 direction
-    reversal): gather + vmapped map + segment_reduce this bucket's live
-    edges into `target_col`, then fold the result into the carried-in `acc`
-    via `Monoid.combine_pairwise` so contributions from earlier buckets
+    """Fold one bucket's live edges into a carried-in per-unit accumulator.
+
+    Shared by forward (target=TO_ID, other=FROM_ID) and backward
+    (target=FROM_ID, other=TO_ID, direction reversed). Gathers, vmaps
+    `map_fn` over this bucket's live edges, segment-reduces the results
+    into `target_col`, then folds that into the carried-in `acc` via
+    `Monoid.combine_pairwise` so contributions from earlier buckets
     survive (the level-walk correctness requirement: a unit's accumulator
     is not read by Apply until every bucket that can write to it has run).
 
     `map_fn`'s first unit-id argument is always the accumulator target,
-    matching the oracle's own calling convention (`FP::Map(UnitAlloc,
-    ToId...)` at :56 vs `BP::Map(UnitAlloc, FromId...)` at :247).
+    matching each pass direction's own calling convention.
     """
 
     def accumulate(units: Columns, bucket_conns: Columns, acc: Any, g: GS) -> Any:
@@ -128,10 +148,9 @@ def _accumulate_into[GS](
 
         per_edge_acc = jax.vmap(per_edge)(target_id, other_id, conn_ids)
 
-        # Null-slot trick (rung0 design section 3): a dead conn's target is
-        # pushed to num_units (one past the end), so segment_reduce's
-        # FILL_OR_DROP mode (scatter.py:187) drops its contribution instead
-        # of a shape-changing masked gather [D:6].
+        # Null-slot trick: a dead conn's target is pushed to num_units (one
+        # past the end), so segment_reduce's FILL_OR_DROP mode drops its
+        # contribution instead of a shape-changing masked gather.
         null_target_id = jnp.where(dead, num_units, target_id)
 
         def combine_leaf(
@@ -158,9 +177,11 @@ def _apply_masked[GS](
     *,
     num_units: int,
 ) -> ApplyFn[GS]:
-    """Shared by forward and backward: apply is computed uniformly for
-    every unit under vmap (static shapes, no dynamic-size gather over a
-    unit subset), `mask` selects which units are finalized -- written into
+    """Merge a masked, vmapped apply pass into units and reset finalized acc.
+
+    Shared by forward and backward: apply is computed uniformly for every
+    unit under vmap (static shapes, no dynamic-size gather over a unit
+    subset); `mask` selects which units are finalized -- written into
     `units` and reset to identity in `acc` -- this call. Units outside the
     mask keep their previous `units` value and carry their in-progress
     `acc` to a later call, which is exactly what lets the accumulator
@@ -172,9 +193,9 @@ def _apply_masked[GS](
         unit_ids = jnp.arange(num_units)
 
         def per_unit_apply(i: jax.Array, acc_i: Any) -> dict[str, jax.Array]:
-            # UnitWrite is not pytree-registered (views.py); unwrap .fields
-            # to a plain dict before returning, so vmap never has to batch
-            # the wrapper object itself, only its array-valued contents.
+            # UnitWrite is not pytree-registered; unwrap .fields to a plain
+            # dict before returning, so vmap never has to batch the wrapper
+            # object itself, only its array-valued contents.
             write = apply_fn(u_view, UnitIdx(i), g, acc_i)
             return dict(write.fields)
 
@@ -196,8 +217,21 @@ def _apply_masked[GS](
 def build_forward_accumulate[GS](
     fp: ForwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
 ) -> AccumulateFn[GS]:
-    """One bucket's contribution folded into a persisted per-unit
-    accumulator indexed by TO_ID (dispatch_cpu.hpp:41-67)."""
+    """Build an accumulate step folding one bucket into a TO_ID accumulator.
+
+    Type Args:
+        GS: Global-state type threaded through the pass.
+
+    Args:
+        fp: Forward pass defining the map function and accumulator monoid.
+        num_units: Total number of units.
+        indices_are_sorted: Whether TO_ID is sorted within the bucket, to
+            speed up segment_reduce.
+
+    Returns:
+        Accumulate function combining one bucket's edges into a persisted
+        per-unit accumulator indexed by destination unit.
+    """
     return _accumulate_into(
         fp.map,
         fp.combine,
@@ -211,7 +245,19 @@ def build_forward_accumulate[GS](
 def build_forward_apply[GS](
     fp: ForwardPass[object, GS], *, num_units: int
 ) -> ApplyFn[GS]:
-    """Vmapped apply over destination units (dispatch_cpu.hpp:41-67)."""
+    """Build a vmapped apply step over destination units.
+
+    Type Args:
+        GS: Global-state type threaded through the pass.
+
+    Args:
+        fp: Forward pass defining the apply function and accumulator monoid.
+        num_units: Total number of units.
+
+    Returns:
+        Apply function merging finalized units' writes and resetting their
+        accumulator to identity.
+    """
     return _apply_masked(fp.apply, fp.combine, num_units=num_units)
 
 
@@ -222,21 +268,33 @@ def build_forward_sweep[GS](
     indices_are_sorted: bool,
     input_ids: tuple[int, ...],
 ) -> BucketSweep[GS]:
-    """One-shot forward sweep over a single bucket: identity accumulator in,
-    every non-input unit finalized (dispatch_cpu.hpp:202-223 pipeline
-    semantics -- no level structure, one hop per call). The topological
-    level walk (phases.py) instead composes `build_forward_accumulate` and
+    """Build a one-shot forward sweep over a single bucket.
+
+    Identity accumulator in, every non-input unit finalized -- pipeline
+    semantics, no level structure, one hop per call. The topological level
+    walk instead composes `build_forward_accumulate` and
     `build_forward_apply` directly across the bucket loop so the
     accumulator can persist across buckets; this function is their
-    one-bucket-and-done composition, unchanged from M2's behaviour.
+    one-bucket-and-done composition.
 
-    `input_ids` (Deviation, IMPLEMENTATION_PLAN.md M2 -- the stub signature
-    had no such parameter): dispatch_cpu.hpp:217-222 only Applies over `I in
-    [NumInput, NumUnits)`, leaving input units' activation exactly as the
-    step's input-scatter wrote it. plastax input units are an arbitrary id
-    tuple (NetworkBuilder.mark_input), not necessarily the prefix `[0,
-    NumInput)` C++ assumes, so the skip is a static boolean mask rather than
-    a slice offset.
+    Input units are skipped on apply: only non-input units are finalized,
+    leaving input units' activation exactly as the step's input-scatter
+    wrote it. Input units are an arbitrary id tuple, not necessarily a
+    `[0, n)` prefix, so the skip is a static boolean mask rather than a
+    slice offset.
+
+    Type Args:
+        GS: Global-state type threaded through the pass.
+
+    Args:
+        fp: Forward pass defining map, apply, and accumulator monoid.
+        num_units: Total number of units.
+        indices_are_sorted: Whether TO_ID is sorted within the bucket, to
+            speed up segment_reduce.
+        input_ids: Static tuple of input unit ids, skipped on apply.
+
+    Returns:
+        Sweep function computing one bucket's forward update.
     """
     accumulate = build_forward_accumulate(
         fp, num_units=num_units, indices_are_sorted=indices_are_sorted
@@ -256,10 +314,25 @@ def build_forward_sweep[GS](
 def build_backward_accumulate[GS](
     bp: BackwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
 ) -> AccumulateFn[GS]:
-    """One bucket's contribution folded into a persisted per-unit
-    accumulator indexed by FROM_ID -- direction reversal
-    (dispatch_cpu.hpp:232-258): the accumulator target is the edge's
-    SOURCE, not its destination."""
+    """Build an accumulate step folding one bucket into a FROM_ID accumulator.
+
+    Direction reversal versus forward: the accumulator target is the
+    edge's source, not its destination -- accumulates into the source
+    unit.
+
+    Type Args:
+        GS: Global-state type threaded through the pass.
+
+    Args:
+        bp: Backward pass defining the map function and accumulator monoid.
+        num_units: Total number of units.
+        indices_are_sorted: Whether FROM_ID is sorted within the bucket,
+            to speed up segment_reduce.
+
+    Returns:
+        Accumulate function combining one bucket's edges into a persisted
+        per-unit accumulator indexed by source unit.
+    """
     return _accumulate_into(
         bp.map,
         bp.combine,
@@ -273,26 +346,48 @@ def build_backward_accumulate[GS](
 def build_backward_apply[GS](
     bp: BackwardPass[object, GS], *, num_units: int
 ) -> ApplyFn[GS]:
-    """Vmapped apply over source units (dispatch_cpu.hpp:232-258)."""
+    """Build a vmapped apply step over source units.
+
+    Type Args:
+        GS: Global-state type threaded through the pass.
+
+    Args:
+        bp: Backward pass defining the apply function and accumulator
+            monoid.
+        num_units: Total number of units.
+
+    Returns:
+        Apply function merging finalized units' writes and resetting their
+        accumulator to identity.
+    """
     return _apply_masked(bp.apply, bp.combine, num_units=num_units)
 
 
 def build_backward_sweep[GS](
     bp: BackwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
 ) -> BucketSweep[GS]:
-    """Accumulates into FROM_ID sources; apply runs on sources
-    (dispatch_cpu.hpp:232-258), one bucket and done -- the pipeline
-    (dispatch_cpu.hpp:390-411) shape of the backward sweep, mirroring
-    build_forward_sweep. No `input_ids` parameter (unlike
-    build_forward_sweep): DoBackwardPipeline's NumInput parameter is
-    declared but unused (dispatch_cpu.hpp:391-392, `size_t /*NumInput*/`)
-    and its Apply loop runs unconditionally over `[0, NumUnits)`
-    (dispatch_cpu.hpp:405-410) -- pipeline-mode backward really does apply
-    to every unit, inputs included, so this sweep takes no skip mask. The
-    topological level walk (phases.py) DOES skip input units on apply
-    (dispatch_cpu.hpp:250, same bound as forward) by composing
-    build_backward_accumulate/build_backward_apply directly with its own
-    mask, same split rationale as the forward sweep above.
+    """Build a one-shot backward sweep over a single bucket.
+
+    Accumulates into FROM_ID sources; apply runs on sources, one bucket
+    and done -- the pipeline shape of the backward sweep, mirroring
+    `build_forward_sweep`. Takes no `input_ids` parameter: pipeline-mode
+    backward applies to every unit, inputs included, so this sweep needs
+    no skip mask. The topological level walk does skip input units on
+    apply (same bound as forward) by composing `build_backward_accumulate`
+    and `build_backward_apply` directly with its own mask, same split
+    rationale as the forward sweep.
+
+    Type Args:
+        GS: Global-state type threaded through the pass.
+
+    Args:
+        bp: Backward pass defining map, apply, and accumulator monoid.
+        num_units: Total number of units.
+        indices_are_sorted: Whether FROM_ID is sorted within the bucket,
+            to speed up segment_reduce.
+
+    Returns:
+        Sweep function computing one bucket's backward update.
     """
     accumulate = build_backward_accumulate(
         bp, num_units=num_units, indices_are_sorted=indices_are_sorted
@@ -310,15 +405,26 @@ def build_backward_sweep[GS](
 
 
 def materialize_acc_columns(combine: MonoidTree, num_units: int) -> Columns:
-    """One accumulator column per monoid leaf, initialized to identity;
-    reset in the sweep epilogue (UAcc = Acc{} analogue).
+    """Build one accumulator column per monoid leaf, initialized to identity.
 
-    `combine` is walked like any pytree (a bare Monoid is itself an atomic
-    leaf since Monoid is an unregistered dataclass, matching the tree_map
-    zip in build_forward_sweep above); leaves are named by their key path
-    (jax.tree_util.keystr) so a struct accumulator (dict/tuple MonoidTree,
-    rung0 design section 3) gets one distinctly-named column per field, and
-    the common bare-Monoid case collapses to a single "acc" column.
+    Reset in the sweep epilogue. `combine` is walked like any pytree (a
+    bare Monoid is itself an atomic leaf since Monoid is an unregistered
+    dataclass, matching the tree_map zip in `_accumulate_into`); leaves
+    are named by their key path so a struct accumulator gets one
+    distinctly-named column per field, and the common bare-Monoid case
+    collapses to a single "acc" column.
+
+    Args:
+        combine: Monoid or MonoidTree describing the accumulator's
+            structure and each leaf's identity/dtype behavior.
+        num_units: Number of units; each column has shape (num_units,).
+
+    Returns:
+        Mapping from column name to an (num_units,) array of that leaf's
+        identity value.
+
+    Raises:
+        ValueError: If two leaves in `combine` produce the same key path.
     """
     leaves_with_paths, _ = jax.tree_util.tree_flatten_with_path(combine)
     columns: Columns = {}
@@ -340,21 +446,19 @@ def _build_conn_update[GS](
     first_col: FieldSpec[Any],
     second_col: FieldSpec[Any],
 ) -> ConnUpdateSweep[GS]:
-    """Shared by UpdateConn.incoming (first_col=TO_ID, second_col=FROM_ID)
-    and .outgoing (first_col=FROM_ID, second_col=TO_ID): every conn in the
-    bucket gets one vmapped `update_fn` call, live rows merged back into
-    this bucket's own columns. `update_fn`'s first unit-id argument matches
-    the oracle's own calling convention for each direction
-    (`UC::UpdateIncomingConnection(UnitAlloc, ToId, FromId, ...)` at
-    dispatch_cpu.hpp:458 vs `UC::UpdateOutgoingConnection(UnitAlloc,
-    FromId, ToId, ...)` at :466).
+    """Run one vmapped conn-update pass over a bucket's live edges.
 
-    No segment_reduce: a `ConnWrite` targets only the writing edge's own
-    row (never a cross-edge aggregation into a unit-indexed accumulator,
-    unlike `_accumulate_into`), so a dead conn's write is dropped by a
-    plain `jnp.where(dead, old, written)` keep-old merge rather than an
-    out-of-bounds null-slot scatter -- the degenerate case of the same
-    discipline (module docstring, M3b).
+    Shared by the incoming direction (first_col=TO_ID, second_col=FROM_ID)
+    and the outgoing direction (first_col=FROM_ID, second_col=TO_ID):
+    every conn in the bucket gets one vmapped `update_fn` call, live rows
+    merged back into this bucket's own columns. `update_fn`'s first
+    unit-id argument matches each direction's own calling convention.
+
+    No segment_reduce: a connection write targets only the writing edge's
+    own row (never a cross-edge aggregation into a unit-indexed
+    accumulator, unlike `_accumulate_into`), so a dead conn's write is
+    dropped by a plain keep-old merge rather than an out-of-bounds
+    null-slot scatter -- the degenerate case of the same discipline.
     """
 
     def update_bucket(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
@@ -386,16 +490,34 @@ def _build_conn_update[GS](
 def build_incoming_conn_update[GS](
     update_fn: ConnUpdateFn[GS],
 ) -> ConnUpdateSweep[GS]:
-    """One bucket's `UpdateConn.incoming` pass (dispatch_cpu.hpp:453-459's
-    first loop): first id arg is the edge's destination, second its
-    source."""
+    """Build one bucket's incoming connection-update pass.
+
+    Type Args:
+        GS: Global-state type threaded through the update function.
+
+    Args:
+        update_fn: Function computing one edge's connection field writes,
+            called with the destination unit id first, source id second.
+
+    Returns:
+        Sweep function updating one bucket's live connection rows.
+    """
     return _build_conn_update(update_fn, first_col=TO_ID, second_col=FROM_ID)
 
 
 def build_outgoing_conn_update[GS](
     update_fn: ConnUpdateFn[GS],
 ) -> ConnUpdateSweep[GS]:
-    """One bucket's `UpdateConn.outgoing` pass (dispatch_cpu.hpp:461-467's
-    second loop): first id arg is the edge's source, second its
-    destination."""
+    """Build one bucket's outgoing connection-update pass.
+
+    Type Args:
+        GS: Global-state type threaded through the update function.
+
+    Args:
+        update_fn: Function computing one edge's connection field writes,
+            called with the source unit id first, destination id second.
+
+    Returns:
+        Sweep function updating one bucket's live connection rows.
+    """
     return _build_conn_update(update_fn, first_col=FROM_ID, second_col=TO_ID)

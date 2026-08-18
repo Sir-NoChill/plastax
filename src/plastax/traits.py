@@ -1,8 +1,7 @@
 """User-facing traits surface: policy Protocols + Network base class.
 
-Python analogue of the C++ policy concepts (traits.hpp:357-395). Static
-checking via ty / mypy --strict (TOOLING.md); runtime concept check in
-__init_subclass__.
+Python analogue of the C++ policy concepts; static checking via ty / mypy
+--strict; runtime concept check in __init_subclass__.
 """
 
 from __future__ import annotations
@@ -30,6 +29,16 @@ from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 @runtime_checkable
 class ForwardPass[Acc, GS](Protocol):
+    """Forward propagation policy: map-reduce over incoming edges per unit.
+
+    Type Args:
+        Acc: the per-edge accumulator type combined by `combine`.
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        combine: the monoid tree used to reduce per-edge Acc values.
+    """
+
     combine: MonoidTree
 
     def map(
@@ -40,15 +49,50 @@ class ForwardPass[Acc, GS](Protocol):
         c: ConnView,
         cid: ConnIdx,
         g: GS,
-    ) -> Acc: ...
+    ) -> Acc:
+        """Compute the accumulator contribution of one incoming edge.
 
-    def apply(self, u: UnitView, i: UnitIdx, g: GS, acc: Acc) -> UnitWrite: ...
+        Args:
+            u: the unit view.
+            dst: index of the destination unit.
+            src: index of the source unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            The per-edge accumulator contribution.
+        """
+        ...
+
+    def apply(self, u: UnitView, i: UnitIdx, g: GS, acc: Acc) -> UnitWrite:
+        """Combine the reduced accumulator into a write for one unit.
+
+        Args:
+            u: the unit view.
+            i: index of the unit.
+            g: the global state.
+            acc: the reduced accumulator for this unit.
+
+        Returns:
+            The UnitWrite for that unit.
+        """
+        ...
 
 
 @runtime_checkable
 class BackwardPass[Acc, GS](Protocol):
-    """Same shape as ForwardPass; accumulates into the SOURCE unit
-    (dispatch_cpu.hpp:232-258 reverses direction)."""
+    """Backward propagation policy.
+
+    Same shape as ForwardPass but accumulates into the SOURCE unit.
+
+    Type Args:
+        Acc: the per-edge accumulator type combined by `combine`.
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        combine: the monoid tree used to reduce per-edge Acc values.
+    """
 
     combine: MonoidTree
 
@@ -60,27 +104,73 @@ class BackwardPass[Acc, GS](Protocol):
         c: ConnView,
         cid: ConnIdx,
         g: GS,
-    ) -> Acc: ...
+    ) -> Acc:
+        """Compute the accumulator contribution of one outgoing edge.
 
-    def apply(self, u: UnitView, i: UnitIdx, g: GS, acc: Acc) -> UnitWrite: ...
+        Args:
+            u: the unit view.
+            dst: index of the destination unit.
+            src: index of the source unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            The per-edge accumulator contribution.
+        """
+        ...
+
+    def apply(self, u: UnitView, i: UnitIdx, g: GS, acc: Acc) -> UnitWrite:
+        """Combine the reduced accumulator into a write for one unit.
+
+        Args:
+            u: the unit view.
+            i: index of the unit.
+            g: the global state.
+            acc: the reduced accumulator for this unit.
+
+        Returns:
+            The UnitWrite for that unit.
+        """
+        ...
 
 
 @runtime_checkable
 class Loss[GS](Protocol):
-    # jaxtyping scalar-shape strings below read as broken forward refs to
-    # ruff's F722 (TOOLING.md: jaxtyping friction).
+    """Per-output loss policy producing a loss contribution and a unit write.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
+
     def per_output(
         self,
         u: UnitView,
         i: UnitIdx,
-        target: Float[Array, ""],  # noqa: F722
+        target: Float[Array, ""],
         g: GS,
-    ) -> tuple[Float[Array, ""], UnitWrite]: ...  # noqa: F722
+    ) -> tuple[Float[Array, ""], UnitWrite]:
+        """Compute the loss contribution and gradient write for one output.
+
+        Args:
+            u: the unit view.
+            i: index of the output unit.
+            target: the target value for this output.
+            g: the global state.
+
+        Returns:
+            A (loss-contribution, UnitWrite) pair.
+        """
+        ...
 
 
 @runtime_checkable
 class UpdateConn[GS](Protocol):
-    """Two full passes, incoming then outgoing (dispatch_cpu.hpp:450-469)."""
+    """Connection update policy: two full passes, incoming then outgoing.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
 
     def incoming(
         self,
@@ -90,7 +180,21 @@ class UpdateConn[GS](Protocol):
         c: ConnView,
         cid: ConnIdx,
         g: GS,
-    ) -> ConnWrite: ...
+    ) -> ConnWrite:
+        """Update one connection from the destination unit's perspective.
+
+        Args:
+            u: the unit view.
+            dst: index of the destination unit.
+            src: index of the source unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            The ConnWrite for this connection.
+        """
+        ...
 
     def outgoing(
         self,
@@ -100,37 +204,134 @@ class UpdateConn[GS](Protocol):
         c: ConnView,
         cid: ConnIdx,
         g: GS,
-    ) -> ConnWrite: ...
+    ) -> ConnWrite:
+        """Update one connection from the source unit's perspective.
+
+        Args:
+            u: the unit view.
+            src: index of the source unit.
+            dst: index of the destination unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            The ConnWrite for this connection.
+        """
+        ...
 
 
 @runtime_checkable
 class PruneConn[GS](Protocol):
+    """Connection pruning policy: tombstone connections by predicate.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
+
     def predicate(
         self, u: UnitView, c: ConnView, cid: ConnIdx, g: GS
-    ) -> Bool[Array, ""]: ...  # noqa: F722  jaxtyping scalar shape
+    ) -> Bool[Array, ""]:
+        """Decide whether to tombstone one connection.
+
+        Args:
+            u: the unit view.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            A scalar bool; True to tombstone the connection.
+        """
+        ...
 
 
 @runtime_checkable
 class AddConn[GS](Protocol):
-    """K-bounded growth (rung0 design section 5; GrowFanout analogue)."""
+    """Connection growth policy: K-bounded growth by scored candidates.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        max_candidates: the maximum number of candidate connections
+            considered per growth step.
+    """
 
     max_candidates: int
 
-    def score(
-        self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS
-    ) -> Float[Array, ""]: ...  # noqa: F722  jaxtyping scalar shape
+    def score(self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS) -> Float[Array, ""]:
+        """Score a candidate connection for growth.
 
-    def init(self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS) -> ConnWrite: ...
+        Args:
+            u: the unit view.
+            src: index of the candidate source unit.
+            dst: index of the candidate destination unit.
+            g: the global state.
+
+        Returns:
+            The candidate score.
+        """
+        ...
+
+    def init(self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS) -> ConnWrite:
+        """Initialize a new connection selected for growth.
+
+        Args:
+            u: the unit view.
+            src: index of the source unit.
+            dst: index of the destination unit.
+            g: the global state.
+
+        Returns:
+            The ConnWrite for the new edge.
+        """
+        ...
 
 
 @runtime_checkable
 class ResetGlobal[GS](Protocol):
-    def reset(self, g: GS) -> GS: ...
+    """Global-state reset policy invoked between episodes or runs.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
+
+    def reset(self, g: GS) -> GS:
+        """Reset the global state.
+
+        Args:
+            g: the current global state.
+
+        Returns:
+            The reset global state.
+        """
+        ...
 
 
 class Network[GS]:
-    """Subclass and set class attributes; absent phases are elided at trace
-    time. Mirrors DefaultNetworkTraits<> slot-for-slot for the v1 scope."""
+    """Base configuration surface for a network's traits.
+
+    Subclass and set class attributes; absent phases are elided at trace
+    time.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        forward_pass: the forward propagation policy.
+        backward_pass: the backward propagation policy, or None to elide it.
+        loss: the loss policy, or None to elide it.
+        update_conn: the connection update policy, or None to elide it.
+        prune_conn: the connection pruning policy, or None to elide it.
+        add_conn: the connection growth policy, or None to elide it.
+        reset_global: the global-state reset policy, or None to elide it.
+        extra_unit_fields: extra per-unit fields beyond the builtin ones.
+        extra_conn_fields: extra per-connection fields beyond the builtin ones.
+        propagation: the propagation strategy used to schedule updates.
+        kahn_max_depth: max depth for Kahn-order propagation, or None if unbounded.
+        neighbourhood: the neighbourhood radius used by the propagation strategy.
+    """
 
     forward_pass: ForwardPass[object, GS]
     backward_pass: BackwardPass[object, GS] | None = None
@@ -147,6 +348,7 @@ class Network[GS]:
     neighbourhood: int = 1
 
     def __init_subclass__(cls) -> None:
+        """Validate the trait slots when a Network subclass is defined."""
         _validate_traits(cls)
 
 
@@ -158,9 +360,20 @@ _RESERVED_FIELD_NAMES = frozenset(
 def _validate_monoid_tree(
     tree: object, cls: type[Network[Any]], attr_name: str
 ) -> None:
-    """Recursively check `tree` is a well-formed MonoidTree: a Monoid leaf,
-    or a non-empty dict/tuple of well-formed MonoidTrees (rung0 design
-    section 3: a product of monoids is a monoid)."""
+    """Recursively check that `tree` is a well-formed MonoidTree.
+
+    A well-formed MonoidTree is a Monoid leaf, or a non-empty dict/tuple of
+    well-formed MonoidTrees -- a product of monoids is itself a monoid.
+
+    Args:
+        tree: the candidate MonoidTree to validate.
+        cls: the Network subclass being validated, used for error messages.
+        attr_name: the name of the trait attribute `tree` belongs to.
+
+    Raises:
+        ValueError: if a dict or tuple node in `tree` is empty.
+        TypeError: if `tree` is not a Monoid, dict, or tuple.
+    """
     if isinstance(tree, Monoid):
         return
     if isinstance(tree, dict):
@@ -186,8 +399,18 @@ def _validate_monoid_tree(
 
 
 def _validate_field_names(cls: type[Network[Any]]) -> None:
-    """Field-name uniqueness across builtin+extra unit and conn fields; user
-    extra fields must not collide with reserved builtin names."""
+    """Check field-name uniqueness and reject reserved builtin names.
+
+    Verifies uniqueness across builtin and extra unit/conn fields, and that
+    user extra fields do not collide with reserved builtin names.
+
+    Args:
+        cls: the Network subclass whose extra fields are validated.
+
+    Raises:
+        ValueError: if an extra field name collides with a reserved builtin
+            name, or if two extra field names collide with each other.
+    """
     all_extra = (*cls.extra_unit_fields, *cls.extra_conn_fields)
     seen: set[str] = set()
     for spec in all_extra:
@@ -204,8 +427,21 @@ def _validate_field_names(cls: type[Network[Any]]) -> None:
 
 
 def _validate_traits(cls: type[Network[Any]]) -> None:
-    """Runtime concept check: protocol conformance, monoid tree structure
-    matches a probe Acc, field name uniqueness, no reserved names."""
+    """Run the runtime concept check for a Network subclass.
+
+    Checks protocol conformance of each configured trait, delegating monoid
+    tree structure and field-name checks to `_validate_monoid_tree` and
+    `_validate_field_names` respectively.
+
+    Args:
+        cls: the Network subclass to validate.
+
+    Raises:
+        TypeError: if forward_pass is missing, or a configured trait does
+            not satisfy its protocol.
+        ValueError: if a delegated check fails -- a malformed combine
+            MonoidTree, or a field-name collision or duplicate.
+    """
     forward_pass = getattr(cls, "forward_pass", None)
     if forward_pass is None:
         raise TypeError(f"{cls.__name__}.forward_pass is required and was not set")

@@ -53,6 +53,12 @@ dev = [
   "ty",
   "ruff",
   "pre-commit",
+  # jax.test_util (jax._src.test_util) imports absl.testing.parameterized;
+  # jax itself only declares this as an optional test extra, not a runtime
+  # dependency, so it must be added explicitly to use
+  # assert_num_jit_and_pmap_compilations (M4b Deviation, IMPLEMENTATION_PLAN.md
+  # -- the retrace-count tests the task requires import jax.test_util).
+  "absl-py",
 ]
 
 [tool.hatch.build.targets.wheel]

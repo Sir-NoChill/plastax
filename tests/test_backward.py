@@ -18,7 +18,7 @@ import plastax as px
 from plastax import sweep as sweep_mod
 from plastax.views import UnitWrite
 
-_GRAD = px.FieldSpec.f32("grad")
+_GRAD = px.FieldSpec.float32("grad")
 
 
 class _TrivialForward(px.ForwardPass):

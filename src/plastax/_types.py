@@ -1,9 +1,24 @@
 """Core shared types.
 
-Typing discipline for the package: FieldSpec is generic over its numpy
-scalar type so view access returns correctly-typed arrays; unit and conn
-indices are distinct NewTypes so they cannot be interchanged; array shapes
-are expressed with jaxtyping annotations.
+Typing discipline for the package.
+
+Plastax defines a network as a Struct of Arrays (SoA),
+each array containing some metadata fields of either
+the units (sometimes called neurons, depending on the
+algorithm) or the connections between them. Some
+metadata is implemented by default for all connections
+and units, but the user can also specify arbitrary
+metadata so long as it is of a known size at compile
+time.
+
+Implementing additional metadata fields uses the
+FieldSpec type, which is generic over any numpy scalar
+or fixed size type, so view access returns correctly-
+typed arrays.
+
+Indices are distinct NewTypes so they cannot be
+interchanged; array shapes are expressed with jaxtyping
+annotations.
 """
 
 from __future__ import annotations
@@ -15,26 +30,31 @@ from typing import NewType
 import numpy as np
 from jaxtyping import Array, Bool, Int32
 
-# Distinct index spaces; a UnitIdx must never index a conn column and vice
-# versa. Scalar int32 arrays, wrapped at the view boundary: jaxtyping erases
-# the shape to jax.Array for the static checker, a subclassable base NewType
-# accepts (mypy resolves it now that the follow_imports skip is gone).
+# All units are in unit space, all connections in connection space
 UnitIdx = NewType("UnitIdx", Int32[Array, ""])
 ConnIdx = NewType("ConnIdx", Int32[Array, ""])
-Level = NewType("Level", int)
+Level = NewType("Level", int)  # for topological sort layer deps
 
 
 class Propagation(enum.Enum):
+    """Sweep scheduling mode."""
+
     TOPOLOGICAL = "topological"
     PIPELINE = "pipeline"
 
 
 @dataclasses.dataclass(frozen=True)
 class FieldSpec[DT: np.generic]:
-    """One SOA column: analogue of plastix::alloc::SOAField<Tag, T>.
+    """One SOA column.
 
-    The generic parameter is the numpy scalar type of the column; it flows
-    through UnitView/ConnView.__getitem__ so reads are typed end to end.
+    Type Args:
+        DT: the numpy scalar type of the column, flowing through
+            UnitView/ConnView.__getitem__.
+
+    Attributes:
+        name: Column name (the SOA tag, used as the arena dict key).
+        dtype: numpy dtype of the column's values.
+        default: Fill value for freshly allocated or tombstoned rows.
     """
 
     name: str
@@ -42,27 +62,50 @@ class FieldSpec[DT: np.generic]:
     default: DT
 
     @staticmethod
-    def f32(name: str, default: float = 0.0) -> FieldSpec[np.float32]:
-        return FieldSpec(name, np.dtype(np.float32), np.float32(default))
+    def field[T: np.generic](name: str, dtype: type[T], default: T) -> FieldSpec[T]:
+        """Build a column spec for an arbitrary numpy scalar dtype.
+
+        Type Args:
+            T: the numpy scalar type of the column.
+
+        Args:
+            name: Column name.
+            dtype: numpy scalar type of the column.
+            default: Fill value for freshly allocated rows.
+
+        Returns:
+            A FieldSpec typed to the given scalar dtype.
+        """
+        return FieldSpec(name, np.dtype(dtype), default)
+
+    # Convenience constructors for the common scalar types; each is a thin
+    # typed wrapper over `field` that also coerces a plain-Python default.
 
     @staticmethod
-    def i32(name: str, default: int = 0) -> FieldSpec[np.int32]:
-        return FieldSpec(name, np.dtype(np.int32), np.int32(default))
+    def float32(name: str, default: float = 0.0) -> FieldSpec[np.float32]:
+        """Build a float32 column spec."""
+        return FieldSpec.field(name, np.float32, np.float32(default))
+
+    @staticmethod
+    def int32(name: str, default: int = 0) -> FieldSpec[np.int32]:
+        """Build an int32 column spec."""
+        return FieldSpec.field(name, np.int32, np.int32(default))
 
     @staticmethod
     def boolean(name: str, default: bool = False) -> FieldSpec[np.bool_]:
-        return FieldSpec(name, np.dtype(np.bool_), np.bool_(default))
+        """Build a boolean column spec."""
+        return FieldSpec.field(name, np.bool_, np.bool_(default))
 
 
-# Built-in conn columns, mirroring conn.hpp:13-37.
-FROM_ID: FieldSpec[np.int32] = FieldSpec.i32("from_id")
-TO_ID: FieldSpec[np.int32] = FieldSpec.i32("to_id")
+# Built-in conn columns
+FROM_ID: FieldSpec[np.int32] = FieldSpec.int32("from_id")
+TO_ID: FieldSpec[np.int32] = FieldSpec.int32("to_id")
 DEAD: FieldSpec[np.bool_] = FieldSpec.boolean("dead", default=True)
-WEIGHT: FieldSpec[np.float32] = FieldSpec.f32("weight")
+WEIGHT: FieldSpec[np.float32] = FieldSpec.float32("weight")
 
-# Built-in unit columns, mirroring unit_state.hpp:12-45 (accumulator columns
-# are materialized per monoid leaf by the sweep builder, not declared here).
-ACTIVATION: FieldSpec[np.float32] = FieldSpec.f32("activation")
-LEVEL: FieldSpec[np.int32] = FieldSpec.i32("level")
+# Built-in unit columns (accumulator columns are materialized per
+# monoid leaf by the sweep builder, not declared here).
+ACTIVATION: FieldSpec[np.float32] = FieldSpec.float32("activation")
+LEVEL: FieldSpec[np.int32] = FieldSpec.int32("level")
 
 DeadMask = Bool[Array, " capacity"]

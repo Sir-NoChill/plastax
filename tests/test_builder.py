@@ -48,8 +48,8 @@ class _PipelineNet(px.Network[None]):
     propagation = px.Propagation.PIPELINE
 
 
-Bias = FieldSpec.f32("bias")
-Tag = FieldSpec.f32("tag")
+Bias = FieldSpec.float32("bias")
+Tag = FieldSpec.float32("tag")
 
 
 class _ExtraFieldsNet(px.Network[None]):

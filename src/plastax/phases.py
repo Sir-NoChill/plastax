@@ -12,10 +12,11 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+import numpy as np
+from jaxtyping import Array, Bool, Float
 
-from plastax._types import LEVEL, Propagation, UnitIdx
-from plastax.state import NetworkState, NetworkStatic
+from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, ConnIdx, Propagation, UnitIdx
+from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.sweep import (
     build_backward_accumulate,
     build_backward_apply,
@@ -29,7 +30,7 @@ from plastax.sweep import (
     unit_id_mask,
 )
 from plastax.traits import Network
-from plastax.views import UnitView
+from plastax.views import ConnView, UnitView
 
 # PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
 # forward references need no quoting. Every phase also returns a scalar loss
@@ -65,24 +66,35 @@ class StepInputs:
 
 
 def build_phases[GS](
-    net: type[Network[GS]], static: NetworkStatic
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    *,
+    overflow_sink: list[Bool[Array, ""]] | None = None,  # noqa: F722
 ) -> tuple[Phase[GS], ...]:
     """Assemble only the present phases; absent slots contribute nothing to
     the trace. Topological forward walks buckets 1..L (Python loop, static
     slices); backward walks L..1; pipeline is the 1-bucket flat sweep.
 
-    M3b scope: PIPELINE and TOPOLOGICAL, among {forward, loss, backward,
-    update_conn, reset_global}; prune_conn/add_conn are M4 and still raise.
     Presence is a Python-level `if`, so an absent phase is never traced --
     zero equations, never lax.cond [D:2], which is exactly what
     test_phases_elision checks. Phase order (module docstring): forward,
     loss, backward, update_conn, prune_conn, add_conn, reset_global.
-    """
-    if net.prune_conn is not None:
-        raise NotImplementedError("prune_conn: M4")
-    if net.add_conn is not None:
-        raise NotImplementedError("add_conn: M4")
 
+    `overflow_sink` (Deviation, IMPLEMENTATION_PLAN.md M4a -- absent from
+    the rung0 sketch): an optional out-parameter, a length-1 list that
+    `build_add_conn_phase` overwrites with its computed overflow flag on
+    every call. `Phase[GS]`'s 2-tuple return `(state, loss_contribution)`
+    has no slot for a THIRD, add_conn-only signal; widening it would ripple
+    into every phase builder plus every existing direct caller
+    (test_phases_elision.py's `_trace_phases`, test_update_conn.py's direct
+    `build_update_conn_phase` calls). A mutable sink threaded only to the
+    one phase that needs it keeps `Phase` and this function's own return
+    type unchanged for every other caller, at the cost of one internal
+    plumbing parameter. `step.py`'s `_cached_make_step` is the only real
+    caller: the mutation happens once, at trace time (`jax.jit` traces the
+    Python body of `step` exactly once), so the sunk value flows into the
+    jaxpr as an ordinary data dependency, not a stale Python-side read.
+    """
     phases: list[Phase[GS]] = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
@@ -90,6 +102,10 @@ def build_phases[GS](
         phases.append(_build_backward_phase(net, static))
     if net.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
+    if net.prune_conn is not None:
+        phases.append(build_prune_conn_phase(net, static))
+    if net.add_conn is not None:
+        phases.append(build_add_conn_phase(net, static, overflow_sink=overflow_sink))
     if net.reset_global is not None:
         phases.append(_build_reset_global_phase(net))
     return tuple(phases)
@@ -338,11 +354,232 @@ def build_update_conn_phase[GS](
     return update_conn_phase
 
 
-def build_add_conn_phase[GS](
+def build_prune_conn_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
+    """Pure tombstone write (rung0 design section 5): vmap
+    `prune_conn.predicate` over every conn row of every bucket, OR the
+    result into that bucket's own `dead` column. Static shapes, no resort,
+    no counter -- live counts stay derived (`state.live_conn_count`,
+    `sum(~dead)`), matching dispatch_cpu.hpp:538-558's `DoPruneConnections`
+    (the ConnPrune-only half; AddUnit/PruneUnit are out of scope, `plan.md`
+    Scope contract, so the `HasUnitPrune` branch has no plastax analogue).
+
+    dispatch_cpu.hpp:541-542 skips already-dead rows (`if (DeadTag) continue`)
+    before calling `ShouldPrune`, both to save work and because a dead row's
+    ids may be stale. vmap cannot skip (data-dependent control flow), so
+    every row's predicate is evaluated unconditionally instead -- harmless:
+    `dead[i] | predicate(...)` is `True` regardless of the (possibly
+    meaningless) predicate result whenever `dead[i]` already is, so the OR
+    merge is equivalent to the skip-then-OR the oracle performs.
+    """
+    pc = net.prune_conn
+    assert pc is not None  # build_phases only calls this when set
+
+    def prune_conn_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:  # noqa: F722
+        del inputs
+        u_view = UnitView(state.units)
+        g = state.globals_
+
+        def prune_bucket(bucket_conns: Columns) -> Columns:
+            c_view = ConnView(bucket_conns)
+            dead = bucket_conns[DEAD.name]
+            cids = jnp.arange(dead.shape[0], dtype=jnp.int32)
+
+            def per_conn(cid: jax.Array) -> jax.Array:
+                return pc.predicate(u_view, c_view, ConnIdx(cid), g)
+
+            should_die = jax.vmap(per_conn)(cids)
+            new_bucket: Columns = dict(bucket_conns)
+            new_bucket[DEAD.name] = dead | should_die
+            return new_bucket
+
+        new_conns = tuple(prune_bucket(bucket) for bucket in state.conns)
+        return dataclasses.replace(state, conns=new_conns), jnp.float32(0.0)
+
+    return prune_conn_phase
+
+
+def build_add_conn_phase[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    *,
+    overflow_sink: list[Bool[Array, ""]] | None = None,  # noqa: F722
+) -> Phase[GS]:
     """K-bounded candidates from the neighbourhood window; lax.top_k
-    (static k, stable); per-bucket prefix-sum slot claim; overflow ->
-    dropped scatter + flag; level-preserving adds must NOT set
-    needs_resort (rung0 design section 5)."""
-    raise NotImplementedError
+    (static k, stable, lax.py:3563); per-bucket prefix-sum slot claim;
+    overflow -> dropped scatter + flag; level-preserving adds must NOT set
+    needs_resort (rung0 design section 5).
+
+    Candidate window (Deviation, IMPLEMENTATION_PLAN.md M4a -- narrower
+    than dispatch_cpu.hpp:811-822's rolling window, which also visits
+    same-source-level pairs La==Lb): only dst strictly AHEAD of src, i.e.
+    `0 < level[dst] - level[src] <= net.neighbourhood`. A same-level pair
+    is the only way an accepted edge could ever force a Kahn relevel (an
+    edge into a unit at its OWN source level, or behind it, needs that
+    destination bumped to source_level + 1); M4a ships AddConn/PruneConn
+    but `topo.recompute_levels`/`topo.resort` stay `NotImplementedError`
+    (M4b), so there is no host mechanism yet to ACT on a relevel request.
+    Restricting the window to strictly-ahead pairs makes every accepted
+    candidate provably level-preserving by construction: dst's level
+    already exceeds src's, so Kahn's `level(dst) = max(incoming src
+    levels) + 1` cannot increase. `needs_resort` below is real, general
+    code (not a hardcoded constant) -- it is simply never observed to fire
+    given this window; a future window that admits same-level pairs would
+    exercise it without changing this mechanism.
+
+    One bucket is one top_k + prefix-sum claim, independent of every other
+    bucket (no cross-bucket sequencing, unlike UpdateConn): in TOPOLOGICAL
+    mode bucket `b` sources candidates only from units at level `b`
+    (matching NetworkBuilder.finalize's `bucket_of_conn = levels[src_arr]`
+    convention); PIPELINE's single bucket (level_capacities is a 1-tuple,
+    rung0 design section 3) accepts a source at ANY level, since every
+    live conn lives in that one flat arena regardless of source level --
+    the level WINDOW itself is still consulted in both modes (native's
+    AddConnections has no Pipeline/Topological distinction at all,
+    dispatch_cpu.hpp:699-762 is driven purely by Kahn levels; only the
+    destination BUCKET differs here, which is exactly why PIPELINE mode
+    can never resort -- there is only the one bucket to land in).
+    """
+    ac = net.add_conn
+    assert ac is not None  # build_phases only calls this when set
+    num_units = static.num_units
+    num_buckets = len(static.level_capacities)
+    neighbourhood = net.neighbourhood
+    is_pipeline = net.propagation is Propagation.PIPELINE
+    # Static (Python-int) candidate-pool bound: top_k requires k <= pool
+    # size, and a small test network's unit count squared can undercut a
+    # generously-configured max_candidates.
+    k = max(0, min(ac.max_candidates, num_units * num_units))
+
+    # Full (src, dst) unit-id grid, built once (num_units is static): the
+    # per-bucket validity mask (level window, and TOPOLOGICAL's source-level
+    # filter) is a boolean over this SAME fixed pool every step, never a
+    # dynamically-sized candidate list [D:2 -- static shapes throughout].
+    unit_ids = jnp.arange(num_units, dtype=jnp.int32)
+    flat_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
+    flat_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
+
+    def add_conn_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:  # noqa: F722
+        del inputs
+        units = state.units
+        g = state.globals_
+        u_view = UnitView(units)
+        unit_level = units[LEVEL.name]
+        src_level = unit_level[flat_src]
+        dst_level = unit_level[flat_dst]
+        level_gap = dst_level - src_level
+        # "dst at levels ahead of src" (module docstring above): excludes
+        # the same-level (La==Lb) pairs of dispatch_cpu.hpp's full window.
+        window_ok = (level_gap >= 1) & (level_gap <= neighbourhood)
+
+        def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
+            raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
+            return jnp.where(ok, raw.astype(jnp.float32), jnp.float32(-jnp.inf))
+
+        def init_one(s: jax.Array, d: jax.Array) -> dict[str, jax.Array]:
+            # ConnWrite is not pytree-registered (views.py); unwrap .fields
+            # to a plain dict before vmap, matching _build_conn_update /
+            # _apply_masked's UnitWrite handling in sweep.py.
+            write = ac.init(u_view, UnitIdx(s), UnitIdx(d), g)
+            return dict(write.fields)
+
+        new_conns: list[Columns] = []
+        overflow = jnp.bool_(False)
+        reassigning = jnp.bool_(False)
+        for bucket_idx in range(num_buckets):
+            bucket_conns = state.conns[bucket_idx]
+            capacity_b = static.level_capacities[bucket_idx]
+            src_ok = (
+                jnp.ones_like(src_level, dtype=jnp.bool_)
+                if is_pipeline
+                else src_level == bucket_idx
+            )
+            valid = window_ok & src_ok
+
+            flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
+            _, top_idx = jax.lax.top_k(flat_scores, k)
+            top_src = flat_src[top_idx]
+            top_dst = flat_dst[top_idx]
+            top_valid = valid[top_idx]
+
+            # Prefix-sum slot claim over this bucket's OWN dead mask
+            # (rung0 design section 5): rank[i] is dead-position i's 0-based
+            # rank among this bucket's dead slots; scattering `positions` by
+            # `rank` (dropping live positions via the always-OOB `sink_len`
+            # index) inverts that into slot_for_rank[j] = the position of
+            # the j-th free slot, `capacity_b` (never a real position) where
+            # fewer than j+1 free slots exist. `sink_len = max(capacity_b,
+            # k)` keeps both the scatter (indices < capacity_b <= sink_len,
+            # in bounds) and the later static `[:k]` slice in bounds without
+            # a runtime clamp, even if k > capacity_b.
+            dead_b = bucket_conns[DEAD.name]
+            rank = jnp.cumsum(dead_b.astype(jnp.int32)) - 1
+            positions = jnp.arange(capacity_b, dtype=jnp.int32)
+            sink_len = max(capacity_b, k)
+            scatter_target = jnp.where(dead_b, rank, jnp.int32(sink_len))
+            slot_for_rank = (
+                jnp.full((sink_len,), capacity_b, dtype=jnp.int32)
+                .at[scatter_target]
+                .set(positions, mode="drop")
+            )
+            free_slot = slot_for_rank[:k]
+            has_room = free_slot < capacity_b
+            committed = top_valid & has_room
+            # Overflow (module docstring, rung0 design section 5): a REAL
+            # (valid, top-k-selected) candidate for which this bucket ran
+            # out of dead slots. Un-committed candidates (invalid OR no
+            # room) scatter to `capacity_b`, one past this bucket's own
+            # valid range -- FILL_OR_DROP (scatter.py:187, the implicit
+            # default mode) drops them rather than mis-writing a live slot.
+            overflow = overflow | jnp.any(top_valid & ~has_room)
+            target_slot = jnp.where(committed, free_slot, jnp.int32(capacity_b))
+
+            # needs_resort (module docstring above): always False given
+            # this window's construction, computed for real rather than
+            # hardcoded so a future wider window is correct for free.
+            level_preserving = unit_level[top_dst] > unit_level[top_src]
+            reassigning = reassigning | jnp.any(committed & ~level_preserving)
+
+            batched_init = jax.vmap(init_one)(top_src, top_dst)
+
+            new_bucket: Columns = dict(bucket_conns)
+            for spec in static.conn_fields:
+                value: jax.Array
+                if spec.name == FROM_ID.name:
+                    value = top_src.astype(spec.dtype)
+                elif spec.name == TO_ID.name:
+                    value = top_dst.astype(spec.dtype)
+                elif spec.name == DEAD.name:
+                    value = jnp.zeros((k,), dtype=spec.dtype)
+                elif spec.name in batched_init:
+                    value = batched_init[spec.name].astype(spec.dtype)
+                else:
+                    # Not touched by ac.init: reset to the FieldSpec default
+                    # rather than inheriting whatever a PREVIOUS tenant (a
+                    # conn tombstoned by this same step's prune_conn pass,
+                    # or the builder's initial padding) left behind --
+                    # mirrors native's SOAAllocator.Allocate() placement-new
+                    # default-constructing every field on claim
+                    # (alloc.hpp:171-188), applied to plastax's dead-slot
+                    # recycling in place of native's bump allocation.
+                    value = jnp.full((k,), np.asarray(spec.default), dtype=spec.dtype)
+                new_bucket[spec.name] = (
+                    bucket_conns[spec.name].at[target_slot].set(value, mode="drop")
+                )
+            new_conns.append(new_bucket)
+
+        if overflow_sink is not None:
+            overflow_sink[0] = overflow
+        new_state = dataclasses.replace(
+            state,
+            conns=tuple(new_conns),
+            needs_resort=state.needs_resort | reassigning,
+        )
+        return new_state, jnp.float32(0.0)
+
+    return add_conn_phase

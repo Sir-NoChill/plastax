@@ -1,4 +1,4 @@
-"""Level assignment and resort (rung0 design section 4).
+"""Level assignment and resort.
 
 Deletion never resorts. Level-preserving adds never resort. Resort runs
 only on level reassignment; bucket growth is handled by state.grow_bucket.
@@ -23,13 +23,23 @@ from plastax.sweep import unit_id_mask
 
 def initial_levels(
     num_units: int,
-    edges: np.ndarray,  # (E, 2) int32 host array, from builder
+    edges: np.ndarray,
 ) -> np.ndarray:
-    """Host-side Kahn/BFS for initial construction (pre-jit, plain numpy).
+    """Compute initial levels host-side via Kahn/BFS, before jit.
 
     Longest-path levels: in-degree-0 units are level 0; level(v) = max over
     incoming edges (u -> v) of level(u) + 1. Raises on a cycle (edges must
-    form a DAG; M1 topologies -- dense/conv2d/sequential -- always do).
+    form a DAG; the dense/conv2d/sequential topologies always do).
+
+    Args:
+        num_units: Total number of units in the network.
+        edges: (E, 2) int32 host array of edges, from builder.
+
+    Returns:
+        Per-unit levels as an int32 host array.
+
+    Raises:
+        ValueError: The edges do not form a DAG (a cycle was detected).
     """
     levels = np.zeros(num_units, dtype=np.int32)
     if edges.shape[0] == 0:
@@ -64,31 +74,36 @@ def initial_levels(
 
 def recompute_levels[GS](
     static: NetworkStatic, state: NetworkState[GS]
-) -> Int32[Array, " num_units"]:  # noqa: F722  jaxtyping named-axis string
-    """On-device Kahn relaxation: lax.fori_loop bounded by
-    static.kahn_max_depth or num_units (both static). Carry is
-    fixed-capacity (loops.py:545-619 constraints).
+) -> Int32[Array, " num_units"]:
+    """Relax unit levels on-device via bounded Kahn/Bellman-Ford iteration.
 
-    Bellman-Ford-style longest-path relaxation: the vectorized analogue of
-    dispatch_cpu.hpp:1407-1474's frontier BFS, which resets every non-input
-    unit's Level to 0 and then only ever RAISES a unit's Level by walking
-    forward from the NumInput-sized input frontier (an input's Level is
-    simply never visited by that walk). Every unit here likewise starts at
-    level 0; each of the `max_depth` rounds gathers, for every LIVE conn,
-    its source's current level + 1 as a candidate for its destination, and
-    folds candidates into each destination via a max-segment-reduce
-    (monoid.max_, jax.ops.segment_max -- dead conns are routed to the
-    out-of-range null slot `num_units`, dropped by FILL_OR_DROP, matching
-    sweep._accumulate_into); declared inputs (static.input_ids) are re-
-    pinned to 0 at the end of every round so an input can never become a
-    relaxation TARGET regardless of what the live edge set looks like,
-    mirroring the oracle's Level array never being written for I <
-    NumInput. A DAG's longest path visits fewer than num_units edges, so
-    kahn_max_depth-or-num_units rounds always converges to the exact same
-    longest-path level `initial_levels` computes host-side from the same
-    edge set, when the graph's structurally-in-degree-0 units are exactly
-    the declared inputs (true for every M1 topology and this module's own
-    test graphs -- the acceptance bar the task sets).
+    Runs as a jax.lax.fori_loop bounded by static.kahn_max_depth or
+    num_units (both static); the carry is fixed-capacity as the loop
+    requires. Bellman-Ford-style longest-path relaxation: every unit
+    starts at level 0; each of the `max_depth` rounds gathers, for every
+    LIVE conn, its source's current level + 1 as a candidate for its
+    destination, and folds candidates into each destination via a
+    max-segment-reduce (monoid.max_, jax.ops.segment_max -- dead conns are
+    routed to the out-of-range null slot `num_units`, dropped by
+    FILL_OR_DROP, matching sweep._accumulate_into); declared inputs
+    (static.input_ids) are re-pinned to 0 at the end of every round so an
+    input can never become a relaxation TARGET regardless of what the
+    live edge set looks like. A DAG's longest path visits fewer than
+    num_units edges, so kahn_max_depth-or-num_units rounds always
+    converges to the exact same longest-path level `initial_levels`
+    computes host-side from the same edge set, when the graph's
+    structurally-in-degree-0 units are exactly the declared inputs (true
+    for every topology in this module's own test graphs).
+
+    Type Args:
+        GS: Growth-state type parameter carried by NetworkState.
+
+    Args:
+        static: Static network configuration.
+        state: Current network state.
+
+    Returns:
+        Per-unit levels after relaxation.
     """
     num_units = static.num_units
     max_depth = (
@@ -101,9 +116,9 @@ def recompute_levels[GS](
     is_input = unit_id_mask(static.input_ids, num_units)
 
     def relax(
-        _: Int32[Array, ""],  # noqa: F722  jaxtyping scalar-shape string
-        level: Int32[Array, " num_units"],  # noqa: F722
-    ) -> Int32[Array, " num_units"]:  # noqa: F722
+        _: Int32[Array, ""],
+        level: Int32[Array, " num_units"],
+    ) -> Int32[Array, " num_units"]:
         candidate = level[from_id] + jnp.int32(1)
         incoming_max = monoid.max_.segment_reduce(
             candidate, safe_to, num_units, indices_are_sorted=False
@@ -113,25 +128,25 @@ def recompute_levels[GS](
 
     init = jnp.zeros((num_units,), dtype=jnp.int32)
     # jax.lax.fori_loop's stub resolves the carry generically enough that
-    # mypy loses the concrete Array return type here (confirmed: the SAME
-    # cast-not-ignore choice as step.py's jax.jit call, for the same
-    # follow_imports reason cited there).
+    # mypy loses the concrete Array return type, hence the cast.
     return cast(
         Int32[Array, " num_units"], jax.lax.fori_loop(0, max_depth, relax, init)
-    )  # noqa: F722
+    )
 
 
 def resort[GS](
     static: NetworkStatic, state: NetworkState[GS]
 ) -> tuple[NetworkStatic, NetworkState[GS]]:
-    """Host-driven: recompute levels, redistribute conns into new buckets
+    """Recompute levels, redistribute conns into new buckets, and resort.
+
+    Host-driven: recompute levels, redistribute conns into new buckets
     (gather per level), stable sort each bucket by (dead, to_id) via
-    lax.sort_key_val (lax.py:3509) -- doubles as compaction -- then derive
-    new level_capacities via capacity_policy. Per-level live counts are the
+    lax.sort_key_val -- doubles as compaction -- then derive new
+    level_capacities via capacity_policy. Per-level live counts are the
     only host transfer. Returns new (static, state); caller retraces.
 
-    PIPELINE mode keeps exactly one bucket (rung0 design section 3, mirrored
-    from NetworkBuilder.finalize's own PIPELINE branch); TOPOLOGICAL's new
+    PIPELINE mode keeps exactly one bucket, mirrored from
+    NetworkBuilder.finalize's own PIPELINE branch; TOPOLOGICAL's new
     bucket count is `max(new_level.max(), 1)`, exactly finalize's "the
     highest level ever used as a source is max(levels) - 1" derivation --
     unlike construction, a resort's bucket count can move in EITHER
@@ -151,6 +166,16 @@ def resort[GS](
     restores the (dead, to_id) order the segment reductions' `indices_are_
     sorted=True` needs -- step (1) preserves each match's OLD relative
     order, not to_id order, so this second pass is not redundant with it.
+
+    Type Args:
+        GS: Growth-state type parameter carried by NetworkState.
+
+    Args:
+        static: Static network configuration.
+        state: Current network state.
+
+    Returns:
+        The new (static, state) pair with resorted conns.
     """
     num_units = static.num_units
     new_level = recompute_levels(static, state)
@@ -182,8 +207,7 @@ def resort[GS](
             indices_are_sorted=False,
         )
         # Host transfer 2/2: the per-level live-conn counts (module
-        # docstring / design section 4), sliced to just the buckets that
-        # will actually exist.
+        # docstring), sliced to just the buckets that will actually exist.
         live_counts = [int(c) for c in np.asarray(histogram[:new_num_buckets])]
 
     new_level_capacities = tuple(capacity_policy(live) for live in live_counts)
@@ -223,8 +247,18 @@ def resort[GS](
 
 
 def capacity_policy(live: int, *, min_bucket: int = 64) -> int:
-    """Default: max(next_pow2(live), min_bucket) so buckets carry headroom
-    by construction. Constants are an open tuning item (design section 9)."""
+    """Compute a bucket capacity with headroom above the live count.
+
+    Default policy: max(next_pow2(live), min_bucket) so buckets carry
+    headroom by construction. Constants are an open tuning item.
+
+    Args:
+        live: Number of live conns the bucket must hold.
+        min_bucket: Minimum capacity to allocate regardless of live count.
+
+    Returns:
+        The capacity to allocate for the bucket.
+    """
     if live <= 0:
         return min_bucket
     next_pow2 = 1 << (live - 1).bit_length()

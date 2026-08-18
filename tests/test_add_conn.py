@@ -200,10 +200,14 @@ def test_level_preserving_add_does_not_set_needs_resort() -> None:
     phase = phases.build_add_conn_phase(_AddConnNet, static)
     new_state, _ = phase(state, _DUMMY_INPUTS)
 
-    # Every candidate this window can ever propose has dst strictly ahead
-    # of src (module docstring, phases.py's build_add_conn_phase
-    # docstring), so it is already level-preserving by construction: no
-    # accepted edge ever forces a Kahn relevel.
+    # M4b Deviation (IMPLEMENTATION_PLAN.md): the window is no longer
+    # restricted to dst-strictly-ahead-of-src (phases.py's
+    # build_add_conn_phase docstring), so a same-level or behind-src
+    # candidate CAN now be proposed and scored -- but _SRC_BONUS makes
+    # every (SRC, dst in _DST) candidate outscore every such candidate here
+    # (see the module docstring), so the top-3 actually COMMITTED are still
+    # exactly the level-preserving (SRC, 2/3/4) edges and needs_resort
+    # stays False, same outcome as M4a for a different reason.
     assert bool(new_state.needs_resort) is False
 
 
@@ -290,11 +294,19 @@ def test_added_edge_participates_in_the_next_forward_sweep() -> None:
 def test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort() -> None:
     """PIPELINE's level_capacities is a 1-tuple (rung0 design section 3):
     every accepted candidate, regardless of its source unit's level, must
-    land in that one flat bucket -- and, per design section 5, pipeline
-    mode adds never resort. The level WINDOW itself is still consulted
-    (native's AddConnections has no Pipeline/Topological distinction,
-    dispatch_cpu.hpp:699-762), so the accepted set is identical to the
-    TOPOLOGICAL case above.
+    land in that one flat bucket. The level WINDOW itself is still
+    consulted (native's AddConnections has no Pipeline/Topological
+    distinction, dispatch_cpu.hpp:699-762), so the accepted set is
+    identical to the TOPOLOGICAL case above.
+
+    needs_resort stays False here for the SAME reason as the TOPOLOGICAL
+    test above (_SRC_BONUS keeps the actually-committed top-3 confined to
+    the level-preserving (SRC, dst) edges), not because PIPELINE mode
+    structurally forbids it (M4b Deviation, IMPLEMENTATION_PLAN.md,
+    phases.py's build_add_conn_phase docstring: design section 5's "in
+    pipeline mode adds never resort at all" described a consequence of
+    M4a's narrower window, not a carve-out in the reassignment formula,
+    which never distinguished propagation mode).
     """
     static, state = _build_net(_PipelineAddConnNet)
     assert len(static.level_capacities) == 1

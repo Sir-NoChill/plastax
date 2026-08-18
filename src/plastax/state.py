@@ -1,4 +1,4 @@
-"""Network state: static config (jit cache key)
+"""Network state: static config (jit cache key).
 
 NetworkStatic meta fields must stay hashable primitives, so the SoA fields
 need to be of known size before the jit. These are only checked once, when

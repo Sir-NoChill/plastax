@@ -10,14 +10,9 @@ repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.12.7
     hooks:
-      # examples/mlp_xor.py landed (M3b) and is ruff-clean; only
-      # ipc_multilayer.py remains an unimplemented stub until M5. Drop this
-      # exclude and add ipc_multilayer.py to the CI ruff args once it lands.
       - id: ruff
         args: [--fix]
-        exclude: '^examples/ipc_multilayer\.py$'
       - id: ruff-format
-        exclude: '^examples/ipc_multilayer\.py$'
 
   - repo: local
     hooks:

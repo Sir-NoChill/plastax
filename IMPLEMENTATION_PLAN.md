@@ -520,6 +520,44 @@ AddConn window, the retrace-count contract):
   commit; the retrace-count test's job is `make_step`'s cache behaviour
   specifically, which does not care what set the flag.
 
+#### M5 (2026-08-18)
+
+- examples/ipc_multilayer.py: implemented per ipc_multilayer.cpp's traits
+  (iPCForwardPass/iPCBackwardPass/iPCUpdateConn, three ExtraUnitFields,
+  Pipeline). The oracle's iPCStep wraps its three framework kernels in two
+  HOST-side per-unit loops -- a pre-step `Activation = f(ValueNode)` copy and
+  the value-node update `x += gamma*(-eps + bottom_up)` -- neither of which
+  is a plastax phase (the phase set is fixed: forward, loss, backward,
+  update_conn, prune_conn, add_conn, reset_global; there is no user per-unit
+  post-update slot). Both stay host-side here too, which is faithful: they
+  are plain host loops in the C++ as well, not framework kernels. The
+  pre-step copy is elided entirely by reading `f(ValueNode[src])` inline in
+  the forward map (identity for input sources, tanh for hidden), so
+  ACTIVATION is never consumed by the iPC kernels; the value-node update and
+  the once-per-observation boundary clamp (ValueNode[input]=x, [output]=y)
+  run between `step()` calls in `run()` via ordinary `state.units` surgery.
+  LeCun-uniform init matches the oracle's per-destination bounds exactly
+  (`jax.nn.initializers.lecun_uniform`: fan_in 3 hidden / 16 output =
+  sqrt(3/fan_in)). Parity is aggregate, not bit-level: the port settles at
+  the same iPC/baseline ratio as the C++ (~0.25) but not the same absolute
+  trajectory, since jax PRNG != std::mt19937 for both data and init.
+- tests/test_oracle_cpp.py: bit-level C++ parity is pinned via the
+  `manual-fcc` example, NOT via golden CSVs of the two flagship examples.
+  Reason: mlp_xor and ipc_multilayer both seed weights from a PRNG that
+  cannot reproduce the oracle's std::mt19937 stream, so their per-step
+  scalars are not bit-comparable at the plan's rtol=1e-5/1e-4 tolerances;
+  manual-fcc is the one built-in example with NO randomness (fixed 0.5/-0.3
+  weights, fixed tanh forward, fixed inputs), so it pins the topological
+  forward kernel exactly. Reproduced with `from_topology` + constant
+  initialisers driven through the host `Driver`. The three golden output
+  activations are pinned inline (3 scalars -> no separate tests/golden/ CSV
+  is warranted) with the regeneration command documented in the test.
+- tests/test_ipc_multilayer.py: added (the plan named only test_oracle_cpp +
+  test_donation for M5, but the mlp_xor example got a parallel acceptance
+  test in M3, so ipc gets the same treatment): asserts the example beats the
+  predict-previous baseline with a 2x margin, is seed-deterministic, and
+  uses Pipeline propagation.
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

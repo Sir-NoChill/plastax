@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool
 
-from plastax._types import FieldSpec, Propagation
+from plastax._types import FieldSpec, Propagation, ShardSpec
 
 
 @jax.tree_util.register_dataclass
@@ -34,6 +34,7 @@ class NetworkStatic:
         input_ids: builder-recorded unit ids that StepInputs scatters onto.
         output_ids: builder-recorded unit ids that the loss clamps targets
             to.
+        sharding: Scheme-A sharding config, or None for a single device.
     """
 
     num_units: int = dataclasses.field(metadata=dict(static=True))
@@ -48,6 +49,9 @@ class NetworkStatic:
     kahn_max_depth: int | None = dataclasses.field(metadata=dict(static=True))
     input_ids: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
     output_ids: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+    sharding: ShardSpec | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
 
 Columns = dict[str, Array]  # keyed by FieldSpec.name; one array per SOA tag
@@ -192,6 +196,7 @@ def grow_bucket[GS](
         kahn_max_depth=static.kahn_max_depth,
         input_ids=static.input_ids,
         output_ids=static.output_ids,
+        sharding=static.sharding,
     )
     new_state = NetworkState(
         units=state.units,

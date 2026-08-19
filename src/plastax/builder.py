@@ -270,6 +270,7 @@ class NetworkBuilder[GS]:
             kahn_max_depth=self.net.kahn_max_depth,
             input_ids=tuple(self._input_ids),
             output_ids=tuple(self._output_ids),
+            sharding=self.net.sharding,
         )
         state = NetworkState(
             units=unit_cols,

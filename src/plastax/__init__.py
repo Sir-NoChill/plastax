@@ -11,6 +11,7 @@ from plastax._types import (
     ConnIdx,
     FieldSpec,
     Propagation,
+    ShardSpec,
     UnitIdx,
 )
 from plastax.builder import NetworkBuilder
@@ -53,6 +54,7 @@ __all__ = [
     "Propagation",
     "PruneConn",
     "ResetGlobal",
+    "ShardSpec",
     "StepInputs",
     "StepResult",
     "UnitIdx",

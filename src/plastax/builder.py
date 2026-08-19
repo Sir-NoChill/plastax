@@ -209,7 +209,16 @@ class NetworkBuilder[GS]:
             if src_arr.size
             else np.zeros((0, 2), np.int32)
         )
-        levels = topo.initial_levels(num_units, edges)
+        # Pipeline propagation admits recurrent (cyclic) structure -- an
+        # echo state network's reservoir is the canonical case -- since
+        # every conn lands in the single flat bucket and each step is one
+        # synchronous sweep reading the previous step's activations.
+        # Topological propagation still requires a DAG.
+        levels = topo.initial_levels(
+            num_units,
+            edges,
+            allow_cycles=self.net.propagation is Propagation.PIPELINE,
+        )
 
         unit_cols: Columns = {}
         for spec in self._unit_fields:

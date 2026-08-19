@@ -24,22 +24,34 @@ from plastax.sweep import unit_id_mask
 def initial_levels(
     num_units: int,
     edges: np.ndarray,
+    *,
+    allow_cycles: bool = False,
 ) -> np.ndarray:
     """Compute initial levels host-side via Kahn/BFS, before jit.
 
     Longest-path levels: in-degree-0 units are level 0; level(v) = max over
-    incoming edges (u -> v) of level(u) + 1. Raises on a cycle (edges must
-    form a DAG; the dense/conv2d/sequential topologies always do).
+    incoming edges (u -> v) of level(u) + 1. Raises on a cycle (topological
+    propagation needs a DAG; the dense/conv2d/sequential topologies always
+    give one) unless `allow_cycles` is set.
+
+    With `allow_cycles` (pipeline propagation, where recurrent reservoirs
+    are legal), a cycle is not an error: units caught in a cycle never leave
+    the Kahn queue, so they keep the best-effort longest-path level reached
+    from their acyclic predecessors (0 when they have none). Levels are
+    cosmetic in pipeline mode -- every conn lands in the single flat bucket
+    regardless of source level -- so a partial assignment is harmless.
 
     Args:
         num_units: Total number of units in the network.
         edges: (E, 2) int32 host array of edges, from builder.
+        allow_cycles: If True, tolerate cycles and return best-effort
+            levels instead of raising.
 
     Returns:
         Per-unit levels as an int32 host array.
 
     Raises:
-        ValueError: The edges do not form a DAG (a cycle was detected).
+        ValueError: The edges do not form a DAG and `allow_cycles` is False.
     """
     levels = np.zeros(num_units, dtype=np.int32)
     if edges.shape[0] == 0:
@@ -67,7 +79,7 @@ def initial_levels(
             if remaining[v] == 0:
                 queue.append(v)
 
-    if processed != num_units:
+    if processed != num_units and not allow_cycles:
         raise ValueError("initial_levels: edges do not form a DAG (cycle detected)")
     return levels
 

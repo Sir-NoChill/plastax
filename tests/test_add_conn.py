@@ -327,3 +327,58 @@ def test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort() -> None
 
     assert new_edges == {(_SRC, 2), (_SRC, 3), (_SRC, 4)}
     assert bool(new_state.needs_resort) is False
+
+
+class _NoBonusAddConn(px.AddConn[None]):
+    """score is dst's activation alone, with NO SRC bonus, so the highest-
+    scored candidates are the already-live (ANCHOR, dst) pairs (dst 2/3/4,
+    activations 5/4/3). Without dedup those would be selected and grown as
+    duplicate parallel edges; the occupancy mask must exclude them, leaving
+    growth to the fresh (SRC, dst) pairs of equal dst score."""
+
+    max_candidates = 3
+
+    def score(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> jax.Array:
+        del src, g
+        return u[px.ACTIVATION, dst]
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+class _NoBonusAddConnNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _NoBonusAddConn()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def test_add_conn_never_grows_a_duplicate_of_a_live_edge() -> None:
+    static, state = _build_net(_NoBonusAddConnNet)
+    state = _with_marker_activations(state)
+
+    phase = phases.build_add_conn_phase(_NoBonusAddConnNet, static)
+    new_state, _ = phase(state, _DUMMY_INPUTS)
+
+    bucket = new_state.conns[0]
+    dead = np.asarray(bucket[px.DEAD.name])
+    from_id = np.asarray(bucket[px.FROM_ID.name])
+    to_id = np.asarray(bucket[px.TO_ID.name])
+    live_pairs = [
+        (int(f), int(t)) for f, t, d in zip(from_id, to_id, dead, strict=True) if not d
+    ]
+
+    # No live pair appears twice: the highest-scored candidates are the
+    # already-live (ANCHOR, dst) edges, which the dedup mask excludes rather
+    # than regrowing as parallel duplicates.
+    assert len(live_pairs) == len(set(live_pairs))
+    # Each pre-existing ANCHOR edge survives exactly once.
+    for dst in _DST:
+        assert live_pairs.count((_ANCHOR, dst)) == 1
+    # Growth still happens -- into fresh (SRC, dst) pairs, never duplicates.
+    new_edges = set(live_pairs) - {(_ANCHOR, dst) for dst in _DST}
+    assert new_edges == {(_SRC, 2), (_SRC, 3), (_SRC, 4)}

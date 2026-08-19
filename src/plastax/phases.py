@@ -439,8 +439,11 @@ def build_add_conn_phase[GS](
     single bucket accepts a source at any level, since every live conn
     lives in one flat arena regardless of source level -- the level
     window itself is still consulted in both modes, only the destination
-    bucket differs. Each bucket runs an independent top_k (static k) over
-    its own scored, windowed candidates, with no cross-bucket sequencing.
+    bucket differs. Candidates already present as a live edge in the bucket
+    are masked out (a pair-id occupancy grid built by scatter, gathered per
+    candidate) so growth never regrows an existing pair as a duplicate. Each
+    bucket runs an independent top_k (static k) over its own scored,
+    windowed candidates, with no cross-bucket sequencing.
 
     Free slots are claimed by a prefix-sum scan over each bucket's own
     `dead` mask: the scan turns dead-row rank into a slot assignment, so a
@@ -531,7 +534,29 @@ def build_add_conn_phase[GS](
                 if is_pipeline
                 else src_level == bucket_idx
             )
-            valid = window_ok & src_ok
+            # Exclude candidates already present as a live edge in this
+            # bucket, so growth never regrows an existing pair as a
+            # duplicate. Each edge has a static pair id `src * num_units +
+            # dst`; scatter every LIVE edge's pair id into an occupancy grid
+            # (dead slots routed to the throwaway sink `num_units**2`, so
+            # their stale from/to cannot mark a real pair occupied), then
+            # gather it at each candidate's pair id. A scatter + a gather,
+            # O(num_units**2) -- the same order as the candidate grid
+            # itself, no edge-list search.
+            dead_bucket = bucket_conns[DEAD.name]
+            live_pair = jnp.where(
+                dead_bucket,
+                jnp.int32(num_units * num_units),
+                bucket_conns[FROM_ID.name].astype(jnp.int32) * jnp.int32(num_units)
+                + bucket_conns[TO_ID.name].astype(jnp.int32),
+            )
+            occupied = (
+                jnp.zeros((num_units * num_units + 1,), dtype=jnp.bool_)
+                .at[live_pair]
+                .set(True, mode="drop")
+            )
+            not_duplicate = ~occupied[flat_src * jnp.int32(num_units) + flat_dst]
+            valid = window_ok & src_ok & not_duplicate
 
             flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
             _, top_idx = jax.lax.top_k(flat_scores, k)

@@ -2,10 +2,10 @@
 
 A feedforward (DAG) sparse tanh network whose connections are sharded
 edge-wise across the device mesh while units are replicated -- Scheme A. This
-is the feedforward precursor to a recurrent Echo State Network: plastax's
-builder currently levels the graph with Kahn's algorithm and rejects cycles,
-so a truly recurrent reservoir does not build yet (a cyclic-graph builder mode
-is the natural next step). Run directly: `python examples/sharded_reservoir.py`.
+is the feedforward, sharded counterpart to a recurrent Echo State Network:
+topological propagation levels the graph with Kahn's algorithm and rejects
+cycles, so the recurrent reservoir lives in pipeline mode instead (see
+examples/echo_state_network.py). Run directly: `python examples/sharded_reservoir.py`.
 It uses four fake CPU devices so it runs anywhere; on a real multi-GPU host the
 same ShardSpec shards across the physical devices.
 """

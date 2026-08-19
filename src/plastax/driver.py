@@ -1,9 +1,24 @@
-"""Host driver: owns the retrace protocol.
+"""Host driver + retrace protocol.
 
-The step function is pure; the driver owns the retrace protocol, reading
-needs_resort/overflow on host, calling topo.resort / state.grow_bucket,
-and swapping in the new (static, step). Retrace count is observable for
-tests via jax.test_util.assert_num_jit_and_pmap_compilations.
+The step function returns flags for the network needing
+either a resort or having overflowed memory. If either flag
+is true, then we call into jax to redo the network trace and
+recompile the code. The user can check the number of
+retraces performed via
+jax.test_util.assert_num_jit_and_pmap_compilations .
+
+## Recommendations for Poor Performance
+
+1. If your algorithm exhibits many overflow events then
+   you should pre-allocate more VRAM. Note that in plastix
+   native this should not be an issue as VRAM is
+   reallocated on demand
+2. If your algorithm exhibits many retrace events, then you
+   may want to consider implementing a pipelined version
+   of your algorithm. Pipelined versions do not have to be
+   sorted and execution order is arbitrary. If your algorithm
+   is amenable to that paradigm, it will almost invariably
+   perform better than a topologically sorted algorithm
 """
 
 from __future__ import annotations

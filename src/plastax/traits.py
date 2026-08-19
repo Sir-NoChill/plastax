@@ -251,6 +251,15 @@ class PruneConn[GS](Protocol):
 class AddConn[GS](Protocol):
     """Connection growth policy: K-bounded growth by scored candidates.
 
+    An implementation may optionally declare two extra members to shortlist
+    growth candidates instead of scoring the full num_units^2 grid: an integer
+    attribute `max_candidate_units` (M) and a method
+    `importance(u, i, g) -> Float[Array, ""]`. When both are present (and
+    0 < M < num_units), the add-conn phase draws candidates only from the M x M
+    grid of that step's top-M most important units -- O(num_units + M^2) instead
+    of O(num_units^2). They are read structurally (getattr), so omitting them
+    keeps the exhaustive grid; they are not part of the required protocol.
+
     Type Args:
         GS: the global state type threaded through the network.
 

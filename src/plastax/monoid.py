@@ -11,6 +11,7 @@ import enum
 import math
 from collections.abc import Callable
 
+import jax.lax
 import jax.numpy as jnp
 import jax.ops
 from jaxtyping import Array, DTypeLike, Int32, Shaped
@@ -45,6 +46,16 @@ _NAMED_PAIRWISE: dict[_Named, Callable[[Array, Array], Array]] = {
     _Named.PROD: jnp.multiply,
     _Named.MAX: jnp.maximum,
     _Named.MIN: jnp.minimum,
+}
+
+# Cross-device all-reduce for each named monoid, used to combine per-shard
+# partial reductions under Scheme-A sharding. `prod` has no direct JAX
+# collective and is intentionally absent (a generic all_gather + reduce is
+# deferred).
+_NAMED_COLLECTIVE: dict[_Named, Callable[..., Array]] = {
+    _Named.SUM: jax.lax.psum,
+    _Named.MAX: jax.lax.pmax,
+    _Named.MIN: jax.lax.pmin,
 }
 
 
@@ -161,6 +172,37 @@ class Monoid[Acc]:
                 )
             return jnp.asarray(self.identity, dtype=dtype)
         return jnp.asarray(_NAMED_IDENTITY[self.named], dtype=dtype)
+
+    def collective(
+        self, value: Shaped[Array, " n"], axis_name: str
+    ) -> Shaped[Array, " n"]:
+        """Combine per-shard partial reductions across a device-mesh axis.
+
+        Under Scheme-A sharding each device reduces only its own slice of the
+        connection arena, so its `segment_reduce` yields a partial per-unit
+        accumulator. This all-reduces those partials with the monoid's
+        collective (sum to psum, max to pmax, min to pmin), leaving the full
+        accumulator identical on every shard. It must be called inside a
+        `shard_map`/`jit` context where `axis_name` is bound.
+
+        Args:
+            value: This shard's partial reduction.
+            axis_name: Mesh axis to reduce over.
+
+        Returns:
+            The value combined across all shards on `axis_name`.
+
+        Raises:
+            UnsupportedMonoidError: If this monoid has no collective lowering
+                (a generic monoid, or prod, which lacks a direct collective).
+        """
+        if self.named is None or self.named not in _NAMED_COLLECTIVE:
+            raise UnsupportedMonoidError(
+                "monoid has no collective lowering for sharding; only "
+                "sum/max/min map to psum/pmax/pmin (prod and generic monoids "
+                "are unsupported)"
+            )
+        return _NAMED_COLLECTIVE[self.named](value, axis_name)
 
 
 sum_: Monoid[Array] = Monoid(_Named.SUM)

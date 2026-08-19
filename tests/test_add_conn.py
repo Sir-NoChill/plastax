@@ -382,3 +382,57 @@ def test_add_conn_never_grows_a_duplicate_of_a_live_edge() -> None:
     # Growth still happens -- into fresh (SRC, dst) pairs, never duplicates.
     new_edges = set(live_pairs) - {(_ANCHOR, dst) for dst in _DST}
     assert new_edges == {(_SRC, 2), (_SRC, 3), (_SRC, 4)}
+
+
+class _ShortlistAddConn(px.AddConn[None]):
+    """max_candidate_units shortlists growth candidates to the top-M units by
+    `importance`. Here importance favors SRC and DST id 6, so the only
+    level-increasing candidate the M=2 shortlist can form is (SRC, 6)."""
+
+    max_candidates = 3
+    max_candidate_units = 2
+
+    def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
+        del u, g
+        favored = (i == jnp.int32(_SRC)) | (i == jnp.int32(6))
+        return jnp.where(favored, jnp.float32(10.0), jnp.float32(0.0))
+
+    def score(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> jax.Array:
+        del u, src, dst, g
+        return jnp.float32(1.0)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+class _ShortlistAddConnNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _ShortlistAddConn()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def test_add_conn_candidate_shortlist_restricts_growth_to_top_m_units() -> None:
+    static, state = _build_net(_ShortlistAddConnNet)
+    state = _with_marker_activations(state)
+
+    phase = phases.build_add_conn_phase(_ShortlistAddConnNet, static)
+    new_state, _ = phase(state, _DUMMY_INPUTS)
+
+    bucket = new_state.conns[0]
+    dead = np.asarray(bucket[px.DEAD.name])
+    from_id = np.asarray(bucket[px.FROM_ID.name])
+    to_id = np.asarray(bucket[px.TO_ID.name])
+    live = [
+        (int(f), int(t)) for f, t, d in zip(from_id, to_id, dead, strict=True) if not d
+    ]
+
+    # Only (SRC, 6) can form from the {SRC, 6} shortlist as a forward edge --
+    # growth touches no other pair, and never a duplicate.
+    new_edges = set(live) - {(_ANCHOR, dst) for dst in _DST}
+    assert new_edges == {(_SRC, 6)}
+    assert len(live) == len(set(live))

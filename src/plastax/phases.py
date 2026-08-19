@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -430,8 +431,12 @@ def build_add_conn_phase[GS](
 ) -> Phase[GS]:
     """Select each bucket's top-k candidates and claim free slots via prefix sum.
 
-    Candidates come from the full (src, dst) unit-id grid, filtered to a
-    level-gap window: `abs(level[dst] - level[src]) <= net.neighbourhood`,
+    Candidates come from the (src, dst) unit-id grid -- the full num_units^2
+    grid, or, when the AddConn declares `max_candidate_units` (M) and an
+    `importance(u, i, g)` method, the M x M grid of that step's top-M most
+    important units (an O(num_units + M^2) shortlist replacing the O(num_units^2)
+    sweep) -- filtered to a level-gap window:
+    `abs(level[dst] - level[src]) <= net.neighbourhood`,
     self-loops excluded (see the `window_ok` comment below for the
     per-ordered-pair derivation). In TOPOLOGICAL mode a bucket only
     sources candidates from units at its own level (matching
@@ -479,19 +484,49 @@ def build_add_conn_phase[GS](
     num_buckets = len(static.level_capacities)
     neighbourhood = net.neighbourhood
     is_pipeline = net.propagation is Propagation.PIPELINE
-    # Static (Python-int) candidate-pool bound: top_k requires k <= pool
-    # size, and a small test network's unit count squared can undercut a
-    # generously-configured max_candidates.
-    k = max(0, min(ac.max_candidates, num_units * num_units))
 
-    # Full (src, dst) unit-id grid, built once (num_units is static): the
-    # per-bucket validity mask (level window, and TOPOLOGICAL's source-level
-    # filter) is a boolean over this SAME fixed pool every step, never a
-    # dynamically-sized candidate list.
+    # Optional candidate reduction: an AddConn may declare `max_candidate_units`
+    # (M) and an `importance(u, i, g)` method to shortlist the M most important
+    # units each step and draw candidates only from that M x M grid, cutting
+    # the per-step cost from O(num_units^2) to O(num_units + M^2). Absent (or M
+    # >= num_units), the full grid is used -- the historical behavior, so
+    # existing AddConn policies are unaffected. Shortlisting is global (top-M
+    # over all units); a bucket whose source level is missing from the shortlist
+    # simply grows nothing that step.
+    max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
+    importance_fn = getattr(ac, "importance", None)
+    use_shortlist = (
+        max_candidate_units is not None
+        and importance_fn is not None
+        and 0 < max_candidate_units < num_units
+    )
+    pool_side = max_candidate_units if use_shortlist else num_units
+    assert pool_side is not None  # use_shortlist implies max_candidate_units set
+    # Static (Python-int) candidate-pool bound: top_k requires k <= pool size,
+    # and a small test network's pool can undercut a generous max_candidates.
+    k = max(0, min(ac.max_candidates, pool_side * pool_side))
+
     unit_ids = jnp.arange(num_units, dtype=jnp.int32)
-    flat_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
-    flat_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
-    not_self = flat_src != flat_dst
+    # Full (src, dst) grid, built once when not shortlisting; the shortlisted
+    # grid is rebuilt per step inside the phase (importance is state-dependent).
+    _full_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
+    _full_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
+
+    def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
+        """This step's (flat_src, flat_dst) candidate grid."""
+        if not use_shortlist:
+            return _full_src, _full_dst
+        assert importance_fn is not None  # use_shortlist implies it is set
+
+        def one(i: jax.Array) -> jax.Array:
+            score = importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
+            return cast(jax.Array, score)
+
+        scores = jax.vmap(one)(unit_ids)
+        _, top = jax.lax.top_k(scores, pool_side)
+        src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
+        dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
+        return src, dst
 
     def add_conn_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -500,6 +535,8 @@ def build_add_conn_phase[GS](
         units = state.units
         g = state.globals_
         u_view = UnitView(units)
+        flat_src, flat_dst = candidate_grid(u_view, g)
+        not_self = flat_src != flat_dst
         unit_level = units[LEVEL.name]
         src_level = unit_level[flat_src]
         dst_level = unit_level[flat_dst]

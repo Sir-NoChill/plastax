@@ -445,10 +445,11 @@ def build_add_conn_phase[GS](
     lives in one flat arena regardless of source level -- the level
     window itself is still consulted in both modes, only the destination
     bucket differs. Candidates already present as a live edge in the bucket
-    are masked out (a pair-id occupancy grid built by scatter, gathered per
-    candidate) so growth never regrows an existing pair as a duplicate. Each
-    bucket runs an independent top_k (static k) over its own scored,
-    windowed candidates, with no cross-bucket sequencing.
+    are masked out (each candidate's pair id binary-searched against the
+    sorted live pair ids -- no num_units**2 occupancy grid) so growth never
+    regrows an existing pair as a duplicate. Each bucket runs an independent
+    top_k (static k) over its own scored, windowed candidates, with no
+    cross-bucket sequencing.
 
     Free slots are claimed by a prefix-sum scan over each bucket's own
     `dead` mask: the scan turns dead-row rank into a slot assignment, so a
@@ -572,27 +573,27 @@ def build_add_conn_phase[GS](
                 else src_level == bucket_idx
             )
             # Exclude candidates already present as a live edge in this
-            # bucket, so growth never regrows an existing pair as a
-            # duplicate. Each edge has a static pair id `src * num_units +
-            # dst`; scatter every LIVE edge's pair id into an occupancy grid
-            # (dead slots routed to the throwaway sink `num_units**2`, so
-            # their stale from/to cannot mark a real pair occupied), then
-            # gather it at each candidate's pair id. A scatter + a gather,
-            # O(num_units**2) -- the same order as the candidate grid
-            # itself, no edge-list search.
+            # bucket, so growth never regrows an existing pair as a duplicate.
+            # Each edge has a pair id `src * num_units + dst`; sort the live
+            # edges' pair ids (dead slots sent to -1, which no candidate id
+            # matches) and binary-search each candidate against them. Bounded
+            # by the candidate count and the bucket capacity -- O((P + cap) *
+            # log cap), with no num_units**2 occupancy grid -- so a
+            # shortlisted phase stays free of any num_units**2 term.
             dead_bucket = bucket_conns[DEAD.name]
             live_pair = jnp.where(
                 dead_bucket,
-                jnp.int32(num_units * num_units),
+                jnp.int32(-1),
                 bucket_conns[FROM_ID.name].astype(jnp.int32) * jnp.int32(num_units)
                 + bucket_conns[TO_ID.name].astype(jnp.int32),
             )
-            occupied = (
-                jnp.zeros((num_units * num_units + 1,), dtype=jnp.bool_)
-                .at[live_pair]
-                .set(True, mode="drop")
+            sorted_live = jnp.sort(live_pair)
+            candidate_pair = flat_src * jnp.int32(num_units) + flat_dst
+            pos = jnp.minimum(
+                jnp.searchsorted(sorted_live, candidate_pair),
+                jnp.int32(sorted_live.shape[0] - 1),
             )
-            not_duplicate = ~occupied[flat_src * jnp.int32(num_units) + flat_dst]
+            not_duplicate = sorted_live[pos] != candidate_pair
             valid = window_ok & src_ok & not_duplicate
 
             flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)

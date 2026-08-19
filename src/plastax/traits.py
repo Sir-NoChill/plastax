@@ -21,6 +21,7 @@ from plastax._types import (
     ConnIdx,
     FieldSpec,
     Propagation,
+    ShardSpec,
     UnitIdx,
 )
 from plastax.monoid import Monoid, MonoidTree
@@ -331,6 +332,7 @@ class Network[GS]:
         propagation: the propagation strategy used to schedule updates.
         kahn_max_depth: max depth for Kahn-order propagation, or None if unbounded.
         neighbourhood: the neighbourhood radius used by the propagation strategy.
+        sharding: Scheme-A sharding config, or None for a single device.
     """
 
     forward_pass: ForwardPass[object, GS]
@@ -346,6 +348,7 @@ class Network[GS]:
     propagation: Propagation = Propagation.TOPOLOGICAL
     kahn_max_depth: int | None = None
     neighbourhood: int = 1
+    sharding: ShardSpec | None = None
 
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""

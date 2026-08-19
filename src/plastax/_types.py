@@ -44,6 +44,24 @@ class Propagation(enum.Enum):
 
 
 @dataclasses.dataclass(frozen=True)
+class ShardSpec:
+    """Scheme-A sharding config: connections split over a device-mesh axis.
+
+    Units and globals are replicated on every device; the connection arenas
+    are sharded on their capacity axis, and each phase's per-shard partial
+    accumulators are combined with a monoid collective. Held as a static,
+    hashable field on NetworkStatic so a sharding change forces a recompile.
+
+    Attributes:
+        axis_name: Name of the mesh axis the connections are sharded over.
+        num_shards: Number of shards (devices) along that axis.
+    """
+
+    axis_name: str
+    num_shards: int
+
+
+@dataclasses.dataclass(frozen=True)
 class FieldSpec[DT: np.generic]:
     """One SOA column.
 

@@ -118,6 +118,7 @@ def _accumulate_into[GS](
     indices_are_sorted: bool,
     target_col: FieldSpec[Any],
     other_col: FieldSpec[Any],
+    shard_axis: str | None = None,
 ) -> AccumulateFn[GS]:
     """Fold one bucket's live edges into a carried-in per-unit accumulator.
 
@@ -131,6 +132,12 @@ def _accumulate_into[GS](
 
     `map_fn`'s first unit-id argument is always the accumulator target,
     matching each pass direction's own calling convention.
+
+    When `shard_axis` is set (Scheme-A sharding), the connection arena is
+    sharded across that mesh axis, so each shard's `segment_reduce` sees
+    only its own edges; the per-shard partial is all-reduced with the
+    monoid's collective before it is folded into the carried accumulator,
+    making the result identical to the single-device reduction.
     """
 
     def accumulate(units: Columns, bucket_conns: Columns, acc: Any, g: GS) -> Any:
@@ -159,6 +166,8 @@ def _accumulate_into[GS](
             bucket_reduced = monoid.segment_reduce(
                 data, null_target_id, num_units, indices_are_sorted=indices_are_sorted
             )
+            if shard_axis is not None:
+                bucket_reduced = monoid.collective(bucket_reduced, shard_axis)
             return monoid.combine_pairwise(prev, bucket_reduced)
 
         # combine (Monoid leaves), acc, and per_edge_acc (Array leaves) share
@@ -215,7 +224,11 @@ def _apply_masked[GS](
 
 
 def build_forward_accumulate[GS](
-    fp: ForwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
+    fp: ForwardPass[object, GS],
+    *,
+    num_units: int,
+    indices_are_sorted: bool,
+    shard_axis: str | None = None,
 ) -> AccumulateFn[GS]:
     """Build an accumulate step folding one bucket into a TO_ID accumulator.
 
@@ -227,6 +240,8 @@ def build_forward_accumulate[GS](
         num_units: Total number of units.
         indices_are_sorted: Whether TO_ID is sorted within the bucket, to
             speed up segment_reduce.
+        shard_axis: Mesh axis to all-reduce the per-shard partial over
+            under Scheme-A sharding, or None for a single device.
 
     Returns:
         Accumulate function combining one bucket's edges into a persisted
@@ -239,6 +254,7 @@ def build_forward_accumulate[GS](
         indices_are_sorted=indices_are_sorted,
         target_col=TO_ID,
         other_col=FROM_ID,
+        shard_axis=shard_axis,
     )
 
 
@@ -267,6 +283,7 @@ def build_forward_sweep[GS](
     num_units: int,
     indices_are_sorted: bool,
     input_ids: tuple[int, ...],
+    shard_axis: str | None = None,
 ) -> BucketSweep[GS]:
     """Build a one-shot forward sweep over a single bucket.
 
@@ -292,12 +309,17 @@ def build_forward_sweep[GS](
         indices_are_sorted: Whether TO_ID is sorted within the bucket, to
             speed up segment_reduce.
         input_ids: Static tuple of input unit ids, skipped on apply.
+        shard_axis: Mesh axis to all-reduce the per-shard partial over
+            under Scheme-A sharding, or None for a single device.
 
     Returns:
         Sweep function computing one bucket's forward update.
     """
     accumulate = build_forward_accumulate(
-        fp, num_units=num_units, indices_are_sorted=indices_are_sorted
+        fp,
+        num_units=num_units,
+        indices_are_sorted=indices_are_sorted,
+        shard_axis=shard_axis,
     )
     apply = build_forward_apply(fp, num_units=num_units)
     is_input = unit_id_mask(input_ids, num_units)
@@ -312,7 +334,11 @@ def build_forward_sweep[GS](
 
 
 def build_backward_accumulate[GS](
-    bp: BackwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
+    bp: BackwardPass[object, GS],
+    *,
+    num_units: int,
+    indices_are_sorted: bool,
+    shard_axis: str | None = None,
 ) -> AccumulateFn[GS]:
     """Build an accumulate step folding one bucket into a FROM_ID accumulator.
 
@@ -328,6 +354,8 @@ def build_backward_accumulate[GS](
         num_units: Total number of units.
         indices_are_sorted: Whether FROM_ID is sorted within the bucket,
             to speed up segment_reduce.
+        shard_axis: Mesh axis to all-reduce the per-shard partial over
+            under Scheme-A sharding, or None for a single device.
 
     Returns:
         Accumulate function combining one bucket's edges into a persisted
@@ -340,6 +368,7 @@ def build_backward_accumulate[GS](
         indices_are_sorted=indices_are_sorted,
         target_col=FROM_ID,
         other_col=TO_ID,
+        shard_axis=shard_axis,
     )
 
 
@@ -364,7 +393,11 @@ def build_backward_apply[GS](
 
 
 def build_backward_sweep[GS](
-    bp: BackwardPass[object, GS], *, num_units: int, indices_are_sorted: bool
+    bp: BackwardPass[object, GS],
+    *,
+    num_units: int,
+    indices_are_sorted: bool,
+    shard_axis: str | None = None,
 ) -> BucketSweep[GS]:
     """Build a one-shot backward sweep over a single bucket.
 
@@ -385,12 +418,17 @@ def build_backward_sweep[GS](
         num_units: Total number of units.
         indices_are_sorted: Whether FROM_ID is sorted within the bucket,
             to speed up segment_reduce.
+        shard_axis: Mesh axis to all-reduce the per-shard partial over
+            under Scheme-A sharding, or None for a single device.
 
     Returns:
         Sweep function computing one bucket's backward update.
     """
     accumulate = build_backward_accumulate(
-        bp, num_units=num_units, indices_are_sorted=indices_are_sorted
+        bp,
+        num_units=num_units,
+        indices_are_sorted=indices_are_sorted,
+        shard_axis=shard_axis,
     )
     apply = build_backward_apply(bp, num_units=num_units)
 

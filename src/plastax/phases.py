@@ -103,6 +103,11 @@ def build_phases[GS](
     return tuple(phases)
 
 
+def _shard_axis(static: NetworkStatic) -> str | None:
+    """Return the Scheme-A mesh axis name, or None when unsharded."""
+    return static.sharding.axis_name if static.sharding is not None else None
+
+
 def _build_forward_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
@@ -115,6 +120,7 @@ def _build_forward_phase[GS](
             num_units=static.num_units,
             indices_are_sorted=True,
             input_ids=static.input_ids,
+            shard_axis=_shard_axis(static),
         )
 
         def forward_phase(
@@ -150,7 +156,10 @@ def _build_forward_topological_phase[GS](
     num_levels = len(static.level_capacities)
     fp = net.forward_pass
     accumulate = build_forward_accumulate(
-        fp, num_units=num_units, indices_are_sorted=True
+        fp,
+        num_units=num_units,
+        indices_are_sorted=True,
+        shard_axis=_shard_axis(static),
     )
     apply = build_forward_apply(fp, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
@@ -185,7 +194,10 @@ def _build_backward_phase[GS](
         # TO_ID), so those indices are not sorted -- correct on CPU either
         # way, honest for GPU/TPU, matching the topological backward.
         sweep = build_backward_sweep(
-            bp, num_units=static.num_units, indices_are_sorted=False
+            bp,
+            num_units=static.num_units,
+            indices_are_sorted=False,
+            shard_axis=_shard_axis(static),
         )
 
         def backward_phase(
@@ -232,7 +244,10 @@ def _build_backward_topological_phase[GS](
     bp = net.backward_pass
     assert bp is not None  # build_phases only calls this when set
     accumulate = build_backward_accumulate(
-        bp, num_units=num_units, indices_are_sorted=False
+        bp,
+        num_units=num_units,
+        indices_are_sorted=False,
+        shard_axis=_shard_axis(static),
     )
     apply = build_backward_apply(bp, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)

@@ -14,6 +14,8 @@ from typing import Any, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, PartitionSpec
 from jaxtyping import Array, Bool, Float
 
 from plastax._types import ACTIVATION
@@ -71,6 +73,64 @@ def make_step[GS](net: type[Network[GS]], static: NetworkStatic) -> StepFn[GS]:
     return cast(StepFn[GS], _cached_make_step(net, static))  # type: ignore[arg-type]
 
 
+def _spec(cls: type[Any], **fields: Any) -> Any:
+    """Build a frozen-dataclass spec instance without running its __init__.
+
+    The shard_map spec pytrees hold PartitionSpec leaves in the array-typed
+    state/input/result container shapes, so the type-checked constructors
+    (instrumented by jaxtyping under test) would reject them. This bypasses
+    __init__ via object.__new__, yielding an instance with the same pytree
+    structure whose leaves are the given specs.
+    """
+    obj = object.__new__(cls)
+    for name, value in fields.items():
+        object.__setattr__(obj, name, value)
+    return obj
+
+
+def _shard_map_step(
+    step: Callable[[NetworkState[Any], StepInputs], StepResult[Any]],
+    static: NetworkStatic,
+) -> Callable[[NetworkState[Any], StepInputs], StepResult[Any]]:
+    """Wrap `step` in a shard_map that shards connections across the mesh.
+
+    Scheme A: the connection arenas are sharded on their capacity axis over
+    the device mesh; units, globals, and the scalar signals are replicated.
+    Each shard's sweep sees only its own edges, and the monoid collective in
+    the sweep all-reduces the per-shard partial accumulators, so the sharded
+    step is identical to the single-device step. The spec pytrees hold
+    PartitionSpec leaves in the state/input/result container shapes; a bare
+    replicated PartitionSpec at `globals_` is a prefix over the whole opaque
+    globals subtree.
+    """
+    sharding = static.sharding
+    assert sharding is not None  # only called on the sharded branch
+    mesh = Mesh(np.asarray(jax.devices()[: sharding.num_shards]), (sharding.axis_name,))
+    # PartitionSpec is untyped in jax's stubs; the spec pytrees deliberately
+    # hold PartitionSpec leaves in the array-typed state/input/result shapes,
+    # so they are built and threaded as Any.
+    repl: Any = PartitionSpec()  # type: ignore[no-untyped-call]
+    conn: Any = PartitionSpec(sharding.axis_name)  # type: ignore[no-untyped-call]
+    units_spec: Any = {spec.name: repl for spec in static.unit_fields}
+    conns_spec: Any = tuple(
+        {spec.name: conn for spec in static.conn_fields}
+        for _ in static.level_capacities
+    )
+    state_spec: Any = _spec(
+        NetworkState,
+        units=units_spec,
+        conns=conns_spec,
+        globals_=repl,
+        needs_resort=repl,
+    )
+    in_specs: Any = (state_spec, _spec(StepInputs, inputs=repl, targets=repl))
+    out_specs: Any = _spec(StepResult, state=state_spec, overflow=repl, loss=repl)
+    sharded: Any = jax.shard_map(
+        step, mesh=mesh, in_specs=in_specs, out_specs=out_specs
+    )
+    return cast(Callable[[NetworkState[Any], StepInputs], StepResult[Any]], sharded)
+
+
 # jax.util.weakref_lru_cache is not cleanly importable off the pinned jax
 # floor, so functools.cache is used instead: it gives the same hash/eq-keyed
 # reuse, at the cost of strong (rather than weak) references to (net,
@@ -103,7 +163,11 @@ def _cached_make_step(net: type[Network[Any]], static: NetworkStatic) -> StepFn[
 
         return StepResult(state=state, overflow=overflow_sink[0], loss=total_loss)
 
+    # Under Scheme-A sharding, wrap the step in a shard_map (connections
+    # sharded, rest replicated) before jitting; single-device is unchanged.
+    traced = step if static.sharding is None else _shard_map_step(step, static)
+
     # jax.jit's return type is opaque under follow_imports="skip" (pyproject,
     # jax.* -> Any); step's own signature is the true (and already checked)
     # contract, so cast rather than let strict mypy's no-any-return fire.
-    return cast(StepFn[Any], jax.jit(step, donate_argnums=0))
+    return cast(StepFn[Any], jax.jit(traced, donate_argnums=0))

@@ -47,7 +47,7 @@ def _load_example(name: str) -> types.ModuleType:
 mlp_xor = _load_example("mlp_xor")
 
 N_IN, H, K = 12, 6, 4
-LR, MU = 0.1, 0.9
+LR, MU, ADAM_LR = 0.1, 0.9, 0.01
 STEPS = 60
 # max |Δ| observed ~1e-7 (float32 rounding); bounds fail on any real divergence
 # while tolerating the differing reduction order of the two backends.
@@ -59,6 +59,7 @@ _CASES: list[
 ] = [
     ("sgd", lambda gf: px.optim.sgd(LR, gf), optax.sgd(LR)),
     ("momentum", lambda gf: px.optim.momentum(LR, MU, gf), optax.sgd(LR, momentum=MU)),
+    ("adam", lambda gf: px.optim.adam(ADAM_LR, gf), optax.adam(ADAM_LR)),
 ]
 
 

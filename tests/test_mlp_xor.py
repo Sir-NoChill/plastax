@@ -2,7 +2,8 @@
 mlp_xor example trains XOR to convergence"). End to end through
 build_phases/make_step -- forward, loss, backward, update_conn all wired
 together via a real gradient-descent training loop, not a hand-fed
-reference.
+reference. The example is now optimizer-parameterized; the fast tests pin the
+sgd path and a slow test checks every optimizer the showcase provides.
 
 examples/mlp_xor.py is not part of the plastax distribution (examples/ has
 no __init__.py and is not installed), so it is loaded directly by file path
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import jax
 import numpy as np
+import pytest
 
 import plastax as px
 
@@ -43,18 +45,25 @@ mlp_xor = _load_example("mlp_xor")
 _WANT_CLASS = (0, 1, 1, 0)
 
 
-def test_xor_training_converges_and_classifies_all_patterns_correctly() -> None:
-    key = jax.random.PRNGKey(mlp_xor.SEED)
-    static, state = mlp_xor.build_net(key)
-    state, final_loss = mlp_xor.train(static, state, verbose=False)
+def _sgd() -> px.optim.Optimizer:
+    return px.optim.sgd(0.5, mlp_xor.GradPreAct)
 
-    # "loss drops below a small threshold" (task acceptance): the example
+
+def test_xor_training_converges_and_classifies_all_patterns_correctly() -> None:
+    opt = _sgd()
+    key = jax.random.PRNGKey(mlp_xor.SEED)
+    net, static, state = mlp_xor.build_net(opt, key)
+    state, final_loss = mlp_xor.train(
+        net, static, state, num_epochs=5000, verbose=False
+    )
+
+    # "loss drops below a small threshold" (task acceptance): the sgd path
     # converges to ~9e-4 (uv run python examples/mlp_xor.py); 0.05 is a
     # generous but decisive threshold -- well below the ~0.5 starting loss,
     # well above float32 noise -- so this only passes on real convergence.
     assert final_loss < 0.05
 
-    _, ok, predictions = mlp_xor.evaluate(static, state)
+    _, ok, predictions = mlp_xor.evaluate(opt, static, state)
     assert ok is True
     assert len(predictions) == 4
     for pred, want in zip(predictions, _WANT_CLASS, strict=True):
@@ -74,8 +83,8 @@ def test_xor_training_is_deterministic_for_a_fixed_seed() -> None:
 
     def run() -> tuple[float, tuple[np.ndarray, ...]]:
         key = jax.random.PRNGKey(mlp_xor.SEED)
-        static, state = mlp_xor.build_net(key)
-        state, loss = mlp_xor.train(static, state, num_epochs=200, verbose=False)
+        net, static, state = mlp_xor.build_net(_sgd(), key)
+        state, loss = mlp_xor.train(net, static, state, num_epochs=200, verbose=False)
         weights = tuple(np.asarray(bucket[px.WEIGHT.name]) for bucket in state.conns)
         return loss, weights
 
@@ -93,7 +102,24 @@ def test_xor_net_uses_topological_propagation_with_two_hidden_levels() -> None:
     1, output at level 2 -- 2 buckets, matching the M3 topological
     level-walk this milestone's acceptance is meant to exercise (not the
     pipeline degenerate case)."""
-    static, _ = mlp_xor.build_net(jax.random.PRNGKey(mlp_xor.SEED))
+    _, static, _ = mlp_xor.build_net(_sgd(), jax.random.PRNGKey(mlp_xor.SEED))
     assert static.propagation is px.Propagation.TOPOLOGICAL
     assert len(static.level_capacities) == 2
     assert len(static.output_ids) == 1
+
+
+@pytest.mark.slow
+def test_every_showcase_optimizer_learns_xor() -> None:
+    """The example's headline claim: swapping the optimizer is a one-line
+    change and every optimizer plastax.optim provides learns XOR through the
+    same traits. Mirrors examples/mlp_xor.py's main(); slow (trains five nets
+    to convergence)."""
+    for name, optimizer, epochs in mlp_xor.showcase():
+        net, static, state = mlp_xor.build_net(
+            optimizer, jax.random.PRNGKey(mlp_xor.SEED)
+        )
+        state, loss = mlp_xor.train(
+            net, static, state, num_epochs=epochs, verbose=False
+        )
+        _, ok, _ = mlp_xor.evaluate(optimizer, static, state)
+        assert ok, f"{name} failed to learn XOR (final loss {loss:.4f})"

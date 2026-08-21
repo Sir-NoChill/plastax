@@ -1,10 +1,14 @@
 [build-system]
-requires = ["hatchling>=1.27"]  # PEP 639 SPDX license metadata support
+# PEP 639 SPDX license metadata (hatchling>=1.27); hatch-vcs derives the
+# version from git tags so releases are tag-driven, never hand-edited.
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
 build-backend = "hatchling.build"
 
 [project]
 name = "plastax"
-version = "0.1.0.dev0"
+# Version comes from the latest `vX.Y.Z` git tag via [tool.hatch.version];
+# do not set it here. Untagged/local builds use fallback_version (see below).
+dynamic = ["version"]
 description = "Declarative plastic-network traits for JAX"
 readme = "README.md"
 license = "MIT"
@@ -33,13 +37,17 @@ requires-python = ">=3.12"
 dependencies = [
   "jax>=0.11.0",
   "jaxtyping>=0.2.36",
+  # numpy is imported directly across src/plastax (state, builder, step,
+  # topo, views, ...); declare it rather than lean on jax's transitive
+  # install (P0.4). Floor matches jax 0.11's numpy>=2 requirement.
+  "numpy>=2",
 ]
 
-# Repository URLs land once the remote is provisioned (pending, per handoff).
-# [project.urls]
-# Homepage = "https://github.com/<owner>/plastax"
-# Repository = "https://github.com/<owner>/plastax"
-# Issues = "https://github.com/<owner>/plastax/issues"
+[project.urls]
+Homepage = "https://github.com/Sir-NoChill/plastax"
+Repository = "https://github.com/Sir-NoChill/plastax"
+Issues = "https://github.com/Sir-NoChill/plastax/issues"
+Documentation = "https://plastax.readthedocs.io"
 
 # PEP 735 dependency group (not an extra): `uv sync` / `uv run` install this
 # by default, so the bare `uv run ty|mypy|pytest` hook entries resolve it.
@@ -47,7 +55,7 @@ dependencies = [
 dev = [
   "pytest>=8",
   "pytest-xdist",
-  "numpy",
+  # numpy is a runtime dependency (see [project].dependencies), not dev-only.
   "beartype",
   "mypy>=1.14",
   "ty",
@@ -61,6 +69,25 @@ dev = [
   # -- the retrace-count tests the task requires import jax.test_util).
   "absl-py",
 ]
+# Docs group installed by RTD (.readthedocs.yaml) and the CI docs job;
+# locally: `uv sync --group docs`, then
+# `uv run sphinx-build -b html docs docs/_build`.
+docs = [
+  "sphinx>=8",
+  "furo",
+  "myst-parser",
+  "sphinx-autodoc-typehints",
+  "sphinx-copybutton",
+]
+
+# Tag-driven version: hatch-vcs reads the latest `vX.Y.Z` git tag (PEP 440).
+# The repo starts tagless (P0.3), so untagged/dirty local builds fall back to
+# fallback_version; a real `v*` tag push in CI derives the release version.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+fallback_version = "0.1.0.dev0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/plastax"]

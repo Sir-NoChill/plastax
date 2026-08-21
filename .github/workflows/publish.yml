@@ -1,0 +1,87 @@
+# Tag-driven publishing via PyPI trusted publishing (OIDC); see RELEASING.md.
+# The PyPI trusted publisher is registered against THIS filename (publish.yml)
+# and the `pypi` environment -- renaming either breaks authentication.
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # hatch-vcs derives the version from tag history (P1.2)
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    env:
+      JAX_PLATFORMS: cpu
+    steps:
+      - uses: actions/checkout@v4 # only for examples/; install is wheel-only
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      # P2.1: install from the wheel alone, smoke-test outside the repo dir
+      # so accidental reliance on repo files is caught.
+      - run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          ./venv/bin/python -c "import plastax"
+          ./venv/bin/python "$GITHUB_WORKSPACE/examples/mlp_xor.py"
+
+  publish-pypi:
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/plastax/
+    permissions:
+      id-token: write # OIDC token for trusted publishing; no stored secrets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # rc tags (v0.1.0rc1) go to TestPyPI. Requires a TestPyPI trusted publisher
+  # registered for publish.yml + environment `testpypi` (pending, HUMAN --
+  # DISTRIBUTION_PLAN.md P4.3).
+  publish-testpypi:
+    if: ${{ contains(github.ref_name, 'rc') }}
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/plastax/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/

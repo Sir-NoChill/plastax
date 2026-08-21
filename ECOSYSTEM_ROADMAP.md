@@ -18,7 +18,7 @@ test oracles, never runtime deps.
 
 ---
 
-## Track A -- plastax.optim (v0.1.x, before final paper benchmarks)
+## Track A -- plastax.optim
 
 The `optim` stub already fixes the shape: an Optimizer is a bundle --
 UpdateConn policy + per-connection `state_fields` + optional step counter in
@@ -26,24 +26,42 @@ globals. Because optimizer state lives as SOA columns, it shards with the
 connections under scheme-A for free; that is a selling point worth a docs
 page and a paper sentence.
 
-- A1 Settle the two open contracts blocking promotion from the
-  parallel_mnist AdamUpdateConn prototype:
+Track A splits along the paper deadline (2026-08-21 deviation): **A.1** (dense
+optimizer parity) is the pre-submission critical path -- the benchmarks must
+run on `plastax.optim`, not example-local optimizers -- while **A.2**
+(sparse-aware state) is deferred to v0.2, where Track B's regrowth is what
+actually exercises it.
+
+### Track A.1 -- dense optimizer parity (v0.1.x, pre-submission)
+
+- A1.1 Settle the two open contracts (the bundle shape is fixed by the stub;
+  these are the ergonomics blocking concrete optimizers):
   - field declaration: how a Network merges `optimizer.state_fields` into
     `extra_conn_fields` without name collisions (namespace prefix, e.g.
     `opt/m`, `opt/v`);
   - step counter: globals slot reserved iff `needs_step_counter`, bumped by
     the assembled step, reset by ResetGlobal.
-- A2 Implementations, in order: `sgd` (stateless baseline), `momentum`,
+- A1.2 Implementations, in order: `sgd` (stateless baseline), `momentum`,
   `adam`, `adamw`, `rmsprop`. Each validated against optax on dense
-  topologies to fp tolerance [optax][deepmind-jax].
-- A3 Sparse-aware semantics: on AddConn, new connections need initialized
-  optimizer state (zeros for moments) -- specify this as part of the
-  Optimizer protocol (an `init_fields` per-connection default), since
-  RigL-style regrowth explicitly zeroes moments for regrown weights
-  [rigl].
-- A4 Acceptance: mlp_xor and parallel_mnist examples switch to
+  topologies to fp tolerance [optax][deepmind-jax] -- reference-oracle parity
+  is the core correctness claim for the subpackage.
+- A1.3 Acceptance: mlp_xor and parallel_mnist examples switch to
   `plastax.optim`; optax-oracle tests marked `slow`; docs page "Optimizers
   as trait bundles".
+  - Prototype note: author `AdamUpdateConn` fresh against the settled A1.1
+    contract. The parallel_mnist tree is a *reference*, not a source to lift --
+    it is untracked and in flux, driving Adam via `optax.adam` + an
+    `EqxOptimizer` wrapper rather than a native trait.
+
+### Track A.2 -- sparse-aware optimizer state (v0.2, with Track B)
+
+- A2.1 On AddConn, new connections need initialized optimizer state (zeros for
+  moments) -- specify this as part of the Optimizer protocol (an `init_fields`
+  per-connection default), since RigL-style regrowth explicitly zeroes moments
+  for regrown weights [rigl]. Sequenced with Track B because regrowth is what
+  first exercises it.
+- A2.2 Acceptance: a Track B rewiring/churn variant that regrows connections
+  shows correct optimizer-state init, checked against a numpy-reference oracle.
 
 ## Track B -- plastax.heuristics: growth/prune defaults (v0.2)
 
@@ -114,13 +132,20 @@ Deferred core items, ordered by how many ecosystem doors they open:
 
 ## Sequencing against the paper
 
-1. Now -> submission: DISTRIBUTION_PLAN phases 0-4 (installable artifact,
-   docs), Track A (benchmarks should use plastax.optim, not example-local
+1. Now -> submission: DISTRIBUTION_PLAN phases 0-4 (DONE 2026-08-21 --
+   installable artifact on TestPyPI, RTD docs live) + Track A.1 (dense
+   optimizer parity; benchmarks run on plastax.optim, not example-local
    optimizers).
-2. Submission -> camera-ready: Track B (heuristics strengthen the
-   continual/streaming story), C1-C2.
+2. Submission -> camera-ready: Track A.2 (sparse optimizer state) + Track B
+   (heuristics strengthen the continual/streaming story), C1-C2.
 3. Post-paper: C3-C5, Track D.
 
 ## Deviations
 
-(Date + rationale, as elsewhere.)
+- 2026-08-21 (Track A split): Track A divided into A.1 (dense optax-parity,
+  pre-submission critical path) and A.2 (sparse-aware AddConn state init,
+  deferred to v0.2 alongside Track B). Rationale: A.2's sparse state-init does
+  not gate the paper's dense benchmarks, and only regrowth exercises it, so
+  sequencing it with Track B's heuristics tightens the pre-submission path.
+  Distribution (DISTRIBUTION_PLAN phases 0-4) landed the same day, leaving
+  Track A.1 as the sole remaining pre-submission item.

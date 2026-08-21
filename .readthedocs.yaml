@@ -1,0 +1,21 @@
+# Read the Docs config; project: https://app.readthedocs.org/projects/plastax/
+# No RTD-side env vars needed. Builds trigger via the RTD GitHub App webhook.
+version: 2
+
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.13"
+  jobs:
+    install:
+      # PEP 735 group install (pip >= 25.1 supports --group). After P1.2
+      # (hatch-vcs) lands, RTD's shallow clone may need tags:
+      # add `git fetch --unshallow --tags || true` as a pre_install job.
+      - pip install --upgrade pip
+      - pip install --group docs .
+
+sphinx:
+  configuration: docs/conf.py
+  # Flip to true once Phase 3 (full page structure) replaces the scaffold;
+  # DISTRIBUTION_PLAN.md P3.4.
+  fail_on_warning: false

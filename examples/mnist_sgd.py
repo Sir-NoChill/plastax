@@ -142,14 +142,20 @@ def _mlp_class(lr: float, *, train: bool) -> type[px.Network[None]]:
 
 
 def build_plastax(
-    sizes: list[int], weights: Weights, lr: float, key: jax.Array
+    sizes: list[int], weights: Weights, lr: float
 ) -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
     cls = _mlp_class(lr, train=True)
     blocks = [px.topology.input_units(sizes[0])]
     for i, w in enumerate(weights):
         blocks.append(px.topology.dense(sizes[i], sizes[i + 1], init=_const(w)))
     topo = px.topology.sequential(*blocks)
-    static, state = px.NetworkBuilder.from_topology(cls, topo, key, globals_=None)
+    # Every dense layer inits via _const(w), so the shared numpy weights are the
+    # sole source of truth and from_topology's key seeds nothing observable. The
+    # API still requires a valid key (sequential splits it per block), so pass a
+    # fixed dummy rather than thread args.seed through inertly.
+    static, state = px.NetworkBuilder.from_topology(
+        cls, topo, jax.random.PRNGKey(0), globals_=None
+    )
     return cls, static, state
 
 
@@ -209,7 +215,7 @@ def main() -> None:
     weights = glorot_weights(sizes, rng)
 
     # plastax
-    cls, static, state = build_plastax(sizes, weights, args.lr, jax.random.PRNGKey(0))
+    cls, static, state = build_plastax(sizes, weights, args.lr)
     step = px.make_step(cls, static)
 
     # jax + optax reference (identical init)

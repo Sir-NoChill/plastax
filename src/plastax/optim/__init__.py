@@ -1,4 +1,4 @@
-"""Reusable optimizer bundles for plastax weight updates (STUB).
+"""Reusable optimizer bundles for plastax weight updates.
 
 An optimizer in plastax is a *bundle*, not just a weight-update rule: an
 UpdateConn policy that computes the step, the extra per-connection fields its
@@ -12,9 +12,9 @@ This package will ship validated implementations (SGD, momentum, Adam, ...),
 using optax only as a correctness reference in tests, never as a runtime
 dependency.
 
-Status: SGD implemented (see `sgd`). The stateful optimizers (momentum, adam,
-adamw, rmsprop) follow, keeping their per-connection state in
-`extra_conn_fields` columns plus an optional globals step counter.
+Status: SGD and momentum implemented (see `sgd`, `momentum`). Adam, adamw, and
+rmsprop follow, keeping their per-connection state in `extra_conn_fields`
+columns plus a globals step counter for bias correction.
 """
 
 from __future__ import annotations
@@ -24,10 +24,11 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from plastax._types import FieldSpec
+from plastax.optim._momentum import Momentum, momentum
 from plastax.optim._sgd import SGD, sgd
 from plastax.traits import UpdateConn
 
-__all__ = ["SGD", "Optimizer", "sgd"]
+__all__ = ["Momentum", "Optimizer", "SGD", "momentum", "sgd"]
 
 
 @runtime_checkable
@@ -44,7 +45,7 @@ class Optimizer(Protocol):
             settled against the example prototype.
     """
 
-    state_fields: tuple[FieldSpec[np.generic], ...]
+    state_fields: tuple[FieldSpec[np.float32], ...]
     needs_step_counter: bool
 
     def update_conn(self) -> UpdateConn[object]:

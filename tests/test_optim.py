@@ -1,12 +1,13 @@
-"""plastax.optim.sgd matches optax.sgd to float32 precision (Track A.1).
+"""plastax.optim optimizers match their optax reference to float32 (Track A.1).
 
-Oracle test: a dense MLP built two ways -- plastax (`optim.sgd`) and jax+optax
-(`optax.sgd`) -- from identical initial weights, fed identical synthetic samples
-online (batch-1), must agree on the per-step loss and the final weights to
-float32 tolerance. That pins `optim.sgd`'s weight update to the reference SGD.
+Oracle test: a dense MLP built two ways -- plastax (plastax.optim) and jax+optax
+-- from identical initial weights, fed identical synthetic samples online
+(batch-1), must agree on the per-step loss and the final weights to float32.
+Each plastax optimizer is paired with the optax transform it should reproduce;
+add a row to ``_CASES`` per new optimizer.
 
 optax is a test-only oracle, never a runtime dependency, so this module is
-marked `slow` and skips when optax is absent. examples/mlp_xor.py supplies the
+marked slow and skips when optax is absent. examples/mlp_xor.py supplies the
 sigmoid forward/backward and MSE-loss traits; it is loaded by file path
 (examples/ is not an installed package), matching test_mlp_xor.py.
 """
@@ -25,6 +26,7 @@ import numpy as np
 import pytest
 
 import plastax as px
+from plastax._types import FieldSpec
 
 optax = pytest.importorskip("optax")
 
@@ -45,11 +47,19 @@ def _load_example(name: str) -> types.ModuleType:
 mlp_xor = _load_example("mlp_xor")
 
 N_IN, H, K = 12, 6, 4
-LR = 0.1
+LR, MU = 0.1, 0.9
 STEPS = 60
-# max |Δ| below was ~6e-8 (float32 rounding); these bounds fail on any real
-# divergence while tolerating the differing reduction order of the two backends.
+# max |Δ| observed ~1e-7 (float32 rounding); bounds fail on any real divergence
+# while tolerating the differing reduction order of the two backends.
 RTOL, ATOL = 1e-4, 1e-5
+
+# Each plastax optimizer paired with the optax transform it must reproduce.
+_CASES: list[
+    tuple[str, Callable[[FieldSpec[np.float32]], px.optim.Optimizer], object]
+] = [
+    ("sgd", lambda gf: px.optim.sgd(LR, gf), optax.sgd(LR)),
+    ("momentum", lambda gf: px.optim.momentum(LR, MU, gf), optax.sgd(LR, momentum=MU)),
+]
 
 
 def _const(mat: np.ndarray) -> Callable[[jax.Array, tuple[int, ...]], jax.Array]:
@@ -63,14 +73,15 @@ def _const(mat: np.ndarray) -> Callable[[jax.Array, tuple[int, ...]], jax.Array]
 
 
 def _build_plastax(
-    w1: np.ndarray, w2: np.ndarray
+    optimizer: px.optim.Optimizer, w1: np.ndarray, w2: np.ndarray
 ) -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
     class _MLP(px.Network[None]):
         forward_pass = mlp_xor.SigmoidForward()
         backward_pass = mlp_xor.SigmoidBackward()
         loss = mlp_xor.MSELoss()
-        update_conn = px.optim.sgd(LR, mlp_xor.GradPreAct).update_conn()
+        update_conn = optimizer.update_conn()
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
+        extra_conn_fields = optimizer.state_fields
         propagation = px.Propagation.TOPOLOGICAL
 
     topo = px.topology.sequential(
@@ -96,11 +107,9 @@ def _plastax_weights(state: px.NetworkState[None]) -> tuple[np.ndarray, np.ndarr
         fr.append(np.asarray(bucket[px.FROM_ID.name])[live])
         to.append(np.asarray(bucket[px.TO_ID.name])[live])
         we.append(np.asarray(bucket[px.WEIGHT.name])[live])
-    from_ids, to_ids, weights = (
-        np.concatenate(fr),
-        np.concatenate(to),
-        np.concatenate(we),
-    )
+    from_ids = np.concatenate(fr)
+    to_ids = np.concatenate(to)
+    weights = np.concatenate(we)
     w1 = np.zeros((N_IN, H), np.float32)
     w2 = np.zeros((H, K), np.float32)
     for f, t, w in zip(from_ids, to_ids, weights, strict=True):
@@ -111,17 +120,24 @@ def _plastax_weights(state: px.NetworkState[None]) -> tuple[np.ndarray, np.ndarr
     return w1, w2
 
 
-def test_sgd_matches_optax_online() -> None:
+@pytest.mark.parametrize(
+    ("make_plastax", "optax_opt"),
+    [(case[1], case[2]) for case in _CASES],
+    ids=[case[0] for case in _CASES],
+)
+def test_optimizer_matches_optax_online(
+    make_plastax: Callable[[FieldSpec[np.float32]], px.optim.Optimizer],
+    optax_opt: optax.GradientTransformation,
+) -> None:
     rng = np.random.default_rng(0)
     w1 = (rng.standard_normal((N_IN, H)) * 0.3).astype(np.float32)
     w2 = (rng.standard_normal((H, K)) * 0.3).astype(np.float32)
 
-    cls, static, state = _build_plastax(w1, w2)
+    cls, static, state = _build_plastax(make_plastax(mlp_xor.GradPreAct), w1, w2)
     step = px.make_step(cls, static)
 
     params = {"W1": jnp.asarray(w1), "W2": jnp.asarray(w2)}
-    opt = optax.sgd(LR)
-    opt_state = opt.init(params)
+    opt_state = optax_opt.init(params)
 
     def loss_fn(p: dict[str, jax.Array], x: jax.Array, y: jax.Array) -> jax.Array:
         h = jax.nn.sigmoid(x @ p["W1"])
@@ -134,7 +150,7 @@ def test_sgd_matches_optax_online() -> None:
         p: dict[str, jax.Array], os: optax.OptState, x: jax.Array, y: jax.Array
     ) -> tuple[dict[str, jax.Array], optax.OptState, jax.Array]:
         loss, grad = jax.value_and_grad(loss_fn)(p, x, y)
-        updates, os = opt.update(grad, os, p)
+        updates, os = optax_opt.update(grad, os, p)
         return optax.apply_updates(p, updates), os, loss
 
     xs = (rng.standard_normal((STEPS, N_IN)) * 0.5).astype(np.float32)

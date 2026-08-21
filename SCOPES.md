@@ -26,8 +26,19 @@ Cross-cutting scopes:
 - `examples` — examples/
 - `tests` — tests/ when the diff is test infrastructure rather than one
   module's tests (a test for sweep.py alone is `test(sweep): ...`)
-- `tooling` — pyproject, .pre-commit-config.yaml, TOOLING.md, uv
-- `plan` — IMPLEMENTATION_PLAN.md, SCOPES.md, TAGS.md, README.md
-- `repo` — git/hook/scripts mechanics (scripts/git-agent-commit etc.)
+- `tooling` — dev-tool config: ruff/mypy/ty/pytest tables in pyproject,
+  TOOLING.md, uv, and the code-quality hooks in .pre-commit-config.yaml
+  (ruff, ruff-format, pydoclint, mypy, pytest). Distribution metadata is
+  `packaging`; commit-governance hooks are `repo`.
+- `packaging` — distribution + dependency metadata in pyproject: `[project]`,
+  `[build-system]`, `[dependency-groups]`, `[tool.hatch.*]` (runtime/dev/docs
+  deps, version, classifiers, URLs, wheel/sdist contents)
+- `release` — release automation: .github/workflows/publish.yml, RELEASING.md
+- `docs-site` — user-facing Sphinx / Read the Docs documentation: docs/ and
+  .readthedocs.yaml (its `docs` dependency group lives in pyproject, `packaging`)
+- `plan` — IMPLEMENTATION_PLAN.md, DISTRIBUTION_PLAN.md,
+  ECOSYSTEM_ROADMAP.md, SCOPES.md, TAGS.md, README.md, distribution-plan.bib
+- `repo` — git plumbing and commit-governance mechanics: scripts/, the
+  commit-msg type/scope gate wiring, .git hooks, agent identity
 
 If no scope fits, do not invent one: split the change or ask.

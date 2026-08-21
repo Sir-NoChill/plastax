@@ -1,15 +1,17 @@
 """plastax.optim optimizers match their optax reference to float32 (Track A.1).
 
 Oracle test: a dense MLP built two ways -- plastax (plastax.optim) and jax+optax
--- from identical initial weights, fed identical synthetic samples online
-(batch-1), must agree on the per-step loss and the final weights to float32.
-Each plastax optimizer is paired with the optax transform it should reproduce;
-add a row to ``_CASES`` per new optimizer.
+-- from identical initial weights, fed identical samples online (batch-1), must
+agree on the per-step loss and the final weights to float32. Each plastax
+optimizer is paired with the optax transform it should reproduce (`_CASES`; add
+a row per new optimizer), and every optimizer is checked both on small synthetic
+data and on a real MNIST slice.
 
 optax is a test-only oracle, never a runtime dependency, so this module is
-marked slow and skips when optax is absent. examples/mlp_xor.py supplies the
-sigmoid forward/backward and MSE-loss traits; it is loaded by file path
-(examples/ is not an installed package), matching test_mlp_xor.py.
+marked slow and skips when optax is absent. examples/{mlp_xor,mnist_sgd}.py are
+loaded by file path (examples/ is not an installed package), matching
+test_mlp_xor.py; the MNIST test skips when the cached IDX files are absent (e.g.
+in CI), so it runs locally without adding a dataset dependency to CI.
 """
 
 from __future__ import annotations
@@ -45,22 +47,26 @@ def _load_example(name: str) -> types.ModuleType:
 
 
 mlp_xor = _load_example("mlp_xor")
+mnist_sgd = _load_example("mnist_sgd")  # data loader reuse; needs mlp_xor loaded first
 
-N_IN, H, K = 12, 6, 4
-LR, MU, ADAM_LR = 0.1, 0.9, 0.01
+LR, MU, ADAM_LR, RMS_LR = 0.1, 0.9, 0.01, 0.001
 STEPS = 60
 # max |Δ| observed ~1e-7 (float32 rounding); bounds fail on any real divergence
 # while tolerating the differing reduction order of the two backends.
 RTOL, ATOL = 1e-4, 1e-5
 
+OptFactory = Callable[[FieldSpec[np.float32]], px.optim.Optimizer]
+
 # Each plastax optimizer paired with the optax transform it must reproduce.
-_CASES: list[
-    tuple[str, Callable[[FieldSpec[np.float32]], px.optim.Optimizer], object]
-] = [
+_CASES: list[tuple[str, OptFactory, object]] = [
     ("sgd", lambda gf: px.optim.sgd(LR, gf), optax.sgd(LR)),
     ("momentum", lambda gf: px.optim.momentum(LR, MU, gf), optax.sgd(LR, momentum=MU)),
     ("adam", lambda gf: px.optim.adam(ADAM_LR, gf), optax.adam(ADAM_LR)),
+    ("adamw", lambda gf: px.optim.adamw(ADAM_LR, gf), optax.adamw(ADAM_LR)),
+    ("rmsprop", lambda gf: px.optim.rmsprop(RMS_LR, gf), optax.rmsprop(RMS_LR)),
 ]
+_IDS = [case[0] for case in _CASES]
+_PARAMS = [(case[1], case[2]) for case in _CASES]
 
 
 def _const(mat: np.ndarray) -> Callable[[jax.Array, tuple[int, ...]], jax.Array]:
@@ -74,7 +80,7 @@ def _const(mat: np.ndarray) -> Callable[[jax.Array, tuple[int, ...]], jax.Array]
 
 
 def _build_plastax(
-    optimizer: px.optim.Optimizer, w1: np.ndarray, w2: np.ndarray
+    optimizer: px.optim.Optimizer, sizes: list[int], weights: list[np.ndarray]
 ) -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
     class _MLP(px.Network[None]):
         forward_pass = mlp_xor.SigmoidForward()
@@ -85,88 +91,117 @@ def _build_plastax(
         extra_conn_fields = optimizer.state_fields
         propagation = px.Propagation.TOPOLOGICAL
 
-    topo = px.topology.sequential(
-        px.topology.input_units(N_IN),
-        px.topology.dense(N_IN, H, init=_const(w1)),
-        px.topology.dense(H, K, init=_const(w2)),
-    )
+    blocks = [px.topology.input_units(sizes[0])]
+    for i, w in enumerate(weights):
+        blocks.append(px.topology.dense(sizes[i], sizes[i + 1], init=_const(w)))
+    topo = px.topology.sequential(*blocks)
     static, state = px.NetworkBuilder.from_topology(
         _MLP, topo, jax.random.PRNGKey(0), globals_=None
     )
     return _MLP, static, state
 
 
-def _plastax_weights(state: px.NetworkState[None]) -> tuple[np.ndarray, np.ndarray]:
-    """Reassemble the live edge weights into the two dense weight matrices.
-
-    Unit ids are laid out inputs [0, N_IN), hidden [N_IN, N_IN+H), outputs
-    after that, so an edge's endpoints identify which matrix cell it is.
-    """
-    fr, to, we = [], [], []
+def _plastax_weights(
+    state: px.NetworkState[None], sizes: list[int]
+) -> list[np.ndarray]:
+    """Reassemble live edge weights into per-layer matrices via unit-id ranges."""
+    offsets = np.cumsum([0, *sizes])
+    mats = [
+        np.zeros((sizes[i], sizes[i + 1]), np.float32) for i in range(len(sizes) - 1)
+    ]
     for bucket in state.conns:
         live = ~np.asarray(bucket[px.DEAD.name])
-        fr.append(np.asarray(bucket[px.FROM_ID.name])[live])
-        to.append(np.asarray(bucket[px.TO_ID.name])[live])
-        we.append(np.asarray(bucket[px.WEIGHT.name])[live])
-    from_ids = np.concatenate(fr)
-    to_ids = np.concatenate(to)
-    weights = np.concatenate(we)
-    w1 = np.zeros((N_IN, H), np.float32)
-    w2 = np.zeros((H, K), np.float32)
-    for f, t, w in zip(from_ids, to_ids, weights, strict=True):
-        if t < N_IN + H:
-            w1[f, t - N_IN] = w
-        else:
-            w2[f - N_IN, t - N_IN - H] = w
-    return w1, w2
+        froms = np.asarray(bucket[px.FROM_ID.name])[live]
+        tos = np.asarray(bucket[px.TO_ID.name])[live]
+        vals = np.asarray(bucket[px.WEIGHT.name])[live]
+        for f, t, v in zip(froms, tos, vals, strict=True):
+            layer = int(np.searchsorted(offsets, t, side="right") - 2)
+            mats[layer][f - offsets[layer], t - offsets[layer + 1]] = v
+    return mats
 
 
-@pytest.mark.parametrize(
-    ("make_plastax", "optax_opt"),
-    [(case[1], case[2]) for case in _CASES],
-    ids=[case[0] for case in _CASES],
-)
-def test_optimizer_matches_optax_online(
-    make_plastax: Callable[[FieldSpec[np.float32]], px.optim.Optimizer],
+def _glorot(sizes: list[int], rng: np.random.Generator) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    for a, b in zip(sizes[:-1], sizes[1:], strict=True):
+        limit = float(np.sqrt(6.0 / (a + b)))
+        out.append(rng.uniform(-limit, limit, size=(a, b)).astype(np.float32))
+    return out
+
+
+def _assert_parity(
+    make_plastax: OptFactory,
     optax_opt: optax.GradientTransformation,
+    sizes: list[int],
+    weights: list[np.ndarray],
+    xs: np.ndarray,
+    ys: np.ndarray,
 ) -> None:
-    rng = np.random.default_rng(0)
-    w1 = (rng.standard_normal((N_IN, H)) * 0.3).astype(np.float32)
-    w2 = (rng.standard_normal((H, K)) * 0.3).astype(np.float32)
-
-    cls, static, state = _build_plastax(make_plastax(mlp_xor.GradPreAct), w1, w2)
+    """Run one optimizer both ways online and assert loss + weights agree."""
+    cls, static, state = _build_plastax(
+        make_plastax(mlp_xor.GradPreAct), sizes, weights
+    )
     step = px.make_step(cls, static)
 
-    params = {"W1": jnp.asarray(w1), "W2": jnp.asarray(w2)}
+    params = [jnp.asarray(w) for w in weights]
     opt_state = optax_opt.init(params)
 
-    def loss_fn(p: dict[str, jax.Array], x: jax.Array, y: jax.Array) -> jax.Array:
-        h = jax.nn.sigmoid(x @ p["W1"])
-        out = jax.nn.sigmoid(h @ p["W2"])
-        diff = out - y
-        return 0.5 * jnp.sum(diff * diff)
+    def loss_fn(p: list[jax.Array], x: jax.Array, y: jax.Array) -> jax.Array:
+        a = x
+        for w in p:
+            a = jax.nn.sigmoid(a @ w)
+        return 0.5 * jnp.sum((a - y) ** 2)
 
     @jax.jit
     def jax_step(
-        p: dict[str, jax.Array], os: optax.OptState, x: jax.Array, y: jax.Array
-    ) -> tuple[dict[str, jax.Array], optax.OptState, jax.Array]:
+        p: list[jax.Array], os: optax.OptState, x: jax.Array, y: jax.Array
+    ) -> tuple[list[jax.Array], optax.OptState, jax.Array]:
         loss, grad = jax.value_and_grad(loss_fn)(p, x, y)
         updates, os = optax_opt.update(grad, os, p)
         return optax.apply_updates(p, updates), os, loss
 
-    xs = (rng.standard_normal((STEPS, N_IN)) * 0.5).astype(np.float32)
-    ys = rng.integers(0, K, size=STEPS)
-
-    for t in range(STEPS):
-        x = jnp.asarray(xs[t])
-        y = jax.nn.one_hot(ys[t], K, dtype=jnp.float32)
-        result = step(state, px.StepInputs(inputs=x, targets=y))
+    for x, y in zip(xs, ys, strict=True):
+        xj, yj = jnp.asarray(x), jnp.asarray(y)
+        result = step(state, px.StepInputs(inputs=xj, targets=yj))
         state = result.state
-        params, opt_state, jax_loss = jax_step(params, opt_state, x, y)
+        params, opt_state, jax_loss = jax_step(params, opt_state, xj, yj)
         np.testing.assert_allclose(
             float(result.loss), float(jax_loss), rtol=RTOL, atol=ATOL
         )
 
-    pw1, pw2 = _plastax_weights(state)
-    np.testing.assert_allclose(pw1, np.asarray(params["W1"]), rtol=RTOL, atol=ATOL)
-    np.testing.assert_allclose(pw2, np.asarray(params["W2"]), rtol=RTOL, atol=ATOL)
+    for got, want in zip(_plastax_weights(state, sizes), params, strict=True):
+        np.testing.assert_allclose(got, np.asarray(want), rtol=RTOL, atol=ATOL)
+
+
+@pytest.mark.parametrize(("make_plastax", "optax_opt"), _PARAMS, ids=_IDS)
+def test_optimizer_matches_optax_online(
+    make_plastax: OptFactory, optax_opt: optax.GradientTransformation
+) -> None:
+    rng = np.random.default_rng(0)
+    sizes = [12, 6, 4]
+    weights = _glorot(sizes, rng)
+    xs = (rng.standard_normal((STEPS, sizes[0])) * 0.5).astype(np.float32)
+    ys = np.asarray(jax.nn.one_hot(rng.integers(0, sizes[-1], size=STEPS), sizes[-1]))
+    _assert_parity(make_plastax, optax_opt, sizes, weights, xs, ys)
+
+
+_MNIST_RAW = Path("/tmp/data/MNIST/raw")
+_MNIST_PRESENT = all(
+    (_MNIST_RAW / f).exists() or (_MNIST_RAW / f"{f}.gz").exists()
+    for f in ("train-images-idx3-ubyte", "train-labels-idx1-ubyte")
+)
+
+
+@pytest.mark.skipif(not _MNIST_PRESENT, reason="MNIST IDX cache absent (e.g. CI)")
+@pytest.mark.parametrize(("make_plastax", "optax_opt"), _PARAMS, ids=_IDS)
+def test_optimizer_matches_optax_on_mnist(
+    make_plastax: OptFactory, optax_opt: optax.GradientTransformation
+) -> None:
+    xtr, ytr, _, _ = mnist_sgd.load_mnist()
+    images = mnist_sgd.preprocess(xtr, pool=2)  # 14x14 = 196 inputs
+    n_steps = 40
+    sizes = [images.shape[1], 16, 10]
+    rng = np.random.default_rng(0)
+    weights = _glorot(sizes, rng)
+    xs = images[:n_steps]
+    ys = np.asarray(jax.nn.one_hot(ytr[:n_steps], 10))
+    _assert_parity(make_plastax, optax_opt, sizes, weights, xs, ys)

@@ -122,7 +122,7 @@ class Momentum:
     lr: float
     momentum: float
     grad_field: FieldSpec[np.float32]
-    state_fields: tuple[FieldSpec[np.float32], ...] = (_VELOCITY,)
+    state_fields: tuple[FieldSpec[np.generic], ...] = (_VELOCITY,)
     needs_step_counter: bool = False
 
     def update_conn(self) -> _MomentumUpdateConn:

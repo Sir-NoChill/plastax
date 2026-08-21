@@ -68,6 +68,9 @@ dev = [
   # assert_num_jit_and_pmap_compilations (M4b Deviation, IMPLEMENTATION_PLAN.md
   # -- the retrace-count tests the task requires import jax.test_util).
   "absl-py",
+  # optax: reference oracle for the plastax.optim parity tests (Track A.1). A
+  # test-only dependency, never a runtime dep (ECOSYSTEM_ROADMAP.md).
+  "optax",
 ]
 # Docs group installed by RTD (.readthedocs.yaml) and the CI docs job;
 # locally: `uv sync --group docs`, then

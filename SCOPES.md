@@ -19,6 +19,7 @@ Module scopes (src/plastax/):
 - `builder` — builder.py (host construction, finalize, from_topology)
 - `driver` — driver.py (host loop, retrace/overflow protocol)
 - `topology` — topology.py (dense/conv2d/sequential generators)
+- `optim` — optim/ (Optimizer bundles: sgd, momentum, adam; state_fields contract)
 
 Cross-cutting scopes:
 

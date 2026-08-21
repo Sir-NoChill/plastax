@@ -12,10 +12,9 @@ This package will ship validated implementations (SGD, momentum, Adam, ...),
 using optax only as a correctness reference in tests, never as a runtime
 dependency.
 
-Status: STUB. It reserves the namespace and fixes the bundle interface below.
-Concrete optimizers are being prototyped as traits in
-examples/parallel_mnist (AdamUpdateConn) and will be promoted here once the
-field-declaration and step-counter ergonomics are settled.
+Status: SGD implemented (see `sgd`). The stateful optimizers (momentum, adam,
+adamw, rmsprop) follow, keeping their per-connection state in
+`extra_conn_fields` columns plus an optional globals step counter.
 """
 
 from __future__ import annotations
@@ -25,9 +24,10 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from plastax._types import FieldSpec
+from plastax.optim._sgd import SGD, sgd
 from plastax.traits import UpdateConn
 
-__all__ = ["Optimizer"]
+__all__ = ["SGD", "Optimizer", "sgd"]
 
 
 @runtime_checkable

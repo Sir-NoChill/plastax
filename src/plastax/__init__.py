@@ -1,6 +1,6 @@
 """plastax: declarative plastic-network traits for JAX."""
 
-from plastax import monoid, topology
+from plastax import monoid, optim, topology
 from plastax._types import (
     ACTIVATION,
     DEAD,
@@ -64,5 +64,6 @@ __all__ = [
     "make_empty_state",
     "make_step",
     "monoid",
+    "optim",
     "topology",
 ]

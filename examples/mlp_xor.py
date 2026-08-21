@@ -1,7 +1,10 @@
-"""Port of examples/mlp-xor/mlp_xor.cpp: sigmoid MLP, MSE loss, SGD.
+"""Port of examples/mlp-xor/mlp_xor.cpp: sigmoid MLP, MSE loss, backprop.
 
-Canonical backprop trait example and the first oracle target: topological
-mode, all four differentiable phases, no dynamics.
+Canonical backprop trait example and the first oracle target: topological mode,
+all four differentiable phases, no dynamics. The forward/backward/loss traits
+are fixed; only the optimizer changes. `main` showcases that every optimizer in
+`plastax.optim` -- sgd, momentum, adam, adamw, rmsprop -- learns XOR through the
+same traits, wired in via `update_conn` + `extra_conn_fields`.
 """
 
 from __future__ import annotations
@@ -27,8 +30,6 @@ GradPreAct = px.FieldSpec.float32("grad_pre_act")
 # carry a stale value from a previous step into a hidden unit's gradient.
 LossGrad = px.FieldSpec.float32("loss_grad")
 
-LEARNING_RATE = 0.5
-NUM_EPOCHS = 5000
 NUM_HIDDEN = 4
 SEED = 0
 PRINT_EVERY = 500
@@ -121,67 +122,59 @@ class MSELoss(px.Loss):
         return loss, px.UnitWrite.of((LossGrad, diff))
 
 
-class SgdUpdateConn(px.UpdateConn):
-    """w -= lr * dL/dz_dst * a_src, entirely in the incoming pass; outgoing
-    is a genuine no-op (mlp_xor.cpp's GradientDescentConn)."""
+def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[None]]:
+    """Build the XOR MLP Network class wired to `optimizer`.
 
-    def incoming(
-        self,
-        u: px.UnitView,
-        dst: px.UnitIdx,
-        src: px.UnitIdx,
-        c: px.ConnView,
-        cid: px.ConnIdx,
-        g: None,
-    ) -> px.ConnWrite:
-        grad = u[GradPreAct, dst]
-        activation_src = u[px.ACTIVATION, src]
-        delta = jnp.float32(LEARNING_RATE) * grad * activation_src
-        return px.ConnWrite.of((px.WEIGHT, c[px.WEIGHT, cid] - delta))
+    The forward/backward/loss traits are identical across optimizers; only
+    `update_conn` and the `extra_conn_fields` it needs differ. `train=False`
+    returns a forward-only sibling sharing the same field layout, so it drives
+    the same (static, state) for read-only inference (rung0 design section 2
+    phase elision; mirrors mlp_xor.cpp's Net.DoForwardPass vs Net.DoStep).
 
-    def outgoing(
-        self,
-        u: px.UnitView,
-        src: px.UnitIdx,
-        dst: px.UnitIdx,
-        c: px.ConnView,
-        cid: px.ConnIdx,
-        g: None,
-    ) -> px.ConnWrite:
-        del u, src, dst, c, cid, g
-        return px.ConnWrite.of()
+    Args:
+        optimizer: the plastax.optim bundle supplying update_conn/state_fields.
+        train: whether to include the backward/loss/update phases.
 
+    Returns:
+        A Network subclass for the given optimizer.
+    """
+    if train:
 
-class XorNet(px.Network[None]):
-    forward_pass = SigmoidForward()
-    backward_pass = SigmoidBackward()
-    loss = MSELoss()
-    update_conn = SgdUpdateConn()
-    extra_unit_fields = (GradPreAct, LossGrad)
-    propagation = px.Propagation.TOPOLOGICAL
+        class _XorNet(px.Network[None]):
+            forward_pass = SigmoidForward()
+            backward_pass = SigmoidBackward()
+            loss = MSELoss()
+            update_conn = optimizer.update_conn()
+            extra_unit_fields = (GradPreAct, LossGrad)
+            extra_conn_fields = optimizer.state_fields
+            propagation = px.Propagation.TOPOLOGICAL
+
+        return _XorNet
+
+    class _XorNetEval(px.Network[None]):
+        forward_pass = SigmoidForward()
+        extra_unit_fields = (GradPreAct, LossGrad)
+        extra_conn_fields = optimizer.state_fields
+        propagation = px.Propagation.TOPOLOGICAL
+
+    return _XorNetEval
 
 
-class XorNetEval(px.Network[None]):
-    """Forward-only sibling sharing XorNet's exact unit/conn field sets, so
-    the same (static, state) drives either's make_step (rung0 design
-    section 2 phase elision): mirrors mlp_xor.cpp's separate
-    Net.DoForwardPass(...) used for final, read-only inference, as opposed
-    to Net.DoStep(...), which also back-propagates and updates weights."""
-
-    forward_pass = SigmoidForward()
-    extra_unit_fields = (GradPreAct, LossGrad)
-    propagation = px.Propagation.TOPOLOGICAL
-
-
-def build_net(key: jax.Array) -> tuple[px.NetworkStatic, px.NetworkState[None]]:
+def build_net(
+    optimizer: px.optim.Optimizer, key: jax.Array
+) -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
     """3 inputs (x1, x2, bias=1.0) -> NUM_HIDDEN sigmoid hidden -> 1 sigmoid
-    output (mlp_xor.cpp's MlpNetwork construction)."""
+    output (mlp_xor.cpp's MlpNetwork construction), wired to `optimizer`."""
+    net = make_net(optimizer, train=True)
     topology_fn = px.topology.sequential(
         px.topology.input_units(3),
         px.topology.dense(3, NUM_HIDDEN),
         px.topology.dense(NUM_HIDDEN, 1),
     )
-    return px.NetworkBuilder.from_topology(XorNet, topology_fn, key, globals_=None)
+    static, state = px.NetworkBuilder.from_topology(
+        net, topology_fn, key, globals_=None
+    )
+    return net, static, state
 
 
 def _step_inputs(x1: float, x2: float, target: float | None) -> px.StepInputs:
@@ -192,16 +185,17 @@ def _step_inputs(x1: float, x2: float, target: float | None) -> px.StepInputs:
 
 
 def train(
+    net: type[px.Network[None]],
     static: px.NetworkStatic,
     state: px.NetworkState[None],
     *,
-    num_epochs: int = NUM_EPOCHS,
+    num_epochs: int,
     verbose: bool = True,
 ) -> tuple[px.NetworkState[None], float]:
     """Trains on the 4 XOR patterns each epoch (mlp_xor.cpp's main loop:
     one Net.DoStep per pattern, patterns fixed order every epoch). Returns
     the trained state and the final epoch's total loss."""
-    step = px.make_step(XorNet, static)
+    step = px.make_step(net, static)
     epoch_loss = jnp.float32(0.0)
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -219,16 +213,17 @@ def train(
 
 
 def evaluate(
-    static: px.NetworkStatic, state: px.NetworkState[None]
+    optimizer: px.optim.Optimizer,
+    static: px.NetworkStatic,
+    state: px.NetworkState[None],
 ) -> tuple[px.NetworkState[None], bool, tuple[float, ...]]:
     """Forward-only pass over the 4 patterns (mlp_xor.cpp's final
     Net.DoForwardPass loop). Returns the state, whether every pattern is
     classified correctly (threshold 0.5), and the raw predictions."""
-    eval_step = px.make_step(XorNetEval, static)
+    eval_step = px.make_step(make_net(optimizer, train=False), static)
     output_id = static.output_ids[0]
     ok = True
     predictions: list[float] = []
-    print("\nFinal predictions:")
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "error", message=".*Some donated buffers were not usable.*"
@@ -238,27 +233,37 @@ def evaluate(
             state = result.state
             pred = float(state.units[px.ACTIVATION.name][output_id])
             predictions.append(pred)
-            predicted_class = 1 if pred > 0.5 else 0
-            want = int(target)
-            print(
-                f"  [{x1:.1f}, {x2:.1f}] -> {pred:.4f} "
-                f"(class {predicted_class}, target {want})"
-            )
-            if predicted_class != want:
+            if (1 if pred > 0.5 else 0) != int(target):
                 ok = False
     return state, ok, tuple(predictions)
 
 
+# Each optimizer plus the (lr, epochs) that take XOR to convergence through the
+# shared traits. optax-parity is checked in tests/test_optim.py; here the point
+# is that swapping the optimizer is a one-line change and every one learns.
+def showcase() -> list[tuple[str, px.optim.Optimizer, int]]:
+    """Return the (name, optimizer, epochs) rows main() trains and checks."""
+    return [
+        ("sgd", px.optim.sgd(0.5, GradPreAct), 5000),
+        ("momentum", px.optim.momentum(0.2, 0.9, GradPreAct), 3000),
+        ("adam", px.optim.adam(0.05, GradPreAct), 2000),
+        ("adamw", px.optim.adamw(0.05, GradPreAct), 2000),
+        ("rmsprop", px.optim.rmsprop(0.01, GradPreAct), 3000),
+    ]
+
+
 def main() -> None:
-    print("Plastax MLP / XOR Example")
-    print("=========================")
-    key = jax.random.PRNGKey(SEED)
-    static, state = build_net(key)
-    state, final_loss = train(static, state)
-    _, ok, _ = evaluate(static, state)
-    print(f"\nFinal epoch loss: {final_loss:.6f}")
-    print("PASS" if ok else "FAIL")
-    assert ok, "mlp_xor failed to learn XOR"
+    print("Plastax MLP / XOR -- one trait bundle, every optimizer")
+    print("=" * 54)
+    print(f"{'optimizer':9s} {'epochs':>6s} {'loss':>10s}  result   predictions")
+    for name, optimizer, epochs in showcase():
+        net, static, state = build_net(optimizer, jax.random.PRNGKey(SEED))
+        state, final_loss = train(net, static, state, num_epochs=epochs, verbose=False)
+        _, ok, preds = evaluate(optimizer, static, state)
+        preds_str = ", ".join(f"{p:.3f}" for p in preds)
+        result = "LEARNED" if ok else "FAILED "
+        print(f"{name:9s} {epochs:6d} {final_loss:10.6f}  {result}  [{preds_str}]")
+        assert ok, f"{name} failed to learn XOR (loss {final_loss:.4f})"
 
 
 if __name__ == "__main__":

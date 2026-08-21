@@ -1,4 +1,4 @@
-"""Reusable optimizer bundles for plastax weight updates (STUB).
+"""Reusable optimizer bundles for plastax weight updates.
 
 An optimizer in plastax is a *bundle*, not just a weight-update rule: an
 UpdateConn policy that computes the step, the extra per-connection fields its
@@ -12,10 +12,9 @@ This package will ship validated implementations (SGD, momentum, Adam, ...),
 using optax only as a correctness reference in tests, never as a runtime
 dependency.
 
-Status: STUB. It reserves the namespace and fixes the bundle interface below.
-Concrete optimizers are being prototyped as traits in
-examples/parallel_mnist (AdamUpdateConn) and will be promoted here once the
-field-declaration and step-counter ergonomics are settled.
+Status: sgd, momentum, adam, adamw, and rmsprop implemented. Stateful
+optimizers keep their per-connection state (moments and, for Adam, a step-count
+column) in `extra_conn_fields`; optimizer columns use the ``opt/`` prefix.
 """
 
 from __future__ import annotations
@@ -25,9 +24,24 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from plastax._types import FieldSpec
+from plastax.optim._adam import Adam, adam, adamw
+from plastax.optim._momentum import Momentum, momentum
+from plastax.optim._rmsprop import RMSProp, rmsprop
+from plastax.optim._sgd import SGD, sgd
 from plastax.traits import UpdateConn
 
-__all__ = ["Optimizer"]
+__all__ = [
+    "SGD",
+    "Adam",
+    "Momentum",
+    "Optimizer",
+    "RMSProp",
+    "adam",
+    "adamw",
+    "momentum",
+    "rmsprop",
+    "sgd",
+]
 
 
 @runtime_checkable

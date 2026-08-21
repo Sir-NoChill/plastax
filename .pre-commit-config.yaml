@@ -1,3 +1,7 @@
+# A bare `pre-commit install` wires all three stages: the commit-msg scope
+# gate and the pre-push type/test gates, not just pre-commit.
+default_install_hook_types: [pre-commit, commit-msg, pre-push]
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -50,3 +54,9 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
+
+      - id: commit-scope
+        name: commit message type(scope) gate
+        entry: scripts/check-commit-msg.sh
+        language: script
+        stages: [commit-msg]

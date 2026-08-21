@@ -110,7 +110,7 @@ class SGD:
 
     lr: float
     grad_field: FieldSpec[np.float32]
-    state_fields: tuple[FieldSpec[np.generic], ...] = ()
+    state_fields: tuple[FieldSpec[np.float32], ...] = ()
     needs_step_counter: bool = False
 
     def update_conn(self) -> _SGDUpdateConn:

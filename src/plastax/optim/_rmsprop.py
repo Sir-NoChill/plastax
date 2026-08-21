@@ -124,7 +124,7 @@ class RMSProp:
     grad_field: FieldSpec[np.float32]
     decay: float = 0.9
     eps: float = 1e-8
-    state_fields: tuple[FieldSpec[np.float32], ...] = (_MEAN_SQ,)
+    state_fields: tuple[FieldSpec[np.generic], ...] = (_MEAN_SQ,)
     needs_step_counter: bool = False
 
     def update_conn(self) -> _RMSPropUpdateConn:

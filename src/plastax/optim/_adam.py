@@ -162,7 +162,7 @@ class Adam:
     b2: float = 0.999
     eps: float = 1e-8
     weight_decay: float = 0.0
-    state_fields: tuple[FieldSpec[np.float32], ...] = (_M, _V, _T)
+    state_fields: tuple[FieldSpec[np.generic], ...] = (_M, _V, _T)
     needs_step_counter: bool = False
 
     def update_conn(self) -> _AdamUpdateConn:

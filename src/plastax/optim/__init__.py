@@ -58,7 +58,7 @@ class Optimizer(Protocol):
             settled against the example prototype.
     """
 
-    state_fields: tuple[FieldSpec[np.float32], ...]
+    state_fields: tuple[FieldSpec[np.generic], ...]
     needs_step_counter: bool
 
     def update_conn(self) -> UpdateConn[object]:

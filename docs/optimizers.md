@@ -50,6 +50,17 @@ optax reference to float32 precision, online and on MNIST (`tests/test_optim.py`
 and `examples/mnist_sgd.py`). optax is used only as a test oracle -- it is never
 a runtime dependency.
 
+## Sparse and dynamic connectivity
+
+Optimizer state lives per connection, so it does the right thing under dynamic
+sparse training (growing and pruning connections while training). When an
+`AddConn` policy grows a new edge, the framework resets that edge's untouched
+fields to each `FieldSpec`'s default, so a stateful optimizer's moments start at
+zero on a regrown edge -- exactly the "zero the moments for regrown weights"
+that RigL and SET rely on, with no work from the growth policy. A growth policy
+writes `WEIGHT` (and its own fields) only; the optimizer columns re-initialize
+themselves.
+
 ## Reference
 
 ```{eval-rst}

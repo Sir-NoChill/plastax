@@ -49,13 +49,19 @@ class Optimizer(Protocol):
     """A weight-optimizer bundle: an UpdateConn policy plus its state needs.
 
     Attributes:
-        state_fields: Extra per-connection FieldSpecs the optimizer reads and
-            writes for its own state (empty for a stateless rule like SGD).
-            The owning Network must include these in its extra_conn_fields.
-        needs_step_counter: Whether the rule requires the network's globals to
-            carry an int32 step counter (e.g. Adam's bias correction). This
-            field is provisional -- the globals contract is still being
-            settled against the example prototype.
+        state_fields: Extra per-connection FieldSpecs (any numpy dtype) the
+            optimizer reads and writes for its own state (empty for a stateless
+            rule like SGD). The owning Network merges these into its
+            extra_conn_fields. Each FieldSpec's ``default`` is also the value a
+            regrown connection's state initializes to: the add_conn phase resets
+            a new edge's untouched fields to their default, so a stateful
+            optimizer wired with an AddConn growth policy zeroes its moments on
+            regrow automatically (RigL behaviour). Growth policies write WEIGHT
+            and their own fields only, never optimizer columns.
+        needs_step_counter: Whether the rule needs a step counter in the
+            network's globals. The shipped optimizers keep any step count as a
+            per-connection column instead (Adam's ``opt/t``), so this is False
+            for all of them; it is reserved for a future globals-based counter.
     """
 
     state_fields: tuple[FieldSpec[np.generic], ...]

@@ -26,5 +26,6 @@ the matching JAX distribution yourself (for instance `pip install
 :maxdepth: 1
 :hidden:
 
+optimizers
 api
 ```

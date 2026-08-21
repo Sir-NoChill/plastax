@@ -12,9 +12,9 @@ This package will ship validated implementations (SGD, momentum, Adam, ...),
 using optax only as a correctness reference in tests, never as a runtime
 dependency.
 
-Status: SGD, momentum, and Adam implemented (see `sgd`, `momentum`, `adam`);
-adamw and rmsprop follow. Stateful optimizers keep their per-connection state
-(moments and, for Adam, a step-count column) in `extra_conn_fields`.
+Status: sgd, momentum, adam, adamw, and rmsprop implemented. Stateful
+optimizers keep their per-connection state (moments and, for Adam, a step-count
+column) in `extra_conn_fields`; optimizer columns use the ``opt/`` prefix.
 """
 
 from __future__ import annotations
@@ -24,12 +24,24 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from plastax._types import FieldSpec
-from plastax.optim._adam import Adam, adam
+from plastax.optim._adam import Adam, adam, adamw
 from plastax.optim._momentum import Momentum, momentum
+from plastax.optim._rmsprop import RMSProp, rmsprop
 from plastax.optim._sgd import SGD, sgd
 from plastax.traits import UpdateConn
 
-__all__ = ["SGD", "Adam", "Momentum", "Optimizer", "adam", "momentum", "sgd"]
+__all__ = [
+    "SGD",
+    "Adam",
+    "Momentum",
+    "Optimizer",
+    "RMSProp",
+    "adam",
+    "adamw",
+    "momentum",
+    "rmsprop",
+    "sgd",
+]
 
 
 @runtime_checkable

@@ -71,6 +71,10 @@ dev = [
   # optax: reference oracle for the plastax.optim parity tests (Track A.1). A
   # test-only dependency, never a runtime dep (ECOSYSTEM_ROADMAP.md).
   "optax",
+  # torchvision: CIFAR-10 download + loader for the dynamic-sparse-training
+  # example (examples/cifar_dst.py). Dev/example-only -- never a runtime dep;
+  # only its datasets.CIFAR10 reader is used, no torch compute.
+  "torchvision",
 ]
 # Docs group installed by RTD (.readthedocs.yaml) and the CI docs job;
 # locally: `uv sync --group docs`, then

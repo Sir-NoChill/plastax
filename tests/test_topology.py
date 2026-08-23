@@ -155,6 +155,51 @@ def test_conv2d_receptive_field_membership_matches_conv_semantics() -> None:
     assert found_patch == expected_patch
 
 
+@pytest.mark.parametrize(
+    ("h", "w", "c_in", "kh", "kw", "c_out", "stride"),
+    [
+        (5, 5, 2, 2, 2, 3, 1),
+        (6, 6, 2, 3, 3, 4, 2),
+        (7, 7, 3, 3, 3, 5, 3),
+    ],
+)
+def test_conv2d_forward_computes_a_convolution(
+    h: int, w: int, c_in: int, kh: int, kw: int, c_out: int, stride: int
+) -> None:
+    """Running a conv2d layer through the sweep computes an actual convolution.
+
+    The edge-enumeration tests above check structure; this checks the numbers.
+    At init every unrolled edge carries the shared kernel value, so the per-unit
+    weighted sum the forward sweep produces must equal
+    jax.lax.conv_general_dilated on the same image and kernel.
+    """
+    kernel = jax.random.normal(jax.random.PRNGKey(0), (kh, kw, c_in, c_out))
+    build = topology.sequential(
+        topology.input_units(h * w * c_in),
+        topology.conv2d(
+            (h, w, c_in), (kh, kw, c_out), stride=stride, init=lambda _k, _s: kernel
+        ),
+    )
+    static, state = px.NetworkBuilder.from_topology(
+        _TopoNet, build, jax.random.PRNGKey(1), globals_=None
+    )
+    image = jax.random.normal(jax.random.PRNGKey(2), (h, w, c_in))
+    result = px.make_step(_TopoNet, static)(
+        state, px.StepInputs(inputs=image.reshape(-1), targets=None)
+    )
+    got = np.asarray(result.state.units[px.ACTIVATION.name])[
+        np.asarray(static.output_ids)
+    ]
+    reference = jax.lax.conv_general_dilated(
+        image[None],
+        kernel,
+        window_strides=(stride, stride),
+        padding="VALID",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+    )[0].reshape(-1)
+    np.testing.assert_allclose(got, np.asarray(reference), atol=1e-4)
+
+
 def test_conv2d_initializer_statistics_are_sane() -> None:
     """He normal: Var = 2 / fan_in, fan_in = c_in * kh * kw."""
     h, w, c_in = 10, 10, 4

@@ -436,3 +436,57 @@ def test_add_conn_candidate_shortlist_restricts_growth_to_top_m_units() -> None:
     new_edges = set(live) - {(_ANCHOR, dst) for dst in _DST}
     assert new_edges == {(_SRC, 6)}
     assert len(live) == len(set(live))
+
+
+class _DeeperOnlyAddConn(px.AddConn[None]):
+    """Scores deeper candidates finite and vetoes every non-deeper candidate
+    with -inf. max_candidates (10) exceeds the number of deeper candidates
+    (5: SRC -> each DST), and the bucket has many free dead slots, so the veto
+    is the only thing keeping growth to deeper edges: without it, top_k would
+    back-fill the surplus slots with the -inf-scored same-level candidates it
+    surfaces once the finite ones run out (setting needs_resort)."""
+
+    max_candidates = 10
+
+    def score(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> jax.Array:
+        del g
+        deeper = u[px.LEVEL, dst] > u[px.LEVEL, src]
+        return jnp.where(deeper, jnp.float32(1.0), -jnp.inf)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+class _DeeperOnlyNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _DeeperOnlyAddConn()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def test_veto_score_is_never_committed_even_with_free_slots() -> None:
+    static, state = _build_net(_DeeperOnlyNet)
+    state = _with_marker_activations(state)
+
+    phase = phases.build_add_conn_phase(_DeeperOnlyNet, static)
+    new_state, _ = phase(state, _DUMMY_INPUTS)
+
+    bucket = new_state.conns[0]
+    dead = np.asarray(bucket[px.DEAD.name])
+    from_id = np.asarray(bucket[px.FROM_ID.name])
+    to_id = np.asarray(bucket[px.TO_ID.name])
+    live = {
+        (int(f), int(t)) for f, t, d in zip(from_id, to_id, dead, strict=True) if not d
+    }
+    new_edges = live - {(_ANCHOR, dst) for dst in _DST}
+
+    # Only the deeper (SRC, dst) edges grow; the vetoed (-inf) non-deeper
+    # candidates are never committed, even though free dead slots remain and
+    # max_candidates leaves room for them.
+    assert new_edges == {(_SRC, dst) for dst in _DST}
+    # No non-deeper edge was back-filled, so leveling is preserved.
+    assert bool(new_state.needs_resort) is False

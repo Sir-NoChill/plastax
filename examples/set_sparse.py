@@ -342,7 +342,14 @@ def make_net(
 def _choose_pairs(
     n_src: int, n_dst: int, budget: int, rng: np.random.Generator
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Pick ``budget`` distinct (src, dst) local index pairs without replacement.
+    """Pick ``budget`` distinct (src, dst) pairs, one incoming edge per dst.
+
+    Every destination is first seeded with one random source, then the rest of
+    the budget is filled with distinct random pairs. This leaves no orphan
+    destination (zero incoming edges): an orphan would fall to level 0 (a node
+    with no predecessors is a source), and its own outgoing edges would then
+    source from level 0 and land in -- and inflate the capacity of -- the wrong
+    bucket, scrambling the layered structure.
 
     Args:
         n_src: number of source units in the layer.
@@ -352,11 +359,28 @@ def _choose_pairs(
 
     Returns:
         Parallel (src_local, dst_local) int arrays of length ``min(budget,
-        n_src*n_dst)``.
+        n_src*n_dst)``; every dst in ``range(n_dst)`` appears at least once when
+        ``budget >= n_dst``.
     """
     total = n_src * n_dst
     k = min(budget, total)
-    flat = rng.choice(total, size=k, replace=False)
+    if k < n_dst:
+        flat = rng.choice(total, size=k, replace=False)
+        return (flat // n_dst).astype(np.int32), (flat % n_dst).astype(np.int32)
+    seen: set[int] = set()
+    order: list[int] = []
+    for dst, src in enumerate(rng.integers(0, n_src, size=n_dst)):
+        flat_id = int(src) * n_dst + dst  # distinct per dst, so no dedup needed
+        seen.add(flat_id)
+        order.append(flat_id)
+    for flat_id in rng.permutation(total):
+        if len(order) >= k:
+            break
+        fid = int(flat_id)
+        if fid not in seen:
+            seen.add(fid)
+            order.append(fid)
+    flat = np.asarray(order[:k], dtype=np.int64)
     return (flat // n_dst).astype(np.int32), (flat % n_dst).astype(np.int32)
 
 

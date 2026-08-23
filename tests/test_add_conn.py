@@ -490,3 +490,96 @@ def test_veto_score_is_never_committed_even_with_free_slots() -> None:
     assert new_edges == {(_SRC, dst) for dst in _DST}
     # No non-deeper edge was back-filled, so leveling is preserved.
     assert bool(new_state.needs_resort) is False
+
+
+# ids for a 3-level net: two inputs, two hidden, two outputs.
+_IN, _HID, _OUT = (0, 1), (2, 3), (4, 5)
+
+
+def _build_3level(
+    net: type[px.Network[None]],
+) -> tuple[px.NetworkStatic, px.NetworkState[None]]:
+    """A→H0, B→H1, H0→O0, H1→O1: three levels, two source-level buckets."""
+    builder = px.NetworkBuilder(net, None)
+    for _ in range(6):
+        builder.add_unit()
+    for i in _IN:
+        builder.mark_input(i)
+    for o in _OUT:
+        builder.mark_output(o)
+    builder.add_conn(_IN[0], _HID[0], weight=1.0)
+    builder.add_conn(_IN[1], _HID[1], weight=1.0)
+    builder.add_conn(_HID[0], _OUT[0], weight=1.0)
+    builder.add_conn(_HID[1], _OUT[1], weight=1.0)
+    return builder.finalize()
+
+
+class _DeepestImportanceGrow(px.AddConn[None]):
+    """Importance favours the deepest level, so a GLOBAL top-M (M=2) shortlist
+    fills with the two output units -- among which no deeper edge exists -- and
+    the shallow input->hidden transition grows nothing. score grows any deeper
+    candidate; init tags it. Subclasses only toggle `shortlist_per_level`."""
+
+    max_candidates = 4
+    max_candidate_units = 2
+
+    def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
+        del g
+        return jnp.where(
+            u[px.LEVEL, i] == jnp.int32(2), jnp.float32(10.0), jnp.float32(1.0)
+        )
+
+    def score(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> jax.Array:
+        del g
+        deeper = u[px.LEVEL, dst] > u[px.LEVEL, src]
+        return jnp.where(deeper, jnp.float32(1.0), -jnp.inf)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+class _GlobalShortlistNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _DeepestImportanceGrow()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+class _PerLevelGrow(_DeepestImportanceGrow):
+    shortlist_per_level = True
+
+
+class _PerLevelShortlistNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _PerLevelGrow()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def _bucket0_new_edges(
+    net: type[px.Network[None]],
+) -> set[tuple[int, int]]:
+    static, state = _build_3level(net)
+    phase = phases.build_add_conn_phase(net, static)
+    new_state, _ = phase(state, _DUMMY_INPUTS)
+    bucket = new_state.conns[0]  # source-level-0 edges: the input->hidden transition
+    dead = np.asarray(bucket[px.DEAD.name])
+    frm = np.asarray(bucket[px.FROM_ID.name])
+    to = np.asarray(bucket[px.TO_ID.name])
+    live = {(int(f), int(t)) for f, t, d in zip(frm, to, dead, strict=True) if not d}
+    return live - {(_IN[0], _HID[0]), (_IN[1], _HID[1])}  # minus the two seeds
+
+
+def test_per_level_shortlist_serves_a_transition_the_global_starves() -> None:
+    # Importance concentrates the global top-M on the two output units, so the
+    # input->hidden bucket sees no shortlisted source and grows nothing.
+    assert _bucket0_new_edges(_GlobalShortlistNet) == set()
+    # Per-level draws that bucket its own (top-M level-0 sources x top-M level-1
+    # destinations) grid, so the shallow transition grows the two cross edges.
+    assert _bucket0_new_edges(_PerLevelShortlistNet) == {
+        (_IN[0], _HID[1]),
+        (_IN[1], _HID[0]),
+    }

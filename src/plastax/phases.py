@@ -495,15 +495,28 @@ def build_add_conn_phase[GS](
     # units each step and draw candidates only from that M x M grid, cutting
     # the per-step cost from O(num_units^2) to O(num_units + M^2). Absent (or M
     # >= num_units), the full grid is used -- the historical behavior, so
-    # existing AddConn policies are unaffected. Shortlisting is global (top-M
-    # over all units); a bucket whose source level is missing from the shortlist
-    # simply grows nothing that step.
+    # existing AddConn policies are unaffected.
+    #
+    # The shortlist is global (top-M over all units) by default; a policy may
+    # also set `shortlist_per_level = True` to instead draw each bucket its own
+    # M x M grid -- top-M sources at that bucket's source level x top-M deeper
+    # destinations within the window -- so every transition of a layered net is
+    # served. A global top-M can concentrate on one level and starve a bucket,
+    # letting sparsity drift down; per-level is the fix. It is levels-based,
+    # hence topological only (pipeline keeps the global shortlist), and forward
+    # only (its destinations are strictly deeper), matching how growth policies
+    # veto non-deeper edges anyway.
     max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
     importance_fn = getattr(ac, "importance", None)
     use_shortlist = (
         max_candidate_units is not None
         and importance_fn is not None
         and 0 < max_candidate_units < num_units
+    )
+    use_per_level = (
+        use_shortlist
+        and bool(getattr(ac, "shortlist_per_level", False))
+        and not is_pipeline
     )
     pool_side = max_candidate_units if use_shortlist else num_units
     assert pool_side is not None  # use_shortlist implies max_candidate_units set
@@ -517,20 +530,39 @@ def build_add_conn_phase[GS](
     _full_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
     _full_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
 
-    def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
-        """This step's (flat_src, flat_dst) candidate grid."""
-        if not use_shortlist:
-            return _full_src, _full_dst
-        assert importance_fn is not None  # use_shortlist implies it is set
+    def importance_scores(u_view: UnitView, g: GS) -> jax.Array:
+        """The per-unit importance vector (num_units,), for either shortlist."""
+        assert importance_fn is not None  # only called when shortlisting
 
         def one(i: jax.Array) -> jax.Array:
             score = importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
             return cast(jax.Array, score)
 
-        scores = jax.vmap(one)(unit_ids)
-        _, top = jax.lax.top_k(scores, pool_side)
+        return jax.vmap(one)(unit_ids)
+
+    def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
+        """The global (flat_src, flat_dst) grid: full num_units^2 or top-M^2."""
+        if not use_shortlist:
+            return _full_src, _full_dst
+        _, top = jax.lax.top_k(importance_scores(u_view, g), pool_side)
         src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
         dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
+        return src, dst
+
+    def per_level_grid(
+        imp: jax.Array, unit_level: jax.Array, bucket_idx: int
+    ) -> tuple[jax.Array, jax.Array]:
+        """One bucket's grid: top-M sources at its level x top-M deeper dests.
+
+        A source top_k that pulls in a wrong-level unit (fewer than M sit at the
+        level) is harmless -- the bucket's own `src_ok` filter drops it.
+        """
+        src_imp = jnp.where(unit_level == bucket_idx, imp, -jnp.inf)
+        _, src_top = jax.lax.top_k(src_imp, pool_side)
+        deeper = (unit_level > bucket_idx) & (unit_level <= bucket_idx + neighbourhood)
+        _, dst_top = jax.lax.top_k(jnp.where(deeper, imp, -jnp.inf), pool_side)
+        src = jnp.broadcast_to(src_top[:, None], (pool_side, pool_side)).reshape(-1)
+        dst = jnp.broadcast_to(dst_top[None, :], (pool_side, pool_side)).reshape(-1)
         return src, dst
 
     def add_conn_phase(
@@ -540,19 +572,18 @@ def build_add_conn_phase[GS](
         units = state.units
         g = state.globals_
         u_view = UnitView(units)
-        flat_src, flat_dst = candidate_grid(u_view, g)
-        not_self = flat_src != flat_dst
         unit_level = units[LEVEL.name]
-        src_level = unit_level[flat_src]
-        dst_level = unit_level[flat_dst]
-        level_gap = dst_level - src_level
-        # Per ordered (src, dst) pair, the level window is `abs(gap) <=
-        # neighbourhood`: it admits any pair within `neighbourhood` levels
-        # of each other, including same-level pairs and edges toward a
-        # shallower destination, in both directions. Self-loops are
-        # excluded explicitly (`not_self`), since gap == 0 no longer
-        # implies src == dst now that same-level pairs are admitted.
-        window_ok = (jnp.abs(level_gap) <= neighbourhood) & not_self
+        # Per-level shortlisting draws each bucket its own grid in the loop
+        # below; every other mode reuses this one global grid. Its per-bucket
+        # window (`abs(gap) <= neighbourhood`, self-loops excluded -- the window
+        # admits same-level and toward-shallower pairs, which a growth policy's
+        # score vetoes if unwanted) is also computed in the loop, cheap on the
+        # shared grid. The global grid is built unconditionally so the loop's two
+        # branches both bind flat_src/flat_dst; when per-level it is the (small)
+        # top-M grid and goes unused, dead-code-eliminated -- never the
+        # num_units^2 full grid.
+        imp = importance_scores(u_view, g) if use_per_level else None
+        global_src, global_dst = candidate_grid(u_view, g)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
@@ -571,6 +602,15 @@ def build_add_conn_phase[GS](
         for bucket_idx in range(num_buckets):
             bucket_conns = state.conns[bucket_idx]
             capacity_b = static.level_capacities[bucket_idx]
+            if use_per_level:
+                assert imp is not None  # use_per_level implies importance is set
+                flat_src, flat_dst = per_level_grid(imp, unit_level, bucket_idx)
+            else:
+                flat_src, flat_dst = global_src, global_dst
+            src_level = unit_level[flat_src]
+            window_ok = (jnp.abs(unit_level[flat_dst] - src_level) <= neighbourhood) & (
+                flat_src != flat_dst
+            )
             src_ok = (
                 jnp.ones_like(src_level, dtype=jnp.bool_)
                 if is_pipeline

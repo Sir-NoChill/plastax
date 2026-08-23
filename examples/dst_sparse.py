@@ -136,9 +136,13 @@ class _Growth(px.AddConn[None]):
         self.max_candidates = max_candidates
         self.grow_scale = grow_scale
         if shortlist is not None:
-            # Read structurally by build_add_conn_phase (getattr); its presence
-            # switches the phase from the num_units^2 grid to the M x M grid.
+            # Read structurally by build_add_conn_phase (getattr): the phase
+            # draws each bucket its own M x M grid (top-M sources at that source
+            # level x top-M deeper destinations), so every layer transition of
+            # the MLP is served -- a global top-M would concentrate on one level
+            # and let sparsity drift down.
             self.max_candidate_units = shortlist
+            self.shortlist_per_level = True
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
         """Per-unit shortlist score: activity + gradient magnitude.

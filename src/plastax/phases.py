@@ -449,7 +449,11 @@ def build_add_conn_phase[GS](
     sorted live pair ids -- no num_units**2 occupancy grid) so growth never
     regrows an existing pair as a duplicate. Each bucket runs an independent
     top_k (static k) over its own scored, windowed candidates, with no
-    cross-bucket sequencing.
+    cross-bucket sequencing. A candidate scored -inf is never committed -- the
+    framework scores every invalid candidate -inf, and a growth policy returns
+    -inf to veto one it must never grow (e.g. a non-deeper edge) -- so a bucket
+    with more free slots than finite-scored candidates leaves the surplus empty
+    rather than back-filling with vetoed edges.
 
     Free slots are claimed by a prefix-sum scan over each bucket's own
     `dead` mask: the scan turns dead-row rank into a slot assignment, so a
@@ -459,7 +463,7 @@ def build_add_conn_phase[GS](
     scatter's default drop mode discards rather than mis-writing a live
     slot.
 
-    Overflow is a real (valid, top-k-selected) candidate for which its
+    Overflow is a real (growable, top-k-selected) candidate for which its
     own bucket ran out of dead slots; it is dropped and the flag is
     raised via `overflow_sink` rather than committed. A committed
     candidate whose destination is not strictly deeper than its source
@@ -601,6 +605,17 @@ def build_add_conn_phase[GS](
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]
+            # A candidate is growable only if its score is finite. `scored`
+            # sends every framework-invalid candidate (out-of-window, wrong
+            # source level, or a duplicate of a live edge) to -inf, and a growth
+            # policy likewise returns -inf to *veto* a candidate it must never
+            # grow (e.g. a non-deeper edge that would break leveling) rather
+            # than merely rank it last. Gating commitment on finiteness makes
+            # -inf a hard veto: without it, a bucket whose free slots outnumber
+            # its finite-scored candidates would back-fill the surplus with
+            # vetoed edges, since top_k still surfaces them and `has_room`
+            # alone would admit them.
+            top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
 
             # Prefix-sum slot claim over this bucket's own dead mask:
             # rank[i] is dead-position i's 0-based rank among this bucket's
@@ -624,13 +639,14 @@ def build_add_conn_phase[GS](
             )
             free_slot = slot_for_rank[:k]
             has_room = free_slot < capacity_b
-            committed = top_valid & has_room
-            # Overflow: a real (valid, top-k-selected) candidate for which
+            committed = top_growable & has_room
+            # Overflow: a real (growable, top-k-selected) candidate for which
             # this bucket ran out of dead slots. Uncommitted candidates
-            # (invalid or no room) scatter to `capacity_b`, one past this
-            # bucket's own valid range -- the scatter's default drop mode
-            # discards them rather than mis-writing a live slot.
-            overflow = overflow | jnp.any(top_valid & ~has_room)
+            # (invalid, vetoed by a -inf score, or no room) scatter to
+            # `capacity_b`, one past this bucket's own valid range -- the
+            # scatter's default drop mode discards them rather than
+            # mis-writing a live slot.
+            overflow = overflow | jnp.any(top_growable & ~has_room)
             target_slot = jnp.where(committed, free_slot, jnp.int32(capacity_b))
 
             # A committed candidate whose destination is not strictly

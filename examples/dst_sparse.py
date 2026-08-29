@@ -314,29 +314,41 @@ def build_sparse_mlp(
         The finalized (static, state) pair.
     """
     rng = np.random.default_rng(seed)
-    builder: px.NetworkBuilder[None] = px.NetworkBuilder(net, None)
     offsets: list[int] = []
     running = 0
     for size in layer_sizes:
         offsets.append(running)
         running += size
-    for _ in range(running):
-        builder.add_unit()
-    for i in range(layer_sizes[0]):
-        builder.mark_input(i)
-    for i in range(offsets[-1], running):
-        builder.mark_output(i)
 
+    # Assemble every layer's edges as whole (E,) arrays and hand them to the
+    # vectorized builder in one pass -- the per-edge add_conn loop this
+    # replaced was O(E) Python and the wall for large sparse nets.
+    from_chunks: list[np.ndarray] = []
+    to_chunks: list[np.ndarray] = []
+    weight_chunks: list[np.ndarray] = []
     for layer, budget in enumerate(budgets):
         n_src, n_dst = layer_sizes[layer], layer_sizes[layer + 1]
         src_local, dst_local = _choose_pairs(n_src, n_dst, budget, rng)
         scale = 1.0 / np.sqrt(max(1.0, len(src_local) / n_dst))
-        weights = rng.standard_normal(len(src_local)) * scale
-        for s, d, w in zip(src_local, dst_local, weights, strict=True):
-            builder.add_conn(
-                offsets[layer] + int(s), offsets[layer + 1] + int(d), weight=float(w)
-            )
-    return builder.finalize()
+        from_chunks.append(src_local.astype(np.int32) + offsets[layer])
+        to_chunks.append(dst_local.astype(np.int32) + offsets[layer + 1])
+        weight_chunks.append(rng.standard_normal(len(src_local)) * scale)
+
+    empty_i = np.zeros((0,), dtype=np.int32)
+    return px.NetworkBuilder.from_edges(
+        net,
+        running,
+        np.concatenate(from_chunks) if from_chunks else empty_i,
+        np.concatenate(to_chunks) if to_chunks else empty_i,
+        weights=(
+            np.concatenate(weight_chunks)
+            if weight_chunks
+            else np.zeros((0,), dtype=np.float32)
+        ),
+        input_ids=tuple(range(layer_sizes[0])),
+        output_ids=tuple(range(offsets[-1], running)),
+        globals_=None,
+    )
 
 
 def teacher_task(

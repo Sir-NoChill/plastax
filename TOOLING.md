@@ -16,6 +16,22 @@ so the bare `uv run ty|mypy|pytest` hook entries resolve them without extra
 flags. `uv.lock` is gitignored (library convention: CI resolves against the
 current dependency floor).
 
+### GPU (optional)
+
+The default `uv sync` installs the **CPU** jax wheel. For an NVIDIA GPU, add the
+`cuda12` extra (declared in `[project.optional-dependencies]`; `gpu` is an
+alias) so a CUDA-enabled jaxlib + plugin resolves instead:
+
+```
+uv sync --extra cuda12                 # or: pip install "plastax[cuda12]"
+```
+
+plastax itself is backend-agnostic pure Python — the extra only swaps the jax
+wheel. On a **shared** GPU, set `XLA_PYTHON_CLIENT_PREALLOCATE=false` so jax
+grabs only what it needs rather than pre-reserving ~75 % of VRAM. The
+dynamic-sparse CIFAR example (`examples/cifar_dst.py`) is the main GPU workload;
+validated with `jax[cuda12]==0.11.0` on an RTX 3060 Ti.
+
 ## Lint + format: ruff
 
 One tool for both. `ruff check` (rules pinned in pyproject: E/F/I/UP/B/ANN/D)

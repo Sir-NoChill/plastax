@@ -247,3 +247,220 @@ def test_from_topology_equals_manual_builder_construction() -> None:
     ):
         for name in auto_bucket:
             assert jnp.array_equal(auto_bucket[name], manual_bucket[name])
+
+
+# --- from_edges (vectorized construction) -------------------------------
+
+
+def _assert_arenas_equal(
+    a: tuple[px.NetworkStatic, px.NetworkState[None]],
+    b: tuple[px.NetworkStatic, px.NetworkState[None]],
+) -> None:
+    """Byte-identical (static, state) arenas: same config and every column."""
+    static_a, state_a = a
+    static_b, state_b = b
+    assert static_a == static_b
+    assert state_a.units.keys() == state_b.units.keys()
+    for name in state_a.units:
+        assert jnp.array_equal(state_a.units[name], state_b.units[name])
+    assert len(state_a.conns) == len(state_b.conns)
+    for bucket_a, bucket_b in zip(state_a.conns, state_b.conns, strict=True):
+        assert bucket_a.keys() == bucket_b.keys()
+        for name in bucket_a:
+            assert jnp.array_equal(bucket_a[name], bucket_b[name])
+
+
+def test_from_edges_equals_manual_builder_with_weights_and_extra_columns() -> None:
+    """The vectorized path reproduces the per-edge path byte-for-byte.
+
+    Diamond 0->1, 0->2, 1->3, 2->3 with per-edge weights and a settable extra
+    conn field (tag): from_edges must bucket, stable-sort by dst, and pad
+    exactly as add_conn + finalize do, including permuting the tag column with
+    its edges and default-filling the untouched Bias unit field.
+    """
+    from_ids = np.array([0, 0, 1, 2], dtype=np.int32)
+    to_ids = np.array([1, 2, 3, 3], dtype=np.int32)
+    weights = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    tags = np.array([9.0, 8.0, 7.0, 6.0], dtype=np.float32)
+
+    vectorized = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        4,
+        from_ids,
+        to_ids,
+        weights=weights,
+        input_ids=(0,),
+        output_ids=(3,),
+        globals_=None,
+        extra_conn_columns={"tag": tags},
+    )
+
+    manual = px.NetworkBuilder(_ExtraFieldsNet, None)
+    for _ in range(4):
+        manual.add_unit()
+    manual.mark_input(0)
+    manual.mark_output(3)
+    for s, d, w, t in zip(
+        from_ids.tolist(), to_ids.tolist(), weights.tolist(), tags.tolist(), strict=True
+    ):
+        manual.add_conn(s, d, weight=w, tag=t)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_multi_bucket_matches_manual_at_scale() -> None:
+    """A three-level net wired with hundreds of edges matches the per-edge path.
+
+    Exercises multiple source-level buckets and next_pow2 capacity growth in a
+    single vectorized pass -- the regime the per-edge loop is slow in.
+    """
+    rng = np.random.default_rng(0)
+    # layers [0,32) -> [32,96) -> [96,112); wire each pair densely-ish random.
+    froms: list[np.ndarray] = []
+    tos: list[np.ndarray] = []
+    for lo_in, hi_in, lo_out, hi_out in [(0, 32, 32, 96), (32, 96, 96, 112)]:
+        src = rng.integers(lo_in, hi_in, size=400)
+        dst = rng.integers(lo_out, hi_out, size=400)
+        # one seed edge per output unit so no unit orphans to level 0.
+        seed_dst = np.arange(lo_out, hi_out)
+        seed_src = rng.integers(lo_in, hi_in, size=seed_dst.size)
+        froms.append(np.concatenate([seed_src, src]))
+        tos.append(np.concatenate([seed_dst, dst]))
+    from_ids = np.concatenate(froms).astype(np.int32)
+    to_ids = np.concatenate(tos).astype(np.int32)
+    weights = rng.standard_normal(from_ids.size).astype(np.float32)
+
+    vectorized = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        112,
+        from_ids,
+        to_ids,
+        weights=weights,
+        input_ids=tuple(range(32)),
+        output_ids=tuple(range(96, 112)),
+        globals_=None,
+    )
+
+    manual = px.NetworkBuilder(_TopoNet, None)
+    for _ in range(112):
+        manual.add_unit()
+    for i in range(32):
+        manual.mark_input(i)
+    for i in range(96, 112):
+        manual.mark_output(i)
+    for s, d, w in zip(
+        from_ids.tolist(), to_ids.tolist(), weights.tolist(), strict=True
+    ):
+        manual.add_conn(s, d, weight=w)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_empty_edge_set_matches_manual() -> None:
+    """No edges: one empty tombstoned bucket, exactly as finalize builds."""
+    empty = np.zeros((0,), dtype=np.int32)
+    vectorized = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        3,
+        empty,
+        empty,
+        input_ids=(0, 1, 2),
+        output_ids=(0, 1, 2),
+        globals_=None,
+    )
+
+    manual = px.NetworkBuilder(_TopoNet, None)
+    for _ in range(3):
+        manual.add_unit()
+    for i in range(3):
+        manual.mark_input(i)
+        manual.mark_output(i)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_pipeline_mode_single_bucket() -> None:
+    """PIPELINE construction lands every edge in one flat bucket."""
+    from_ids = np.array([0, 1, 2], dtype=np.int32)
+    to_ids = np.array([1, 2, 0], dtype=np.int32)  # a cycle: legal in pipeline
+    static, state = px.NetworkBuilder.from_edges(
+        _PipelineNet,
+        3,
+        from_ids,
+        to_ids,
+        weights=np.ones(3, dtype=np.float32),
+        input_ids=(0,),
+        output_ids=(2,),
+        globals_=None,
+    )
+    assert len(static.level_capacities) == 1
+    assert int(px.state.live_conn_count(state)) == 3
+
+
+def test_from_edges_defaults_weight_when_omitted() -> None:
+    """Omitting weights fills the WEIGHT column with its spec default (0)."""
+    static, state = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        2,
+        np.array([0], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+        input_ids=(0,),
+        output_ids=(1,),
+        globals_=None,
+    )
+    live = int(px.state.live_conn_count(state, 0))
+    assert np.asarray(state.conns[0]["weight"])[:live].tolist() == [0.0]
+
+
+def test_from_edges_rejects_mismatched_endpoint_lengths() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            3,
+            np.array([0, 1], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(2,),
+            globals_=None,
+        )
+
+
+def test_from_edges_rejects_mismatched_weight_length() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            3,
+            np.array([0, 1], dtype=np.int32),
+            np.array([1, 2], dtype=np.int32),
+            weights=np.ones(3, dtype=np.float32),
+            input_ids=(0,),
+            output_ids=(2,),
+            globals_=None,
+        )
+
+
+def test_from_edges_rejects_out_of_range_endpoint() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            3,
+            np.array([0], dtype=np.int32),
+            np.array([99], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(2,),
+            globals_=None,
+        )
+
+
+def test_from_edges_rejects_unknown_extra_conn_column() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            2,
+            np.array([0], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(1,),
+            globals_=None,
+            extra_conn_columns={"not_a_field": np.zeros(1, dtype=np.float32)},
+        )

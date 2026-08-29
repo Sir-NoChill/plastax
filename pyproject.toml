@@ -43,6 +43,16 @@ dependencies = [
   "numpy>=2",
 ]
 
+# Optional GPU backend. `pip install plastax[cuda12]` (or `uv sync --extra
+# cuda12`) pulls the CUDA-12 jaxlib + plugin in place of the default CPU wheel;
+# `gpu` is a friendly alias for it. plastax is backend-agnostic pure Python --
+# the extra only swaps which jax wheel resolves, nothing in src/plastax changes.
+# Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). Set
+# XLA_PYTHON_CLIENT_PREALLOCATE=false on a shared GPU (see TOOLING.md).
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]>=0.11.0"]
+gpu = ["plastax[cuda12]"]
+
 [project.urls]
 Homepage = "https://github.com/Sir-NoChill/plastax"
 Repository = "https://github.com/Sir-NoChill/plastax"

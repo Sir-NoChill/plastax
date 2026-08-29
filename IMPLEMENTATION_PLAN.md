@@ -178,6 +178,19 @@ Tooling / infrastructure (2026-08-17, scaffolding handoff):
 - repo: no repo-local commit wrapper — contributors attribute and sign with
   their own agents (per user, review 2026-08-17).
 
+Tooling / infrastructure (2026-08-29, jax floor widening):
+
+- pyproject (packaging): `jax>=0.11.0` -> `jax>=0.10.2` (and the `cuda12`
+  extra likewise). plastax uses only APIs stable at 0.10.2 —
+  `jax.tree_util.register_dataclass`, `jax.shard_map` (top-level since 0.8.0;
+  `jax.experimental.shard_map` is the deprecated alias), `jax.sharding.Mesh`/
+  `PartitionSpec`, `make_array_from_process_local_data` — and the fast suite,
+  including the Scheme-A sharding-equivalence test, passes on jax 0.10.2.
+  Reason: Alliance Canada's Narval wheelhouse ships a version-consistent
+  CUDA JAX only at 0.10.2 (the cuda12 plugin/pjrt top out there), so the
+  multi-GPU scaling experiments run on 0.10.2; the 0.11 floor was the
+  conservative dev/validation version, not a hard dependency.
+
 Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
 - All modules: converted to PEP 695 generics (`class Foo[T]`, `def f[T]`)

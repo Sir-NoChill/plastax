@@ -6,7 +6,7 @@ connections imperatively, then finalize into (NetworkStatic, NetworkState).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import jax.numpy as jnp
 import numpy as np
@@ -87,8 +87,8 @@ class NetworkBuilder[GS]:
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Expand a plastax.topology spec into arenas.
 
-        Adds units, marks the first/last blocks as inputs/outputs, bulk
-        add_conn's the edge set, then finalizes.
+        Draws the topology, then hands its EdgeSet straight to `from_edges`
+        for vectorized column assembly -- no per-edge Python pass.
 
         Args:
             net: The network type to build.
@@ -100,22 +100,115 @@ class NetworkBuilder[GS]:
             The finalized (NetworkStatic, NetworkState) pair.
         """
         spec = topology_fn(key)
+        return cls.from_edges(
+            net,
+            spec.num_units,
+            spec.edges.from_ids,
+            spec.edges.to_ids,
+            weights=spec.edges.weights,
+            input_ids=spec.input_ids,
+            output_ids=spec.output_ids,
+            globals_=globals_,
+        )
+
+    @classmethod
+    def from_edges(
+        cls,
+        net: type[Network[GS]],
+        num_units: int,
+        from_ids: np.ndarray,
+        to_ids: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        input_ids: Sequence[int],
+        output_ids: Sequence[int],
+        globals_: GS,
+        extra_conn_columns: Mapping[str, np.ndarray] | None = None,
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
+        """Build arenas from whole edge-column arrays, no per-edge Python.
+
+        The vectorized construction path: the caller supplies parallel
+        ``(E,)`` source/destination arrays (plus optional per-edge weight and
+        extra-field columns), and every column is bucketed, sorted, and padded
+        with numpy fancy-indexing instead of the ``add_unit``/``add_conn`` loop
+        `finalize` walks. Output is byte-identical to the imperative path (both
+        route through the same assembler), so a large sparse or dense net
+        builds in one vectorized pass rather than E Python calls.
+
+        Units carry field defaults (topology construction sets no per-unit
+        values); a conn field is filled from ``weights``/``extra_conn_columns``
+        if given, else its spec default. All edges live (``DEAD`` false); the
+        assembler tombstones only the per-bucket capacity padding.
+
+        Args:
+            net: The network type to build.
+            num_units: Total unit count; ids must fall in ``[0, num_units)``.
+            from_ids: ``(E,)`` source unit ids.
+            to_ids: ``(E,)`` destination unit ids (parallel to ``from_ids``).
+            weights: ``(E,)`` initial edge weights, or None for the ``WEIGHT``
+                default.
+            input_ids: Unit ids StepInputs scatters onto.
+            output_ids: Unit ids the loss clamps targets to.
+            globals_: The network's globals value.
+            extra_conn_columns: Optional per-edge values for settable conn
+                fields (e.g. an optimizer's ``opt/…`` columns), each ``(E,)``;
+                unset fields take their spec default.
+
+        Returns:
+            The finalized (NetworkStatic, NetworkState) pair.
+
+        Raises:
+            ValueError: On mismatched array lengths, an out-of-range unit id,
+                or an unknown/non-settable ``extra_conn_columns`` key.
+        """
         builder = cls(net, globals_)
-        for _ in range(spec.num_units):
-            builder.add_unit()
-        for unit_id in spec.input_ids:
-            builder.mark_input(unit_id)
-        for unit_id in spec.output_ids:
-            builder.mark_output(unit_id)
-        edges = spec.edges
-        for from_id, to_id, weight in zip(
-            edges.from_ids.tolist(),
-            edges.to_ids.tolist(),
-            edges.weights.tolist(),
-            strict=True,
-        ):
-            builder.add_conn(from_id, to_id, weight=weight)
-        return builder.finalize()
+        src_arr = np.asarray(from_ids, dtype=np.int32)
+        dst_arr = np.asarray(to_ids, dtype=np.int32)
+        if src_arr.ndim != 1 or dst_arr.shape != src_arr.shape:
+            raise ValueError(
+                "from_edges: from_ids and to_ids must be 1-D arrays of equal "
+                f"length, got {src_arr.shape} and {dst_arr.shape}"
+            )
+        num_edges = int(src_arr.shape[0])
+
+        extra = dict(extra_conn_columns or {})
+        for name in extra:
+            if name not in builder._settable_conn_fields or name == WEIGHT.name:
+                raise ValueError(
+                    f"from_edges: unknown or non-settable conn field {name!r} "
+                    "in extra_conn_columns"
+                )
+
+        conn_columns: dict[str, np.ndarray] = {}
+        for name, spec in builder._settable_conn_fields.items():
+            if name == WEIGHT.name and weights is not None:
+                supplied: np.ndarray | None = np.asarray(weights)
+            else:
+                supplied = extra.get(name)
+            if supplied is None:
+                conn_columns[name] = np.full(
+                    (num_edges,), spec.default, dtype=spec.dtype
+                )
+            elif supplied.shape != (num_edges,):
+                raise ValueError(
+                    f"from_edges: conn column {name!r} has shape {supplied.shape}, "
+                    f"expected ({num_edges},)"
+                )
+            else:
+                conn_columns[name] = supplied
+        unit_columns: dict[str, np.ndarray] = {
+            name: np.full((num_units,), spec.default, dtype=spec.dtype)
+            for name, spec in builder._settable_unit_fields.items()
+        }
+        return builder._assemble(
+            num_units,
+            src_arr,
+            dst_arr,
+            conn_columns,
+            unit_columns,
+            tuple(input_ids),
+            tuple(output_ids),
+        )
 
     def add_unit(self, **field_values: float | int | bool) -> int:
         """Add a unit, filling unset fields with their defaults.
@@ -176,34 +269,90 @@ class NetworkBuilder[GS]:
     def finalize(self) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Freeze the accumulated units and connections into arenas.
 
-        Computes initial levels (topo.initial_levels), buckets conns by
-        source level with capacity_policy headroom, allocates arenas, and
-        freezes the static config.
+        Re-views the imperative per-edge / per-unit rows as one array per
+        settable field (in insertion order) and hands them to the shared
+        `_assemble` core, which validates ids, buckets conns by source level
+        with capacity_policy headroom, allocates arenas, and freezes the static
+        config (raising ValueError via `_assemble` on an out-of-range id).
 
         Returns:
             The (NetworkStatic, NetworkState) pair for the built network.
-
-        Raises:
-            ValueError: A referenced unit id is out of range.
         """
         num_units = len(self._units)
-        for unit_id in (
-            *self._input_ids,
-            *self._output_ids,
-            *self._conn_src,
-            *self._conn_dst,
-        ):
-            if not 0 <= unit_id < num_units:
-                raise ValueError(
-                    f"finalize: unit id {unit_id} out of range [0, {num_units})"
-                )
-
         if self._conn_src:
             src_arr = np.asarray(self._conn_src, dtype=np.int32)
             dst_arr = np.asarray(self._conn_dst, dtype=np.int32)
         else:
             src_arr = np.zeros((0,), dtype=np.int32)
             dst_arr = np.zeros((0,), dtype=np.int32)
+
+        # Column-major re-view of the row dicts: one (E,) / (num_units,) array
+        # per settable field, in insertion order -- the assembler's contract.
+        conn_columns = {
+            name: np.asarray([row[name] for row in self._conn_values])
+            for name in self._settable_conn_fields
+        }
+        unit_columns = {
+            name: np.asarray([row[name] for row in self._units])
+            for name in self._settable_unit_fields
+        }
+        return self._assemble(
+            num_units,
+            src_arr,
+            dst_arr,
+            conn_columns,
+            unit_columns,
+            tuple(self._input_ids),
+            tuple(self._output_ids),
+        )
+
+    def _assemble(
+        self,
+        num_units: int,
+        src_arr: np.ndarray,
+        dst_arr: np.ndarray,
+        conn_columns: dict[str, np.ndarray],
+        unit_columns: dict[str, np.ndarray],
+        input_ids: tuple[int, ...],
+        output_ids: tuple[int, ...],
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
+        """Bucket, sort, and pad whole edge columns into frozen arenas.
+
+        The single construction core both `finalize` (imperative rows) and
+        `from_edges` (vectorized arrays) feed: computes initial levels, buckets
+        edges by source level, stable-sorts each bucket by destination id, pads
+        to a capacity_policy capacity with tombstoned slots, and freezes the
+        static config. The built-in `from_id`/`to_id`/`dead` columns and the
+        derived `level` are filled here; callers supply only settable fields.
+
+        Args:
+            num_units: Total unit count.
+            src_arr: (E,) int32 source ids in insertion order.
+            dst_arr: (E,) int32 destination ids (parallel to src_arr).
+            conn_columns: Settable conn field name -> (E,) values.
+            unit_columns: Settable unit field name -> (num_units,) values.
+            input_ids: Input unit ids.
+            output_ids: Output unit ids.
+
+        Returns:
+            The (NetworkStatic, NetworkState) pair for the built network.
+
+        Raises:
+            ValueError: A referenced unit id or edge endpoint is out of range.
+        """
+        for unit_id in (*input_ids, *output_ids):
+            if not 0 <= unit_id < num_units:
+                raise ValueError(
+                    f"finalize: unit id {unit_id} out of range [0, {num_units})"
+                )
+        if src_arr.size:
+            lo = min(int(src_arr.min()), int(dst_arr.min()))
+            hi = max(int(src_arr.max()), int(dst_arr.max()))
+            if lo < 0 or hi >= num_units:
+                raise ValueError(
+                    f"finalize: an edge endpoint is out of range [0, {num_units})"
+                )
+
         edges = (
             np.stack([src_arr, dst_arr], axis=1)
             if src_arr.size
@@ -225,8 +374,9 @@ class NetworkBuilder[GS]:
             if spec.name == LEVEL.name:
                 unit_cols[spec.name] = jnp.asarray(levels, dtype=spec.dtype)
             else:
-                values = [row[spec.name] for row in self._units]
-                unit_cols[spec.name] = jnp.asarray(values, dtype=spec.dtype)
+                unit_cols[spec.name] = jnp.asarray(
+                    unit_columns[spec.name], dtype=spec.dtype
+                )
 
         if self.net.propagation is Propagation.PIPELINE:
             # Single flat arena: every conn lands in bucket 0 regardless of
@@ -261,11 +411,11 @@ class NetworkBuilder[GS]:
                 elif spec.name == DEAD.name:
                     live_vals = np.zeros((live,), dtype=np.bool_)
                 else:
-                    live_vals = np.asarray(
-                        [self._conn_values[j][spec.name] for j in order.tolist()]
-                    )
+                    live_vals = conn_columns[spec.name][order]
                 pad_vals = np.full((pad,), spec.default, dtype=spec.dtype)
-                full = np.concatenate([live_vals.astype(spec.dtype), pad_vals])
+                full = np.concatenate(
+                    [np.asarray(live_vals).astype(spec.dtype), pad_vals]
+                )
                 cols[spec.name] = jnp.asarray(full)
             conns.append(cols)
             level_capacities.append(capacity)
@@ -277,8 +427,8 @@ class NetworkBuilder[GS]:
             conn_fields=self._conn_fields,
             level_capacities=tuple(level_capacities),
             kahn_max_depth=self.net.kahn_max_depth,
-            input_ids=tuple(self._input_ids),
-            output_ids=tuple(self._output_ids),
+            input_ids=input_ids,
+            output_ids=output_ids,
             sharding=self.net.sharding,
         )
         state = NetworkState(

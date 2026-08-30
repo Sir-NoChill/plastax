@@ -18,6 +18,7 @@ Module scopes (src/plastax/):
 - `step` — step.py (assembly, jit, donation, caching)
 - `builder` — builder.py (host construction, finalize, from_topology)
 - `driver` — driver.py (host loop, retrace/overflow protocol)
+- `distributed` — distributed.py (multi-controller state placement, Scheme-A mesh)
 - `topology` — topology.py (dense/conv2d/sequential generators)
 - `optim` — optim/ (Optimizer bundles: sgd, momentum, adam; state_fields contract)
 

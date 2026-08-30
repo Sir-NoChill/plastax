@@ -430,6 +430,103 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+@dataclasses.dataclass(frozen=True)
+class ShortlistCoverage:
+    """How much of one bucket's destination population a shortlist can reach.
+
+    Attributes:
+        bucket: the source-level bucket index.
+        candidate_units: the shortlist size M the AddConn declares.
+        source_units: units sitting at this bucket's source level.
+        destination_units: units this bucket may grow INTO, i.e. those within
+            the neighbourhood window and strictly deeper.
+        covered: whether M reaches every eligible destination.
+    """
+
+    bucket: int
+    candidate_units: int
+    source_units: int
+    destination_units: int
+    covered: bool
+
+
+def shortlist_coverage[GS](
+    net: type[Network[GS]], static: NetworkStatic, state: NetworkState[GS]
+) -> tuple[ShortlistCoverage, ...]:
+    """Report, per bucket, whether the growth shortlist reaches every destination.
+
+    A shortlisted `add_conn` draws candidates from the M most important sources
+    at a bucket's own level crossed with the M most important eligible
+    destinations. **M therefore bounds how many distinct units can receive a new
+    edge**, which is a different and usually tighter constraint than the
+    "M >= sqrt(zeta * E)" volume rule: a bucket whose destination layer is wider
+    than M can only ever refill into M of those units, so a
+    count-conserving churn quietly under-fills and the realized sparsity drifts
+    away from the target. Measured on a 16-unit hidden layer, M=8 bled a
+    128-edge arena down to 121-125 while M>=16 held it exactly.
+
+    This runs on the host against a built state, because the level assignment
+    that decides which units are eligible is runtime data, not static config --
+    so the traced phase cannot check it for you.
+
+    Args:
+        net: the network type whose ``add_conn`` declares the shortlist.
+        static: static network configuration.
+        state: a built state, read for its LEVEL column.
+
+    Returns:
+        One ShortlistCoverage per bucket, empty when the net declares no
+        shortlist (the exhaustive grid always covers everything).
+    """
+    add_conn = net.add_conn
+    max_candidate_units: int | None = getattr(add_conn, "max_candidate_units", None)
+    if add_conn is None or max_candidate_units is None:
+        return ()
+    levels = np.asarray(state.units[LEVEL.name])
+    neighbourhood = net.neighbourhood
+    out: list[ShortlistCoverage] = []
+    for bucket in range(len(static.level_capacities)):
+        sources = int(np.sum(levels == bucket))
+        # matches build_add_conn_phase's own window: strictly deeper, within
+        # the neighbourhood radius.
+        destinations = int(
+            np.sum((levels > bucket) & (levels <= bucket + neighbourhood))
+        )
+        out.append(
+            ShortlistCoverage(
+                bucket=bucket,
+                candidate_units=max_candidate_units,
+                source_units=sources,
+                destination_units=destinations,
+                covered=max_candidate_units >= destinations,
+            )
+        )
+    return tuple(out)
+
+
+def recommended_shortlist[GS](
+    net: type[Network[GS]], static: NetworkStatic, state: NetworkState[GS]
+) -> int:
+    """Smallest shortlist that reaches every eligible destination in every bucket.
+
+    Use as a floor, not a target: it satisfies the destination-coverage
+    constraint only. The candidate *volume* rule still applies on top -- a churn
+    frees about ``zeta * E`` slots and can refill only from the shortlisted
+    grid, so size M above ``sqrt(zeta * E)`` as well.
+
+    Args:
+        net: the network type whose ``add_conn`` declares the shortlist.
+        static: static network configuration.
+        state: a built state, read for its LEVEL column.
+
+    Returns:
+        The maximum eligible-destination count over buckets, or 0 when the net
+        declares no shortlist.
+    """
+    coverage = shortlist_coverage(net, static, state)
+    return max((c.destination_units for c in coverage), default=0)
+
+
 def build_add_conn_phase[GS](
     net: type[Network[GS]],
     static: NetworkStatic,

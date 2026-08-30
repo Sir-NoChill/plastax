@@ -192,3 +192,54 @@ def test_churn_conserves_live_edges() -> None:
         assert len(set(live_history)) == 1, (
             f"{method}: live-edge count drifted: {sorted(set(live_history))}"
         )
+
+
+def test_cosine_zeta_anneals_to_zero() -> None:
+    """The rewiring fraction starts at zeta0, decreases, and ends exactly at 0.
+
+    Ending at 0 is the point of the schedule: the last cycles refine the wiring
+    the earlier ones found instead of tearing it up right before the net is
+    measured.
+    """
+    num_cycles = 10
+    schedule = [xmc.cosine_zeta(0.3, c, num_cycles) for c in range(num_cycles)]
+    np.testing.assert_allclose(schedule[0], 0.3, rtol=1e-6)
+    np.testing.assert_allclose(schedule[-1], 0.0, atol=1e-9)
+    assert all(a > b for a, b in zip(schedule[:-1], schedule[1:], strict=True))
+    # A single-cycle run has no schedule to walk; don't prune at all.
+    assert xmc.cosine_zeta(0.3, 0, 1) == 0.0
+
+
+def test_zeta_column_controls_pruning() -> None:
+    """zeta is a runtime column: 0 makes churn a no-op, >0 rewires.
+
+    Both cases run the SAME compiled churn step, which is what lets the host
+    anneal between cycles without retracing.
+    """
+    split = xmc.synthetic_split(32, 128, 256, nnz=8, rank=8, seed=0)
+    optimizer = px.optim.adam(0.01, GradPreAct)
+    churn_net = xmc.make_net(
+        optimizer, method="rigl", mode="churn", max_candidates=4096, shortlist=32
+    )
+    static, base = xmc.build_xmc_net(
+        churn_net,
+        split.num_features,
+        split.num_labels,
+        32,
+        hidden_fan_in=16,
+        label_fan_in=4,
+        seed=0,
+    )
+    churn_step = px.make_step(churn_net, static)
+    inputs = px.StepInputs(inputs=jnp.asarray(split.dense_input(0)), targets=None)
+
+    def live_after(zeta: float) -> set[tuple[int, int]]:
+        state = jax.tree.map(jnp.copy, base)
+        state = churn_step(xmc.set_zeta(state, zeta), inputs).state
+        return set(_edge_weights(state))
+
+    before = set(_edge_weights(base))
+    assert live_after(0.0) == before, "zeta=0 must leave the wiring untouched"
+    rewired = live_after(0.3)
+    assert len(rewired) == len(before), "churn must conserve the live-edge count"
+    assert rewired != before, "zeta>0 must actually rewire"

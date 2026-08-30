@@ -41,6 +41,16 @@ def test_seed_set_is_pinned_by_value() -> None:
     assert len(set(protocol.SEEDS)) == len(protocol.SEEDS)
 
 
+def test_confirmation_seeds_are_disjoint_from_the_main_block() -> None:
+    """A held-out block only confirms if it shares no seed with the first.
+
+    An amended rule re-run on the seeds that motivated the amendment reproduces
+    the same numbers and confirms nothing.
+    """
+    assert not set(protocol.SEEDS) & set(protocol.CONFIRMATION_SEEDS)
+    assert len(protocol.CONFIRMATION_SEEDS) == len(protocol.SEEDS)
+
+
 def test_summary_reports_percentiles_not_standard_error() -> None:
     """The summary is order statistics, so it tracks spread rather than shrinking.
 
@@ -88,16 +98,53 @@ def test_paired_difference_rejects_mismatched_lengths() -> None:
         protocol.paired_difference([1.0, 2.0], [1.0])
 
 
-def test_verdict_follows_the_prereigstered_rule() -> None:
-    """Overlap with zero is 'no effect', never reported as a trend."""
-    better = protocol.summarize([-3.0, -2.0, -1.0])
-    worse = protocol.summarize([1.0, 2.0, 3.0])
-    overlapping = protocol.summarize([-2.0, 0.0, 2.0])
-    assert protocol.verdict(better) == "better"
-    assert protocol.verdict(worse) == "worse"
-    assert protocol.verdict(overlapping) == "no effect at this power"
-    # lower_is_better=False flips which sign counts as an improvement
-    assert protocol.verdict(worse, lower_is_better=False) == "better"
+def test_sign_test_counts_wins_and_drops_ties() -> None:
+    """Ties reduce the effective sample rather than counting as half a win."""
+    test = protocol.sign_test([1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 3.0, 3.0])
+    assert (test.wins, test.losses, test.ties) == (2, 1, 1)
+    assert test.effective_n == 3
+
+
+def test_sign_test_rejects_the_case_the_old_rule_missed() -> None:
+    """27 of 30 wins must be an effect; the retired IPR-90 rule called it none.
+
+    This is the regression the amendment exists for. IPR-90 excluding zero
+    demands the 5th-to-95th band lie one side of zero, i.e. at least 29/30
+    wins, so it reported no effect at p = 4e-06.
+    """
+    control = [10.0] * 30
+    treatment = [9.0] * 27 + [11.0] * 3
+    test = protocol.sign_test(treatment, control)
+    assert test.wins == 27
+    assert test.p_value < 1e-5
+    assert protocol.verdict(test) == "better"
+    # and the old criterion would still straddle zero on this same data
+    assert not protocol.paired_difference(treatment, control).excludes_zero
+
+
+def test_verdict_requires_direction_as_well_as_significance() -> None:
+    """A consistent shift the WRONG way is 'worse', not 'better'."""
+    control = [10.0] * 30
+    worse = [11.0] * 27 + [9.0] * 3
+    assert protocol.verdict(protocol.sign_test(worse, control)) == "worse"
+    # flipping the objective flips the reading of the same data
+    flipped = protocol.sign_test(worse, control, lower_is_better=False)
+    assert protocol.verdict(flipped, lower_is_better=False) == "better"
+
+
+def test_verdict_reports_no_effect_when_split() -> None:
+    """A coin-flip split is not an effect however many seeds are run."""
+    control = [10.0] * 30
+    treatment = [9.0] * 15 + [11.0] * 15
+    assert protocol.verdict(protocol.sign_test(treatment, control)) == (
+        "no effect at this power"
+    )
+
+
+def test_sign_test_rejects_mismatched_lengths() -> None:
+    """A dropped seed must be an error, never a silent realignment."""
+    with pytest.raises(ValueError):
+        protocol.sign_test([1.0, 2.0], [1.0])
 
 
 def test_summarize_rejects_empty() -> None:

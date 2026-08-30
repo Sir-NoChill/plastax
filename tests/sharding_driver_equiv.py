@@ -13,9 +13,10 @@ single-device Driver exactly. This pins that:
     scatter + sort) produces the same capacities, levels, and conn columns.
 
 This is the single-controller (multi-device) case. True multi-controller
-(jax.distributed, one process per node) additionally needs the state to be a
-global array across processes; the host-side logic here is the same SPMD path,
-validated separately on a multi-node run.
+(jax.distributed, one process per node) additionally needs the state built as a
+global array across processes via `plastax.distribute_state`; the host-side logic
+here is the same SPMD path, validated across genuinely separate processes in
+`tests/mc_driver_equiv.py` (grow + resort) and `tests/mc_sharding_equiv.py`.
 
 Run directly (`python tests/sharding_driver_equiv.py`) or via the wrapper in
 test_sharding_driver.py.

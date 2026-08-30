@@ -8,7 +8,7 @@ mask over a dense weight matrix -- the label edges that exist are the only
 ones stored.
 
 Differences from `dst_sparse.py`, which supplies the DST policies unchanged
-(`MagnitudeStats` pruning, `RandomGrow`/`GradientGrow` regrowth, the shortlist):
+(magnitude pruning, `RandomGrow`/`GradientGrow` regrowth, the shortlist):
 
 * **ReLU hidden, linear output.** Sigmoid hidden units saturate on BoW inputs
   with 10^5 features; the output unit holds the raw logit so the loss can use
@@ -29,6 +29,7 @@ Run:  uv run python examples/xmc.py            # synthetic fallback
 
 from __future__ import annotations
 
+import math
 import os
 import time
 
@@ -39,7 +40,6 @@ from dst_sparse import (
     SET_CURSOR,
     SET_THRESH,
     GradientGrow,
-    MagnitudeStats,
     RandomGrow,
     SetPrune,
     build_sparse_mlp,
@@ -53,7 +53,14 @@ import plastax as px
 # construction (see `mark_outputs`) and never written by a phase.
 IS_OUT = px.FieldSpec.float32("xmc/is_out")
 
-_UNIT_FIELDS = (GradPreAct, LossGrad, SET_THRESH, SET_CURSOR, IS_OUT)
+# The per-unit prune fraction. A COLUMN rather than a trace-time constant so the
+# host can anneal it between cycles without retracing the churn step: both SET
+# (Mocanu 2018) and RigL (Evci 2020) decay the rewiring fraction to zero over
+# training, and a constant fraction right up to the final cycle leaves the net
+# freshly disrupted at the point it is measured.
+ZETA = px.FieldSpec.float32("xmc/zeta")
+
+_UNIT_FIELDS = (GradPreAct, LossGrad, SET_THRESH, SET_CURSOR, IS_OUT, ZETA)
 _GROWTH = {"set": RandomGrow, "rigl": GradientGrow}
 
 
@@ -170,6 +177,77 @@ class BCEWithLogitsLoss(px.Loss):
         return loss, px.UnitWrite.of((LossGrad, grad))
 
 
+class AnnealedMagnitudeStats(px.ForwardPass):
+    """dst_sparse.MagnitudeStats with the prune fraction read from a column.
+
+    Identical statistics -- reduce `(count, sum|w|)` over each unit's live
+    incoming edges and write the half-normal zeta-quantile threshold
+    `tau = sqrt(pi)*erfinv(zeta)*mean|w|` -- but `zeta` comes from the ZETA unit
+    column instead of being bound at construction, so `set_zeta` can change it
+    between cycles against the same compiled step. At zeta = 0 the threshold is
+    0, nothing is pruned, and the churn step becomes a no-op: that is what lets
+    an annealing schedule end training with the learned wiring intact.
+    """
+
+    combine = (px.monoid.sum_, px.monoid.sum_)
+
+    def map(
+        self,
+        u: px.UnitView,
+        dst: px.UnitIdx,
+        src: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Contribute (1, |weight|) for one live incoming edge."""
+        del u, dst, src, g
+        return jnp.float32(1.0), jnp.abs(c[px.WEIGHT, cid])
+
+    def apply(
+        self,
+        u: px.UnitView,
+        i: px.UnitIdx,
+        g: None,
+        acc: tuple[jax.Array, jax.Array],
+    ) -> px.UnitWrite:
+        """Write this unit's prune threshold and advance its rewiring cursor."""
+        del g
+        count, sum_abs = acc
+        mean_abs = sum_abs / jnp.maximum(count, jnp.float32(1.0))
+        alpha = jnp.sqrt(jnp.pi) * jax.scipy.special.erfinv(u[ZETA, i])
+        return px.UnitWrite.of(
+            (SET_THRESH, alpha * mean_abs),
+            (SET_CURSOR, u[SET_CURSOR, i] + jnp.int32(1)),
+        )
+
+
+def set_zeta(state: px.NetworkState[None], zeta: float) -> px.NetworkState[None]:
+    """Set the prune fraction on every unit; returns the updated state."""
+    column = jnp.full_like(state.units[ZETA.name], jnp.float32(zeta))
+    state.units = {**state.units, ZETA.name: column}
+    return state
+
+
+def cosine_zeta(zeta0: float, cycle: int, num_cycles: int) -> float:
+    """RigL's cosine-annealed rewiring fraction for one cycle.
+
+    `f_decay(t) = zeta0/2 * (1 + cos(pi*t/T_end))` (Evci 2020 eq. 3), which
+    starts at zeta0 and reaches exactly 0 on the final cycle.
+
+    Args:
+        zeta0: the initial prune fraction.
+        cycle: 0-based index of the current cycle.
+        num_cycles: total cycles in the run.
+
+    Returns:
+        The prune fraction for this cycle.
+    """
+    if num_cycles <= 1:
+        return 0.0
+    return 0.5 * zeta0 * (1.0 + math.cos(math.pi * cycle / (num_cycles - 1)))
+
+
 def make_net(
     optimizer: px.optim.Optimizer,
     *,
@@ -226,10 +304,11 @@ def make_net(
         return _Eval
 
     if mode == "churn":
+        del zeta  # now a runtime column (ZETA); see AnnealedMagnitudeStats
         grow = _GROWTH[method](max_candidates, grow_scale, shortlist)
 
         class _Churn(px.Network[None]):
-            forward_pass = MagnitudeStats(zeta)
+            forward_pass = AnnealedMagnitudeStats()
             prune_conn = SetPrune()
             add_conn = grow
             extra_unit_fields = _UNIT_FIELDS
@@ -407,6 +486,7 @@ def run(
     shortlist: int | None = 512,
     lr: float = 0.01,
     zeta: float = 0.3,
+    anneal: bool = True,
     pos_weight: float = 64.0,
     steps_per_cycle: int = 512,
     num_cycles: int = 20,
@@ -424,7 +504,9 @@ def run(
         label_fan_in: average live incoming edges per label unit.
         shortlist: M for the shortlisted growth grid, or None for exhaustive.
         lr: adam learning rate.
-        zeta: target per-unit prune fraction.
+        zeta: initial per-unit prune fraction.
+        anneal: cosine-decay the prune fraction to 0 over the run (RigL eq. 3);
+            False holds it at ``zeta`` for every cycle.
         pos_weight: positive-class weight in the loss.
         steps_per_cycle: training examples between rewiring events.
         num_cycles: number of (train-then-churn) cycles.
@@ -492,6 +574,12 @@ def run(
             )
             state = result.state
             cycle_loss += float(result.loss)
+        # Anneal the rewiring fraction toward 0 (RigL eq. 3) so the final
+        # cycles refine the wiring the earlier ones found instead of tearing it
+        # up right before the net is measured. Writing the ZETA column reuses
+        # the already-compiled churn step -- no retrace.
+        cycle_zeta = cosine_zeta(zeta, cycle, num_cycles) if anneal else zeta
+        state = set_zeta(state, cycle_zeta)
         # Re-scatter the last training input so the activations RigL's growth
         # score reads stay consistent with the persisted grad_pre_act.
         state = churn_step(state, px.StepInputs(inputs=last_inputs, targets=None)).state
@@ -501,7 +589,7 @@ def run(
             elapsed = time.perf_counter() - started
             print(
                 f"  cycle {cycle:3d}  loss {cycle_loss / steps_per_cycle:9.4f}"
-                f"  live {live_history[-1]:9d}"
+                f"  zeta {cycle_zeta:.3f}  live {live_history[-1]:9d}"
                 f"  P@1 {precision[0]:.3f}  P@3 {precision[1]:.3f}"
                 f"  P@5 {precision[2]:.3f}  {elapsed:6.1f}s"
             )

@@ -44,13 +44,22 @@ Run:  uv run python examples/ne.py
 from __future__ import annotations
 
 import math
+import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from dst_sparse import SET_CURSOR, _hash01
 from mlp_xor import GradPreAct, LossGrad, MSELoss
-from nonstationary import ACT_EMA, IS_OUT, ReluBackward, ReluForward, mark_outputs
+from nonstationary import (
+    ACT_EMA,
+    IS_OUT,
+    CycleRecord,
+    DriftingTask,
+    ReluBackward,
+    ReluForward,
+    mark_outputs,
+)
 
 import plastax as px
 
@@ -428,3 +437,123 @@ def set_prune_probability(
     column = np.where(elastic, np.float32(probability), np.float32(0.0))
     state.units = {**state.units, NE_PRUNE_P.name: jnp.asarray(column)}
     return state
+
+
+def run(
+    *,
+    theta: float = math.pi / 4,
+    switch_period: int | None = 15,
+    d: int = 32,
+    hidden_layers: tuple[int, ...] = (128, 128),
+    classes: int = 8,
+    lr: float = 0.001,
+    initial_density: float = 0.2,
+    terminal_density: float = 1.0,
+    alpha: float = 0.3,
+    omega: float = 0.5,
+    tau: float = 1e-6,
+    shortlist: int | None = 128,
+    steps_per_cycle: int = 100,
+    num_cycles: int = 600,
+    grow_until: float = 0.8,
+    seed: int = 0,
+) -> tuple[list[CycleRecord], list[tuple[int, float, int]]]:
+    """Train on the drifting teacher while NE grows the interior.
+
+    Args:
+        theta: rotation angle per switch.
+        switch_period: cycles between switches, or None for stationary.
+        d: input dimensionality.
+        hidden_layers: width of each hidden layer; needs at least two so there
+            is an interior transition to grow.
+        classes: output classes.
+        lr: adam learning rate.
+        initial_density: interior density at the start.
+        terminal_density: interior density the headroom must accommodate.
+        alpha: initial growth rate for the cosine schedule.
+        omega: pruning cap as a fraction of the growth count.
+        tau: dormancy threshold.
+        shortlist: M for the growth candidate grid, or None for exhaustive.
+        steps_per_cycle: training examples per cycle.
+        num_cycles: cycles to run.
+        grow_until: fraction of the run after which growth shuts down.
+        seed: PRNG seed.
+
+    Returns:
+        The per-cycle records, and a per-cycle (dormant count, growth rate,
+        interior live edges) trace -- the diagnostic that shows whether the
+        pruning half ever fires.
+    """
+    layers = (d + 1, *hidden_layers, classes)
+    optimizer = px.optim.adam(lr, GradPreAct)
+    train_net = make_net(optimizer, mode="train")
+    grow_budget = max(1024, (shortlist or 32) ** 2)
+    churn_net = make_net(
+        optimizer,
+        mode="churn",
+        tau=tau,
+        max_candidates=grow_budget,
+        shortlist=shortlist,
+    )
+    static, state = build_ne_net(
+        train_net,
+        layers,
+        initial_density=initial_density,
+        terminal_density=terminal_density,
+        seed=seed,
+    )
+    train_step = px.make_step(train_net, static)
+    churn_step = px.make_step(churn_net, static)
+
+    task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
+    eye = np.eye(classes, dtype=np.float32)
+    elastic = np.asarray(state.units[NE_ELASTIC.name]) > 0.5
+    hidden_units = np.arange(layers[0], sum(layers) - classes)
+    out_ids = np.asarray(static.output_ids)
+    dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
+    horizon = int(grow_until * num_cycles)
+
+    records: list[CycleRecord] = []
+    trace: list[tuple[int, float, int]] = []
+    last_inputs = jnp.zeros((layers[0],), dtype=jnp.float32)
+    for cycle in range(num_cycles):
+        task.advance(cycle)
+        started = time.perf_counter()
+        total_loss, correct = 0.0, 0
+        for _ in range(steps_per_cycle):
+            inputs, label = task.sample()
+            result = train_step(
+                state, px.StepInputs(inputs=inputs, targets=jnp.asarray(eye[label]))
+            )
+            state = result.state
+            total_loss += float(result.loss)
+            preds = np.asarray(state.units[px.ACTIVATION.name])[out_ids]
+            correct += int(np.argmax(preds) == label)
+            last_inputs = inputs
+
+        rate = cosine_growth_rate(cycle, horizon, alpha)
+        dormant = int(((np.asarray(state.units[ACT_EMA.name]) <= tau) & elastic).sum())
+        state = set_growth_rate(state, rate)
+        state = set_prune_probability(
+            state, omega=omega, expected_grown=rate * int(elastic.sum()), tau=tau
+        )
+        state = churn_step(state, px.StepInputs(inputs=last_inputs, targets=None)).state
+
+        interior = int((~np.asarray(state.conns[1][px.DEAD.name])).sum())
+        trace.append((dormant, rate, interior))
+        live = int(px.state.live_conn_count(state))
+        ema = np.asarray(state.units[ACT_EMA.name])[hidden_units]
+        records.append(
+            CycleRecord(
+                cycle=cycle,
+                loss=total_loss / steps_per_cycle,
+                accuracy=correct / steps_per_cycle,
+                live_edges=live,
+                density=live / dense_edges,
+                dormant=float(np.mean(ema < 0.01)),
+                mean_abs_w=0.0,
+                switched=task.switched,
+                seconds=time.perf_counter() - started,
+            )
+        )
+    return records, trace

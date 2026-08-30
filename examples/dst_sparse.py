@@ -297,6 +297,8 @@ def build_sparse_mlp(
     layer_sizes: tuple[int, ...],
     budgets: tuple[int, ...],
     seed: int,
+    *,
+    capacity_headroom: float = 0.0,
 ) -> tuple[px.NetworkStatic, px.NetworkState[None]]:
     """Build a layered MLP wired sparsely at a fixed per-layer edge budget.
 
@@ -309,6 +311,8 @@ def build_sparse_mlp(
         layer_sizes: units per layer, input first (include a bias input).
         budgets: live edges per consecutive layer pair.
         seed: numpy PRNG seed.
+        capacity_headroom: extra dead-slot fraction to pre-allocate per bucket,
+            forwarded to NetworkBuilder.from_edges; 0.0 packs to the budget.
 
     Returns:
         The finalized (static, state) pair.
@@ -348,6 +352,7 @@ def build_sparse_mlp(
         input_ids=tuple(range(layer_sizes[0])),
         output_ids=tuple(range(offsets[-1], running)),
         globals_=None,
+        capacity_headroom=capacity_headroom,
     )
 
 

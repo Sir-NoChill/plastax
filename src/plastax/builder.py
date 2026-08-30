@@ -84,6 +84,7 @@ class NetworkBuilder[GS]:
         key: PRNGKeyArray,
         *,
         globals_: GS,
+        capacity_headroom: float = 0.0,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Expand a plastax.topology spec into arenas.
 
@@ -95,6 +96,8 @@ class NetworkBuilder[GS]:
             topology_fn: Draws a topology spec from a PRNG key.
             key: PRNG key passed to topology_fn.
             globals_: The network's globals value.
+            capacity_headroom: Extra dead-slot fraction to pre-allocate per
+                bucket (see from_edges); 0.0 sizes buckets to the live count.
 
         Returns:
             The finalized (NetworkStatic, NetworkState) pair.
@@ -109,6 +112,7 @@ class NetworkBuilder[GS]:
             input_ids=spec.input_ids,
             output_ids=spec.output_ids,
             globals_=globals_,
+            capacity_headroom=capacity_headroom,
         )
 
     @classmethod
@@ -124,6 +128,7 @@ class NetworkBuilder[GS]:
         output_ids: Sequence[int],
         globals_: GS,
         extra_conn_columns: Mapping[str, np.ndarray] | None = None,
+        capacity_headroom: float = 0.0,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Build arenas from whole edge-column arrays, no per-edge Python.
 
@@ -153,13 +158,19 @@ class NetworkBuilder[GS]:
             extra_conn_columns: Optional per-edge values for settable conn
                 fields (e.g. an optimizer's ``opt/…`` columns), each ``(E,)``;
                 unset fields take their spec default.
+            capacity_headroom: Extra dead-slot fraction to pre-allocate per
+                bucket above its live count (0.0 = size to live). Reserves
+                slots add_conn can grow into device-resident, cutting overflow
+                -> host grow_bucket rebuilds; capacity stays a power of two, so
+                Scheme-A divisibility holds. See topo.capacity_policy.
 
         Returns:
             The finalized (NetworkStatic, NetworkState) pair.
 
         Raises:
             ValueError: On mismatched array lengths, an out-of-range unit id,
-                or an unknown/non-settable ``extra_conn_columns`` key.
+                an unknown/non-settable ``extra_conn_columns`` key, or a
+                negative ``capacity_headroom``.
         """
         builder = cls(net, globals_)
         src_arr = np.asarray(from_ids, dtype=np.int32)
@@ -208,6 +219,7 @@ class NetworkBuilder[GS]:
             unit_columns,
             tuple(input_ids),
             tuple(output_ids),
+            capacity_headroom=capacity_headroom,
         )
 
     def add_unit(self, **field_values: float | int | bool) -> int:
@@ -266,7 +278,9 @@ class NetworkBuilder[GS]:
         """Mark a unit id as a network output."""
         self._output_ids.append(unit_id)
 
-    def finalize(self) -> tuple[NetworkStatic, NetworkState[GS]]:
+    def finalize(
+        self, *, capacity_headroom: float = 0.0
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Freeze the accumulated units and connections into arenas.
 
         Re-views the imperative per-edge / per-unit rows as one array per
@@ -274,6 +288,11 @@ class NetworkBuilder[GS]:
         `_assemble` core, which validates ids, buckets conns by source level
         with capacity_policy headroom, allocates arenas, and freezes the static
         config (raising ValueError via `_assemble` on an out-of-range id).
+
+        Args:
+            capacity_headroom: Extra dead-slot fraction to pre-allocate per
+                bucket for device-resident growth (see from_edges); 0.0 sizes
+                each bucket to its live count.
 
         Returns:
             The (NetworkStatic, NetworkState) pair for the built network.
@@ -304,6 +323,7 @@ class NetworkBuilder[GS]:
             unit_columns,
             tuple(self._input_ids),
             tuple(self._output_ids),
+            capacity_headroom=capacity_headroom,
         )
 
     def _assemble(
@@ -315,6 +335,8 @@ class NetworkBuilder[GS]:
         unit_columns: dict[str, np.ndarray],
         input_ids: tuple[int, ...],
         output_ids: tuple[int, ...],
+        *,
+        capacity_headroom: float = 0.0,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Bucket, sort, and pad whole edge columns into frozen arenas.
 
@@ -333,6 +355,8 @@ class NetworkBuilder[GS]:
             unit_columns: Settable unit field name -> (num_units,) values.
             input_ids: Input unit ids.
             output_ids: Output unit ids.
+            capacity_headroom: Extra dead-slot fraction passed to
+                capacity_policy for each bucket (0.0 = size to live).
 
         Returns:
             The (NetworkStatic, NetworkState) pair for the built network.
@@ -398,7 +422,7 @@ class NetworkBuilder[GS]:
             idx = np.flatnonzero(bucket_of_conn == level_idx)
             order = idx[np.argsort(dst_arr[idx], kind="stable")]
             live = int(order.size)
-            capacity = topo.capacity_policy(live)
+            capacity = topo.capacity_policy(live, headroom=capacity_headroom)
             pad = capacity - live
 
             cols: Columns = {}

@@ -57,15 +57,32 @@ def _outgoing_abs_weight(
     return totals
 
 
-def test_utility_matches_numpy_oracle() -> None:
-    """utility(i) == |activation(i)| * sum_{j in out(i)} |w_ij|.
+def _incoming_abs_weight(
+    static: px.NetworkStatic, state: px.NetworkState[None]
+) -> np.ndarray:
+    """NumPy oracle for the adaptation term sum_{j in in(i)} |w_ji|."""
+    totals = np.zeros(static.num_units)
+    for bucket in state.conns:
+        dead = np.asarray(bucket[px.DEAD.name])
+        to_ids = np.asarray(bucket[px.TO_ID.name])[~dead]
+        weights = np.asarray(bucket[px.WEIGHT.name])[~dead]
+        np.add.at(totals, to_ids, np.abs(weights))
+    return totals
 
-    eta=1 makes the running average the instantaneous value, so the EMA cannot
-    hide a wrong reduction.
+
+def test_utility_matches_numpy_oracle() -> None:
+    """utility == (|h - f_hat| * sum|w_out|) / sum|w_in|, the paper's form.
+
+    Both reductions are checked at once, and they run in OPPOSITE directions:
+    sum|w_out| is a BackwardPass reduction into the source, sum|w_in| a
+    ForwardPass reduction into the destination. decay=0 collapses the running
+    average to the instantaneous value so no EMA can hide a wrong reduction, and
+    at the first churn the activation average is still 0, so f_hat is 0 and the
+    mean correction is inert.
     """
     optimizer = px.optim.adam(0.01, cbp.GradPreAct)
     static, state, train_net = cbp.build(optimizer, _LAYERS, 0)
-    churn_net = cbp.make_net(optimizer, mode="churn", eta=1.0, maturity=0)
+    churn_net = cbp.make_net(optimizer, mode="churn", decay=0.0, maturity=0)
     inputs = jnp.asarray(
         np.random.default_rng(0).standard_normal(_LAYERS[0]), jnp.float32
     )
@@ -75,7 +92,9 @@ def test_utility_matches_numpy_oracle() -> None:
     ).state
 
     activations = np.asarray(state.units[px.ACTIVATION.name])
-    expected = np.abs(activations) * _outgoing_abs_weight(static, state)
+    expected = (np.abs(activations) * _outgoing_abs_weight(static, state)) / np.maximum(
+        _incoming_abs_weight(static, state), 1e-8
+    )
 
     state = cbp.set_oracle_threshold(static, state, 0.05)
     state = px.make_step(churn_net, static)(
@@ -106,7 +125,7 @@ def test_reset_zeroes_outgoing_weights_and_optimizer_state() -> None:
     """A replaced unit stops driving the network and starts adam afresh."""
     optimizer = px.optim.adam(0.01, cbp.GradPreAct)
     static, state, train_net = cbp.build(optimizer, _LAYERS, 0)
-    churn_net = cbp.make_net(optimizer, mode="churn", eta=0.5, maturity=5)
+    churn_net = cbp.make_net(optimizer, mode="churn", decay=0.0, maturity=5)
     inputs = jnp.asarray(np.ones(_LAYERS[0]), jnp.float32)
     targets = jnp.asarray(np.eye(_LAYERS[-1], dtype=np.float32)[0])
     train_step = px.make_step(train_net, static)
@@ -137,7 +156,7 @@ def test_immature_unit_is_never_reset() -> None:
     """Age gating protects fresh units even with an unreachable threshold."""
     optimizer = px.optim.adam(0.01, cbp.GradPreAct)
     static, state, _ = cbp.build(optimizer, _LAYERS, 0)
-    churn_net = cbp.make_net(optimizer, mode="churn", eta=0.5, maturity=5)
+    churn_net = cbp.make_net(optimizer, mode="churn", decay=0.0, maturity=5)
     thresh = np.full(static.num_units, np.inf, dtype=np.float32)
     state.units = {**state.units, cbp.CBP_THRESH.name: jnp.asarray(thresh)}
     # every age starts at 0, i.e. below maturity

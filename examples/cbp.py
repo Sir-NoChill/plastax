@@ -81,6 +81,20 @@ CBP_RESET = px.FieldSpec.float32("cbp/reset")
 CBP_THRESH = px.FieldSpec.float32("cbp/thresh")
 # Mean utility of a unit's fan-in sources -- the first hop of the local rule.
 CBP_FANIN_UTIL = px.FieldSpec.float32("cbp/fanin_util")
+# Running average of this unit's activation. The paper's utility uses the
+# MEAN-CORRECTED contribution |h - f_hat|, not |h|: a unit whose activation is
+# large but constant carries no information downstream, so what counts is how
+# far it moves from its own average.
+CBP_ACT_AVG = px.FieldSpec.float32("cbp/act_avg")
+# sum |w_in| -- the paper's "adaptation utility" denominator. Its inverse is how
+# fast a unit can change its function, so a unit with heavy incoming weights is
+# harder to repurpose and is worth less. This is an INCOMING reduction, and the
+# outgoing sum is an outgoing one: the full CBP utility needs both directions,
+# and the arena has both as first-class operations.
+CBP_IN_ABS = px.FieldSpec.float32("cbp/in_abs")
+# Bias-corrected utility, written by the trace so host-side v0 selection and the
+# in-trace reset test rank units by exactly the same quantity.
+CBP_UTIL_HAT = px.FieldSpec.float32("cbp/util_hat")
 # Live incoming-edge count, used to scale reinitialized weights.
 CBP_FANIN = px.FieldSpec.float32("cbp/fanin")
 # Monotonic per-unit churn counter; the salt that makes a unit reset twice draw
@@ -98,6 +112,9 @@ _UNIT_FIELDS = (
     CBP_RESET,
     CBP_THRESH,
     CBP_FANIN_UTIL,
+    CBP_ACT_AVG,
+    CBP_IN_ABS,
+    CBP_UTIL_HAT,
     CBP_FANIN,
     CBP_CURSOR,
 )
@@ -111,7 +128,7 @@ class CbpFanInUtility(px.ForwardPass):
     reinitialized weight. Reads utilities written by the previous churn.
     """
 
-    combine = (px.monoid.sum_, px.monoid.sum_)
+    combine = (px.monoid.sum_, px.monoid.sum_, px.monoid.sum_)
 
     def map(
         self,
@@ -121,23 +138,24 @@ class CbpFanInUtility(px.ForwardPass):
         c: px.ConnView,
         cid: px.ConnIdx,
         g: None,
-    ) -> tuple[jax.Array, jax.Array]:
-        """Contribute (source utility, 1) for one live incoming edge."""
-        del dst, c, cid, g
-        return u[CBP_UTIL, src], jnp.float32(1.0)
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Contribute (source utility, |w|, 1) for one live incoming edge."""
+        del dst, g
+        return u[CBP_UTIL_HAT, src], jnp.abs(c[px.WEIGHT, cid]), jnp.float32(1.0)
 
     def apply(
         self,
         u: px.UnitView,
         i: px.UnitIdx,
         g: None,
-        acc: tuple[jax.Array, jax.Array],
+        acc: tuple[jax.Array, jax.Array, jax.Array],
     ) -> px.UnitWrite:
-        """Write this unit's fan-in mean utility and live fan-in count."""
+        """Write the fan-in mean utility, the adaptation sum, and the fan-in."""
         del u, i, g
-        total, count = acc
+        total_util, total_abs_w, count = acc
         return px.UnitWrite.of(
-            (CBP_FANIN_UTIL, total / jnp.maximum(count, jnp.float32(1.0))),
+            (CBP_FANIN_UTIL, total_util / jnp.maximum(count, jnp.float32(1.0))),
+            (CBP_IN_ABS, total_abs_w),
             (CBP_FANIN, count),
         )
 
@@ -156,25 +174,29 @@ class CbpUtility(px.BackwardPass):
     def __init__(
         self,
         *,
-        eta: float = 0.1,
+        decay: float = 0.99,
         maturity: int = 5,
         local: bool = False,
         local_scale: float = 0.5,
+        eps: float = 1e-8,
     ) -> None:
-        """Bind the utility EMA rate, age gate and threshold mode.
+        """Bind the running-average decay, age gate and threshold mode.
 
         Args:
-            eta: EMA rate for the running utility average.
+            decay: the paper's eta, the DECAY of both running averages (0.99).
+                Note this is the retention weight, not the update weight.
             maturity: churns a unit must survive before it may be reset.
             local: use the two-hop local threshold (v1) rather than the
                 host-written oracle threshold (v0).
             local_scale: fraction of the neighbourhood mean utility that sets
                 the v1 bar.
+            eps: floor on the adaptation denominator.
         """
-        self.eta = eta
+        self.decay = decay
         self.maturity = maturity
         self.local = local
         self.local_scale = local_scale
+        self.eps = eps
 
     def map(
         self,
@@ -200,17 +222,44 @@ class CbpUtility(px.BackwardPass):
         g: None,
         acc: tuple[jax.Array, jax.Array, jax.Array],
     ) -> px.UnitWrite:
-        """Update the utility average, age the unit, and decide replacement."""
+        """Update the utility average, age the unit, and decide replacement.
+
+        Implements the paper's full utility rather than the |h| * sum|w_out|
+        sketch: the contribution is MEAN-CORRECTED, both running averages are
+        bias-corrected against the unit's age the way Adam corrects against its
+        step count, and the whole thing is divided by the adaptation term
+        sum|w_in| that the forward pass reduced.
+        """
         del g
-        sum_abs_w, sum_neighbour_util, out_count = acc
-        utility = (jnp.float32(1.0) - jnp.float32(self.eta)) * u[
-            CBP_UTIL, i
-        ] + jnp.float32(self.eta) * jnp.abs(u[px.ACTIVATION, i]) * sum_abs_w
+        sum_abs_w_out, sum_neighbour_util, out_count = acc
+        decay = jnp.float32(self.decay)
+        age = u[CBP_AGE, i]
+        next_age = age + jnp.int32(1)
+        # Bias correction, as in Adam: a running average seeded at 0 is biased
+        # toward 0 for its first ~1/(1-decay) updates, which for decay=0.99 is
+        # 100 churns -- long enough that uncorrected utilities would rank young
+        # units below old ones for reasons that have nothing to do with utility.
+        correction = jnp.maximum(
+            jnp.float32(1.0) - decay ** jnp.maximum(age.astype(jnp.float32), 1.0),
+            jnp.float32(self.eps),
+        )
+
+        activation = u[px.ACTIVATION, i]
+        act_avg_prev = u[CBP_ACT_AVG, i]
+        act_avg = decay * act_avg_prev + (jnp.float32(1.0) - decay) * activation
+        act_hat = act_avg_prev / correction
+        contribution = jnp.abs(activation - act_hat) * sum_abs_w_out
+        adaptation = jnp.maximum(u[CBP_IN_ABS, i], jnp.float32(self.eps))
+        instantaneous = contribution / adaptation
+
+        utility_prev = u[CBP_UTIL, i]
+        utility = decay * utility_prev + (jnp.float32(1.0) - decay) * instantaneous
+        utility_hat = utility_prev / correction
 
         if self.local:
             # Hop two: this unit's bar is a fraction of what its downstream
             # neighbourhood averages. A unit with no outgoing edges (an output)
-            # gets a bar of 0 and is therefore never reset, which is correct --
+            # gets a bar of -1 and is therefore never reset, which is correct --
             # CBP replaces hidden units.
             threshold = jnp.float32(self.local_scale) * (
                 sum_neighbour_util / jnp.maximum(out_count, jnp.float32(1.0))
@@ -221,14 +270,16 @@ class CbpUtility(px.BackwardPass):
         else:
             threshold = u[CBP_THRESH, i]
 
-        mature = u[CBP_AGE, i] > jnp.int32(self.maturity)
-        reset = (utility < threshold) & mature
+        mature = age > jnp.int32(self.maturity)
+        reset = (utility_hat < threshold) & mature
+        zero = jnp.float32(0.0)
         return px.UnitWrite.of(
-            # A reset unit's utility is parked at the bar rather than left below
-            # it; the age gate is what actually protects it from re-selection.
-            (CBP_UTIL, jnp.where(reset, threshold, utility)),
-            (CBP_AGE, jnp.where(reset, jnp.int32(0), u[CBP_AGE, i] + jnp.int32(1))),
-            (CBP_RESET, jnp.where(reset, jnp.float32(1.0), jnp.float32(0.0))),
+            # The paper resets utility, the activation average and age to zero.
+            (CBP_UTIL, jnp.where(reset, zero, utility)),
+            (CBP_UTIL_HAT, jnp.where(reset, zero, utility_hat)),
+            (CBP_ACT_AVG, jnp.where(reset, zero, act_avg)),
+            (CBP_AGE, jnp.where(reset, jnp.int32(0), next_age)),
+            (CBP_RESET, jnp.where(reset, jnp.float32(1.0), zero)),
             (CBP_THRESH, threshold),
             (CBP_CURSOR, u[CBP_CURSOR, i] + jnp.int32(1)),
         )
@@ -304,7 +355,7 @@ def make_net(
     optimizer: px.optim.Optimizer,
     *,
     mode: str,
-    eta: float = 0.1,
+    decay: float = 0.99,
     maturity: int = 5,
     local: bool = False,
     local_scale: float = 0.5,
@@ -316,7 +367,8 @@ def make_net(
     Args:
         optimizer: the plastax.optim bundle.
         mode: ``"train"``, ``"churn"`` or ``"eval"``.
-        eta: utility EMA rate (churn).
+        decay: retention weight of the running averages (the paper's eta,
+            0.99); NOT the update weight.
         maturity: churns before a unit may be reset (churn).
         local: use the v1 two-hop threshold instead of the v0 oracle (churn).
         local_scale: fraction of the neighbourhood mean setting the v1 bar.
@@ -357,7 +409,10 @@ def make_net(
         class _Churn(px.Network[None]):
             forward_pass = CbpFanInUtility()
             backward_pass = CbpUtility(
-                eta=eta, maturity=maturity, local=local, local_scale=local_scale
+                decay=decay,
+                maturity=maturity,
+                local=local,
+                local_scale=local_scale,
             )
             update_conn = CbpReinit(optimizer.state_fields, init_scale=init_scale)
             extra_unit_fields = _UNIT_FIELDS
@@ -408,7 +463,7 @@ def set_oracle_threshold(
     Returns:
         The state with `cbp/thresh` written.
     """
-    utility = np.asarray(state.units[CBP_UTIL.name])
+    utility = np.asarray(state.units[CBP_UTIL_HAT.name])
     ages = np.asarray(state.units[CBP_AGE.name])
     levels = np.asarray(state.units[px.LEVEL.name])
     threshold = np.full(static.num_units, -1.0, dtype=np.float32)
@@ -418,7 +473,10 @@ def set_oracle_threshold(
         mature = members[ages[members] > maturity]
         if mature.size == 0:
             continue
-        count = min(mature.size, max(1, int(round(rho * members.size))))
+        # the paper replaces rho of the ELIGIBLE (mature) units per layer,
+        # not rho of the layer -- the two differ sharply early in a run when
+        # most units are still under the maturity gate.
+        count = min(mature.size, max(1, int(round(rho * mature.size))))
         chosen = mature[np.argsort(utility[mature], kind="stable")[:count]]
         threshold[chosen] = np.inf
     state.units = {**state.units, CBP_THRESH.name: jnp.asarray(threshold)}
@@ -467,7 +525,7 @@ def run(
     classes: int = 8,
     lr: float = 0.001,
     rho: float = 0.05,
-    eta: float = 0.1,
+    decay: float = 0.99,
     maturity: int = 5,
     local_scale: float = 0.5,
     churn_period: int = 1,
@@ -487,7 +545,7 @@ def run(
         classes: output classes.
         lr: adam learning rate.
         rho: replacement rate for the v0 quantile.
-        eta: utility EMA rate.
+        decay: retention weight of the running averages (the paper's eta).
         maturity: churns before a unit may be reset.
         local_scale: fraction of the neighbourhood mean setting the v1 bar.
         churn_period: cycles between replacement events.
@@ -513,7 +571,7 @@ def run(
         churn_net = make_net(
             optimizer,
             mode="churn",
-            eta=eta,
+            decay=decay,
             maturity=maturity,
             local=(threshold == "v1"),
             local_scale=local_scale,
@@ -572,7 +630,7 @@ def jaccard_gate(
     hidden: int = 128,
     classes: int = 8,
     rho: float = 0.05,
-    eta: float = 0.1,
+    decay: float = 0.99,
     maturity: int = 5,
     local_scale: float = 0.5,
     theta: float = math.pi / 4,
@@ -593,7 +651,7 @@ def jaccard_gate(
         hidden: hidden layer width.
         classes: output classes.
         rho: replacement rate for the v0 quantile.
-        eta: utility EMA rate.
+        decay: retention weight of the running averages (the paper's eta).
         maturity: churns before a unit may be reset.
         local_scale: fraction of the neighbourhood mean setting the v1 bar.
         theta: rotation angle per switch.
@@ -611,7 +669,7 @@ def jaccard_gate(
     optimizer = px.optim.adam(0.001, GradPreAct)
     static, state, train_net = build(optimizer, layers, seed)
     train_step = px.make_step(train_net, static)
-    common = {"eta": eta, "maturity": maturity, "local_scale": local_scale}
+    common = {"decay": decay, "maturity": maturity, "local_scale": local_scale}
     step_v0 = px.make_step(
         make_net(optimizer, mode="churn", local=False, **common), static
     )

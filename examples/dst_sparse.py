@@ -299,6 +299,7 @@ def build_sparse_mlp(
     seed: int,
     *,
     capacity_headroom: float = 0.0,
+    sharding: px.ShardSpec | None = None,
 ) -> tuple[px.NetworkStatic, px.NetworkState[None]]:
     """Build a layered MLP wired sparsely at a fixed per-layer edge budget.
 
@@ -313,6 +314,9 @@ def build_sparse_mlp(
         seed: numpy PRNG seed.
         capacity_headroom: extra dead-slot fraction to pre-allocate per bucket,
             forwarded to NetworkBuilder.from_edges; 0.0 packs to the budget.
+        sharding: Scheme-A ShardSpec to build a distributed state directly via
+            per-shard construction (no process holds the full arena), or None for
+            a single-device state. Forwarded to NetworkBuilder.from_edges.
 
     Returns:
         The finalized (static, state) pair.
@@ -353,6 +357,7 @@ def build_sparse_mlp(
         output_ids=tuple(range(offsets[-1], running)),
         globals_=None,
         capacity_headroom=capacity_headroom,
+        sharding=sharding,
     )
 
 

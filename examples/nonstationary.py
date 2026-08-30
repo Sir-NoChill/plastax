@@ -106,10 +106,9 @@ class ReluForward(px.ForwardPass):
 class ReluBackward(px.BackwardPass):
     """Reverse walk; dL/dz from the loss at the output, ReLU derivative inside.
 
-    NOTE the inverted naming: `build_backward_accumulate` passes the accumulator
-    target (FROM_ID, the shallower unit) as `dst` and the already-finalized
-    deeper unit as `src`, because map_fn's first unit-id argument is always the
-    accumulator target in both directions. The finalized dL/dz to read is `src`.
+    Backward accumulates into the edge's SOURCE, so `src` is this pass's
+    accumulator target and `dst` is the deeper unit the reverse level walk has
+    already finalized -- the one whose dL/dz the map reads.
     """
 
     combine = px.monoid.sum_
@@ -117,15 +116,15 @@ class ReluBackward(px.BackwardPass):
     def map(
         self,
         u: px.UnitView,
-        dst: px.UnitIdx,
         src: px.UnitIdx,
+        dst: px.UnitIdx,
         c: px.ConnView,
         cid: px.ConnIdx,
         g: None,
     ) -> jax.Array:
         """Propagate weight * dL/dz of the deeper unit back into this one."""
-        del dst, g
-        return c[px.WEIGHT, cid] * u[GradPreAct, src]
+        del src, g
+        return c[px.WEIGHT, cid] * u[GradPreAct, dst]
 
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jax.Array

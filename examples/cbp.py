@@ -164,9 +164,8 @@ class CbpUtility(px.BackwardPass):
     """Contribution utility over OUTGOING edges, and the reset decision.
 
     `sum_{j in out(i)} |w_ij|` is a reduction into the SOURCE unit, which is
-    what a BackwardPass does. Note the inverted parameter naming: the callback's
-    first unit-id argument is always the accumulator target, so `dst` holds the
-    accumulating (shallower) unit and `src` holds the edge's destination.
+    exactly what a BackwardPass does: `src` is the accumulator target and `dst`
+    is the edge's destination, whose weight this map contributes.
     """
 
     combine = (px.monoid.sum_, px.monoid.sum_, px.monoid.sum_)
@@ -201,17 +200,17 @@ class CbpUtility(px.BackwardPass):
     def map(
         self,
         u: px.UnitView,
-        dst: px.UnitIdx,
         src: px.UnitIdx,
+        dst: px.UnitIdx,
         c: px.ConnView,
         cid: px.ConnIdx,
         g: None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Contribute (|w|, destination's fan-in mean utility, 1) per out-edge."""
-        del dst, g
+        del src, g
         return (
             jnp.abs(c[px.WEIGHT, cid]),
-            u[CBP_FANIN_UTIL, src],
+            u[CBP_FANIN_UTIL, dst],
             jnp.float32(1.0),
         )
 

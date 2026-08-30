@@ -92,13 +92,13 @@ class SigmoidBackward(px.BackwardPass):
     def map(
         self,
         u: px.UnitView,
-        dst: px.UnitIdx,
         src: px.UnitIdx,
+        dst: px.UnitIdx,
         c: px.ConnView,
         cid: px.ConnIdx,
         g: None,
     ) -> jnp.ndarray:
-        return c[px.WEIGHT, cid] * u[GradPreAct, src]
+        return c[px.WEIGHT, cid] * u[GradPreAct, dst]
 
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray

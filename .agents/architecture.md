@@ -179,7 +179,12 @@ per-bucket level walk for TOPOLOGICAL). `build_add_conn_phase` (`phases.py:426`)
 is the most complex: candidate grid (full or shortlisted) → level-window filter
 + dedup vs live edges → `score` → per-bucket `top_k` → prefix-sum free-slot
 claim → commit only finite-scored candidates → set `needs_resort` if a
-committed edge isn't level-preserving. A `-inf` score is a **hard veto**.
+committed edge isn't level-preserving. A `-inf` score is a **hard veto**. Under
+Scheme-A it is device-resident and shards byte-identically: the dedup all-
+reduces (so every shard agrees on the candidate set and `top_k`), and the
+free-slot claim runs over each shard's capacity slice with an all-gathered
+global free-slot rank sending each new edge to the one shard that owns its slot
+(`total_free` a `psum`, keeping `overflow`/`needs_resort` replicated).
 
 ### Monomorphization (`step.py`)
 

@@ -15,6 +15,7 @@ from plastax._types import (
     UnitIdx,
 )
 from plastax.builder import NetworkBuilder
+from plastax.distributed import distribute_state, scheme_a_mesh
 from plastax.driver import Driver
 from plastax.phases import StepInputs
 from plastax.state import NetworkState, NetworkStatic, make_empty_state
@@ -61,9 +62,11 @@ __all__ = [
     "UnitView",
     "UnitWrite",
     "UpdateConn",
+    "distribute_state",
     "make_empty_state",
     "make_step",
     "monoid",
     "optim",
+    "scheme_a_mesh",
     "topology",
 ]

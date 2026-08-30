@@ -464,3 +464,57 @@ def test_from_edges_rejects_unknown_extra_conn_column() -> None:
             globals_=None,
             extra_conn_columns={"not_a_field": np.zeros(1, dtype=np.float32)},
         )
+
+
+def test_from_edges_capacity_headroom_pre_allocates_dead_slots() -> None:
+    """capacity_headroom enlarges each bucket's capacity (extra dead slots) but
+    leaves the live edges identical to the no-headroom build -- so add_conn can
+    grow into the reserved slots without a rebuild."""
+    # 10 sources -> 10 dests: 100 edges in one bucket, above the min_bucket=64
+    # floor so headroom actually changes the capacity.
+    src, dst = np.meshgrid(np.arange(10), np.arange(10, 20), indexing="ij")
+    from_ids = src.reshape(-1).astype(np.int32)
+    to_ids = dst.reshape(-1).astype(np.int32)
+    weights = np.arange(100, dtype=np.float32)
+    common = {
+        "input_ids": tuple(range(10)),
+        "output_ids": tuple(range(10, 20)),
+        "globals_": None,
+    }
+
+    static_b, state_b = px.NetworkBuilder.from_edges(
+        _TopoNet, 20, from_ids, to_ids, weights=weights, **common
+    )
+    static_r, state_r = px.NetworkBuilder.from_edges(
+        _TopoNet, 20, from_ids, to_ids, weights=weights, capacity_headroom=1.0, **common
+    )
+
+    assert static_b.level_capacities == (128,)  # next_pow2(100)
+    assert static_r.level_capacities == (256,)  # next_pow2(ceil(100 * 2))
+    live = 100
+    assert int(px.state.live_conn_count(state_b, 0)) == live
+    assert int(px.state.live_conn_count(state_r, 0)) == live
+    # the live prefix is byte-identical; the roomy build just has more dead pad.
+    for name in state_b.conns[0]:
+        assert np.array_equal(
+            np.asarray(state_b.conns[0][name])[:live],
+            np.asarray(state_r.conns[0][name])[:live],
+        )
+    assert bool(np.all(np.asarray(state_r.conns[0]["dead"])[live:]))
+    _assert_bucket_sorted_by_dead_then_to_id(state_r.conns[0])
+
+
+def test_finalize_capacity_headroom_matches_from_edges() -> None:
+    """The imperative finalize path honors capacity_headroom the same way."""
+    builder = px.NetworkBuilder(_TopoNet, None)
+    for _ in range(20):
+        builder.add_unit()
+    for i in range(10):
+        builder.mark_input(i)
+    for i in range(10, 20):
+        builder.mark_output(i)
+    for s in range(10):
+        for d in range(10, 20):
+            builder.add_conn(s, d, weight=1.0)
+    static, _ = builder.finalize(capacity_headroom=1.0)
+    assert static.level_capacities == (256,)

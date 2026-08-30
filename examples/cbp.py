@@ -70,36 +70,28 @@ import plastax as px
 
 # Running average of contribution utility.
 CBP_UTIL = px.FieldSpec.float32("cbp/util")
-# Churns since this unit was last reset; gates replacement so a freshly reset
-# unit is not immediately recycled before it can earn utility.
+# Churns since last reset; gates replacement so a fresh unit can earn utility.
 CBP_AGE = px.FieldSpec.int32("cbp/age")
 # 1.0 for units selected for reinitialization this churn.
 CBP_RESET = px.FieldSpec.float32("cbp/reset")
-# The bar a unit's utility must clear: written host-side in v0, computed from
-# the two-hop neighbourhood in v1, and always written back so the host can
-# score one against the other.
+# The bar a utility must clear: host-written in v0, two-hop local in v1.
+# Always written back so the host can score one against the other.
 CBP_THRESH = px.FieldSpec.float32("cbp/thresh")
 # Mean utility of a unit's fan-in sources -- the first hop of the local rule.
 CBP_FANIN_UTIL = px.FieldSpec.float32("cbp/fanin_util")
-# Running average of this unit's activation. The paper's utility uses the
-# MEAN-CORRECTED contribution |h - f_hat|, not |h|: a unit whose activation is
-# large but constant carries no information downstream, so what counts is how
-# far it moves from its own average.
+# Running average of activation. The utility is mean-corrected (|h - f_hat|),
+# because a large but CONSTANT activation carries no information downstream.
 CBP_ACT_AVG = px.FieldSpec.float32("cbp/act_avg")
-# sum |w_in| -- the paper's "adaptation utility" denominator. Its inverse is how
-# fast a unit can change its function, so a unit with heavy incoming weights is
-# harder to repurpose and is worth less. This is an INCOMING reduction, and the
-# outgoing sum is an outgoing one: the full CBP utility needs both directions,
-# and the arena has both as first-class operations.
+# sum |w_in|, the paper's adaptation denominator: heavy incoming weights make a
+# unit harder to repurpose. An INCOMING reduction, where sum|w_out| is outgoing.
 CBP_IN_ABS = px.FieldSpec.float32("cbp/in_abs")
-# Bias-corrected utility, written by the trace so host-side v0 selection and the
-# in-trace reset test rank units by exactly the same quantity.
+# Bias-corrected utility: written by the trace so host v0 selection and the
+# in-trace reset test rank by the same quantity.
 CBP_UTIL_HAT = px.FieldSpec.float32("cbp/util_hat")
 # Live incoming-edge count, used to scale reinitialized weights.
 CBP_FANIN = px.FieldSpec.float32("cbp/fanin")
-# Monotonic per-unit churn counter; the salt that makes a unit reset twice draw
-# different weights. CBP_AGE cannot serve -- it is zeroed on every reset, so it
-# would hand every reset the same hash input.
+# Monotonic churn counter, the salt for reinit draws. CBP_AGE cannot serve: it
+# is zeroed on every reset, so every reset would hash identically.
 CBP_CURSOR = px.FieldSpec.int32("cbp/cursor")
 
 _UNIT_FIELDS = (
@@ -234,10 +226,8 @@ class CbpUtility(px.BackwardPass):
         decay = jnp.float32(self.decay)
         age = u[CBP_AGE, i]
         next_age = age + jnp.int32(1)
-        # Bias correction, as in Adam: a running average seeded at 0 is biased
-        # toward 0 for its first ~1/(1-decay) updates, which for decay=0.99 is
-        # 100 churns -- long enough that uncorrected utilities would rank young
-        # units below old ones for reasons that have nothing to do with utility.
+        # Adam-style: an average seeded at 0 stays biased low for ~1/(1-decay)
+        # updates, which would rank young units below old ones spuriously.
         correction = jnp.maximum(
             jnp.float32(1.0) - decay ** jnp.maximum(age.astype(jnp.float32), 1.0),
             jnp.float32(self.eps),
@@ -256,10 +246,8 @@ class CbpUtility(px.BackwardPass):
         utility_hat = utility_prev / correction
 
         if self.local:
-            # Hop two: this unit's bar is a fraction of what its downstream
-            # neighbourhood averages. A unit with no outgoing edges (an output)
-            # gets a bar of -1 and is therefore never reset, which is correct --
-            # CBP replaces hidden units.
+            # Hop two: compare against the downstream neighbourhood average.
+            # No outgoing edges (an output) => bar of -1, so never reset.
             threshold = jnp.float32(self.local_scale) * (
                 sum_neighbour_util / jnp.maximum(out_count, jnp.float32(1.0))
             )
@@ -520,7 +508,7 @@ def run(
     theta: float = math.pi / 4,
     switch_period: int | None = 30,
     d: int = 32,
-    hidden: int = 128,
+    hidden_layers: tuple[int, ...] = (128, 128),
     classes: int = 8,
     lr: float = 0.001,
     rho: float = 0.05,
@@ -540,7 +528,8 @@ def run(
         theta: rotation angle per switch, in radians.
         switch_period: cycles between switches, or None for stationary.
         d: input dimensionality.
-        hidden: hidden layer width.
+        hidden_layers: width of each hidden layer; shared by every arm so the
+            comparison stays matched (NE needs an interior transition).
         classes: output classes.
         lr: adam learning rate.
         rho: replacement rate for the v0 quantile.
@@ -561,7 +550,7 @@ def run(
     """
     if threshold not in ("v0", "v1", "off"):
         raise ValueError(f"run: unknown threshold {threshold!r}")
-    layers = (d + 1, hidden, classes)
+    layers = (d + 1, *hidden_layers, classes)
     optimizer = px.optim.adam(lr, GradPreAct)
     static, state, train_net = build(optimizer, layers, seed)
     train_step = px.make_step(train_net, static)
@@ -579,7 +568,7 @@ def run(
 
     task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
     eye = np.eye(classes, dtype=np.float32)
-    hidden_units = np.arange(layers[0], layers[0] + hidden)
+    hidden_units = np.arange(layers[0], sum(layers) - classes)
     out_ids = np.asarray(static.output_ids)
     dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
     records: list[CycleRecord] = []
@@ -626,7 +615,7 @@ def run(
 def jaccard_gate(
     *,
     d: int = 32,
-    hidden: int = 128,
+    hidden_layers: tuple[int, ...] = (128, 128),
     classes: int = 8,
     rho: float = 0.05,
     decay: float = 0.99,
@@ -647,7 +636,7 @@ def jaccard_gate(
 
     Args:
         d: input dimensionality.
-        hidden: hidden layer width.
+        hidden_layers: width of each hidden layer.
         classes: output classes.
         rho: replacement rate for the v0 quantile.
         decay: retention weight of the running averages (the paper's eta).
@@ -664,7 +653,7 @@ def jaccard_gate(
         omitted, not scored as agreement) and the per-churn (v0, v1) reset-set
         sizes, which distinguish a rate mismatch from a ranking disagreement.
     """
-    layers = (d + 1, hidden, classes)
+    layers = (d + 1, *hidden_layers, classes)
     optimizer = px.optim.adam(0.001, GradPreAct)
     static, state, train_net = build(optimizer, layers, seed)
     train_step = px.make_step(train_net, static)

@@ -22,12 +22,30 @@ term that is not O(E) -- it is the wall (empirically ~5k units before a churn
 costs seconds and >1GB). Passing `shortlist=M` makes each growth policy declare
 `max_candidate_units`, so the phase draws candidates from the M x M grid of the
 M most *important* units (here |grad_pre_act| + |activation|) -- O(num_units + M^2)
--- and num_units scales far past the exhaustive wall. Size M >= sqrt(zeta * E):
-a churn frees ~zeta*E slots and can refill only from the ~M^2 shortlisted
-candidates, so too small an M leaves the arena unable to refill and sparsity
-drifts *down* (still sparse, just below target). It is also a global top-M, so
-on a deep MLP it can under-serve a layer transition; a per-level shortlist is
-the clean fix and is future work.
+-- and num_units scales far past the exhaustive wall.
+
+**Sizing M has TWO constraints, and the second is usually the binding one.**
+
+1. *Volume.* M >= sqrt(zeta * E): a churn frees ~zeta*E slots and can refill
+   only from the ~M^2 shortlisted candidates, so too small an M leaves the
+   arena unable to refill and sparsity drifts *down* (still sparse, just below
+   target).
+2. *Destination coverage.* The grid is the top-M sources crossed with the top-M
+   eligible destinations, so **M also bounds how many distinct units can
+   receive a new edge**. A bucket whose destination layer is wider than M can
+   only ever refill into M of those units, however generous the volume budget
+   is. Measured: M=8 against a 16-unit hidden layer bled a 128-edge arena down
+   to 121-125, while M >= 16 held it exactly.
+
+Constraint 2 is not statically checkable -- the level assignment that decides
+which units are eligible is runtime data -- so `plastax.shortlist_coverage(net,
+static, state)` reports it per bucket against a built state, and
+`plastax.recommended_shortlist(net, static, state)` returns the floor that
+satisfies it. Both are host-side; neither changes what the traced phase does.
+
+`shortlist_per_level` (set by the growth policies here) already fixes the
+*separate* problem that a single global top-M concentrates on one level and
+starves the others.
 
 Run:  uv run python examples/dst_sparse.py
 """

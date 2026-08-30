@@ -34,6 +34,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import time
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -501,6 +502,25 @@ def run(
             shortlist=shortlist,
         )
         churn_step = px.make_step(churn_net, static)
+        # Surface the shortlist/layer-width interplay at build time rather than
+        # letting it show up as a slow density drift nobody attributes: an
+        # uncovered bucket can only refill into M of its destinations, so the
+        # run silently proceeds at a lower sparsity than it reports.
+        uncovered = [
+            c for c in px.shortlist_coverage(churn_net, static, state) if not c.covered
+        ]
+        if uncovered:
+            floor = px.recommended_shortlist(churn_net, static, state)
+            warnings.warn(
+                f"shortlist={shortlist} does not cover "
+                f"{len(uncovered)} bucket(s): "
+                + ", ".join(
+                    f"bucket {c.bucket} has {c.destination_units} eligible destinations"
+                    for c in uncovered
+                )
+                + f". Live-edge count will drift below target; use >= {floor}.",
+                stacklevel=2,
+            )
 
     task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
     eye = np.eye(classes, dtype=np.float32)

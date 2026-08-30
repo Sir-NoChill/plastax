@@ -4,8 +4,8 @@ Like test_sharding.py, the real check lives in `sharding_churn_equiv.py` and
 runs in a separate interpreter without pytest's jaxtyping instrumentation
 (shard_map reconstructs the registered NetworkState pytree with placeholder
 leaves, which beartype rejects -- a test-only artifact). It verifies that a
-full train step and a prune step match single-device under Scheme-A, and pins
-the current limitation that add_conn growth does not shard.
+train step, a prune step, and a full churn step (prune + device-resident
+add_conn growth) all match single-device under Scheme-A.
 """
 
 from __future__ import annotations

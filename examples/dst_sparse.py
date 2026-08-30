@@ -127,6 +127,59 @@ class MagnitudeStats(px.ForwardPass):
         )
 
 
+# Per-unit prune fraction, as a COLUMN rather than a trace-time constant, so a
+# host-side schedule can change it between cycles without retracing.
+ZETA = px.FieldSpec.float32("dst/zeta")
+
+
+class AnnealedMagnitudeStats(px.ForwardPass):
+    """MagnitudeStats with the prune fraction read from the ZETA column.
+
+    Identical statistics; only the source of zeta differs. At zeta = 0 the
+    half-normal quantile is 0, nothing is pruned and the churn is a no-op, which
+    is what lets a schedule start late, stop early, or anneal to nothing.
+    """
+
+    combine = (px.monoid.sum_, px.monoid.sum_)
+
+    def map(
+        self,
+        u: px.UnitView,
+        dst: px.UnitIdx,
+        src: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Contribute (1, |weight|) for one live incoming edge."""
+        del u, dst, src, g
+        return jnp.float32(1.0), jnp.abs(c[px.WEIGHT, cid])
+
+    def apply(
+        self,
+        u: px.UnitView,
+        i: px.UnitIdx,
+        g: None,
+        acc: tuple[jax.Array, jax.Array],
+    ) -> px.UnitWrite:
+        """Write this unit's prune threshold and advance its rewiring cursor."""
+        del g
+        count, sum_abs = acc
+        mean_abs = sum_abs / jnp.maximum(count, jnp.float32(1.0))
+        alpha = jnp.sqrt(jnp.pi) * jax.scipy.special.erfinv(u[ZETA, i])
+        return px.UnitWrite.of(
+            (SET_THRESH, alpha * mean_abs),
+            (SET_CURSOR, u[SET_CURSOR, i] + jnp.int32(1)),
+        )
+
+
+def set_zeta(state: px.NetworkState[None], zeta: float) -> px.NetworkState[None]:
+    """Set the prune fraction on every unit; returns the updated state."""
+    column = jnp.full_like(state.units[ZETA.name], jnp.float32(zeta))
+    state.units = {**state.units, ZETA.name: column}
+    return state
+
+
 class SetPrune(px.PruneConn):
     """Connection-local magnitude pruning against the destination's threshold."""
 

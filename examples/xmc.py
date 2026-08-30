@@ -343,7 +343,7 @@ def synthetic_split(
     )
 
 
-class _TargetBuffer:
+class TargetBuffer:
     """Reusable dense multi-hot target vector.
 
     `StepInputs.targets` is dense over the label set, so a fresh
@@ -464,7 +464,7 @@ def run(
     eval_step = px.make_step(eval_net, static)
 
     rng = np.random.default_rng(seed + 1)
-    targets = _TargetBuffer(split.num_labels)
+    targets = TargetBuffer(split.num_labels)
     eval_indices = rng.choice(
         split.num_points, size=min(eval_points, split.num_points), replace=False
     )

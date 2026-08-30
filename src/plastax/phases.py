@@ -14,7 +14,7 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int32, Shaped
 
 from plastax import monoid
 from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, ConnIdx, Propagation, UnitIdx
@@ -275,7 +275,14 @@ def _build_backward_topological_phase[GS](
 def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phase[GS]:
     loss = net.loss
     assert loss is not None  # build_phases only calls this when set
-    output_ids = static.output_ids
+    # vmapped over the whole output set rather than unrolled per output id:
+    # `per_output` is a pure scalar policy over views (views.py docstring), so
+    # one trace of it serves every output. The unrolled Python loop this
+    # replaced emitted a gather + a scatter *per output unit*, so trace and XLA
+    # compile cost grew superlinearly in the output count -- fine for the 1-10
+    # outputs of an MLP, but the wall for extreme multi-label classification,
+    # whose whole point is 10^5-10^6 output units.
+    output_ids = jnp.asarray(static.output_ids, dtype=jnp.int32)
 
     def loss_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -284,22 +291,21 @@ def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phas
         # docstring); build_phases only reaches here when net.loss is set.
         assert inputs.targets is not None
         u_view = UnitView(state.units)
+        globals_ = state.globals_
+
+        def one(
+            unit_id: Int32[Array, ""], target: Float[Array, ""]
+        ) -> tuple[Float[Array, ""], dict[str, Shaped[Array, ""]]]:
+            # UnitWrite is not a registered pytree, so vmap carries the
+            # underlying field mapping and the scatter below rebuilds columns.
+            value, write = loss.per_output(u_view, UnitIdx(unit_id), target, globals_)
+            return value, dict(write.fields)
+
+        values, columns = jax.vmap(one)(output_ids, inputs.targets)
         units = dict(state.units)
-        total = jnp.float32(0.0)
-        # Static Python loop over the static output_ids tuple (unrolled at
-        # trace time), matching the forward topological level loop's style:
-        # small and static, so no vmap machinery is needed.
-        for k, unit_id in enumerate(output_ids):
-            value, write = loss.per_output(
-                u_view,
-                UnitIdx(jnp.asarray(unit_id, dtype=jnp.int32)),
-                inputs.targets[k],
-                state.globals_,
-            )
-            total = total + value
-            for name, field_value in write.fields.items():
-                units[name] = units[name].at[unit_id].set(field_value)
-        return dataclasses.replace(state, units=units), total
+        for name, column in columns.items():
+            units[name] = units[name].at[output_ids].set(column)
+        return dataclasses.replace(state, units=units), jnp.sum(values)
 
     return loss_phase
 

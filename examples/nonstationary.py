@@ -635,12 +635,21 @@ def main() -> None:
                 seed=seed,
             )
             times = recovery_times(records)
-            recoveries.append(float(np.mean(times)) if times else 0.0)
+            # A stationary arm has no switches to recover from. Reporting 0.0
+            # would read as perfect recovery rather than "not applicable".
+            recoveries.append(float(np.mean(times)) if times else float("nan"))
             accuracies.append(
                 float(np.mean([r.accuracy for r in records[-protocol.FINAL_WINDOW :]]))
             )
-        recovery = protocol.summarize(recoveries)
         accuracy = protocol.summarize(accuracies)
+        if np.isnan(recoveries).all():
+            print(
+                f"{label:20} {'n/a (no switches)':>16} {'':>8} {'':>6} "
+                f"{accuracy.median:7.3f}",
+                flush=True,
+            )
+            continue
+        recovery = protocol.summarize(recoveries)
         print(
             f"{label:20} {recovery.median:16.2f} {recovery.ipr90:8.2f} "
             f"{recovery.relative_ipr:6.2f} {accuracy.median:7.3f}",

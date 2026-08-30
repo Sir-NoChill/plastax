@@ -125,3 +125,45 @@ def test_duplicate_edges_are_handled_like_the_scalar_path() -> None:
     got = topo.initial_levels(3, edges)
     assert np.array_equal(got, _kahn_levels(3, edges, allow_cycles=False))
     assert got.tolist() == [0, 1, 2]
+
+
+# --- capacity_policy headroom ------------------------------------------------
+
+
+def test_capacity_policy_headroom_default_is_unchanged() -> None:
+    """headroom=0.0 keeps the historical next_pow2 / min_bucket policy."""
+    assert topo.capacity_policy(100) == 128
+    assert topo.capacity_policy(256) == 256
+    assert topo.capacity_policy(1) == 64  # min_bucket floor
+    assert topo.capacity_policy(0) == 64
+    assert topo.capacity_policy(100, headroom=0.0) == 128
+
+
+def test_capacity_policy_headroom_pre_allocates_free_slots() -> None:
+    """headroom inflates live before the pow2 rounding, reserving dead slots."""
+    # A power-of-two live count has no slack, so any headroom doubles it.
+    assert topo.capacity_policy(256, headroom=0.5) == 512
+    assert topo.capacity_policy(256, headroom=1.0) == 512
+    assert topo.capacity_policy(256, headroom=3.0) == 1024  # ceil(1024) -> 1024
+    # A non-pow2 live count first fills toward its own next pow2.
+    assert topo.capacity_policy(200, headroom=0.0) == 256
+    assert topo.capacity_policy(200, headroom=1.0) == 512  # ceil(400) -> 512
+    # The min_bucket floor still applies to a tiny inflated bucket.
+    assert topo.capacity_policy(1, headroom=10.0) == 64
+
+
+@pytest.mark.parametrize("live", [1, 5, 63, 64, 65, 200, 256, 1000, 4096])
+@pytest.mark.parametrize("headroom", [0.0, 0.25, 1.0, 2.0, 7.0])
+def test_capacity_policy_result_is_always_a_power_of_two(
+    live: int, headroom: float
+) -> None:
+    """Capacity must stay a power of two so it divides a power-of-two shard count."""
+    cap = topo.capacity_policy(live, headroom=headroom)
+    assert cap >= live
+    assert cap & (cap - 1) == 0  # exact power of two
+    assert cap % 4 == 0  # divisible for G in {1, 2, 4}
+
+
+def test_capacity_policy_rejects_negative_headroom() -> None:
+    with pytest.raises(ValueError):
+        topo.capacity_policy(100, headroom=-0.5)

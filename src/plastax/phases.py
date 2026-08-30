@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Float
 
+from plastax import monoid
 from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, ConnIdx, Propagation, UnitIdx
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.sweep import (
@@ -490,6 +491,14 @@ def build_add_conn_phase[GS](
     neighbourhood = net.neighbourhood
     is_pipeline = net.propagation is Propagation.PIPELINE
 
+    # Scheme-A sharding: the conn arena is split across `num_shards` devices on
+    # its capacity axis, so the slot claim below runs over each shard's own
+    # slice and coordinates growth across shards with collectives -- entirely
+    # device-resident, no host round-trip. Both reduce to the single-device
+    # identity (num_shards == 1, shard_axis is None) when unsharded.
+    shard_axis = _shard_axis(static)
+    num_shards = static.sharding.num_shards if static.sharding is not None else 1
+
     # Optional candidate reduction: an AddConn may declare `max_candidate_units`
     # (M) and an `importance(u, i, g)` method to shortlist the M most important
     # units each step and draw candidates only from that M x M grid, cutting
@@ -638,6 +647,19 @@ def build_add_conn_phase[GS](
                 jnp.int32(sorted_live.shape[0] - 1),
             )
             not_duplicate = sorted_live[pos] != candidate_pair
+            if shard_axis is not None:
+                # Under Scheme-A the live edges are split across shards, so the
+                # binary search above only sees THIS shard's slice. A candidate
+                # already live on any other shard must count as a duplicate
+                # everywhere -- otherwise shards would score a different
+                # candidate set, top_k differently, and disagree on the global
+                # slot assignment below. All-reduce the local duplicate mask
+                # (pmax == boolean OR) so valid/scores/top_k are identical on
+                # every shard.
+                dup_any = monoid.max_.collective(
+                    (~not_duplicate).astype(jnp.int32), shard_axis
+                )
+                not_duplicate = dup_any == jnp.int32(0)
             valid = window_ok & src_ok & not_duplicate
 
             flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
@@ -657,37 +679,70 @@ def build_add_conn_phase[GS](
             # alone would admit them.
             top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
 
-            # Prefix-sum slot claim over this bucket's own dead mask:
-            # rank[i] is dead-position i's 0-based rank among this bucket's
-            # dead slots; scattering `positions` by `rank` (dropping live
-            # positions via the always-OOB `sink_len` index) inverts that
-            # into slot_for_rank[j] = the position of the j-th free slot,
-            # `capacity_b` (never a real position) where fewer than j+1
-            # free slots exist. `sink_len = max(capacity_b, k)` keeps both
-            # the scatter (indices < capacity_b <= sink_len, in bounds) and
-            # the later static `[:k]` slice in bounds without a runtime
-            # clamp, even if k > capacity_b.
+            # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
+            # dead mask is this shard's capacity slice (size capacity_b //
+            # num_shards; power-of-two capacities keep it exact), so the claim
+            # runs over the LOCAL slice and is coordinated across shards: each
+            # growable candidate takes a GLOBAL free-slot rank and lands on the
+            # one shard that owns it. Because shard g holds arena positions
+            # [g*local_capacity, (g+1)*local_capacity), the global free-slot
+            # order (shard 0's free slots, then shard 1's, ...) is exactly the
+            # single-device position order -- so a candidate lands where the
+            # single-device add_conn would. local_capacity == capacity_b and
+            # offset == 0 when unsharded, leaving that path byte-identical.
+            local_capacity = capacity_b // num_shards
             dead_b = bucket_conns[DEAD.name]
+            local_free = jnp.sum(dead_b.astype(jnp.int32))
+            # local_slot_for_rank[j] = position (within this shard's slice) of
+            # its j-th free slot, or local_capacity when it has fewer than j+1.
+            # `sink_len = max(local_capacity, k)` keeps the scatter and the
+            # index below in bounds even if k > local_capacity.
             rank = jnp.cumsum(dead_b.astype(jnp.int32)) - 1
-            positions = jnp.arange(capacity_b, dtype=jnp.int32)
-            sink_len = max(capacity_b, k)
+            positions = jnp.arange(local_capacity, dtype=jnp.int32)
+            sink_len = max(local_capacity, k)
             scatter_target = jnp.where(dead_b, rank, jnp.int32(sink_len))
-            slot_for_rank = (
-                jnp.full((sink_len,), capacity_b, dtype=jnp.int32)
+            local_slot_for_rank = (
+                jnp.full((sink_len,), local_capacity, dtype=jnp.int32)
                 .at[scatter_target]
                 .set(positions, mode="drop")
             )
-            free_slot = slot_for_rank[:k]
-            has_room = free_slot < capacity_b
-            committed = top_growable & has_room
-            # Overflow: a real (growable, top-k-selected) candidate for which
-            # this bucket ran out of dead slots. Uncommitted candidates
-            # (invalid, vetoed by a -inf score, or no room) scatter to
-            # `capacity_b`, one past this bucket's own valid range -- the
-            # scatter's default drop mode discards them rather than
-            # mis-writing a live slot.
-            overflow = overflow | jnp.any(top_growable & ~has_room)
-            target_slot = jnp.where(committed, free_slot, jnp.int32(capacity_b))
+            # This shard's offset into the global free-slot space, and the total
+            # free count. The offset is an exclusive prefix of the per-shard
+            # free counts (an all-gather -- a prefix is not a plain all-reduce)
+            # and feeds only the per-shard placement below. total_free is a
+            # psum, not sum(all_gather): it flows into `overflow` and
+            # `needs_resort`, which shard_map requires be provably replicated,
+            # and psum is the all-reduce it recognizes as replicating. Both are
+            # device-resident collectives.
+            if shard_axis is not None:
+                all_free = jax.lax.all_gather(local_free, shard_axis)
+                my_index = jax.lax.axis_index(shard_axis)
+                offset = jnp.sum(
+                    jnp.where(jnp.arange(num_shards) < my_index, all_free, 0)
+                )
+                total_free = monoid.sum_.collective(local_free, shard_axis)
+            else:
+                offset = jnp.int32(0)
+                total_free = local_free
+            # growth_rank[i] = candidate i's rank among the growable top-k --
+            # its global free-slot index. The -inf-scored candidates sort to
+            # the tail of top_k, so top_growable is a contiguous prefix and
+            # growth_rank[i] == i there: identical to the old per-index claim
+            # when unsharded. A candidate whose rank exceeds the total free
+            # slots is overflow -- dropped, flag raised.
+            growth_rank = jnp.cumsum(top_growable.astype(jnp.int32)) - 1
+            committed = top_growable & (growth_rank < total_free)
+            overflow = overflow | jnp.any(top_growable & (growth_rank >= total_free))
+            # A committed candidate belongs to THIS shard iff its global rank
+            # falls in [offset, offset + local_free); place it at that shard-
+            # local free slot, else scatter to `local_capacity` (out of this
+            # slice's range), dropped by the scatter's drop mode.
+            local_rank = growth_rank - offset
+            mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
+            safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
+            target_slot = jnp.where(
+                mine, local_slot_for_rank[safe_rank], jnp.int32(local_capacity)
+            )
 
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it

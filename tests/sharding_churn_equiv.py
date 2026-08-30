@@ -1,20 +1,21 @@
-"""Scheme-A across the DST phases: train and prune shard, growth does not.
+"""Scheme-A shards every DST phase: train, prune, and churn (growth).
 
 Checked in a clean subprocess (no jaxtyping instrumentation -- shard_map is
 incompatible with it; see test_sharding.py). Complements the forward-only
 sharding_equiv.py by covering the phases a dynamic-sparse run actually uses:
 
   * a full TRAIN step (forward + loss + backward + adam update_conn) under
-    Scheme-A must match the single-device step numerically, incl. every
-    per-edge optimizer column -- this is the path the memory/perf timing runs
-    execute on a static sharded topology;
-  * a magnitude PRUNE step shards too (edge-local tombstone);
-  * ADD_CONN growth does NOT shard: build_add_conn_phase's prefix-sum slot
-    claim mixes the static full bucket capacity with the per-shard capacity
-    slice, so it raises under shard_map. Pinned here so the limitation is
-    explicit and can't regress silently -- and it is exactly why the scaling
-    experiment times a static sharded topology and characterizes churn
-    (rewiring) single-node.
+    Scheme-A matches the single-device step numerically, incl. every per-edge
+    optimizer column -- the path the memory/perf timing runs execute on a
+    static sharded topology;
+  * a magnitude PRUNE step shards (edge-local tombstone);
+  * a full SET CHURN step (prune + add_conn growth) shards byte-identically:
+    add_conn coordinates its slot claim across shards entirely on device (an
+    all-reduce dedup so all shards agree on the candidate set, plus an
+    all-gathered global free-slot rank that sends each new edge to the one
+    shard owning its slot), so every rewired edge lands in the same arena
+    position as single-device. This is what lets churn run under Scheme-A, not
+    just the static-topology timing path.
 
 Run directly (`python tests/sharding_churn_equiv.py`) or via the subprocess
 wrapper in test_sharding_churn.py; usable on real multi-GPU too.
@@ -125,22 +126,27 @@ def _check_prune_step_shards(
         raise AssertionError("prune: conn columns differ sharded vs single")
 
 
-def _check_add_conn_does_not_shard(
-    static_s: px.NetworkStatic, state: px.NetworkState[None]
+def _check_churn_step_shards(
+    static: px.NetworkStatic, static_s: px.NetworkStatic, state: px.NetworkState[None]
 ) -> None:
-    """add_conn growth is single-device-only; assert it raises under sharding."""
+    """A full SET churn step (prune + device-resident add_conn) shards exactly.
+
+    add_conn's slot claim is coordinated across shards (all-reduce dedup +
+    all-gathered global free-slot rank), and because shard g owns arena
+    positions [g*cap/G, (g+1)*cap/G) the global free-slot order equals the
+    single-device position order -- so the rewired arena is byte-identical.
+    """
     churn_net = make_net(
         _OPT, method="set", mode="churn", zeta=0.3, max_candidates=max(_BUDGETS)
     )
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
-    try:
-        px.make_step(churn_net, static_s)(_copy(state), sp)
-    except ValueError:
-        return  # expected: prefix-sum slot claim mismatches the sharded slice
-    raise AssertionError(
-        "add_conn under sharding did not raise -- the limitation changed; "
-        "revisit whether growth is now shardable and update the docs/design"
-    )
+    single = px.make_step(churn_net, static)(_copy(state), sp).state
+    sharded = px.make_step(churn_net, static_s)(_copy(state), sp).state
+
+    if int(px.state.live_conn_count(single)) != int(px.state.live_conn_count(sharded)):
+        raise AssertionError("churn: live-edge count differs sharded vs single")
+    if not _conns_allclose(single, sharded):
+        raise AssertionError("churn: rewired conn columns differ sharded vs single")
 
 
 def main() -> None:
@@ -156,8 +162,8 @@ def main() -> None:
     print("OK train step shards (forward + loss + backward + adam update_conn)")
     _check_prune_step_shards(static, static_s, state)
     print("OK prune step shards")
-    _check_add_conn_does_not_shard(static_s, state)
-    print("OK add_conn growth is single-device-only (raises under sharding)")
+    _check_churn_step_shards(static, static_s, state)
+    print("OK churn step shards (prune + device-resident add_conn growth)")
     print("CHURN SHARDING CHECK PASS")
 
 

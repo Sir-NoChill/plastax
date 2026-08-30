@@ -191,6 +191,32 @@ Tooling / infrastructure (2026-08-29, jax floor widening):
   multi-GPU scaling experiments run on 0.10.2; the 0.11 floor was the
   conservative dev/validation version, not a hard dependency.
 
+Multi-controller sharding (2026-08-30, `sparse` branch):
+
+- distributed.py (new): `distribute_state(static, state)` places a host-built
+  NetworkState onto the Scheme-A mesh as a global `jax.Array` — conn columns
+  sharded on the capacity axis, units/globals/needs_resort replicated — via
+  `make_array_from_process_local_data`, so the state can enter the sharded step
+  under true multi-controller (jax.distributed, one process per device-group),
+  where no single process holds every device. Single-controller `shard_map`
+  slices a host array implicitly and needs no placement; this makes it explicit
+  and is a no-op when `static.sharding is None`. `scheme_a_mesh(static)` factors
+  the mesh construction out of `step._shard_map_step` (single source of truth).
+- Finding: the earlier "multi-controller resort/overflow unhandled" note was
+  only untested, not unimplemented. Once the state is a global array, the
+  Driver's eager host-side transforms (grow_bucket pad+retrace, topo.resort)
+  run as collective SPMD ops — scalar reads (`live_conn_count`, overflow) reduce
+  globally, and resort's per-level live histogram comes back replicated because
+  the reduced axis is not the sharded one — so no change to driver.py /
+  grow_bucket / resort was needed.
+- tests: `tests/mc_sharding_equiv.py` (train + SET/RigL churn) and
+  `tests/mc_driver_equiv.py` (overflow->grow, resort + a sharded step on the
+  resorted state) launch one process per shard via jax.distributed (gloo on
+  CPU, one device each) and assert byte-identical equivalence to single-device
+  plus cross-process host-read consistency; `slow`-marked subprocess wrappers
+  `test_mc_sharding.py` / `test_mc_driver.py`. This is the local stand-in for a
+  one-process-per-node Narval run (closes the local scope of follow-up #15).
+
 Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
 - All modules: converted to PEP 695 generics (`class Foo[T]`, `def f[T]`)

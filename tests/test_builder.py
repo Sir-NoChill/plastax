@@ -6,6 +6,8 @@ capacity_policy. Implemented when M1 lands.
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +15,8 @@ import pytest
 
 import plastax as px
 from plastax import topo, topology
-from plastax._types import FieldSpec
+from plastax._types import WEIGHT, FieldSpec
+from plastax.builder import _window_column
 from plastax.state import Columns
 from plastax.views import UnitWrite
 
@@ -518,3 +521,94 @@ def test_finalize_capacity_headroom_matches_from_edges() -> None:
             builder.add_conn(s, d, weight=1.0)
     static, _ = builder.finalize(capacity_headroom=1.0)
     assert static.level_capacities == (256,)
+
+
+# --- per-shard construction (Scheme-A) ---------------------------------
+
+
+def test_window_column_tiles_to_full() -> None:
+    """G windows of a bucket concatenate back to the full padded column.
+
+    This is the invariant per-shard construction relies on: shard g materialises
+    positions [g*cap/G, (g+1)*cap/G) and the union is byte-identical to the full
+    column the single-device path builds -- live edges in sorted order, then
+    tombstoned padding.
+    """
+    rng = np.random.default_rng(0)
+    live, capacity, shards = 50, 128, 4
+    order = rng.permutation(live).astype(np.int64)
+    src = rng.integers(0, 100, size=200).astype(np.int32)
+    dst = rng.integers(0, 100, size=200).astype(np.int32)
+    conn_columns = {WEIGHT.name: rng.standard_normal(200).astype(np.float32)}
+
+    full = _window_column(WEIGHT, order, live, 0, capacity, src, dst, conn_columns)
+    step = capacity // shards
+    tiles = [
+        _window_column(
+            WEIGHT, order, live, g * step, (g + 1) * step, src, dst, conn_columns
+        )
+        for g in range(shards)
+    ]
+    assert all(tile.shape == (step,) for tile in tiles)
+    assert np.array_equal(full, np.concatenate(tiles))
+    for g, tile in enumerate(tiles):
+        assert np.array_equal(tile, full[g * step : (g + 1) * step])
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs >= 4 devices")
+def test_from_edges_sharding_matches_distribute_state() -> None:
+    """from_edges(sharding=) builds the same global array as distribute_state.
+
+    Single controller (all shards owned by one process), so per-shard
+    construction materialises the full band; this pins that the sharded
+    construction path assembles a global array byte-identical to slicing a
+    fully-built state. Partial per-process windows are exercised in
+    tests/mc_construct_equiv.py.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(0)
+    n = 24
+    pairs = [tuple(sorted(rng.choice(n, 2, replace=False))) for _ in range(120)]
+    from_ids = np.array([a for a, _ in pairs], dtype=np.int32)
+    to_ids = np.array([b for _, b in pairs], dtype=np.int32)
+    shard = px.ShardSpec("shard", 4)
+
+    static_f, state_f = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        n,
+        from_ids,
+        to_ids,
+        input_ids=(0,),
+        output_ids=(n - 1,),
+        globals_=None,
+    )
+    distributed = px.distribute_state(
+        dataclasses.replace(static_f, sharding=shard), state_f
+    )
+    static_s, state_s = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        n,
+        from_ids,
+        to_ids,
+        input_ids=(0,),
+        output_ids=(n - 1,),
+        globals_=None,
+        sharding=shard,
+    )
+
+    assert static_s.sharding == shard
+    assert static_s.level_capacities == static_f.level_capacities
+
+    repl = NamedSharding(px.scheme_a_mesh(static_s), PartitionSpec())
+
+    def gather(x: jax.Array) -> np.ndarray:
+        return np.asarray(jax.jit(lambda a: a, out_shardings=repl)(x))
+
+    for bucket_d, bucket_s in zip(distributed.conns, state_s.conns, strict=True):
+        for name in bucket_d:
+            assert np.array_equal(gather(bucket_d[name]), gather(bucket_s[name]))
+    for name in distributed.units:
+        assert np.array_equal(
+            gather(distributed.units[name]), gather(state_s.units[name])
+        )

@@ -452,6 +452,7 @@ def run(
     alpha: float = 0.3,
     omega: float = 0.5,
     tau: float = 1e-6,
+    density_target: float | None = None,
     shortlist: int | None = 128,
     steps_per_cycle: int = 100,
     num_cycles: int = 600,
@@ -473,6 +474,9 @@ def run(
         alpha: initial growth rate for the cosine schedule.
         omega: pruning cap as a fraction of the growth count.
         tau: dormancy threshold.
+        density_target: interior density at which growth stops, or None to let
+            it run to the schedule's end. The paper grows to full capacity; a
+            cap is what keeps a representational advantage to measure.
         shortlist: M for the growth candidate grid, or None for exhaustive.
         steps_per_cycle: training examples per cycle.
         num_cycles: cycles to run.
@@ -512,6 +516,7 @@ def run(
     out_ids = np.asarray(static.output_ids)
     dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
     horizon = int(grow_until * num_cycles)
+    interior_capacity = hidden_layers[0] * hidden_layers[1]
 
     records: list[CycleRecord] = []
     trace: list[tuple[int, float, int]] = []
@@ -532,6 +537,10 @@ def run(
             last_inputs = inputs
 
         rate = cosine_growth_rate(cycle, horizon, alpha)
+        if density_target is not None:
+            interior_now = int((~np.asarray(state.conns[1][px.DEAD.name])).sum())
+            if interior_now >= density_target * interior_capacity:
+                rate = 0.0
         dormant = int(((np.asarray(state.units[ACT_EMA.name]) <= tau) & elastic).sum())
         state = set_growth_rate(state, rate)
         state = set_prune_probability(

@@ -217,6 +217,31 @@ Multi-controller sharding (2026-08-30, `sparse` branch):
   `test_mc_sharding.py` / `test_mc_driver.py`. This is the local stand-in for a
   one-process-per-node Narval run (closes the local scope of follow-up #15).
 
+Per-shard construction (2026-08-30, `sparse` branch):
+
+- builder.py: `from_edges`/`from_topology`/`finalize` gain `sharding: ShardSpec
+  | None`. When set, `_assemble` computes the same plan (levels, per-bucket sort
+  order, capacities) but materialises only each process's addressable
+  capacity-axis band per bucket via the new `_window_column`, then assembles a
+  global `jax.Array` (conns sharded, units/globals/needs_resort replicated) with
+  the distributed placement helpers. So no process ever holds the full padded
+  arena -- previously even `distribute_state` needed the whole state built first
+  (and `_assemble`'s `jnp.asarray` put a full column on one device). The window
+  is `capacity / num_shards`; the single-controller path (`sharding=None`) is
+  unchanged and byte-identical (fast suite still green).
+- distributed.py: factored `_shardings_for_spec` / `_place` /
+  `_addressable_window`, shared by `distribute_state` and the builder.
+- tests: `test_builder.py` pins the windowed materialiser (G windows tile back
+  to the full column) and single-controller `from_edges(sharding=)` ==
+  `distribute_state`; `tests/mc_construct_equiv.py` (slow wrapper
+  `test_mc_construct.py`) builds one shard per process and asserts the window is
+  exactly `cap/num_shards`, the assembled state matches the full build sliced,
+  and a sharded forward on it matches single-device.
+- Scope: Level 1 -- each process still generates the full edge list transiently
+  to compute global sort ranks, but materialises only its `cap/G` columns.
+  Generating only `~E/G` edges per process (a distributed sort) is a larger,
+  separate change, unneeded for single-node multi-GPU.
+
 Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
 - All modules: converted to PEP 695 generics (`class Foo[T]`, `def f[T]`)

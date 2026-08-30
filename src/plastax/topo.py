@@ -7,6 +7,7 @@ only on level reassignment; bucket growth is handled by state.grow_bucket.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections import deque
 from typing import cast
 
@@ -339,20 +340,35 @@ def resort[GS](
     return new_static, new_state
 
 
-def capacity_policy(live: int, *, min_bucket: int = 64) -> int:
+def capacity_policy(live: int, *, min_bucket: int = 64, headroom: float = 0.0) -> int:
     """Compute a bucket capacity with headroom above the live count.
 
-    Default policy: max(next_pow2(live), min_bucket) so buckets carry
-    headroom by construction. Constants are an open tuning item.
+    Default policy: max(next_pow2(live), min_bucket). `headroom` pre-allocates
+    more dead slots for device-resident growth: the live count is inflated by
+    (1 + headroom) before the next-power-of-two rounding, reserving slots that
+    add_conn can grow into without an overflow -> host `grow_bucket` rebuild
+    (each rebuild is a retrace). The result stays a power of two, so it stays
+    divisible by a power-of-two Scheme-A shard count. The rounding is coarse:
+    any headroom > 0 on a power-of-two live count lands at the next power of two
+    (a full doubling). headroom=0.0 is the historical policy; constants are an
+    open tuning item.
 
     Args:
         live: Number of live conns the bucket must hold.
         min_bucket: Minimum capacity to allocate regardless of live count.
+        headroom: Extra dead-slot fraction to pre-allocate above `live`
+            (0.0 = none, 1.0 = at least double). Must be non-negative.
 
     Returns:
         The capacity to allocate for the bucket.
+
+    Raises:
+        ValueError: If `headroom` is negative.
     """
+    if headroom < 0.0:
+        raise ValueError(f"capacity_policy: headroom must be >= 0, got {headroom}")
     if live <= 0:
         return min_bucket
-    next_pow2 = 1 << (live - 1).bit_length()
+    target = math.ceil(live * (1.0 + headroom))
+    next_pow2 = 1 << (target - 1).bit_length()
     return max(next_pow2, min_bucket)

@@ -179,7 +179,7 @@ def test_rewiring_holds_sparsity_across_a_switch() -> None:
             theta=math.pi / 2,
             switch_period=2,
             d=8,
-            hidden=16,
+            hidden_layers=(16,),
             classes=4,
             density=0.3,
             num_cycles=6,

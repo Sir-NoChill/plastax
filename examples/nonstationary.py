@@ -432,7 +432,7 @@ def run(
     theta: float = math.pi / 4,
     switch_period: int | None = 40,
     d: int = 32,
-    hidden: int = 128,
+    hidden_layers: tuple[int, ...] = (128, 128),
     classes: int = 8,
     density: float = 0.1,
     lr: float = 0.001,
@@ -452,7 +452,10 @@ def run(
         theta: rotation angle per switch, in radians.
         switch_period: cycles between switches, or None for stationary.
         d: input dimensionality.
-        hidden: hidden layer width.
+        hidden_layers: width of each hidden layer. Two hidden layers is the
+            default because NE keeps the first and last transitions dense, so a
+            single hidden layer leaves it nothing to grow into; every arm shares
+            the architecture so the comparison stays matched.
         classes: output classes.
         density: live-edge fraction for every method except ``dense``.
         lr: adam learning rate. The default is deliberately low: at 0.01
@@ -476,7 +479,7 @@ def run(
     if method not in ("dense", "static", "set", "rigl"):
         raise ValueError(f"run: unknown method {method!r}")
     rewires = method in ("set", "rigl")
-    layers = (d + 1, hidden, classes)
+    layers = (d + 1, *hidden_layers, classes)
     budgets = _budgets(layers, density)
     dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
 
@@ -501,10 +504,8 @@ def run(
             shortlist=shortlist,
         )
         churn_step = px.make_step(churn_net, static)
-        # Surface the shortlist/layer-width interplay at build time rather than
-        # letting it show up as a slow density drift nobody attributes: an
-        # uncovered bucket can only refill into M of its destinations, so the
-        # run silently proceeds at a lower sparsity than it reports.
+        # An uncovered bucket refills into only M of its destinations, so the
+        # run proceeds at a lower sparsity than it reports. Say so at build.
         uncovered = [
             c for c in px.shortlist_coverage(churn_net, static, state) if not c.covered
         ]
@@ -523,7 +524,7 @@ def run(
 
     task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
     eye = np.eye(classes, dtype=np.float32)
-    hidden_ids = np.arange(layers[0], layers[0] + hidden)
+    hidden_ids = np.arange(layers[0], sum(layers) - classes)
     records: list[CycleRecord] = []
     last_inputs = jnp.zeros((layers[0],), dtype=jnp.float32)
 

@@ -566,3 +566,46 @@ def run(
             )
         )
     return records, trace
+
+
+def main() -> None:
+    """Report NE's growth trajectory and whether its pruning half ever fires.
+
+    The uncapped arm is the paper's: it grows toward full capacity, which leaves
+    the arena dense and so leaves plastax no representational advantage. The
+    capped arm is what keeps one, so both are reported side by side.
+    """
+    num_cycles = 200
+    hidden = (128, 128)
+    capacity = hidden[0] * hidden[1]
+    print("NE -- elastic growth on RigL's score, dormant-unit pruning")
+    print(f"interior dense limit {capacity} edges, {num_cycles} cycles")
+    print("=" * 82)
+    print(f"{'arm':22} {'dormant/cycle':>14} {'fired':>10} {'interior':>25} {'acc':>7}")
+    for label, kwargs in (
+        ("stationary, uncapped", {"switch_period": None, "theta": 0.0}),
+        ("pi/4, uncapped", {}),
+        ("pi/4, capped @0.5", {"density_target": 0.5}),
+    ):
+        records, trace = run(  # type: ignore[arg-type]
+            hidden_layers=hidden, num_cycles=num_cycles, **kwargs
+        )
+        dormant = np.array([d for d, _, _ in trace], dtype=float)
+        interior = np.array([e for _, _, e in trace])
+        accuracy = float(np.mean([r.accuracy for r in records[-5:]]))
+        span = f"{interior[0]} -> {interior.max()} peak -> {interior[-1]}"
+        print(
+            f"{label:22} {dormant.mean():14.1f} "
+            f"{int((dormant > 0).sum()):4d}/{len(dormant):<5d} {span:>25} "
+            f"{accuracy:7.3f}",
+            flush=True,
+        )
+    print()
+    print(
+        "The premise holds if dormancy fires on most cycles: NE starts sparse, "
+        "so it creates the fully-dormant units it later prunes."
+    )
+
+
+if __name__ == "__main__":
+    main()

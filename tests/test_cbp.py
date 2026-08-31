@@ -22,6 +22,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import plastax as px
 
@@ -200,3 +201,30 @@ def test_jaccard_does_not_score_empty_agreement() -> None:
     assert cbp.jaccard(set(), set()) is None
     assert cbp.jaccard({1, 2}, {1, 2}) == 1.0
     assert cbp.jaccard({1}, {1, 2, 3}) == 1 / 3
+
+
+@pytest.mark.slow
+def test_v1_local_threshold_fails_its_gate_on_rate() -> None:
+    """RL_PLAN's 0.9 Jaccard bar for the two-hop local threshold is NOT met.
+
+    Asserting the FAILURE is deliberate. The measured number lived only in a
+    stdout that was never captured, and the plan's fallback (ship v0, report v1
+    open) depends on it, so the state has to be pinned somewhere that breaks
+    loudly when v1 is fixed rather than rediscovered each session.
+
+    The diagnosis is the second half: v1 fires several times more resets than
+    v0, so the disagreement is a RATE mismatch, not the two-hop rule ranking
+    units differently. v0 selects a fixed rho by rank; v1's bar is a fraction of
+    a neighbourhood mean and controls nothing.
+    """
+    scores, sizes = cbp.jaccard_gate(
+        d=16, hidden_layers=(32, 32), classes=4, num_cycles=30, steps_per_cycle=50
+    )
+    settled = scores[8:]
+    assert settled, "no churn scored -- the gate measured nothing"
+    mean_score = float(np.mean(settled))
+    assert mean_score < 0.5, f"v1 now agrees with v0 at {mean_score:.3f}: re-gate it"
+
+    n0 = float(np.mean([a for a, _ in sizes[8:]]))
+    n1 = float(np.mean([b for _, b in sizes[8:]]))
+    assert n1 > 2.0 * n0, f"v1 no longer over-fires ({n1:.1f} vs {n0:.1f}): re-diagnose"

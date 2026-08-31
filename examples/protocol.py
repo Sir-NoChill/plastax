@@ -58,6 +58,16 @@ measures.
 Median and IPR-90 remain the reported statistics; only the decision moves to the
 sign test. The amendment was made after seeing G2 and is therefore applied ONLY
 to comparisons re-run under it -- the original G2 verdict stands as recorded.
+
+## Recovery is not comparable across arms at different accuracy
+
+`report` prints accuracy in the same row as recovery, and says so, because
+recovery is measured against each arm's OWN pre-switch plateau. Across the
+Stage-0 baselines `pearson(median accuracy, median recovery) = +0.995`: every
+sparse arm "recovers faster" than dense on 30/30 seeds simply by being a weaker
+network with a lower plateau and less of a drop to climb back. Ranking arms on
+recovery alone is therefore invalid; see todo/rl-recovery-metric-confound.md for
+the two real fixes (match capacity, or use a scale-free metric).
 """
 
 from __future__ import annotations
@@ -334,8 +344,11 @@ def report(results: dict[str, tuple[Summary, Summary]], control: str) -> None:
     """
     arms = [name for name in results if name != control]
     alpha = ALPHA / max(len(arms), 1)
+    # The actual seed count, not len(SEEDS): a short block is a smoke run and
+    # the header must not claim otherwise.
+    used = len(results[control][0].values)
     print(
-        f"protocol: {len(SEEDS)} fixed seeds, paired, "
+        f"protocol: {used} of {len(SEEDS)} fixed seeds, paired, "
         f"theta=pi/4 switch_period={SWITCH_PERIOD} cycles={NUM_CYCLES}"
     )
     print("statistic: per-run mean recovery time; median and IPR-90 across seeds")
@@ -345,17 +358,26 @@ def report(results: dict[str, tuple[Summary, Summary]], control: str) -> None:
     )
     print()
     print(
-        f"{'arm':18} {'median rec':>11} {'IPR90':>8} {'diff':>7} "
+        f"{'arm':18} {'median rec':>11} {'IPR90':>8} {'acc':>7} {'diff':>7} "
         f"{'wins':>7} {'p':>10} {'verdict':>22}"
     )
-    base = results[control][0]
-    print(f"{control:18} {base.median:11.2f} {base.ipr90:8.2f} {'(control)':>7}")
+    base, base_accuracy = results[control]
+    print(
+        f"{control:18} {base.median:11.2f} {base.ipr90:8.2f} "
+        f"{base_accuracy.median:7.3f} {'(control)':>7}"
+    )
     for name in arms:
-        recovery = results[name][0]
+        recovery, accuracy = results[name]
         test = sign_test(recovery.values, base.values)
         print(
             f"{name:18} {recovery.median:11.2f} {recovery.ipr90:8.2f} "
-            f"{test.median_difference:7.2f} "
+            f"{accuracy.median:7.3f} {test.median_difference:7.2f} "
             f"{test.wins:3d}/{test.effective_n:<3d} {test.p_value:10.2e} "
             f"{verdict(test, alpha=alpha):>22}"
         )
+    print()
+    print(
+        "Recovery is measured against each arm's OWN plateau, so it is NOT "
+        "comparable across arms at different accuracy: read the pair, and treat "
+        "faster recovery at lower accuracy as uninterpretable, not better."
+    )

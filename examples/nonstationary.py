@@ -437,7 +437,7 @@ def run(
     density: float = 0.1,
     lr: float = 0.001,
     zeta: float = 0.1,
-    shortlist: int | None = 64,
+    shortlist: int | None | str = "auto",
     steps_per_cycle: int = 100,
     num_cycles: int = 200,
     dormant_tau: float = 0.01,
@@ -463,7 +463,11 @@ def run(
             which would confound drift-induced plasticity loss with an
             optimizer artifact (measured, see module docstring).
         zeta: per-unit prune fraction for the rewiring methods.
-        shortlist: M for the growth candidate grid, or None for exhaustive.
+        shortlist: M for the growth candidate grid, ``"auto"`` for the
+            covering floor, or None for exhaustive. A fixed M smaller than the
+            widest layer bleeds edges every churn, so the run drifts BELOW the
+            density it reports -- ``"auto"`` is the default because that drift
+            is silent and invalidates every sparsity comparison.
         steps_per_cycle: training examples per cycle.
         num_cycles: cycles to run.
         dormant_tau: activation-EMA threshold below which a unit is dormant.
@@ -494,15 +498,27 @@ def run(
 
     churn_step = None
     if rewires:
-        grow = max(max(budgets), shortlist**2 if shortlist else max(budgets))
-        churn_net = make_net(
-            optimizer,
-            mode="churn",
-            method=method,
-            zeta=zeta,
-            max_candidates=grow,
-            shortlist=shortlist,
-        )
+
+        def _churn(m: int | None) -> type[px.Network[None]]:
+            return make_net(
+                optimizer,
+                mode="churn",
+                method=method,
+                zeta=zeta,
+                max_candidates=max(max(budgets), m**2 if m else max(budgets)),
+                shortlist=m,
+            )
+
+        if shortlist == "auto":
+            # Both documented constraints: reach every eligible destination, and
+            # hold enough candidate volume to refill the zeta * E freed slots.
+            # recommended_shortlist reports 0 for a net with no shortlist, so it
+            # is asked of a net that declares one.
+            covering = px.recommended_shortlist(_churn(1), static, state)
+            volume = math.ceil(math.sqrt(zeta * sum(budgets)))
+            shortlist = max(covering, volume)
+        assert not isinstance(shortlist, str)
+        churn_net = _churn(shortlist)
         churn_step = px.make_step(churn_net, static)
         # An uncovered bucket refills into only M of its destinations, so the
         # run proceeds at a lower sparsity than it reports. Say so at build.

@@ -42,12 +42,24 @@ Run:  uv run python examples/upgd.py
 
 from __future__ import annotations
 
+import math
+import time
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from dst_sparse import _hash01
 from mlp_xor import GradPreAct, LossGrad, MSELoss
-from nonstationary import ACT_EMA, IS_OUT, ReluBackward
+from nonstationary import (
+    ACT_EMA,
+    IS_OUT,
+    CycleRecord,
+    DriftingTask,
+    ReluBackward,
+    ReluForward,
+    build_dense_mlp,
+    mark_outputs,
+)
 
 import plastax as px
 
@@ -220,6 +232,7 @@ def set_global_eta(state: px.NetworkState[None]) -> px.NetworkState[None]:
 def make_net(
     *,
     mode: str,
+    local: bool = True,
     lr: float = 0.01,
     beta: float = 0.999,
     sigma: float = 0.001,
@@ -232,6 +245,9 @@ def make_net(
 
     Args:
         mode: ``"train"`` or ``"eval"``.
+        local: True for v1's per-destination max, folded into the forward pass.
+            False for v0, whose forward must NOT write `upgd/eta` or it would
+            overwrite the host's broadcast before the update ever reads it.
         lr: step size.
         beta: utility decay rate.
         sigma: perturbation noise scale.
@@ -243,10 +259,11 @@ def make_net(
     Raises:
         ValueError: on an unknown mode.
     """
+    forward = UpgdForward(ema_decay) if local else ReluForward(ema_decay)
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = UpgdForward(ema_decay)
+            forward_pass = forward
             backward_pass = ReluBackward()
             loss = MSELoss()
             update_conn = UpgdUpdate(lr=lr, beta=beta, sigma=sigma)
@@ -259,7 +276,7 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = UpgdForward(ema_decay)
+            forward_pass = forward
             extra_unit_fields = _UNIT_FIELDS
             extra_conn_fields = _CONN_FIELDS
             propagation = px.Propagation.TOPOLOGICAL
@@ -267,3 +284,125 @@ def make_net(
         return _Eval
 
     raise ValueError(f"make_net: unknown mode {mode!r}")
+
+
+def run(
+    *,
+    eta: str = "v1",
+    theta: float = math.pi / 4,
+    switch_period: int | None = 15,
+    d: int = 32,
+    hidden_layers: tuple[int, ...] = (128, 128),
+    classes: int = 8,
+    lr: float = 0.01,
+    beta: float = 0.999,
+    sigma: float = 0.001,
+    steps_per_cycle: int = 100,
+    num_cycles: int = 200,
+    seed: int = 0,
+) -> list[CycleRecord]:
+    """Train through teacher rotations under the UPGD update.
+
+    Args:
+        eta: ``"v0"`` (host global max, every step) or ``"v1"`` (per-destination
+            local max, folded into the forward pass).
+        theta: rotation angle per switch, in radians.
+        switch_period: cycles between switches, or None for stationary.
+        d: input dimensionality.
+        hidden_layers: width of each hidden layer; matched to every other arm.
+        classes: output classes.
+        lr: step size alpha.
+        beta: utility decay rate.
+        sigma: perturbation noise scale.
+        steps_per_cycle: training examples per cycle.
+        num_cycles: cycles to run.
+        seed: PRNG seed.
+
+    Returns:
+        One CycleRecord per cycle, reusing the Stage 0 record so UPGD is scored
+        by the same `recovery_times` as every other arm.
+
+    Raises:
+        ValueError: on an unknown eta mode.
+    """
+    if eta not in ("v0", "v1"):
+        raise ValueError(f"run: unknown eta {eta!r}")
+    layers = (d + 1, *hidden_layers, classes)
+    train_net = make_net(
+        mode="train", local=(eta == "v1"), lr=lr, beta=beta, sigma=sigma
+    )
+    static, state = build_dense_mlp(train_net, layers, seed)
+    state = mark_outputs(static, state)
+    train_step = px.make_step(train_net, static)
+
+    task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
+    eye = np.eye(classes, dtype=np.float32)
+    hidden_units = np.arange(layers[0], sum(layers) - classes)
+    out_ids = np.asarray(static.output_ids)
+    dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
+    records: list[CycleRecord] = []
+
+    for cycle in range(num_cycles):
+        task.advance(cycle)
+        started = time.perf_counter()
+        total_loss, correct = 0.0, 0
+        for _ in range(steps_per_cycle):
+            inputs, label = task.sample()
+            # v0 is Algorithm 1 as published: a host reduction on EVERY step.
+            if eta == "v0":
+                state = set_global_eta(state)
+            result = train_step(
+                state, px.StepInputs(inputs=inputs, targets=jnp.asarray(eye[label]))
+            )
+            state = result.state
+            total_loss += float(result.loss)
+            preds = np.asarray(state.units[px.ACTIVATION.name])[out_ids]
+            correct += int(np.argmax(preds) == label)
+        ema = np.asarray(state.units[ACT_EMA.name])[hidden_units]
+        live = int(px.state.live_conn_count(state))
+        records.append(
+            CycleRecord(
+                cycle=cycle,
+                loss=total_loss / steps_per_cycle,
+                accuracy=correct / steps_per_cycle,
+                live_edges=live,
+                density=live / dense_edges,
+                dormant=float(np.mean(ema < 0.01)),
+                mean_abs_w=0.0,
+                switched=task.switched,
+                seconds=time.perf_counter() - started,
+            )
+        )
+    return records
+
+
+def main() -> None:
+    """Report both eta modes against a no-UPGD control, and v0's per-step cost.
+
+    The interesting column is wall-clock: v0's global max is a device-to-host
+    sync on every training step, which is what v1 exists to remove.
+    """
+    from nonstationary import growth_slope, recovery_times
+
+    print("UPGD -- per-edge utility as one utility-gated connection update")
+    print("=" * 78)
+    print(f"{'arm':16} {'n':>3} {'mean rec':>9} {'slope':>8} {'acc':>7} {'s/cycle':>9}")
+    for label, mode in (("UPGD v1 (local)", "v1"), ("UPGD v0 (global)", "v0")):
+        records = run(eta=mode, num_cycles=200)
+        times = recovery_times(records)
+        accuracy = float(np.mean([r.accuracy for r in records[-5:]]))
+        seconds = float(np.mean([r.seconds for r in records]))
+        print(
+            f"{label:16} {len(times):3d} {np.mean(times):9.1f} "
+            f"{growth_slope(times):+8.2f} {accuracy:7.3f} {seconds:9.3f}",
+            flush=True,
+        )
+    print()
+    print(
+        "v1 reads the PREVIOUS step's utilities, since the forward runs before "
+        "the backward that produces this step's gradient."
+    )
+
+
+if __name__ == "__main__":
+    main()

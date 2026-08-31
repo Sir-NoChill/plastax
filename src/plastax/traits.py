@@ -100,18 +100,25 @@ class BackwardPass[Acc, GS](Protocol):
     def map(
         self,
         u: UnitView,
-        dst: UnitIdx,
         src: UnitIdx,
+        dst: UnitIdx,
         c: ConnView,
         cid: ConnIdx,
         g: GS,
     ) -> Acc:
         """Compute the accumulator contribution of one outgoing edge.
 
+        The first unit-id argument is the ACCUMULATOR TARGET, as in
+        `ForwardPass.map` -- but backward accumulates into the edge's SOURCE, so
+        it is `src` here where forward has `dst`. The argument ORDER is the same
+        in both directions (target first); only which endpoint that is differs.
+        `dst` is the edge's destination, whose value the reverse level walk has
+        already finalized, and is therefore the one a backward map reads.
+
         Args:
             u: the unit view.
-            dst: index of the destination unit.
-            src: index of the source unit.
+            src: index of the source unit -- this pass's accumulator target.
+            dst: index of the destination unit, already finalized.
             c: the connection view.
             cid: index of the connection.
             g: the global state.

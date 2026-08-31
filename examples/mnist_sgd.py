@@ -6,12 +6,9 @@ to float32 precision -- the reference-oracle parity demo for plastax.optim.sgd
 host-driven) and is much slower than the batched jax reference; the point is
 that the weight updates agree and both learn, not throughput.
 
-Data: the pure-numpy IDX reader loads the files torchvision caches under
-``$root/MNIST/raw`` (default /tmp/data); if they are absent and torchvision is
-installed, it downloads them first. To fetch once by hand:
-
-    uv run --with torch --with torchvision python -c \
-        "import torchvision; torchvision.datasets.MNIST('/tmp/data', download=True)"
+Data: ``torchvision.datasets.MNIST`` (a dev dependency) reads/downloads MNIST
+under ``$root`` (default /tmp/data) on first use -- only its dataset reader is
+used, no torch compute.
 
 Run:  uv run python examples/mnist_sgd.py --steps 4000
 """
@@ -19,10 +16,7 @@ Run:  uv run python examples/mnist_sgd.py --steps 4000
 from __future__ import annotations
 
 import argparse
-import gzip
-import struct
 from collections.abc import Callable
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -36,56 +30,25 @@ Weights = list[np.ndarray]
 
 
 # --------------------------------------------------------------------------- #
-# MNIST loading (pure numpy over the torchvision-cached IDX files)
+# MNIST loading (torchvision dataset reader; a dev/example dependency)
 # --------------------------------------------------------------------------- #
-_FILES = (
-    "train-images-idx3-ubyte",
-    "train-labels-idx1-ubyte",
-    "t10k-images-idx3-ubyte",
-    "t10k-labels-idx1-ubyte",
-)
-
-
-def _read_idx(path: Path) -> np.ndarray:
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rb") as handle:
-        (magic,) = struct.unpack(">I", handle.read(4))
-        ndim = magic & 0xFF  # low byte of the IDX magic is the rank
-        dims = struct.unpack(f">{ndim}I", handle.read(4 * ndim))
-        buf = handle.read()
-    return np.frombuffer(buf, dtype=np.uint8).reshape(dims)
-
-
-def _ensure_downloaded(root: str) -> None:
-    try:
-        import torchvision
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise SystemExit(
-            f"MNIST not found under {root} and torchvision is unavailable. Fetch "
-            'with: uv run --with torch --with torchvision python -c "import '
-            f"torchvision; torchvision.datasets.MNIST('{root}', download=True)\""
-        ) from exc
-    torchvision.datasets.MNIST(root, train=True, download=True)
-    torchvision.datasets.MNIST(root, train=False, download=True)
-
-
 def load_mnist(
     root: str = "/tmp/data",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load MNIST as (train_x, train_y, test_x, test_y), images in [0, 1]."""
-    raw = Path(root) / "MNIST" / "raw"
-    present = all((raw / f).exists() or (raw / f"{f}.gz").exists() for f in _FILES)
-    if not present:
-        _ensure_downloaded(root)
+    """Load MNIST via torchvision (downloads on first use).
 
-    def read(name: str) -> np.ndarray:
-        plain = raw / name
-        return _read_idx(plain if plain.exists() else raw / f"{name}.gz")
+    Returns (train_x, train_y, test_x, test_y): images (N, 28, 28) float32 in
+    [0, 1], labels int64. Only torchvision's dataset reader is used, no torch
+    compute.
+    """
+    from torchvision.datasets import MNIST
 
-    xtr = read(_FILES[0]).astype(np.float32) / 255.0
-    ytr = read(_FILES[1]).astype(np.int64)
-    xte = read(_FILES[2]).astype(np.float32) / 255.0
-    yte = read(_FILES[3]).astype(np.int64)
+    train = MNIST(root, train=True, download=True)
+    test = MNIST(root, train=False, download=True)
+    xtr = train.data.numpy().astype(np.float32) / 255.0
+    ytr = train.targets.numpy().astype(np.int64)
+    xte = test.data.numpy().astype(np.float32) / 255.0
+    yte = test.targets.numpy().astype(np.int64)
     return xtr, ytr, xte, yte
 
 

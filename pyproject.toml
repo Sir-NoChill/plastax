@@ -31,17 +31,31 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Typing :: Typed",
 ]
-# jax>=0.11 requires >=3.12 (uv universal resolver fails on 3.11); Deviation
-# 2026-08-17. TOOLING.md pins the concrete interpreter via .python-version.
+# requires-python >=3.12: uv's universal resolver has no solution at 3.11
+# (Deviation 2026-08-17). .python-version pins the concrete interpreter (3.13).
 requires-python = ">=3.12"
 dependencies = [
-  "jax>=0.11.0",
+  # Floor is 0.10.2: the API plastax uses (register_dataclass, jax.shard_map --
+  # stable since 0.8.0 -- sharding.Mesh/PartitionSpec, make_array_from_process_
+  # local_data) is present and validated on 0.10.2 (Alliance/Narval wheelhouse,
+  # full fast suite green) through 0.11.x (local CUDA). See Deviations.
+  "jax>=0.10.2",
   "jaxtyping>=0.2.36",
   # numpy is imported directly across src/plastax (state, builder, step,
   # topo, views, ...); declare it rather than lean on jax's transitive
-  # install (P0.4). Floor matches jax 0.11's numpy>=2 requirement.
+  # install (P0.4). Floor matches jax's numpy>=2 requirement.
   "numpy>=2",
 ]
+
+# Optional GPU backend. `pip install plastax[cuda12]` (or `uv sync --extra
+# cuda12`) pulls the CUDA-12 jaxlib + plugin in place of the default CPU wheel;
+# `gpu` is a friendly alias for it. plastax is backend-agnostic pure Python --
+# the extra only swaps which jax wheel resolves, nothing in src/plastax changes.
+# Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). Set
+# XLA_PYTHON_CLIENT_PREALLOCATE=false on a shared GPU (see TOOLING.md).
+[project.optional-dependencies]
+cuda12 = ["jax[cuda12]>=0.10.2"]
+gpu = ["plastax[cuda12]"]
 
 [project.urls]
 Homepage = "https://github.com/Sir-NoChill/plastax"
@@ -71,6 +85,10 @@ dev = [
   # optax: reference oracle for the plastax.optim parity tests (Track A.1). A
   # test-only dependency, never a runtime dep (ECOSYSTEM_ROADMAP.md).
   "optax",
+  # torchvision: CIFAR-10 download + loader for the dynamic-sparse-training
+  # example (examples/cifar_dst.py). Dev/example-only -- never a runtime dep;
+  # only its datasets.CIFAR10 reader is used, no torch compute.
+  "torchvision",
 ]
 # Docs group installed by RTD (.readthedocs.yaml) and the CI docs job;
 # locally: `uv sync --group docs`, then

@@ -178,6 +178,70 @@ Tooling / infrastructure (2026-08-17, scaffolding handoff):
 - repo: no repo-local commit wrapper — contributors attribute and sign with
   their own agents (per user, review 2026-08-17).
 
+Tooling / infrastructure (2026-08-29, jax floor widening):
+
+- pyproject (packaging): `jax>=0.11.0` -> `jax>=0.10.2` (and the `cuda12`
+  extra likewise). plastax uses only APIs stable at 0.10.2 —
+  `jax.tree_util.register_dataclass`, `jax.shard_map` (top-level since 0.8.0;
+  `jax.experimental.shard_map` is the deprecated alias), `jax.sharding.Mesh`/
+  `PartitionSpec`, `make_array_from_process_local_data` — and the fast suite,
+  including the Scheme-A sharding-equivalence test, passes on jax 0.10.2.
+  Reason: Alliance Canada's Narval wheelhouse ships a version-consistent
+  CUDA JAX only at 0.10.2 (the cuda12 plugin/pjrt top out there), so the
+  multi-GPU scaling experiments run on 0.10.2; the 0.11 floor was the
+  conservative dev/validation version, not a hard dependency.
+
+Multi-controller sharding (2026-08-30, `sparse` branch):
+
+- distributed.py (new): `distribute_state(static, state)` places a host-built
+  NetworkState onto the Scheme-A mesh as a global `jax.Array` — conn columns
+  sharded on the capacity axis, units/globals/needs_resort replicated — via
+  `make_array_from_process_local_data`, so the state can enter the sharded step
+  under true multi-controller (jax.distributed, one process per device-group),
+  where no single process holds every device. Single-controller `shard_map`
+  slices a host array implicitly and needs no placement; this makes it explicit
+  and is a no-op when `static.sharding is None`. `scheme_a_mesh(static)` factors
+  the mesh construction out of `step._shard_map_step` (single source of truth).
+- Finding: the earlier "multi-controller resort/overflow unhandled" note was
+  only untested, not unimplemented. Once the state is a global array, the
+  Driver's eager host-side transforms (grow_bucket pad+retrace, topo.resort)
+  run as collective SPMD ops — scalar reads (`live_conn_count`, overflow) reduce
+  globally, and resort's per-level live histogram comes back replicated because
+  the reduced axis is not the sharded one — so no change to driver.py /
+  grow_bucket / resort was needed.
+- tests: `tests/mc_sharding_equiv.py` (train + SET/RigL churn) and
+  `tests/mc_driver_equiv.py` (overflow->grow, resort + a sharded step on the
+  resorted state) launch one process per shard via jax.distributed (gloo on
+  CPU, one device each) and assert byte-identical equivalence to single-device
+  plus cross-process host-read consistency; `slow`-marked subprocess wrappers
+  `test_mc_sharding.py` / `test_mc_driver.py`. This is the local stand-in for a
+  one-process-per-node Narval run (closes the local scope of follow-up #15).
+
+Per-shard construction (2026-08-30, `sparse` branch):
+
+- builder.py: `from_edges`/`from_topology`/`finalize` gain `sharding: ShardSpec
+  | None`. When set, `_assemble` computes the same plan (levels, per-bucket sort
+  order, capacities) but materialises only each process's addressable
+  capacity-axis band per bucket via the new `_window_column`, then assembles a
+  global `jax.Array` (conns sharded, units/globals/needs_resort replicated) with
+  the distributed placement helpers. So no process ever holds the full padded
+  arena -- previously even `distribute_state` needed the whole state built first
+  (and `_assemble`'s `jnp.asarray` put a full column on one device). The window
+  is `capacity / num_shards`; the single-controller path (`sharding=None`) is
+  unchanged and byte-identical (fast suite still green).
+- distributed.py: factored `_shardings_for_spec` / `_place` /
+  `_addressable_window`, shared by `distribute_state` and the builder.
+- tests: `test_builder.py` pins the windowed materialiser (G windows tile back
+  to the full column) and single-controller `from_edges(sharding=)` ==
+  `distribute_state`; `tests/mc_construct_equiv.py` (slow wrapper
+  `test_mc_construct.py`) builds one shard per process and asserts the window is
+  exactly `cap/num_shards`, the assembled state matches the full build sliced,
+  and a sharded forward on it matches single-device.
+- Scope: Level 1 -- each process still generates the full edge list transiently
+  to compute global sort ranks, but materialises only its `cap/G` columns.
+  Generating only `~E/G` edges per process (a distributed sort) is a larger,
+  separate change, unneeded for single-node multi-GPU.
+
 Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
 - All modules: converted to PEP 695 generics (`class Foo[T]`, `def f[T]`)

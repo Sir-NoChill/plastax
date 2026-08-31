@@ -14,8 +14,9 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int32, Shaped
 
+from plastax import monoid
 from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, ConnIdx, Propagation, UnitIdx
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.sweep import (
@@ -274,7 +275,14 @@ def _build_backward_topological_phase[GS](
 def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phase[GS]:
     loss = net.loss
     assert loss is not None  # build_phases only calls this when set
-    output_ids = static.output_ids
+    # vmapped over the whole output set rather than unrolled per output id:
+    # `per_output` is a pure scalar policy over views (views.py docstring), so
+    # one trace of it serves every output. The unrolled Python loop this
+    # replaced emitted a gather + a scatter *per output unit*, so trace and XLA
+    # compile cost grew superlinearly in the output count -- fine for the 1-10
+    # outputs of an MLP, but the wall for extreme multi-label classification,
+    # whose whole point is 10^5-10^6 output units.
+    output_ids = jnp.asarray(static.output_ids, dtype=jnp.int32)
 
     def loss_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -283,22 +291,21 @@ def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phas
         # docstring); build_phases only reaches here when net.loss is set.
         assert inputs.targets is not None
         u_view = UnitView(state.units)
+        globals_ = state.globals_
+
+        def one(
+            unit_id: Int32[Array, ""], target: Float[Array, ""]
+        ) -> tuple[Float[Array, ""], dict[str, Shaped[Array, ""]]]:
+            # UnitWrite is not a registered pytree, so vmap carries the
+            # underlying field mapping and the scatter below rebuilds columns.
+            value, write = loss.per_output(u_view, UnitIdx(unit_id), target, globals_)
+            return value, dict(write.fields)
+
+        values, columns = jax.vmap(one)(output_ids, inputs.targets)
         units = dict(state.units)
-        total = jnp.float32(0.0)
-        # Static Python loop over the static output_ids tuple (unrolled at
-        # trace time), matching the forward topological level loop's style:
-        # small and static, so no vmap machinery is needed.
-        for k, unit_id in enumerate(output_ids):
-            value, write = loss.per_output(
-                u_view,
-                UnitIdx(jnp.asarray(unit_id, dtype=jnp.int32)),
-                inputs.targets[k],
-                state.globals_,
-            )
-            total = total + value
-            for name, field_value in write.fields.items():
-                units[name] = units[name].at[unit_id].set(field_value)
-        return dataclasses.replace(state, units=units), total
+        for name, column in columns.items():
+            units[name] = units[name].at[output_ids].set(column)
+        return dataclasses.replace(state, units=units), jnp.sum(values)
 
     return loss_phase
 
@@ -423,6 +430,103 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+@dataclasses.dataclass(frozen=True)
+class ShortlistCoverage:
+    """How much of one bucket's destination population a shortlist can reach.
+
+    Attributes:
+        bucket: the source-level bucket index.
+        candidate_units: the shortlist size M the AddConn declares.
+        source_units: units sitting at this bucket's source level.
+        destination_units: units this bucket may grow INTO, i.e. those within
+            the neighbourhood window and strictly deeper.
+        covered: whether M reaches every eligible destination.
+    """
+
+    bucket: int
+    candidate_units: int
+    source_units: int
+    destination_units: int
+    covered: bool
+
+
+def shortlist_coverage[GS](
+    net: type[Network[GS]], static: NetworkStatic, state: NetworkState[GS]
+) -> tuple[ShortlistCoverage, ...]:
+    """Report, per bucket, whether the growth shortlist reaches every destination.
+
+    A shortlisted `add_conn` draws candidates from the M most important sources
+    at a bucket's own level crossed with the M most important eligible
+    destinations. **M therefore bounds how many distinct units can receive a new
+    edge**, which is a different and usually tighter constraint than the
+    "M >= sqrt(zeta * E)" volume rule: a bucket whose destination layer is wider
+    than M can only ever refill into M of those units, so a
+    count-conserving churn quietly under-fills and the realized sparsity drifts
+    away from the target. Measured on a 16-unit hidden layer, M=8 bled a
+    128-edge arena down to 121-125 while M>=16 held it exactly.
+
+    This runs on the host against a built state, because the level assignment
+    that decides which units are eligible is runtime data, not static config --
+    so the traced phase cannot check it for you.
+
+    Args:
+        net: the network type whose ``add_conn`` declares the shortlist.
+        static: static network configuration.
+        state: a built state, read for its LEVEL column.
+
+    Returns:
+        One ShortlistCoverage per bucket, empty when the net declares no
+        shortlist (the exhaustive grid always covers everything).
+    """
+    add_conn = net.add_conn
+    max_candidate_units: int | None = getattr(add_conn, "max_candidate_units", None)
+    if add_conn is None or max_candidate_units is None:
+        return ()
+    levels = np.asarray(state.units[LEVEL.name])
+    neighbourhood = net.neighbourhood
+    out: list[ShortlistCoverage] = []
+    for bucket in range(len(static.level_capacities)):
+        sources = int(np.sum(levels == bucket))
+        # matches build_add_conn_phase's own window: strictly deeper, within
+        # the neighbourhood radius.
+        destinations = int(
+            np.sum((levels > bucket) & (levels <= bucket + neighbourhood))
+        )
+        out.append(
+            ShortlistCoverage(
+                bucket=bucket,
+                candidate_units=max_candidate_units,
+                source_units=sources,
+                destination_units=destinations,
+                covered=max_candidate_units >= destinations,
+            )
+        )
+    return tuple(out)
+
+
+def recommended_shortlist[GS](
+    net: type[Network[GS]], static: NetworkStatic, state: NetworkState[GS]
+) -> int:
+    """Smallest shortlist that reaches every eligible destination in every bucket.
+
+    Use as a floor, not a target: it satisfies the destination-coverage
+    constraint only. The candidate *volume* rule still applies on top -- a churn
+    frees about ``zeta * E`` slots and can refill only from the shortlisted
+    grid, so size M above ``sqrt(zeta * E)`` as well.
+
+    Args:
+        net: the network type whose ``add_conn`` declares the shortlist.
+        static: static network configuration.
+        state: a built state, read for its LEVEL column.
+
+    Returns:
+        The maximum eligible-destination count over buckets, or 0 when the net
+        declares no shortlist.
+    """
+    coverage = shortlist_coverage(net, static, state)
+    return max((c.destination_units for c in coverage), default=0)
+
+
 def build_add_conn_phase[GS](
     net: type[Network[GS]],
     static: NetworkStatic,
@@ -449,7 +553,11 @@ def build_add_conn_phase[GS](
     sorted live pair ids -- no num_units**2 occupancy grid) so growth never
     regrows an existing pair as a duplicate. Each bucket runs an independent
     top_k (static k) over its own scored, windowed candidates, with no
-    cross-bucket sequencing.
+    cross-bucket sequencing. A candidate scored -inf is never committed -- the
+    framework scores every invalid candidate -inf, and a growth policy returns
+    -inf to veto one it must never grow (e.g. a non-deeper edge) -- so a bucket
+    with more free slots than finite-scored candidates leaves the surplus empty
+    rather than back-filling with vetoed edges.
 
     Free slots are claimed by a prefix-sum scan over each bucket's own
     `dead` mask: the scan turns dead-row rank into a slot assignment, so a
@@ -459,7 +567,7 @@ def build_add_conn_phase[GS](
     scatter's default drop mode discards rather than mis-writing a live
     slot.
 
-    Overflow is a real (valid, top-k-selected) candidate for which its
+    Overflow is a real (growable, top-k-selected) candidate for which its
     own bucket ran out of dead slots; it is dropped and the flag is
     raised via `overflow_sink` rather than committed. A committed
     candidate whose destination is not strictly deeper than its source
@@ -486,20 +594,41 @@ def build_add_conn_phase[GS](
     neighbourhood = net.neighbourhood
     is_pipeline = net.propagation is Propagation.PIPELINE
 
+    # Scheme-A sharding: the conn arena is split across `num_shards` devices on
+    # its capacity axis, so the slot claim below runs over each shard's own
+    # slice and coordinates growth across shards with collectives -- entirely
+    # device-resident, no host round-trip. Both reduce to the single-device
+    # identity (num_shards == 1, shard_axis is None) when unsharded.
+    shard_axis = _shard_axis(static)
+    num_shards = static.sharding.num_shards if static.sharding is not None else 1
+
     # Optional candidate reduction: an AddConn may declare `max_candidate_units`
     # (M) and an `importance(u, i, g)` method to shortlist the M most important
     # units each step and draw candidates only from that M x M grid, cutting
     # the per-step cost from O(num_units^2) to O(num_units + M^2). Absent (or M
     # >= num_units), the full grid is used -- the historical behavior, so
-    # existing AddConn policies are unaffected. Shortlisting is global (top-M
-    # over all units); a bucket whose source level is missing from the shortlist
-    # simply grows nothing that step.
+    # existing AddConn policies are unaffected.
+    #
+    # The shortlist is global (top-M over all units) by default; a policy may
+    # also set `shortlist_per_level = True` to instead draw each bucket its own
+    # M x M grid -- top-M sources at that bucket's source level x top-M deeper
+    # destinations within the window -- so every transition of a layered net is
+    # served. A global top-M can concentrate on one level and starve a bucket,
+    # letting sparsity drift down; per-level is the fix. It is levels-based,
+    # hence topological only (pipeline keeps the global shortlist), and forward
+    # only (its destinations are strictly deeper), matching how growth policies
+    # veto non-deeper edges anyway.
     max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
     importance_fn = getattr(ac, "importance", None)
     use_shortlist = (
         max_candidate_units is not None
         and importance_fn is not None
         and 0 < max_candidate_units < num_units
+    )
+    use_per_level = (
+        use_shortlist
+        and bool(getattr(ac, "shortlist_per_level", False))
+        and not is_pipeline
     )
     pool_side = max_candidate_units if use_shortlist else num_units
     assert pool_side is not None  # use_shortlist implies max_candidate_units set
@@ -513,20 +642,39 @@ def build_add_conn_phase[GS](
     _full_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
     _full_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
 
-    def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
-        """This step's (flat_src, flat_dst) candidate grid."""
-        if not use_shortlist:
-            return _full_src, _full_dst
-        assert importance_fn is not None  # use_shortlist implies it is set
+    def importance_scores(u_view: UnitView, g: GS) -> jax.Array:
+        """The per-unit importance vector (num_units,), for either shortlist."""
+        assert importance_fn is not None  # only called when shortlisting
 
         def one(i: jax.Array) -> jax.Array:
             score = importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
             return cast(jax.Array, score)
 
-        scores = jax.vmap(one)(unit_ids)
-        _, top = jax.lax.top_k(scores, pool_side)
+        return jax.vmap(one)(unit_ids)
+
+    def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
+        """The global (flat_src, flat_dst) grid: full num_units^2 or top-M^2."""
+        if not use_shortlist:
+            return _full_src, _full_dst
+        _, top = jax.lax.top_k(importance_scores(u_view, g), pool_side)
         src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
         dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
+        return src, dst
+
+    def per_level_grid(
+        imp: jax.Array, unit_level: jax.Array, bucket_idx: int
+    ) -> tuple[jax.Array, jax.Array]:
+        """One bucket's grid: top-M sources at its level x top-M deeper dests.
+
+        A source top_k that pulls in a wrong-level unit (fewer than M sit at the
+        level) is harmless -- the bucket's own `src_ok` filter drops it.
+        """
+        src_imp = jnp.where(unit_level == bucket_idx, imp, -jnp.inf)
+        _, src_top = jax.lax.top_k(src_imp, pool_side)
+        deeper = (unit_level > bucket_idx) & (unit_level <= bucket_idx + neighbourhood)
+        _, dst_top = jax.lax.top_k(jnp.where(deeper, imp, -jnp.inf), pool_side)
+        src = jnp.broadcast_to(src_top[:, None], (pool_side, pool_side)).reshape(-1)
+        dst = jnp.broadcast_to(dst_top[None, :], (pool_side, pool_side)).reshape(-1)
         return src, dst
 
     def add_conn_phase(
@@ -536,19 +684,18 @@ def build_add_conn_phase[GS](
         units = state.units
         g = state.globals_
         u_view = UnitView(units)
-        flat_src, flat_dst = candidate_grid(u_view, g)
-        not_self = flat_src != flat_dst
         unit_level = units[LEVEL.name]
-        src_level = unit_level[flat_src]
-        dst_level = unit_level[flat_dst]
-        level_gap = dst_level - src_level
-        # Per ordered (src, dst) pair, the level window is `abs(gap) <=
-        # neighbourhood`: it admits any pair within `neighbourhood` levels
-        # of each other, including same-level pairs and edges toward a
-        # shallower destination, in both directions. Self-loops are
-        # excluded explicitly (`not_self`), since gap == 0 no longer
-        # implies src == dst now that same-level pairs are admitted.
-        window_ok = (jnp.abs(level_gap) <= neighbourhood) & not_self
+        # Per-level shortlisting draws each bucket its own grid in the loop
+        # below; every other mode reuses this one global grid. Its per-bucket
+        # window (`abs(gap) <= neighbourhood`, self-loops excluded -- the window
+        # admits same-level and toward-shallower pairs, which a growth policy's
+        # score vetoes if unwanted) is also computed in the loop, cheap on the
+        # shared grid. The global grid is built unconditionally so the loop's two
+        # branches both bind flat_src/flat_dst; when per-level it is the (small)
+        # top-M grid and goes unused, dead-code-eliminated -- never the
+        # num_units^2 full grid.
+        imp = importance_scores(u_view, g) if use_per_level else None
+        global_src, global_dst = candidate_grid(u_view, g)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
@@ -567,6 +714,15 @@ def build_add_conn_phase[GS](
         for bucket_idx in range(num_buckets):
             bucket_conns = state.conns[bucket_idx]
             capacity_b = static.level_capacities[bucket_idx]
+            if use_per_level:
+                assert imp is not None  # use_per_level implies importance is set
+                flat_src, flat_dst = per_level_grid(imp, unit_level, bucket_idx)
+            else:
+                flat_src, flat_dst = global_src, global_dst
+            src_level = unit_level[flat_src]
+            window_ok = (jnp.abs(unit_level[flat_dst] - src_level) <= neighbourhood) & (
+                flat_src != flat_dst
+            )
             src_ok = (
                 jnp.ones_like(src_level, dtype=jnp.bool_)
                 if is_pipeline
@@ -594,6 +750,19 @@ def build_add_conn_phase[GS](
                 jnp.int32(sorted_live.shape[0] - 1),
             )
             not_duplicate = sorted_live[pos] != candidate_pair
+            if shard_axis is not None:
+                # Under Scheme-A the live edges are split across shards, so the
+                # binary search above only sees THIS shard's slice. A candidate
+                # already live on any other shard must count as a duplicate
+                # everywhere -- otherwise shards would score a different
+                # candidate set, top_k differently, and disagree on the global
+                # slot assignment below. All-reduce the local duplicate mask
+                # (pmax == boolean OR) so valid/scores/top_k are identical on
+                # every shard.
+                dup_any = monoid.max_.collective(
+                    (~not_duplicate).astype(jnp.int32), shard_axis
+                )
+                not_duplicate = dup_any == jnp.int32(0)
             valid = window_ok & src_ok & not_duplicate
 
             flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
@@ -601,37 +770,82 @@ def build_add_conn_phase[GS](
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]
+            # A candidate is growable only if its score is finite. `scored`
+            # sends every framework-invalid candidate (out-of-window, wrong
+            # source level, or a duplicate of a live edge) to -inf, and a growth
+            # policy likewise returns -inf to *veto* a candidate it must never
+            # grow (e.g. a non-deeper edge that would break leveling) rather
+            # than merely rank it last. Gating commitment on finiteness makes
+            # -inf a hard veto: without it, a bucket whose free slots outnumber
+            # its finite-scored candidates would back-fill the surplus with
+            # vetoed edges, since top_k still surfaces them and `has_room`
+            # alone would admit them.
+            top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
 
-            # Prefix-sum slot claim over this bucket's own dead mask:
-            # rank[i] is dead-position i's 0-based rank among this bucket's
-            # dead slots; scattering `positions` by `rank` (dropping live
-            # positions via the always-OOB `sink_len` index) inverts that
-            # into slot_for_rank[j] = the position of the j-th free slot,
-            # `capacity_b` (never a real position) where fewer than j+1
-            # free slots exist. `sink_len = max(capacity_b, k)` keeps both
-            # the scatter (indices < capacity_b <= sink_len, in bounds) and
-            # the later static `[:k]` slice in bounds without a runtime
-            # clamp, even if k > capacity_b.
+            # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
+            # dead mask is this shard's capacity slice (size capacity_b //
+            # num_shards; power-of-two capacities keep it exact), so the claim
+            # runs over the LOCAL slice and is coordinated across shards: each
+            # growable candidate takes a GLOBAL free-slot rank and lands on the
+            # one shard that owns it. Because shard g holds arena positions
+            # [g*local_capacity, (g+1)*local_capacity), the global free-slot
+            # order (shard 0's free slots, then shard 1's, ...) is exactly the
+            # single-device position order -- so a candidate lands where the
+            # single-device add_conn would. local_capacity == capacity_b and
+            # offset == 0 when unsharded, leaving that path byte-identical.
+            local_capacity = capacity_b // num_shards
             dead_b = bucket_conns[DEAD.name]
+            local_free = jnp.sum(dead_b.astype(jnp.int32))
+            # local_slot_for_rank[j] = position (within this shard's slice) of
+            # its j-th free slot, or local_capacity when it has fewer than j+1.
+            # `sink_len = max(local_capacity, k)` keeps the scatter and the
+            # index below in bounds even if k > local_capacity.
             rank = jnp.cumsum(dead_b.astype(jnp.int32)) - 1
-            positions = jnp.arange(capacity_b, dtype=jnp.int32)
-            sink_len = max(capacity_b, k)
+            positions = jnp.arange(local_capacity, dtype=jnp.int32)
+            sink_len = max(local_capacity, k)
             scatter_target = jnp.where(dead_b, rank, jnp.int32(sink_len))
-            slot_for_rank = (
-                jnp.full((sink_len,), capacity_b, dtype=jnp.int32)
+            local_slot_for_rank = (
+                jnp.full((sink_len,), local_capacity, dtype=jnp.int32)
                 .at[scatter_target]
                 .set(positions, mode="drop")
             )
-            free_slot = slot_for_rank[:k]
-            has_room = free_slot < capacity_b
-            committed = top_valid & has_room
-            # Overflow: a real (valid, top-k-selected) candidate for which
-            # this bucket ran out of dead slots. Uncommitted candidates
-            # (invalid or no room) scatter to `capacity_b`, one past this
-            # bucket's own valid range -- the scatter's default drop mode
-            # discards them rather than mis-writing a live slot.
-            overflow = overflow | jnp.any(top_valid & ~has_room)
-            target_slot = jnp.where(committed, free_slot, jnp.int32(capacity_b))
+            # This shard's offset into the global free-slot space, and the total
+            # free count. The offset is an exclusive prefix of the per-shard
+            # free counts (an all-gather -- a prefix is not a plain all-reduce)
+            # and feeds only the per-shard placement below. total_free is a
+            # psum, not sum(all_gather): it flows into `overflow` and
+            # `needs_resort`, which shard_map requires be provably replicated,
+            # and psum is the all-reduce it recognizes as replicating. Both are
+            # device-resident collectives.
+            if shard_axis is not None:
+                all_free = jax.lax.all_gather(local_free, shard_axis)
+                my_index = jax.lax.axis_index(shard_axis)
+                offset = jnp.sum(
+                    jnp.where(jnp.arange(num_shards) < my_index, all_free, 0)
+                )
+                total_free = monoid.sum_.collective(local_free, shard_axis)
+            else:
+                offset = jnp.int32(0)
+                total_free = local_free
+            # growth_rank[i] = candidate i's rank among the growable top-k --
+            # its global free-slot index. The -inf-scored candidates sort to
+            # the tail of top_k, so top_growable is a contiguous prefix and
+            # growth_rank[i] == i there: identical to the old per-index claim
+            # when unsharded. A candidate whose rank exceeds the total free
+            # slots is overflow -- dropped, flag raised.
+            growth_rank = jnp.cumsum(top_growable.astype(jnp.int32)) - 1
+            committed = top_growable & (growth_rank < total_free)
+            overflow = overflow | jnp.any(top_growable & (growth_rank >= total_free))
+            # A committed candidate belongs to THIS shard iff its global rank
+            # falls in [offset, offset + local_free); place it at that shard-
+            # local free slot, else scatter to `local_capacity` (out of this
+            # slice's range), dropped by the scatter's drop mode.
+            local_rank = growth_rank - offset
+            mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
+            safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
+            target_slot = jnp.where(
+                mine, local_slot_for_rank[safe_rank], jnp.int32(local_capacity)
+            )
 
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it

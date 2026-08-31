@@ -7,6 +7,7 @@ only on level reassignment; bucket growth is handled by state.grow_bucket.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections import deque
 from typing import cast
 
@@ -20,6 +21,15 @@ from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, Propagation
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.sweep import unit_id_mask
 
+# Frontier-Kahn round cap before the Python longest-path takes over. Rounds
+# equal graph depth; the shallow-wide nets this library builds (a handful of
+# layers over a huge width) settle in a few rounds, so the vectorized path
+# covers them. A graph deeper than this -- e.g. a long chain -- would make the
+# O(depth*E) vectorized pass lose to the O(N+E) Python one, so past the cap we
+# hand off to `_kahn_levels`. 64 comfortably clears any realistic layered net
+# while capping the vectorized work spent before falling back on a deep one.
+_MAX_VECTORIZED_LEVEL_ROUNDS = 64
+
 
 def initial_levels(
     num_units: int,
@@ -27,25 +37,97 @@ def initial_levels(
     *,
     allow_cycles: bool = False,
 ) -> np.ndarray:
-    """Compute initial levels host-side via Kahn/BFS, before jit.
+    """Compute initial longest-path levels host-side, before jit.
 
     Longest-path levels: in-degree-0 units are level 0; level(v) = max over
     incoming edges (u -> v) of level(u) + 1. Raises on a cycle (topological
     propagation needs a DAG; the dense/conv2d/sequential topologies always
     give one) unless `allow_cycles` is set.
 
+    Computed by a **vectorized frontier Kahn** (BFS by level): each round
+    relaxes, in one numpy scatter, every out-edge whose source settled last
+    round, and settles any unit whose remaining in-degree hits zero. A unit
+    settles only after all its predecessors, so its level is final when its
+    out-edges relax -- identical longest-path values to a per-node Kahn queue,
+    but O(depth) numpy rounds instead of a per-edge Python walk. Depth beyond
+    `_MAX_VECTORIZED_LEVEL_ROUNDS` (a rare deep graph) falls back to the
+    O(N+E) `_kahn_levels` so this never regresses versus the old scalar path.
+
     With `allow_cycles` (pipeline propagation, where recurrent reservoirs
-    are legal), a cycle is not an error: units caught in a cycle never leave
-    the Kahn queue, so they keep the best-effort longest-path level reached
-    from their acyclic predecessors (0 when they have none). Levels are
-    cosmetic in pipeline mode -- every conn lands in the single flat bucket
-    regardless of source level -- so a partial assignment is harmless.
+    are legal), a cycle is not an error: the frontier drains once the acyclic
+    prefix settles, leaving cycle units at the best-effort longest-path level
+    reached from their acyclic predecessors (0 when they have none) -- exactly
+    what the scalar Kahn left them at. Levels are cosmetic in pipeline mode
+    (every conn lands in the single flat bucket), so a partial assignment is
+    harmless.
 
     Args:
         num_units: Total number of units in the network.
         edges: (E, 2) int32 host array of edges, from builder.
         allow_cycles: If True, tolerate cycles and return best-effort
             levels instead of raising.
+
+    Returns:
+        Per-unit levels as an int32 host array.
+
+    Raises:
+        ValueError: The edges do not form a DAG and `allow_cycles` is False.
+    """
+    levels = np.zeros(num_units, dtype=np.int32)
+    if edges.shape[0] == 0:
+        return levels
+
+    src = edges[:, 0]
+    dst = edges[:, 1]
+    in_degree = np.zeros(num_units, dtype=np.int64)
+    np.add.at(in_degree, dst, 1)
+
+    remaining = in_degree.copy()
+    settled = in_degree == 0  # (num_units,) bool: level-0 units start settled
+    newly = settled  # this round's frontier (units that just settled)
+    processed = int(settled.sum())
+    rounds = 0
+    while bool(newly.any()):
+        if rounds >= _MAX_VECTORIZED_LEVEL_ROUNDS:
+            # Frontier still advancing past the cap -> a graph deeper than the
+            # vectorized path is worth. The scalar longest-path is O(N+E) and
+            # correct for any depth; recompute from scratch.
+            return _kahn_levels(num_units, edges, allow_cycles=allow_cycles)
+        active = newly[src]  # edges leaving the current frontier
+        active_dst = dst[active]
+        # level[v] = max(level[v], level[u]+1) over this round's edges; the
+        # unbuffered scatter applies every (possibly duplicate) destination.
+        np.maximum.at(levels, active_dst, levels[src[active]] + np.int32(1))
+        np.add.at(remaining, active_dst, np.int64(-1))
+        reached = (remaining == 0) & ~settled
+        settled = settled | reached
+        newly = reached
+        processed += int(reached.sum())
+        rounds += 1
+
+    if processed != num_units and not allow_cycles:
+        raise ValueError("initial_levels: edges do not form a DAG (cycle detected)")
+    return levels
+
+
+def _kahn_levels(
+    num_units: int,
+    edges: np.ndarray,
+    *,
+    allow_cycles: bool,
+) -> np.ndarray:
+    """Scalar Kahn longest-path leveling: the deep-graph fallback.
+
+    The per-node adjacency-plus-queue longest-path `initial_levels` used before
+    it was vectorized, kept as the O(N+E) fallback for graphs deeper than the
+    vectorized round cap. Produces byte-identical levels to the frontier pass
+    on any input (both are longest-path Kahn); the randomized equivalence is
+    pinned in tests/test_topo.py.
+
+    Args:
+        num_units: Total number of units in the network.
+        edges: (E, 2) int32 host array of edges.
+        allow_cycles: If True, tolerate cycles and return best-effort levels.
 
     Returns:
         Per-unit levels as an int32 host array.
@@ -258,20 +340,35 @@ def resort[GS](
     return new_static, new_state
 
 
-def capacity_policy(live: int, *, min_bucket: int = 64) -> int:
+def capacity_policy(live: int, *, min_bucket: int = 64, headroom: float = 0.0) -> int:
     """Compute a bucket capacity with headroom above the live count.
 
-    Default policy: max(next_pow2(live), min_bucket) so buckets carry
-    headroom by construction. Constants are an open tuning item.
+    Default policy: max(next_pow2(live), min_bucket). `headroom` pre-allocates
+    more dead slots for device-resident growth: the live count is inflated by
+    (1 + headroom) before the next-power-of-two rounding, reserving slots that
+    add_conn can grow into without an overflow -> host `grow_bucket` rebuild
+    (each rebuild is a retrace). The result stays a power of two, so it stays
+    divisible by a power-of-two Scheme-A shard count. The rounding is coarse:
+    any headroom > 0 on a power-of-two live count lands at the next power of two
+    (a full doubling). headroom=0.0 is the historical policy; constants are an
+    open tuning item.
 
     Args:
         live: Number of live conns the bucket must hold.
         min_bucket: Minimum capacity to allocate regardless of live count.
+        headroom: Extra dead-slot fraction to pre-allocate above `live`
+            (0.0 = none, 1.0 = at least double). Must be non-negative.
 
     Returns:
         The capacity to allocate for the bucket.
+
+    Raises:
+        ValueError: If `headroom` is negative.
     """
+    if headroom < 0.0:
+        raise ValueError(f"capacity_policy: headroom must be >= 0, got {headroom}")
     if live <= 0:
         return min_bucket
-    next_pow2 = 1 << (live - 1).bit_length()
+    target = math.ceil(live * (1.0 + headroom))
+    next_pow2 = 1 << (target - 1).bit_length()
     return max(next_pow2, min_bucket)

@@ -6,6 +6,8 @@ capacity_policy. Implemented when M1 lands.
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +15,8 @@ import pytest
 
 import plastax as px
 from plastax import topo, topology
-from plastax._types import FieldSpec
+from plastax._types import WEIGHT, FieldSpec
+from plastax.builder import _window_column
 from plastax.state import Columns
 from plastax.views import UnitWrite
 
@@ -247,3 +250,365 @@ def test_from_topology_equals_manual_builder_construction() -> None:
     ):
         for name in auto_bucket:
             assert jnp.array_equal(auto_bucket[name], manual_bucket[name])
+
+
+# --- from_edges (vectorized construction) -------------------------------
+
+
+def _assert_arenas_equal(
+    a: tuple[px.NetworkStatic, px.NetworkState[None]],
+    b: tuple[px.NetworkStatic, px.NetworkState[None]],
+) -> None:
+    """Byte-identical (static, state) arenas: same config and every column."""
+    static_a, state_a = a
+    static_b, state_b = b
+    assert static_a == static_b
+    assert state_a.units.keys() == state_b.units.keys()
+    for name in state_a.units:
+        assert jnp.array_equal(state_a.units[name], state_b.units[name])
+    assert len(state_a.conns) == len(state_b.conns)
+    for bucket_a, bucket_b in zip(state_a.conns, state_b.conns, strict=True):
+        assert bucket_a.keys() == bucket_b.keys()
+        for name in bucket_a:
+            assert jnp.array_equal(bucket_a[name], bucket_b[name])
+
+
+def test_from_edges_equals_manual_builder_with_weights_and_extra_columns() -> None:
+    """The vectorized path reproduces the per-edge path byte-for-byte.
+
+    Diamond 0->1, 0->2, 1->3, 2->3 with per-edge weights and a settable extra
+    conn field (tag): from_edges must bucket, stable-sort by dst, and pad
+    exactly as add_conn + finalize do, including permuting the tag column with
+    its edges and default-filling the untouched Bias unit field.
+    """
+    from_ids = np.array([0, 0, 1, 2], dtype=np.int32)
+    to_ids = np.array([1, 2, 3, 3], dtype=np.int32)
+    weights = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    tags = np.array([9.0, 8.0, 7.0, 6.0], dtype=np.float32)
+
+    vectorized = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        4,
+        from_ids,
+        to_ids,
+        weights=weights,
+        input_ids=(0,),
+        output_ids=(3,),
+        globals_=None,
+        extra_conn_columns={"tag": tags},
+    )
+
+    manual = px.NetworkBuilder(_ExtraFieldsNet, None)
+    for _ in range(4):
+        manual.add_unit()
+    manual.mark_input(0)
+    manual.mark_output(3)
+    for s, d, w, t in zip(
+        from_ids.tolist(), to_ids.tolist(), weights.tolist(), tags.tolist(), strict=True
+    ):
+        manual.add_conn(s, d, weight=w, tag=t)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_multi_bucket_matches_manual_at_scale() -> None:
+    """A three-level net wired with hundreds of edges matches the per-edge path.
+
+    Exercises multiple source-level buckets and next_pow2 capacity growth in a
+    single vectorized pass -- the regime the per-edge loop is slow in.
+    """
+    rng = np.random.default_rng(0)
+    # layers [0,32) -> [32,96) -> [96,112); wire each pair densely-ish random.
+    froms: list[np.ndarray] = []
+    tos: list[np.ndarray] = []
+    for lo_in, hi_in, lo_out, hi_out in [(0, 32, 32, 96), (32, 96, 96, 112)]:
+        src = rng.integers(lo_in, hi_in, size=400)
+        dst = rng.integers(lo_out, hi_out, size=400)
+        # one seed edge per output unit so no unit orphans to level 0.
+        seed_dst = np.arange(lo_out, hi_out)
+        seed_src = rng.integers(lo_in, hi_in, size=seed_dst.size)
+        froms.append(np.concatenate([seed_src, src]))
+        tos.append(np.concatenate([seed_dst, dst]))
+    from_ids = np.concatenate(froms).astype(np.int32)
+    to_ids = np.concatenate(tos).astype(np.int32)
+    weights = rng.standard_normal(from_ids.size).astype(np.float32)
+
+    vectorized = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        112,
+        from_ids,
+        to_ids,
+        weights=weights,
+        input_ids=tuple(range(32)),
+        output_ids=tuple(range(96, 112)),
+        globals_=None,
+    )
+
+    manual = px.NetworkBuilder(_TopoNet, None)
+    for _ in range(112):
+        manual.add_unit()
+    for i in range(32):
+        manual.mark_input(i)
+    for i in range(96, 112):
+        manual.mark_output(i)
+    for s, d, w in zip(
+        from_ids.tolist(), to_ids.tolist(), weights.tolist(), strict=True
+    ):
+        manual.add_conn(s, d, weight=w)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_empty_edge_set_matches_manual() -> None:
+    """No edges: one empty tombstoned bucket, exactly as finalize builds."""
+    empty = np.zeros((0,), dtype=np.int32)
+    vectorized = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        3,
+        empty,
+        empty,
+        input_ids=(0, 1, 2),
+        output_ids=(0, 1, 2),
+        globals_=None,
+    )
+
+    manual = px.NetworkBuilder(_TopoNet, None)
+    for _ in range(3):
+        manual.add_unit()
+    for i in range(3):
+        manual.mark_input(i)
+        manual.mark_output(i)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_pipeline_mode_single_bucket() -> None:
+    """PIPELINE construction lands every edge in one flat bucket."""
+    from_ids = np.array([0, 1, 2], dtype=np.int32)
+    to_ids = np.array([1, 2, 0], dtype=np.int32)  # a cycle: legal in pipeline
+    static, state = px.NetworkBuilder.from_edges(
+        _PipelineNet,
+        3,
+        from_ids,
+        to_ids,
+        weights=np.ones(3, dtype=np.float32),
+        input_ids=(0,),
+        output_ids=(2,),
+        globals_=None,
+    )
+    assert len(static.level_capacities) == 1
+    assert int(px.state.live_conn_count(state)) == 3
+
+
+def test_from_edges_defaults_weight_when_omitted() -> None:
+    """Omitting weights fills the WEIGHT column with its spec default (0)."""
+    static, state = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        2,
+        np.array([0], dtype=np.int32),
+        np.array([1], dtype=np.int32),
+        input_ids=(0,),
+        output_ids=(1,),
+        globals_=None,
+    )
+    live = int(px.state.live_conn_count(state, 0))
+    assert np.asarray(state.conns[0]["weight"])[:live].tolist() == [0.0]
+
+
+def test_from_edges_rejects_mismatched_endpoint_lengths() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            3,
+            np.array([0, 1], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(2,),
+            globals_=None,
+        )
+
+
+def test_from_edges_rejects_mismatched_weight_length() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            3,
+            np.array([0, 1], dtype=np.int32),
+            np.array([1, 2], dtype=np.int32),
+            weights=np.ones(3, dtype=np.float32),
+            input_ids=(0,),
+            output_ids=(2,),
+            globals_=None,
+        )
+
+
+def test_from_edges_rejects_out_of_range_endpoint() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            3,
+            np.array([0], dtype=np.int32),
+            np.array([99], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(2,),
+            globals_=None,
+        )
+
+
+def test_from_edges_rejects_unknown_extra_conn_column() -> None:
+    with pytest.raises(ValueError):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            2,
+            np.array([0], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(1,),
+            globals_=None,
+            extra_conn_columns={"not_a_field": np.zeros(1, dtype=np.float32)},
+        )
+
+
+def test_from_edges_capacity_headroom_pre_allocates_dead_slots() -> None:
+    """capacity_headroom enlarges each bucket's capacity (extra dead slots) but
+    leaves the live edges identical to the no-headroom build -- so add_conn can
+    grow into the reserved slots without a rebuild."""
+    # 10 sources -> 10 dests: 100 edges in one bucket, above the min_bucket=64
+    # floor so headroom actually changes the capacity.
+    src, dst = np.meshgrid(np.arange(10), np.arange(10, 20), indexing="ij")
+    from_ids = src.reshape(-1).astype(np.int32)
+    to_ids = dst.reshape(-1).astype(np.int32)
+    weights = np.arange(100, dtype=np.float32)
+    common = {
+        "input_ids": tuple(range(10)),
+        "output_ids": tuple(range(10, 20)),
+        "globals_": None,
+    }
+
+    static_b, state_b = px.NetworkBuilder.from_edges(
+        _TopoNet, 20, from_ids, to_ids, weights=weights, **common
+    )
+    static_r, state_r = px.NetworkBuilder.from_edges(
+        _TopoNet, 20, from_ids, to_ids, weights=weights, capacity_headroom=1.0, **common
+    )
+
+    assert static_b.level_capacities == (128,)  # next_pow2(100)
+    assert static_r.level_capacities == (256,)  # next_pow2(ceil(100 * 2))
+    live = 100
+    assert int(px.state.live_conn_count(state_b, 0)) == live
+    assert int(px.state.live_conn_count(state_r, 0)) == live
+    # the live prefix is byte-identical; the roomy build just has more dead pad.
+    for name in state_b.conns[0]:
+        assert np.array_equal(
+            np.asarray(state_b.conns[0][name])[:live],
+            np.asarray(state_r.conns[0][name])[:live],
+        )
+    assert bool(np.all(np.asarray(state_r.conns[0]["dead"])[live:]))
+    _assert_bucket_sorted_by_dead_then_to_id(state_r.conns[0])
+
+
+def test_finalize_capacity_headroom_matches_from_edges() -> None:
+    """The imperative finalize path honors capacity_headroom the same way."""
+    builder = px.NetworkBuilder(_TopoNet, None)
+    for _ in range(20):
+        builder.add_unit()
+    for i in range(10):
+        builder.mark_input(i)
+    for i in range(10, 20):
+        builder.mark_output(i)
+    for s in range(10):
+        for d in range(10, 20):
+            builder.add_conn(s, d, weight=1.0)
+    static, _ = builder.finalize(capacity_headroom=1.0)
+    assert static.level_capacities == (256,)
+
+
+# --- per-shard construction (Scheme-A) ---------------------------------
+
+
+def test_window_column_tiles_to_full() -> None:
+    """G windows of a bucket concatenate back to the full padded column.
+
+    This is the invariant per-shard construction relies on: shard g materialises
+    positions [g*cap/G, (g+1)*cap/G) and the union is byte-identical to the full
+    column the single-device path builds -- live edges in sorted order, then
+    tombstoned padding.
+    """
+    rng = np.random.default_rng(0)
+    live, capacity, shards = 50, 128, 4
+    order = rng.permutation(live).astype(np.int64)
+    src = rng.integers(0, 100, size=200).astype(np.int32)
+    dst = rng.integers(0, 100, size=200).astype(np.int32)
+    conn_columns = {WEIGHT.name: rng.standard_normal(200).astype(np.float32)}
+
+    full = _window_column(WEIGHT, order, live, 0, capacity, src, dst, conn_columns)
+    step = capacity // shards
+    tiles = [
+        _window_column(
+            WEIGHT, order, live, g * step, (g + 1) * step, src, dst, conn_columns
+        )
+        for g in range(shards)
+    ]
+    assert all(tile.shape == (step,) for tile in tiles)
+    assert np.array_equal(full, np.concatenate(tiles))
+    for g, tile in enumerate(tiles):
+        assert np.array_equal(tile, full[g * step : (g + 1) * step])
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs >= 4 devices")
+def test_from_edges_sharding_matches_distribute_state() -> None:
+    """from_edges(sharding=) builds the same global array as distribute_state.
+
+    Single controller (all shards owned by one process), so per-shard
+    construction materialises the full band; this pins that the sharded
+    construction path assembles a global array byte-identical to slicing a
+    fully-built state. Partial per-process windows are exercised in
+    tests/mc_construct_equiv.py.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    rng = np.random.default_rng(0)
+    n = 24
+    pairs = [tuple(sorted(rng.choice(n, 2, replace=False))) for _ in range(120)]
+    from_ids = np.array([a for a, _ in pairs], dtype=np.int32)
+    to_ids = np.array([b for _, b in pairs], dtype=np.int32)
+    shard = px.ShardSpec("shard", 4)
+
+    static_f, state_f = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        n,
+        from_ids,
+        to_ids,
+        input_ids=(0,),
+        output_ids=(n - 1,),
+        globals_=None,
+    )
+    distributed = px.distribute_state(
+        dataclasses.replace(static_f, sharding=shard), state_f
+    )
+    static_s, state_s = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        n,
+        from_ids,
+        to_ids,
+        input_ids=(0,),
+        output_ids=(n - 1,),
+        globals_=None,
+        sharding=shard,
+    )
+
+    assert static_s.sharding == shard
+    assert static_s.level_capacities == static_f.level_capacities
+
+    repl = NamedSharding(px.scheme_a_mesh(static_s), PartitionSpec())
+
+    def gather(x: jax.Array) -> np.ndarray:
+        return np.asarray(jax.jit(lambda a: a, out_shardings=repl)(x))
+
+    for bucket_d, bucket_s in zip(distributed.conns, state_s.conns, strict=True):
+        for name in bucket_d:
+            assert np.array_equal(gather(bucket_d[name]), gather(bucket_s[name]))
+    for name in distributed.units:
+        assert np.array_equal(
+            gather(distributed.units[name]), gather(state_s.units[name])
+        )

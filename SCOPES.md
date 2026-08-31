@@ -18,6 +18,7 @@ Module scopes (src/plastax/):
 - `step` — step.py (assembly, jit, donation, caching)
 - `builder` — builder.py (host construction, finalize, from_topology)
 - `driver` — driver.py (host loop, retrace/overflow protocol)
+- `distributed` — distributed.py (multi-controller state placement, Scheme-A mesh)
 - `topology` — topology.py (dense/conv2d/sequential generators)
 - `optim` — optim/ (Optimizer bundles: sgd, momentum, adam; state_fields contract)
 
@@ -37,8 +38,9 @@ Cross-cutting scopes:
 - `release` — release automation: .github/workflows/publish.yml, RELEASING.md
 - `docs-site` — user-facing Sphinx / Read the Docs documentation: docs/ and
   .readthedocs.yaml (its `docs` dependency group lives in pyproject, `packaging`)
-- `plan` — IMPLEMENTATION_PLAN.md, DISTRIBUTION_PLAN.md,
-  ECOSYSTEM_ROADMAP.md, SCOPES.md, TAGS.md, README.md, distribution-plan.bib
+- `plan` — IMPLEMENTATION_PLAN.md, DISTRIBUTION_PLAN.md, SPARSE_PLAN.md,
+  RL_PLAN.md, ECOSYSTEM_ROADMAP.md, SCOPES.md, TAGS.md, README.md,
+  distribution-plan.bib
 - `repo` — git plumbing and commit-governance mechanics: scripts/, the
   commit-msg type/scope gate wiring, .git hooks, agent identity
 

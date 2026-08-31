@@ -6,10 +6,12 @@ connections imperatively, then finalize into (NetworkStatic, NetworkState).
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
 from jaxtyping import PRNGKeyArray
 
 from plastax import topo
@@ -22,7 +24,9 @@ from plastax._types import (
     WEIGHT,
     FieldSpec,
     Propagation,
+    ShardSpec,
 )
+from plastax.distributed import _addressable_window, _place, _shardings_for_spec
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.topology import Topology
 from plastax.traits import Network
@@ -31,6 +35,45 @@ from plastax.traits import Network
 # numpy-scalar FieldSpec.default that fills in unset fields (kept private to
 # the module).
 FieldValue = float | int | bool | np.generic
+
+
+def _window_column(
+    spec: FieldSpec[np.generic],
+    order: np.ndarray,
+    live: int,
+    w_lo: int,
+    w_hi: int,
+    src_arr: np.ndarray,
+    dst_arr: np.ndarray,
+    conn_columns: dict[str, np.ndarray],
+) -> np.ndarray:
+    """Materialise arena positions ``[w_lo, w_hi)`` of one padded conn column.
+
+    The full column is the ``live`` edges (in the bucket's sorted ``order``)
+    followed by ``capacity - live`` tombstoned slots. This builds only the
+    window: the live positions ``[w_lo, min(w_hi, live))`` gathered through
+    ``order``, then the dead remainder at the field default. ``w_lo == 0`` and
+    ``w_hi == capacity`` reproduce the full column; a per-shard band builds just
+    that shard's slice without ever allocating the whole column.
+    """
+    n_live = max(0, min(w_hi, live) - w_lo)
+    n_dead = (w_hi - w_lo) - n_live
+    if n_live > 0:
+        sub = order[w_lo : w_lo + n_live]
+        vals: np.ndarray
+        if spec.name == FROM_ID.name:
+            vals = src_arr[sub]
+        elif spec.name == TO_ID.name:
+            vals = dst_arr[sub]
+        elif spec.name == DEAD.name:
+            vals = np.zeros((n_live,), dtype=np.bool_)
+        else:
+            vals = conn_columns[spec.name][sub]
+        live_part = np.asarray(vals).astype(spec.dtype)
+    else:
+        live_part = np.empty((0,), dtype=spec.dtype)
+    dead_part = np.full((n_dead,), spec.default, dtype=spec.dtype)
+    return np.concatenate([live_part, dead_part])
 
 
 class NetworkBuilder[GS]:
@@ -84,38 +127,155 @@ class NetworkBuilder[GS]:
         key: PRNGKeyArray,
         *,
         globals_: GS,
+        capacity_headroom: float = 0.0,
+        sharding: ShardSpec | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Expand a plastax.topology spec into arenas.
 
-        Adds units, marks the first/last blocks as inputs/outputs, bulk
-        add_conn's the edge set, then finalizes.
+        Draws the topology, then hands its EdgeSet straight to `from_edges`
+        for vectorized column assembly -- no per-edge Python pass.
 
         Args:
             net: The network type to build.
             topology_fn: Draws a topology spec from a PRNG key.
             key: PRNG key passed to topology_fn.
             globals_: The network's globals value.
+            capacity_headroom: Extra dead-slot fraction to pre-allocate per
+                bucket (see from_edges); 0.0 sizes buckets to the live count.
+            sharding: Scheme-A ShardSpec to build a distributed state directly
+                (see from_edges), or None for a single-device state.
 
         Returns:
             The finalized (NetworkStatic, NetworkState) pair.
         """
         spec = topology_fn(key)
+        return cls.from_edges(
+            net,
+            spec.num_units,
+            spec.edges.from_ids,
+            spec.edges.to_ids,
+            weights=spec.edges.weights,
+            input_ids=spec.input_ids,
+            output_ids=spec.output_ids,
+            globals_=globals_,
+            capacity_headroom=capacity_headroom,
+            sharding=sharding,
+        )
+
+    @classmethod
+    def from_edges(
+        cls,
+        net: type[Network[GS]],
+        num_units: int,
+        from_ids: np.ndarray,
+        to_ids: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        input_ids: Sequence[int],
+        output_ids: Sequence[int],
+        globals_: GS,
+        extra_conn_columns: Mapping[str, np.ndarray] | None = None,
+        capacity_headroom: float = 0.0,
+        sharding: ShardSpec | None = None,
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
+        """Build arenas from whole edge-column arrays, no per-edge Python.
+
+        The vectorized construction path: the caller supplies parallel
+        ``(E,)`` source/destination arrays (plus optional per-edge weight and
+        extra-field columns), and every column is bucketed, sorted, and padded
+        with numpy fancy-indexing instead of the ``add_unit``/``add_conn`` loop
+        `finalize` walks. Output is byte-identical to the imperative path (both
+        route through the same assembler), so a large sparse or dense net
+        builds in one vectorized pass rather than E Python calls.
+
+        Units carry field defaults (topology construction sets no per-unit
+        values); a conn field is filled from ``weights``/``extra_conn_columns``
+        if given, else its spec default. All edges live (``DEAD`` false); the
+        assembler tombstones only the per-bucket capacity padding.
+
+        Args:
+            net: The network type to build.
+            num_units: Total unit count; ids must fall in ``[0, num_units)``.
+            from_ids: ``(E,)`` source unit ids.
+            to_ids: ``(E,)`` destination unit ids (parallel to ``from_ids``).
+            weights: ``(E,)`` initial edge weights, or None for the ``WEIGHT``
+                default.
+            input_ids: Unit ids StepInputs scatters onto.
+            output_ids: Unit ids the loss clamps targets to.
+            globals_: The network's globals value.
+            extra_conn_columns: Optional per-edge values for settable conn
+                fields (e.g. an optimizer's ``opt/…`` columns), each ``(E,)``;
+                unset fields take their spec default.
+            capacity_headroom: Extra dead-slot fraction to pre-allocate per
+                bucket above its live count (0.0 = size to live). Reserves
+                slots add_conn can grow into device-resident, cutting overflow
+                -> host grow_bucket rebuilds; capacity stays a power of two, so
+                Scheme-A divisibility holds. See topo.capacity_policy.
+            sharding: Scheme-A ShardSpec to build a distributed state directly.
+                When set, each process materialises only its own capacity-axis
+                band per bucket and assembles a global ``jax.Array`` (conns
+                sharded, units/globals replicated), so no process ever holds the
+                full arena. None builds an ordinary single-device state.
+
+        Returns:
+            The finalized (NetworkStatic, NetworkState) pair.
+
+        Raises:
+            ValueError: On mismatched array lengths, an out-of-range unit id,
+                an unknown/non-settable ``extra_conn_columns`` key, a negative
+                ``capacity_headroom``, or a bucket capacity not divisible by the
+                shard count.
+        """
         builder = cls(net, globals_)
-        for _ in range(spec.num_units):
-            builder.add_unit()
-        for unit_id in spec.input_ids:
-            builder.mark_input(unit_id)
-        for unit_id in spec.output_ids:
-            builder.mark_output(unit_id)
-        edges = spec.edges
-        for from_id, to_id, weight in zip(
-            edges.from_ids.tolist(),
-            edges.to_ids.tolist(),
-            edges.weights.tolist(),
-            strict=True,
-        ):
-            builder.add_conn(from_id, to_id, weight=weight)
-        return builder.finalize()
+        src_arr = np.asarray(from_ids, dtype=np.int32)
+        dst_arr = np.asarray(to_ids, dtype=np.int32)
+        if src_arr.ndim != 1 or dst_arr.shape != src_arr.shape:
+            raise ValueError(
+                "from_edges: from_ids and to_ids must be 1-D arrays of equal "
+                f"length, got {src_arr.shape} and {dst_arr.shape}"
+            )
+        num_edges = int(src_arr.shape[0])
+
+        extra = dict(extra_conn_columns or {})
+        for name in extra:
+            if name not in builder._settable_conn_fields or name == WEIGHT.name:
+                raise ValueError(
+                    f"from_edges: unknown or non-settable conn field {name!r} "
+                    "in extra_conn_columns"
+                )
+
+        conn_columns: dict[str, np.ndarray] = {}
+        for name, spec in builder._settable_conn_fields.items():
+            if name == WEIGHT.name and weights is not None:
+                supplied: np.ndarray | None = np.asarray(weights)
+            else:
+                supplied = extra.get(name)
+            if supplied is None:
+                conn_columns[name] = np.full(
+                    (num_edges,), spec.default, dtype=spec.dtype
+                )
+            elif supplied.shape != (num_edges,):
+                raise ValueError(
+                    f"from_edges: conn column {name!r} has shape {supplied.shape}, "
+                    f"expected ({num_edges},)"
+                )
+            else:
+                conn_columns[name] = supplied
+        unit_columns: dict[str, np.ndarray] = {
+            name: np.full((num_units,), spec.default, dtype=spec.dtype)
+            for name, spec in builder._settable_unit_fields.items()
+        }
+        return builder._assemble(
+            num_units,
+            src_arr,
+            dst_arr,
+            conn_columns,
+            unit_columns,
+            tuple(input_ids),
+            tuple(output_ids),
+            capacity_headroom=capacity_headroom,
+            sharding=sharding,
+        )
 
     def add_unit(self, **field_values: float | int | bool) -> int:
         """Add a unit, filling unset fields with their defaults.
@@ -173,37 +333,120 @@ class NetworkBuilder[GS]:
         """Mark a unit id as a network output."""
         self._output_ids.append(unit_id)
 
-    def finalize(self) -> tuple[NetworkStatic, NetworkState[GS]]:
+    def finalize(
+        self, *, capacity_headroom: float = 0.0, sharding: ShardSpec | None = None
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Freeze the accumulated units and connections into arenas.
 
-        Computes initial levels (topo.initial_levels), buckets conns by
-        source level with capacity_policy headroom, allocates arenas, and
-        freezes the static config.
+        Re-views the imperative per-edge / per-unit rows as one array per
+        settable field (in insertion order) and hands them to the shared
+        `_assemble` core, which validates ids, buckets conns by source level
+        with capacity_policy headroom, allocates arenas, and freezes the static
+        config (raising ValueError via `_assemble` on an out-of-range id).
+
+        Args:
+            capacity_headroom: Extra dead-slot fraction to pre-allocate per
+                bucket for device-resident growth (see from_edges); 0.0 sizes
+                each bucket to its live count.
+            sharding: Scheme-A ShardSpec to build a distributed state directly
+                (see from_edges), or None for a single-device state.
 
         Returns:
             The (NetworkStatic, NetworkState) pair for the built network.
-
-        Raises:
-            ValueError: A referenced unit id is out of range.
         """
         num_units = len(self._units)
-        for unit_id in (
-            *self._input_ids,
-            *self._output_ids,
-            *self._conn_src,
-            *self._conn_dst,
-        ):
-            if not 0 <= unit_id < num_units:
-                raise ValueError(
-                    f"finalize: unit id {unit_id} out of range [0, {num_units})"
-                )
-
         if self._conn_src:
             src_arr = np.asarray(self._conn_src, dtype=np.int32)
             dst_arr = np.asarray(self._conn_dst, dtype=np.int32)
         else:
             src_arr = np.zeros((0,), dtype=np.int32)
             dst_arr = np.zeros((0,), dtype=np.int32)
+
+        # Column-major re-view of the row dicts: one (E,) / (num_units,) array
+        # per settable field, in insertion order -- the assembler's contract.
+        conn_columns = {
+            name: np.asarray([row[name] for row in self._conn_values])
+            for name in self._settable_conn_fields
+        }
+        unit_columns = {
+            name: np.asarray([row[name] for row in self._units])
+            for name in self._settable_unit_fields
+        }
+        return self._assemble(
+            num_units,
+            src_arr,
+            dst_arr,
+            conn_columns,
+            unit_columns,
+            tuple(self._input_ids),
+            tuple(self._output_ids),
+            capacity_headroom=capacity_headroom,
+            sharding=sharding,
+        )
+
+    def _assemble(
+        self,
+        num_units: int,
+        src_arr: np.ndarray,
+        dst_arr: np.ndarray,
+        conn_columns: dict[str, np.ndarray],
+        unit_columns: dict[str, np.ndarray],
+        input_ids: tuple[int, ...],
+        output_ids: tuple[int, ...],
+        *,
+        capacity_headroom: float = 0.0,
+        sharding: ShardSpec | None = None,
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
+        """Bucket, sort, and pad whole edge columns into frozen arenas.
+
+        The single construction core both `finalize` (imperative rows) and
+        `from_edges` (vectorized arrays) feed: computes initial levels, buckets
+        edges by source level, stable-sorts each bucket by destination id, pads
+        to a capacity_policy capacity with tombstoned slots, and freezes the
+        static config. The built-in `from_id`/`to_id`/`dead` columns and the
+        derived `level` are filled here; callers supply only settable fields.
+
+        With `sharding`, the same plan (levels, per-bucket sort order,
+        capacities) is computed identically, but each process materialises only
+        its own capacity-axis band per bucket and assembles a global
+        ``jax.Array`` (conns sharded, units/globals/needs_resort replicated) --
+        byte-identical to the full state, without any process holding the whole
+        arena. `sharding` overrides ``net.sharding`` when given.
+
+        Args:
+            num_units: Total unit count.
+            src_arr: (E,) int32 source ids in insertion order.
+            dst_arr: (E,) int32 destination ids (parallel to src_arr).
+            conn_columns: Settable conn field name -> (E,) values.
+            unit_columns: Settable unit field name -> (num_units,) values.
+            input_ids: Input unit ids.
+            output_ids: Output unit ids.
+            capacity_headroom: Extra dead-slot fraction passed to
+                capacity_policy for each bucket (0.0 = size to live).
+            sharding: Scheme-A ShardSpec for per-shard distributed assembly, or
+                None to build a single-device state (falling back to
+                ``net.sharding``).
+
+        Returns:
+            The (NetworkStatic, NetworkState) pair for the built network.
+
+        Raises:
+            ValueError: A referenced unit id or edge endpoint is out of range,
+                or a bucket capacity is not divisible by the shard count.
+        """
+        for unit_id in (*input_ids, *output_ids):
+            if not 0 <= unit_id < num_units:
+                raise ValueError(
+                    f"finalize: unit id {unit_id} out of range [0, {num_units})"
+                )
+        if src_arr.size:
+            lo = min(int(src_arr.min()), int(dst_arr.min()))
+            hi = max(int(src_arr.max()), int(dst_arr.max()))
+            if lo < 0 or hi >= num_units:
+                raise ValueError(
+                    f"finalize: an edge endpoint is out of range [0, {num_units})"
+                )
+
         edges = (
             np.stack([src_arr, dst_arr], axis=1)
             if src_arr.size
@@ -220,13 +463,24 @@ class NetworkBuilder[GS]:
             allow_cycles=self.net.propagation is Propagation.PIPELINE,
         )
 
+        # sharding overrides net.sharding when given; None -> single device.
+        effective = sharding if sharding is not None else self.net.sharding
+        conn_sharding: NamedSharding | None = None
+        repl_sharding: NamedSharding | None = None
+        num_shards = 0
+        if effective is not None:
+            _, conn_sharding, repl_sharding = _shardings_for_spec(effective)
+            num_shards = effective.num_shards
+
         unit_cols: Columns = {}
         for spec in self._unit_fields:
-            if spec.name == LEVEL.name:
-                unit_cols[spec.name] = jnp.asarray(levels, dtype=spec.dtype)
-            else:
-                values = [row[spec.name] for row in self._units]
-                unit_cols[spec.name] = jnp.asarray(values, dtype=spec.dtype)
+            src_vals = levels if spec.name == LEVEL.name else unit_columns[spec.name]
+            host = np.asarray(src_vals, dtype=spec.dtype)
+            unit_cols[spec.name] = (
+                jnp.asarray(host)
+                if repl_sharding is None
+                else _place(host, repl_sharding, (num_units,))
+            )
 
         if self.net.propagation is Propagation.PIPELINE:
             # Single flat arena: every conn lands in bucket 0 regardless of
@@ -248,27 +502,51 @@ class NetworkBuilder[GS]:
             idx = np.flatnonzero(bucket_of_conn == level_idx)
             order = idx[np.argsort(dst_arr[idx], kind="stable")]
             live = int(order.size)
-            capacity = topo.capacity_policy(live)
-            pad = capacity - live
+            capacity = topo.capacity_policy(live, headroom=capacity_headroom)
+
+            # Materialise only this process's addressable band when sharded, so
+            # no process holds the whole padded column; the full [0, capacity)
+            # window is the single-device path.
+            if conn_sharding is None:
+                window_lo, window_hi = 0, capacity
+            else:
+                if capacity % num_shards != 0:
+                    raise ValueError(
+                        f"from_edges: bucket {level_idx} capacity {capacity} is "
+                        f"not divisible by num_shards {num_shards}"
+                    )
+                window_lo, window_hi = _addressable_window(conn_sharding, capacity)
 
             cols: Columns = {}
             for spec in self._conn_fields:
-                live_vals: np.ndarray
-                if spec.name == FROM_ID.name:
-                    live_vals = src_arr[order]
-                elif spec.name == TO_ID.name:
-                    live_vals = dst_arr[order]
-                elif spec.name == DEAD.name:
-                    live_vals = np.zeros((live,), dtype=np.bool_)
-                else:
-                    live_vals = np.asarray(
-                        [self._conn_values[j][spec.name] for j in order.tolist()]
-                    )
-                pad_vals = np.full((pad,), spec.default, dtype=spec.dtype)
-                full = np.concatenate([live_vals.astype(spec.dtype), pad_vals])
-                cols[spec.name] = jnp.asarray(full)
+                window = _window_column(
+                    spec,
+                    order,
+                    live,
+                    window_lo,
+                    window_hi,
+                    src_arr,
+                    dst_arr,
+                    conn_columns,
+                )
+                cols[spec.name] = (
+                    jnp.asarray(window)
+                    if conn_sharding is None
+                    else _place(window, conn_sharding, (capacity,))
+                )
             conns.append(cols)
             level_capacities.append(capacity)
+
+        if repl_sharding is None:
+            globals_out: GS = self.globals_
+            needs_resort = jnp.bool_(False)
+        else:
+            repl = repl_sharding  # narrowed non-None for the placement closures
+            globals_out = jax.tree_util.tree_map(
+                lambda leaf: _place(np.asarray(leaf), repl, np.asarray(leaf).shape),
+                self.globals_,
+            )
+            needs_resort = _place(np.asarray(False), repl, ())
 
         static = NetworkStatic(
             num_units=num_units,
@@ -277,14 +555,14 @@ class NetworkBuilder[GS]:
             conn_fields=self._conn_fields,
             level_capacities=tuple(level_capacities),
             kahn_max_depth=self.net.kahn_max_depth,
-            input_ids=tuple(self._input_ids),
-            output_ids=tuple(self._output_ids),
-            sharding=self.net.sharding,
+            input_ids=input_ids,
+            output_ids=output_ids,
+            sharding=effective,
         )
         state = NetworkState(
             units=unit_cols,
             conns=tuple(conns),
-            globals_=self.globals_,
-            needs_resort=jnp.bool_(False),
+            globals_=globals_out,
+            needs_resort=needs_resort,
         )
         return static, state

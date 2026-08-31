@@ -1,0 +1,850 @@
+"""Continual Backprop (Dohare et al., Nature 2024) as per-unit-local traits.
+
+CBP continually reinitializes the lowest-**contribution-utility** mature hidden
+units, where a unit's utility is
+
+    utility(i) = |activation(i)| * sum_{j in out(i)} |w_ij|
+
+running-averaged and gated by an age threshold so fresh units are not recycled.
+
+**Why this is the sharpest demonstration in the RL plan.** That sum is a
+reduction over unit `i`'s *outgoing* edges. The literature writes it as a dense
+column norm of the weight matrix because that is the operation a dense framework
+offers; on the edge arena it is one `BackwardPass` monoid reduction -- the native
+operation, at O(E) rather than O(N^2), with no global state.
+
+CBP changes no topology: `prune_conn` and `add_conn` are both absent. It
+reallocates *through* the existing wiring, which is why it needs `update_conn`
+and nothing else.
+
+**Two thresholds, both built.**
+
+* **v0 (oracle).** The host reads `cbp/util`, takes a per-level quantile at the
+  replacement rate, and broadcasts it into `cbp/thresh` -- an O(N) round-trip per
+  churn. Obviously correct, and the reference v1 is scored against.
+* **v1 (local, two-hop).** Each destination reduces the LOG-utility moments of
+  its sources over its *incoming* edges; each source then averages those
+  destination moments over its *outgoing* edges and takes the analytic
+  rho-quantile, `exp(mean + z_rho * sd)`. Pure local, two monoid reductions,
+  zero global state -- the same move that turned SET's global top-k into a
+  per-unit half-normal quantile, with the family chosen by measurement rather
+  than assumption.
+
+  **Why a quantile and not a value.** v1 first compared each unit against a
+  FRACTION of its neighbourhood's mean utility. A value threshold cannot express
+  "the lowest rho": how many units fall below a given bar depends on the shape
+  of the distribution, which drifts through the run and shifts at every task
+  switch. Measured, that fired 2.6-5x more resets than v0 and capped the
+  agreement gate at 0.393 on rate alone.
+
+  **Why log-normal.** Measured over 200 (churn, level) samples, predicting the
+  rho-quantile from local moments: log-normal is accurate to 0.6%, against 41%
+  for a gamma, 51% for SET's half-normal and 57% for an exponential. The
+  utilities have a coefficient of variation of 1.06 and 1.4% exact zeros.
+
+  **In a dense layer the two-hop average is exact, not an approximation.** Every
+  destination reduces over the same source set -- the unit's own level -- so
+  averaging the destinations' moments recovers the per-level statistic with no
+  per-level state. In a sparse layer it becomes an estimate over an overlapping
+  sample.
+
+Deviations, recorded rather than hidden. Two are from the paper, one is a
+disagreement between the paper and the authors' own code:
+
+* **Replacement count: the paper and the code disagree, and we follow the
+  code.** Algorithm 1 says `n_l * rho` -- rho of the LAYER. The released
+  implementation uses `rho * |eligible|` (`loss-of-plasticity`, gnt.py:145).
+* **The fractional count is carried, not rounded.** gnt.py offers both an
+  accumulator (accumulate=True, gnt.py:151-153) and stochastic rounding
+  (accumulate=False, the default). We carry, because our churn is per-CYCLE and
+  there are far fewer replacement events than in the paper's per-step regime, so
+  a floored remainder is a standing rate error rather than rounding noise.
+* Maturity is counted in CHURNS, not the paper's 100 updates (gnt.py defaults to
+  20). Replacement is periodic rather than every update.
+* The paper's utility uses batch activation statistics; at batch 1 it is an EMA
+  over steps, so `eta` is a real hyperparameter and is swept.
+* An edge whose BOTH endpoints reset is reinitialized by the incoming pass and
+  then zeroed by the outgoing pass, because `update_conn` runs incoming first.
+  Zero wins, which is the paper's intent -- a reset unit must not perturb the
+  network's current function through its outputs.
+* The forward pass reads `cbp/util` values written by the PREVIOUS churn's
+  backward pass, so the two-hop threshold carries a one-churn lag.
+* The paper's "transfer average contribution to downstream biases" is not
+  implemented.
+
+Run:  uv run python examples/cbp.py
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from dst_sparse import _hash01
+from mlp_xor import GradPreAct, LossGrad, MSELoss
+from nonstationary import (
+    ACT_EMA,
+    IS_OUT,
+    CycleRecord,
+    DriftingTask,
+    ReluBackward,
+    ReluForward,
+    build_dense_mlp,
+    dormant_fraction,
+    growth_slope,
+    mark_outputs,
+    recovery_times,
+)
+
+import plastax as px
+
+# Running average of contribution utility.
+CBP_UTIL = px.FieldSpec.float32("cbp/util")
+# Churns since last reset; gates replacement so a fresh unit can earn utility.
+CBP_AGE = px.FieldSpec.int32("cbp/age")
+# 1.0 for units selected for reinitialization this churn.
+CBP_RESET = px.FieldSpec.float32("cbp/reset")
+# The bar a utility must clear: host-written in v0, two-hop local in v1.
+# Always written back so the host can score one against the other.
+CBP_THRESH = px.FieldSpec.float32("cbp/thresh")
+# First and second moments of LOG utility over a unit's ELIGIBLE fan-in sources
+# -- hop one of the local rule. Log moments, not the utility mean: the measured
+# utility distribution is log-normal to 0.6% on the rho-quantile, where a
+# half-normal (SET's family) or exponential fit misses by 41-57%.
+CBP_FANIN_LOGU = px.FieldSpec.float32("cbp/fanin_logu")
+CBP_FANIN_LOGU2 = px.FieldSpec.float32("cbp/fanin_logu2")
+# Running average of activation. The utility is mean-corrected (|h - f_hat|),
+# because a large but CONSTANT activation carries no information downstream.
+CBP_ACT_AVG = px.FieldSpec.float32("cbp/act_avg")
+# sum |w_in|, the paper's adaptation denominator: heavy incoming weights make a
+# unit harder to repurpose. An INCOMING reduction, where sum|w_out| is outgoing.
+CBP_IN_ABS = px.FieldSpec.float32("cbp/in_abs")
+# Bias-corrected utility: written by the trace so host v0 selection and the
+# in-trace reset test rank by the same quantity.
+CBP_UTIL_HAT = px.FieldSpec.float32("cbp/util_hat")
+# Live incoming-edge count, used to scale reinitialized weights.
+CBP_FANIN = px.FieldSpec.float32("cbp/fanin")
+# Monotonic churn counter, the salt for reinit draws. CBP_AGE cannot serve: it
+# is zeroed on every reset, so every reset would hash identically.
+CBP_CURSOR = px.FieldSpec.int32("cbp/cursor")
+
+_UNIT_FIELDS = (
+    GradPreAct,
+    LossGrad,
+    ACT_EMA,
+    IS_OUT,
+    CBP_UTIL,
+    CBP_AGE,
+    CBP_RESET,
+    CBP_THRESH,
+    CBP_FANIN_LOGU,
+    CBP_FANIN_LOGU2,
+    CBP_ACT_AVG,
+    CBP_IN_ABS,
+    CBP_UTIL_HAT,
+    CBP_FANIN,
+    CBP_CURSOR,
+)
+
+
+class CbpFanInUtility(px.ForwardPass):
+    """Hop one of the local rule: log-utility moments over the fan-in sources.
+
+    Reduces `(log u, (log u)^2, 1)` over the ELIGIBLE incoming sources -- mature
+    and strictly positive -- plus `(|w|, 1)` over all of them, in one product
+    monoid. Two moments are what a quantile needs; the plain mean hop one used
+    to write could only support a value threshold, which is what made v1
+    rate-uncontrolled. Reads utilities written by the previous churn.
+
+    Ineligible sources contribute zero to both log sums AND to the eligible
+    count, so they neither shift the moments nor shrink them.
+    """
+
+    combine = (
+        px.monoid.sum_,
+        px.monoid.sum_,
+        px.monoid.sum_,
+        px.monoid.sum_,
+        px.monoid.sum_,
+    )
+
+    def __init__(
+        self, maturity: int = 5, moment_decay: float = 0.5, eps: float = 1e-12
+    ) -> None:
+        """Bind the eligibility age gate, the moment EMA and the log floor.
+
+        Args:
+            maturity: churns a source must survive to enter the moments. Matches
+                the reset gate, so the bar is a quantile of the same population
+                the selection is drawn from.
+            moment_decay: retention weight of the running moment estimate. The
+                moments are a sample statistic over one layer's worth of units,
+                so a single churn's estimate is noisy; the utility distribution
+                drifts slowly relative to that noise. 0 disables the
+                smoothing. Measured at (128,128): 0.5 matches v0's rate to 1.07x
+                against 1.15x unsmoothed, while 0.9 lags the drift and is worse
+                than no smoothing at all.
+            eps: floor under the log, for sources whose utility is exactly zero.
+        """
+        self.maturity = maturity
+        self.moment_decay = moment_decay
+        self.eps = eps
+
+    def map(
+        self,
+        u: px.UnitView,
+        dst: px.UnitIdx,
+        src: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Contribute the source's log-utility moments, |w| and the counts."""
+        del dst, g
+        utility = u[CBP_UTIL_HAT, src]
+        eligible = (u[CBP_AGE, src] > jnp.int32(self.maturity)) & (
+            utility > jnp.float32(0.0)
+        )
+        log_u = jnp.log(jnp.maximum(utility, jnp.float32(self.eps)))
+        keep = jnp.where(eligible, jnp.float32(1.0), jnp.float32(0.0))
+        return (
+            keep * log_u,
+            keep * log_u * log_u,
+            keep,
+            jnp.abs(c[px.WEIGHT, cid]),
+            jnp.float32(1.0),
+        )
+
+    def apply(
+        self,
+        u: px.UnitView,
+        i: px.UnitIdx,
+        g: None,
+        acc: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> px.UnitWrite:
+        """Write the fan-in log moments, the adaptation sum, and the fan-in."""
+        del g
+        sum_log, sum_log2, eligible, total_abs_w, count = acc
+        scale = jnp.maximum(eligible, jnp.float32(1.0))
+        mean_log, mean_log2 = sum_log / scale, sum_log2 / scale
+        # Smooth only where this churn actually had a sample to contribute.
+        rho_m = jnp.where(eligible > 0.0, jnp.float32(self.moment_decay), 1.0)
+        blend = jnp.float32(1.0) - rho_m
+        return px.UnitWrite.of(
+            (CBP_FANIN_LOGU, rho_m * u[CBP_FANIN_LOGU, i] + blend * mean_log),
+            (CBP_FANIN_LOGU2, rho_m * u[CBP_FANIN_LOGU2, i] + blend * mean_log2),
+            (CBP_IN_ABS, total_abs_w),
+            (CBP_FANIN, count),
+        )
+
+
+class CbpUtility(px.BackwardPass):
+    """Contribution utility over OUTGOING edges, and the reset decision.
+
+    `sum_{j in out(i)} |w_ij|` is a reduction into the SOURCE unit, which is
+    exactly what a BackwardPass does: `src` is the accumulator target and `dst`
+    is the edge's destination, whose weight this map contributes.
+    """
+
+    combine = (px.monoid.sum_, px.monoid.sum_, px.monoid.sum_, px.monoid.sum_)
+
+    def __init__(
+        self,
+        *,
+        decay: float = 0.99,
+        maturity: int = 5,
+        local: bool = False,
+        rho: float = 0.05,
+        eps: float = 1e-8,
+    ) -> None:
+        """Bind the running-average decay, age gate, threshold mode and rate.
+
+        Args:
+            decay: the paper's eta, the DECAY of both running averages (0.99).
+                Note this is the retention weight, not the update weight.
+            maturity: churns a unit must survive before it may be reset.
+            local: use the two-hop local threshold (v1) rather than the
+                host-written oracle threshold (v0).
+            rho: replacement rate. v1 targets the SAME rate v0 selects by rank,
+                which is the whole point of the quantile form -- the two are now
+                comparable at a matched intervention budget.
+            eps: floor on the adaptation denominator.
+        """
+        self.decay = decay
+        self.maturity = maturity
+        self.local = local
+        self.rho = rho
+        # The standard-normal rho-quantile, a compile-time constant: the bar is
+        # exp(mean + z * sd) of the neighbourhood's log utilities.
+        self.z_rho = math.sqrt(2.0) * float(jax.scipy.special.erfinv(2.0 * rho - 1.0))
+        self.eps = eps
+
+    def map(
+        self,
+        u: px.UnitView,
+        src: px.UnitIdx,
+        dst: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Contribute (|w|, the destination's two log moments, 1) per out-edge."""
+        del src, g
+        return (
+            jnp.abs(c[px.WEIGHT, cid]),
+            u[CBP_FANIN_LOGU, dst],
+            u[CBP_FANIN_LOGU2, dst],
+            jnp.float32(1.0),
+        )
+
+    def apply(
+        self,
+        u: px.UnitView,
+        i: px.UnitIdx,
+        g: None,
+        acc: tuple[jax.Array, jax.Array, jax.Array, jax.Array],
+    ) -> px.UnitWrite:
+        """Update the utility average, age the unit, and decide replacement.
+
+        Implements the paper's full utility rather than the |h| * sum|w_out|
+        sketch: the contribution is MEAN-CORRECTED, both running averages are
+        bias-corrected against the unit's age the way Adam corrects against its
+        step count, and the whole thing is divided by the adaptation term
+        sum|w_in| that the forward pass reduced.
+        """
+        del g
+        sum_abs_w_out, sum_logu, sum_logu2, out_count = acc
+        decay = jnp.float32(self.decay)
+        age = u[CBP_AGE, i]
+        next_age = age + jnp.int32(1)
+        # Adam-style: an average seeded at 0 stays biased low for ~1/(1-decay)
+        # updates, which would rank young units below old ones spuriously.
+        correction = jnp.maximum(
+            jnp.float32(1.0) - decay ** jnp.maximum(age.astype(jnp.float32), 1.0),
+            jnp.float32(self.eps),
+        )
+
+        activation = u[px.ACTIVATION, i]
+        act_avg_prev = u[CBP_ACT_AVG, i]
+        act_avg = decay * act_avg_prev + (jnp.float32(1.0) - decay) * activation
+        act_hat = act_avg_prev / correction
+        contribution = jnp.abs(activation - act_hat) * sum_abs_w_out
+        adaptation = jnp.maximum(u[CBP_IN_ABS, i], jnp.float32(self.eps))
+        instantaneous = contribution / adaptation
+
+        utility_prev = u[CBP_UTIL, i]
+        utility = decay * utility_prev + (jnp.float32(1.0) - decay) * instantaneous
+        utility_hat = utility_prev / correction
+
+        if self.local:
+            # Hop two: average the destinations' log moments back into this
+            # unit, then take the analytic rho-quantile. In a dense layer every
+            # destination reduced over the SAME source set -- this unit's own
+            # level -- so the two-hop average recovers the per-level statistic
+            # exactly, with no per-level state. In a sparse layer it is an
+            # estimate over an overlapping sample.
+            scale = jnp.maximum(out_count, jnp.float32(1.0))
+            mean_log = sum_logu / scale
+            var_log = jnp.maximum(sum_logu2 / scale - mean_log * mean_log, 0.0)
+            threshold = jnp.exp(mean_log + jnp.float32(self.z_rho) * jnp.sqrt(var_log))
+            # No outgoing edges (an output) => bar of -1, so never reset.
+            threshold = jnp.where(
+                out_count > jnp.float32(0.0), threshold, jnp.float32(-1.0)
+            )
+        else:
+            threshold = u[CBP_THRESH, i]
+
+        mature = age > jnp.int32(self.maturity)
+        reset = (utility_hat < threshold) & mature
+        zero = jnp.float32(0.0)
+        return px.UnitWrite.of(
+            # The paper resets utility, the activation average and age to zero.
+            (CBP_UTIL, jnp.where(reset, zero, utility)),
+            (CBP_UTIL_HAT, jnp.where(reset, zero, utility_hat)),
+            (CBP_ACT_AVG, jnp.where(reset, zero, act_avg)),
+            (CBP_AGE, jnp.where(reset, jnp.int32(0), next_age)),
+            (CBP_RESET, jnp.where(reset, jnp.float32(1.0), zero)),
+            (CBP_THRESH, threshold),
+            (CBP_CURSOR, u[CBP_CURSOR, i] + jnp.int32(1)),
+        )
+
+
+class CbpReinit(px.UpdateConn[None]):
+    """Reinitialize a reset unit's incoming edges; zero its outgoing edges.
+
+    Zeroing the outputs is the paper's rule: a replaced unit must not perturb
+    the network's current function until it has relearned something. Both passes
+    write unconditionally and select with `where`, because a vmapped policy must
+    produce the same write structure for every edge.
+    """
+
+    def __init__(
+        self,
+        state_fields: tuple[px.FieldSpec[np.generic], ...],
+        *,
+        init_scale: float = 1.0,
+    ) -> None:
+        """Bind the optimizer state columns to clear and the init scale.
+
+        Args:
+            state_fields: the optimizer's per-connection state columns. Taken
+                from the bundle rather than hardcoded so any optimizer works.
+            init_scale: multiplies the 1/sqrt(fan-in) reinit scale.
+        """
+        self.state_fields = state_fields
+        self.init_scale = init_scale
+
+    def incoming(
+        self,
+        u: px.UnitView,
+        dst: px.UnitIdx,
+        src: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> px.ConnWrite:
+        """Draw a fresh weight into a reset destination and clear its state."""
+        del g
+        reset = u[CBP_RESET, dst] > jnp.float32(0.5)
+        scale = jnp.float32(self.init_scale) / jnp.sqrt(
+            jnp.maximum(u[CBP_FANIN, dst], jnp.float32(1.0))
+        )
+        fresh = (_hash01(src, dst, u[CBP_CURSOR, dst]) * 2.0 - 1.0) * scale
+        writes: list[tuple[px.FieldSpec[np.generic], jax.Array]] = [
+            (px.WEIGHT, jnp.where(reset, fresh, c[px.WEIGHT, cid]))
+        ]
+        for spec in self.state_fields:
+            zero = jnp.zeros((), dtype=spec.dtype)
+            writes.append((spec, jnp.where(reset, zero, c[spec, cid])))
+        return px.ConnWrite.of(*writes)
+
+    def outgoing(
+        self,
+        u: px.UnitView,
+        src: px.UnitIdx,
+        dst: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> px.ConnWrite:
+        """Zero the outgoing weights of a reset source."""
+        del dst, g
+        reset = u[CBP_RESET, src] > jnp.float32(0.5)
+        return px.ConnWrite.of(
+            (px.WEIGHT, jnp.where(reset, jnp.float32(0.0), c[px.WEIGHT, cid]))
+        )
+
+
+def make_net(
+    optimizer: px.optim.Optimizer,
+    *,
+    mode: str,
+    decay: float = 0.99,
+    maturity: int = 5,
+    local: bool = False,
+    rho: float = 0.05,
+    init_scale: float = 1.0,
+    ema_decay: float = 0.05,
+) -> type[px.Network[None]]:
+    """Build the train / churn / eval net for CBP.
+
+    Args:
+        optimizer: the plastax.optim bundle.
+        mode: ``"train"``, ``"churn"`` or ``"eval"``.
+        decay: retention weight of the running averages (the paper's eta,
+            0.99); NOT the update weight.
+        maturity: churns before a unit may be reset (churn).
+        local: use the v1 two-hop threshold instead of the v0 oracle (churn).
+        rho: replacement rate targeted by the v1 quantile bar (churn).
+        init_scale: multiplies the 1/sqrt(fan-in) reinit scale (churn).
+        ema_decay: activation-EMA rate for the dormancy diagnostic.
+
+    Returns:
+        A Network subclass for the requested mode.
+
+    Raises:
+        ValueError: on an unknown mode.
+    """
+    if mode == "train":
+
+        class _Train(px.Network[None]):
+            forward_pass = ReluForward(ema_decay)
+            backward_pass = ReluBackward()
+            loss = MSELoss()
+            update_conn = optimizer.update_conn()
+            extra_unit_fields = _UNIT_FIELDS
+            extra_conn_fields = optimizer.state_fields
+            propagation = px.Propagation.TOPOLOGICAL
+
+        return _Train
+
+    if mode == "eval":
+
+        class _Eval(px.Network[None]):
+            forward_pass = ReluForward(ema_decay)
+            extra_unit_fields = _UNIT_FIELDS
+            extra_conn_fields = optimizer.state_fields
+            propagation = px.Propagation.TOPOLOGICAL
+
+        return _Eval
+
+    if mode == "churn":
+
+        class _Churn(px.Network[None]):
+            forward_pass = CbpFanInUtility(maturity)
+            backward_pass = CbpUtility(
+                decay=decay,
+                maturity=maturity,
+                local=local,
+                rho=rho,
+            )
+            update_conn = CbpReinit(optimizer.state_fields, init_scale=init_scale)
+            extra_unit_fields = _UNIT_FIELDS
+            extra_conn_fields = optimizer.state_fields
+            propagation = px.Propagation.TOPOLOGICAL
+
+        return _Churn
+
+    raise ValueError(f"make_net: unknown mode {mode!r}")
+
+
+def hidden_ids(static: px.NetworkStatic) -> np.ndarray:
+    """Unit ids that CBP may replace: neither inputs nor outputs."""
+    excluded = set(static.input_ids) | set(static.output_ids)
+    return np.array(
+        [i for i in range(static.num_units) if i not in excluded], dtype=np.int32
+    )
+
+
+def set_oracle_threshold(
+    static: px.NetworkStatic,
+    state: px.NetworkState[None],
+    rho: float,
+    *,
+    maturity: int = 5,
+    accumulator: dict[int, float] | None = None,
+) -> px.NetworkState[None]:
+    """v0: mark the lowest-utility mature units per level, at rate `rho`.
+
+    Selection is by RANK, not by a utility value. A value threshold cannot
+    express "replace the lowest rho" once the utility distribution has mass at a
+    point, and here it always does: every ReLU-dormant unit has |activation| = 0
+    and therefore utility exactly 0, so the rho-quantile IS 0 and the strict
+    `utility < threshold` test excludes every one of them -- exactly the units
+    CBP exists to replace. Measured, that collapsed the replacement rate from
+    the requested 6.4 units/churn to 1.3.
+
+    The decision is encoded in `cbp/thresh` rather than in a new column: a
+    selected unit gets an unreachable bar (+inf) and everything else gets -1, so
+    the traced rule `reset = (utility < threshold) & mature` is unchanged and
+    the in-trace maturity gate stays a safety net over the host's own filter.
+
+    Args:
+        static: the network's static config.
+        state: the state to read utilities and ages from.
+        rho: replacement rate -- the fraction of each level's units to reset.
+        maturity: churns a unit must survive before it may be selected.
+        accumulator: per-level carry for the fractional part of `rho * mature`,
+            mutated in place. Pass one dict per run. Omit it only for a
+            single-churn check; without it the rate is floored every churn.
+
+    Returns:
+        The state with `cbp/thresh` written.
+    """
+    utility = np.asarray(state.units[CBP_UTIL_HAT.name])
+    ages = np.asarray(state.units[CBP_AGE.name])
+    levels = np.asarray(state.units[px.LEVEL.name])
+    threshold = np.full(static.num_units, -1.0, dtype=np.float32)
+    replaceable = hidden_ids(static)
+    for level in np.unique(levels[replaceable]):
+        members = replaceable[levels[replaceable] == level]
+        mature = members[ages[members] > maturity]
+        if mature.size == 0:
+            continue
+        # rho of the ELIGIBLE (mature) units, per the authors' released code
+        # (gnt.py:145). Algorithm 1 in the paper says n_l * rho -- rho of the
+        # LAYER -- and the two differ sharply while units are still maturing.
+        wanted = rho * mature.size
+        if accumulator is None:
+            count = int(wanted)
+        else:
+            # gnt.py:151-153, the accumulate=True branch: carry the fractional
+            # part so the long-run rate is rho rather than floor(rho * n). At
+            # our per-CYCLE churn there are far fewer replacement events than
+            # the paper's per-step regime, so a floored remainder is a standing
+            # rate error rather than rounding noise.
+            carried = accumulator.get(int(level), 0.0) + wanted
+            count = int(carried)
+            accumulator[int(level)] = carried - count
+        count = min(mature.size, count)
+        if count == 0:
+            continue
+        chosen = mature[np.argsort(utility[mature], kind="stable")[:count]]
+        threshold[chosen] = np.inf
+    state.units = {**state.units, CBP_THRESH.name: jnp.asarray(threshold)}
+    return state
+
+
+def reset_ids(state: px.NetworkState[None]) -> set[int]:
+    """Unit ids flagged for reinitialization by the most recent churn."""
+    flags = np.asarray(state.units[CBP_RESET.name])
+    return set(np.flatnonzero(flags > 0.5).tolist())
+
+
+def jaccard(a: set[int], b: set[int]) -> float | None:
+    """Jaccard similarity of two reset sets, or None when BOTH are empty.
+
+    Returning None rather than 1.0 for the empty-empty case matters: churns
+    where neither rule fires carry no evidence that the rules agree, and scoring
+    them as perfect agreement inflates the gate. Measured here, that alone moved
+    the reported similarity from 0.10 to 0.72.
+    """
+    if not a and not b:
+        return None
+    return len(a & b) / len(a | b)
+
+
+def build(
+    optimizer: px.optim.Optimizer,
+    layers: tuple[int, ...],
+    seed: int,
+    **net_kwargs: object,
+) -> tuple[px.NetworkStatic, px.NetworkState[None], type[px.Network[None]]]:
+    """Build a dense CBP net and its marked state."""
+    train_net = make_net(optimizer, mode="train")
+    static, state = build_dense_mlp(train_net, layers, seed)
+    del net_kwargs
+    return static, mark_outputs(static, state), train_net
+
+
+def run(
+    *,
+    threshold: str = "v0",
+    theta: float = math.pi / 4,
+    switch_period: int | None = 30,
+    d: int = 32,
+    hidden_layers: tuple[int, ...] = (128, 128),
+    classes: int = 8,
+    lr: float = 0.001,
+    rho: float = 0.05,
+    decay: float = 0.99,
+    maturity: int = 5,
+    churn_period: int = 1,
+    steps_per_cycle: int = 100,
+    num_cycles: int = 330,
+    seed: int = 0,
+) -> list[CycleRecord]:
+    """Train through teacher rotations with CBP replacing low-utility units.
+
+    Args:
+        threshold: ``"v0"`` (host quantile oracle), ``"v1"`` (two-hop local) or
+            ``"off"`` (no churn -- the dense control).
+        theta: rotation angle per switch, in radians.
+        switch_period: cycles between switches, or None for stationary.
+        d: input dimensionality.
+        hidden_layers: width of each hidden layer; shared by every arm so the
+            comparison stays matched (NE needs an interior transition).
+        classes: output classes.
+        lr: adam learning rate.
+        rho: replacement rate for the v0 quantile.
+        decay: retention weight of the running averages (the paper's eta).
+        maturity: churns before a unit may be reset.
+        churn_period: cycles between replacement events.
+        steps_per_cycle: training examples per cycle.
+        num_cycles: cycles to run.
+        seed: PRNG seed.
+
+    Returns:
+        One CycleRecord per cycle, reusing the Stage 0 record so CBP and the
+        dense baseline are scored by the same `recovery_times`.
+
+    Raises:
+        ValueError: on an unknown threshold mode.
+    """
+    if threshold not in ("v0", "v1", "off"):
+        raise ValueError(f"run: unknown threshold {threshold!r}")
+    layers = (d + 1, *hidden_layers, classes)
+    optimizer = px.optim.adam(lr, GradPreAct)
+    static, state, train_net = build(optimizer, layers, seed)
+    train_step = px.make_step(train_net, static)
+    churn_step = None
+    if threshold != "off":
+        churn_net = make_net(
+            optimizer,
+            mode="churn",
+            decay=decay,
+            maturity=maturity,
+            local=(threshold == "v1"),
+            rho=rho,
+        )
+        churn_step = px.make_step(churn_net, static)
+
+    task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
+    eye = np.eye(classes, dtype=np.float32)
+    out_ids = np.asarray(static.output_ids)
+    dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
+    records: list[CycleRecord] = []
+    last_inputs = jnp.zeros((layers[0],), dtype=jnp.float32)
+    # One carry per run, so the replacement rate is rho over the whole run.
+    accumulator: dict[int, float] = {}
+
+    for cycle in range(num_cycles):
+        task.advance(cycle)
+        started = time.perf_counter()
+        total_loss, correct = 0.0, 0
+        for _ in range(steps_per_cycle):
+            inputs, label = task.sample()
+            result = train_step(
+                state, px.StepInputs(inputs=inputs, targets=jnp.asarray(eye[label]))
+            )
+            state = result.state
+            total_loss += float(result.loss)
+            preds = np.asarray(state.units[px.ACTIVATION.name])[out_ids]
+            correct += int(np.argmax(preds) == label)
+            last_inputs = inputs
+        if churn_step is not None and cycle % churn_period == 0:
+            if threshold == "v0":
+                state = set_oracle_threshold(
+                    static, state, rho, maturity=maturity, accumulator=accumulator
+                )
+            state = churn_step(
+                state, px.StepInputs(inputs=last_inputs, targets=None)
+            ).state
+        live = int(px.state.live_conn_count(state))
+        records.append(
+            CycleRecord(
+                cycle=cycle,
+                loss=total_loss / steps_per_cycle,
+                accuracy=correct / steps_per_cycle,
+                live_edges=live,
+                density=live / dense_edges,
+                dormant=dormant_fraction(static, state),
+                mean_abs_w=0.0,
+                switched=task.switched,
+                seconds=time.perf_counter() - started,
+            )
+        )
+    return records
+
+
+def jaccard_gate(
+    *,
+    d: int = 32,
+    hidden_layers: tuple[int, ...] = (128, 128),
+    classes: int = 8,
+    rho: float = 0.05,
+    decay: float = 0.99,
+    maturity: int = 5,
+    theta: float = math.pi / 4,
+    switch_period: int = 30,
+    steps_per_cycle: int = 100,
+    num_cycles: int = 120,
+    seed: int = 0,
+) -> tuple[list[float], list[tuple[int, int]]]:
+    """Score the v1 local threshold against the v0 oracle, churn by churn.
+
+    Both thresholds are applied to the SAME state at every churn -- the
+    trajectory is advanced by v0 so the comparison never drifts into two
+    different networks. Returns one Jaccard similarity per churn; the plan's
+    gate is a mean of at least 0.9.
+
+    Args:
+        d: input dimensionality.
+        hidden_layers: width of each hidden layer.
+        classes: output classes.
+        rho: replacement rate for the v0 quantile.
+        decay: retention weight of the running averages (the paper's eta).
+        maturity: churns before a unit may be reset.
+        theta: rotation angle per switch.
+        switch_period: cycles between switches.
+        steps_per_cycle: training examples per cycle.
+        num_cycles: cycles to run.
+        seed: PRNG seed.
+
+    Returns:
+        The per-churn Jaccard similarities (churns where neither rule fired are
+        omitted, not scored as agreement) and the per-churn (v0, v1) reset-set
+        sizes, which distinguish a rate mismatch from a ranking disagreement.
+    """
+    layers = (d + 1, *hidden_layers, classes)
+    optimizer = px.optim.adam(0.001, GradPreAct)
+    static, state, train_net = build(optimizer, layers, seed)
+    train_step = px.make_step(train_net, static)
+    common = {"decay": decay, "maturity": maturity, "rho": rho}
+    step_v0 = px.make_step(
+        make_net(optimizer, mode="churn", local=False, **common), static
+    )
+    step_v1 = px.make_step(
+        make_net(optimizer, mode="churn", local=True, **common), static
+    )
+
+    task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
+    eye = np.eye(classes, dtype=np.float32)
+    scores: list[float] = []
+    sizes: list[tuple[int, int]] = []
+    accumulator: dict[int, float] = {}
+    last_inputs = jnp.zeros((layers[0],), dtype=jnp.float32)
+
+    for cycle in range(num_cycles):
+        task.advance(cycle)
+        for _ in range(steps_per_cycle):
+            inputs, label = task.sample()
+            state = train_step(
+                state, px.StepInputs(inputs=inputs, targets=jnp.asarray(eye[label]))
+            ).state
+            last_inputs = inputs
+        churn_inputs = px.StepInputs(inputs=last_inputs, targets=None)
+        # make_step donates its state, so each branch needs its own copy.
+        oracle = set_oracle_threshold(
+            static,
+            jax.tree.map(jnp.copy, state),
+            rho,
+            maturity=maturity,
+            accumulator=accumulator,
+        )
+        oracle = step_v0(oracle, churn_inputs).state
+        local = step_v1(jax.tree.map(jnp.copy, state), churn_inputs).state
+        ids0, ids1 = reset_ids(oracle), reset_ids(local)
+        score = jaccard(ids0, ids1)
+        if score is not None:
+            scores.append(score)
+        sizes.append((len(ids0), len(ids1)))
+        state = oracle
+    return scores, sizes
+
+
+def main() -> None:
+    """Report the v0/v1 gate and CBP's effect on recovery-time growth."""
+    print("CBP -- contribution utility as an outgoing-edge monoid reduction")
+    print("=" * 70)
+    scores, sizes = jaccard_gate(num_cycles=90)
+    settled = scores[10:]
+    n0 = float(np.mean([a for a, _ in sizes[10:]]))
+    n1 = float(np.mean([b for _, b in sizes[10:]]))
+    mean_score = float(np.mean(settled)) if settled else float("nan")
+    print(
+        f"v0/v1 reset-set Jaccard over {len(settled)} scored churns: "
+        f"mean {mean_score:.3f}  "
+        f"{'PASS' if mean_score >= 0.9 else 'FAILS the 0.9 gate'}"
+    )
+    print(
+        f"  resets/churn: v0 {n0:.1f} (rank-selected, rate-controlled)  "
+        f"v1 {n1:.1f} (uncontrolled)"
+    )
+    print()
+    print("recovery-time growth at theta=pi/4 (lower slope = more plastic):")
+    for label, mode in (("dense (no CBP)", "off"), ("CBP v0", "v0"), ("CBP v1", "v1")):
+        records = run(threshold=mode, theta=math.pi / 4, num_cycles=330)
+        times = recovery_times(records)
+        final = float(np.mean([r.accuracy for r in records[-5:]]))
+        print(
+            f"  {label:15s} n={len(times):2d}  mean {np.mean(times):5.1f}"
+            f"  slope {growth_slope(times):+6.2f}/switch  acc {final:.3f}"
+        )
+
+
+if __name__ == "__main__":
+    main()

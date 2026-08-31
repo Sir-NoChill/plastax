@@ -14,11 +14,11 @@ from typing import Any, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from jax.sharding import Mesh, PartitionSpec
+from jax.sharding import PartitionSpec
 from jaxtyping import Array, Bool, Float
 
 from plastax._types import ACTIVATION
+from plastax.distributed import scheme_a_mesh
 from plastax.phases import StepInputs, build_phases
 from plastax.state import NetworkState, NetworkStatic
 from plastax.traits import Network
@@ -105,7 +105,7 @@ def _shard_map_step(
     """
     sharding = static.sharding
     assert sharding is not None  # only called on the sharded branch
-    mesh = Mesh(np.asarray(jax.devices()[: sharding.num_shards]), (sharding.axis_name,))
+    mesh = scheme_a_mesh(static)
     # PartitionSpec is untyped in jax's stubs; the spec pytrees deliberately
     # hold PartitionSpec leaves in the array-typed state/input/result shapes,
     # so they are built and threaded as Any.

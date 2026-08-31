@@ -301,6 +301,13 @@ and it is why CBP goes first.
 it does not, ship v0 and report v1 as an open problem. Do not fudge the
 threshold to make the gate pass.
 
+**Gate OUTCOME, measured 2026-08-31: v1 FAILS at 0.393**, and the cause is
+*rate*, not ranking — v1 fires 2.6–5× more resets than v0 because a value
+threshold cannot express "the lowest ρ". Pinned by
+`tests/test_cbp.py::test_v1_local_threshold_fails_its_gate_on_rate`; the
+fallback applies (ship v0) and the salvage options are in
+[`../todo/rl-cbp-v1-rate-control.md`](../todo/rl-cbp-v1-rate-control.md).
+
 **Deviation to record.** The paper's utility uses batch activation statistics; at
 batch 1 it is an EMA over steps. Note it, and sweep η.
 
@@ -791,6 +798,10 @@ table is the index.
 | T6 | Forager, recurrence, state construction | after Stage 2 | high, highest value | [rl-forager-recurrence.md](../todo/rl-forager-recurrence.md) |
 | T7 | per-level vs per-module sparsity policy | Stage 2 | low | [rl-per-level-policy.md](../todo/rl-per-level-policy.md) |
 | T8 | fix the evaluation protocol first | before Stage 2 | ~free | [rl-eval-protocol.md](../todo/rl-eval-protocol.md) |
+| T9 | rate-control CBP's local threshold | Stage 0, blocking T3 | low | [rl-cbp-v1-rate-control.md](../todo/rl-cbp-v1-rate-control.md) |
+
+**T9 is now the one that changes what the plan can claim** — the local-threshold
+move is the capability argument, and it is the part that has not yet worked.
 
 **T1 and T4 are the two that change what gets built.** T1 is the plan's most
 likely novel contribution; T4 decides whether the target density is viable at

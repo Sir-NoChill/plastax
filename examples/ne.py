@@ -58,6 +58,7 @@ from nonstationary import (
     DriftingTask,
     ReluBackward,
     ReluForward,
+    dormant_fraction,
     mark_outputs,
 )
 
@@ -512,7 +513,6 @@ def run(
     task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
     eye = np.eye(classes, dtype=np.float32)
     elastic = np.asarray(state.units[NE_ELASTIC.name]) > 0.5
-    hidden_units = np.arange(layers[0], sum(layers) - classes)
     out_ids = np.asarray(static.output_ids)
     dense_edges = sum(a * b for a, b in zip(layers[:-1], layers[1:], strict=True))
     horizon = int(grow_until * num_cycles)
@@ -551,7 +551,6 @@ def run(
         interior = int((~np.asarray(state.conns[1][px.DEAD.name])).sum())
         trace.append((dormant, rate, interior))
         live = int(px.state.live_conn_count(state))
-        ema = np.asarray(state.units[ACT_EMA.name])[hidden_units]
         records.append(
             CycleRecord(
                 cycle=cycle,
@@ -559,7 +558,7 @@ def run(
                 accuracy=correct / steps_per_cycle,
                 live_edges=live,
                 density=live / dense_edges,
-                dormant=float(np.mean(ema < 0.01)),
+                dormant=dormant_fraction(static, state),
                 mean_abs_w=0.0,
                 switched=task.switched,
                 seconds=time.perf_counter() - started,

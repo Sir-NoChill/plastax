@@ -263,6 +263,52 @@ class CycleRecord:
     seconds: float
 
 
+def dormant_fraction(
+    static: px.NetworkStatic,
+    state: px.NetworkState[None],
+    *,
+    tau: float = 0.025,
+) -> float:
+    """Sokar et al.'s tau-dormant ratio: activation NORMALISED by its layer mean.
+
+    Plasticine's RDU (Ma et al. 2025, appendix D.1, from Sokar et al. 2023):
+
+        s_i = E|h_i| / ((1/H) * sum_k E|h_k|)      over the unit's own layer
+
+    and unit `i` is tau-dormant when `s_i <= tau`. The normalisation is the
+    whole point and an ABSOLUTE threshold does not have it: an arm whose
+    activations are globally smaller reports more dormant units for that reason
+    alone, which is the same scale confound that makes recovery time
+    incomparable across arms of different capacity.
+
+    Args:
+        static: the network's static config, for the unit partition.
+        state: the state to read the activation EMA from.
+        tau: dormancy threshold on the NORMALISED score, not on the activation.
+
+    Returns:
+        The fraction of hidden units that are tau-dormant.
+    """
+    ema = np.asarray(state.units[ACT_EMA.name])
+    levels = np.asarray(state.units[px.LEVEL.name])
+    excluded = set(static.input_ids) | set(static.output_ids)
+    hidden = np.array(
+        [i for i in range(static.num_units) if i not in excluded], dtype=np.int32
+    )
+    if hidden.size == 0:
+        return 0.0
+    dormant = np.zeros(hidden.size, dtype=bool)
+    for level in np.unique(levels[hidden]):
+        members = levels[hidden] == level
+        activations = ema[hidden[members]]
+        mean = float(np.mean(activations))
+        # A layer that is entirely silent is entirely dormant; the normalised
+        # score is 0/0 there, and calling it 0 dormant would invert the meaning.
+        score = activations / mean if mean > 0.0 else np.zeros_like(activations)
+        dormant[members] = score <= tau
+    return float(np.mean(dormant))
+
+
 def _live_weight_stats(state: px.NetworkState[None]) -> float:
     """Mean |weight| over live connections."""
     total, count = 0.0, 0
@@ -540,7 +586,6 @@ def run(
 
     task = DriftingTask(d, classes, theta=theta, switch_period=switch_period, seed=seed)
     eye = np.eye(classes, dtype=np.float32)
-    hidden_ids = np.arange(layers[0], sum(layers) - classes)
     records: list[CycleRecord] = []
     last_inputs = jnp.zeros((layers[0],), dtype=jnp.float32)
 
@@ -565,7 +610,6 @@ def run(
             state = churn_step(
                 state, px.StepInputs(inputs=last_inputs, targets=None)
             ).state
-        ema = np.asarray(state.units[ACT_EMA.name])[hidden_ids]
         live = int(px.state.live_conn_count(state))
         records.append(
             CycleRecord(
@@ -574,7 +618,7 @@ def run(
                 accuracy=correct / steps_per_cycle,
                 live_edges=live,
                 density=live / dense_edges,
-                dormant=float(np.mean(ema < dormant_tau)),
+                dormant=dormant_fraction(state=state, static=static, tau=dormant_tau),
                 mean_abs_w=_live_weight_stats(state),
                 switched=task.switched,
                 seconds=time.perf_counter() - started,

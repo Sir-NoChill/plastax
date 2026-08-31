@@ -25,6 +25,7 @@ import sys
 import types
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 
 import plastax as px
@@ -190,3 +191,36 @@ def test_rewiring_holds_sparsity_across_a_switch() -> None:
         counts = {r.live_edges for r in records}
         assert len(counts) == 1, f"{method}: live-edge count drifted: {counts}"
         assert any(r.switched for r in records), "no switch occurred"
+
+
+def test_dormancy_is_scale_invariant() -> None:
+    """Sokar's normalised score, not an absolute activation threshold.
+
+    This is the same confound as the recovery metric, in the diagnostic that was
+    supposed to be independent of it: under an ABSOLUTE bar an arm whose
+    activations are globally smaller reports more dormant units for that reason
+    alone, so dormancy and accuracy level could not be told apart. Normalising
+    by the layer mean (Plasticine appendix D.1, from Sokar et al. 2023) makes
+    the score invariant to any positive rescaling of a layer.
+
+    Scaling by 0.01 puts EVERY unit under the old 0.01 bar, so the old
+    definition would report total dormancy for a network that has not changed.
+    """
+    optimizer = px.optim.sgd(0.1, ns.GradPreAct)
+    net = ns.make_net(optimizer, mode="train")
+    static, state = ns.build_dense_mlp(net, (4, 9, 6, 3), 0)
+    state = ns.mark_outputs(static, state)
+
+    rng = np.random.default_rng(0)
+    base = np.abs(rng.random(static.num_units).astype(np.float32)) + 0.05
+    # One genuinely quiet unit, so the measurement is not trivially zero.
+    base[static.num_units // 2] = 1e-6
+
+    scores = []
+    for factor in (1.0, 0.01, 100.0):
+        state.units = {**state.units, ns.ACT_EMA.name: jnp.asarray(base * factor)}
+        scores.append(ns.dormant_fraction(static, state, tau=0.025))
+
+    assert scores[0] == scores[1] == scores[2], f"dormancy moved with scale: {scores}"
+    assert scores[0] > 0.0, "the planted quiet unit was not detected"
+    assert scores[0] < 1.0, "every unit reported dormant -- the bar is not relative"

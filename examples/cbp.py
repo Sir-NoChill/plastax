@@ -460,9 +460,9 @@ def set_oracle_threshold(
         mature = members[ages[members] > maturity]
         if mature.size == 0:
             continue
-        # the paper replaces rho of the ELIGIBLE (mature) units per layer,
-        # not rho of the layer -- the two differ sharply early in a run when
-        # most units are still under the maturity gate.
+        # rho of the ELIGIBLE (mature) units, per the authors' released code
+        # (gnt.py:145). Algorithm 1 in the paper says n_l * rho -- rho of the
+        # LAYER -- and the two differ sharply while units are still maturing.
         count = min(mature.size, max(1, int(round(rho * mature.size))))
         chosen = mature[np.argsort(utility[mature], kind="stable")[:count]]
         threshold[chosen] = np.inf

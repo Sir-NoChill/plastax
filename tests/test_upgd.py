@@ -177,3 +177,55 @@ def test_noise_is_deterministic_per_edge_and_step() -> None:
     assert first.keys() == second.keys()
     for key in first:
         assert first[key] == pytest.approx(second[key], abs=1e-9)
+
+
+def test_v0_net_preserves_the_broadcast_eta() -> None:
+    """v0's forward must not overwrite the host's global eta before it is read.
+
+    Reusing the v1 forward for v0 silently discarded `set_global_eta`'s
+    broadcast -- the max_ reduction rewrote the column in the same step, before
+    `update_conn` ever read it, so both modes ran the local rule. Only running
+    the file surfaced that, which is why it went unnoticed.
+    """
+    sentinel = 7.0
+    net, static, state = _build(local=False)
+    state.units = {
+        **state.units,
+        upgd.UPGD_ETA.name: jnp.full_like(state.units[upgd.UPGD_ETA.name], sentinel),
+    }
+    stepped = _run_one_step(net, static, state).state
+    after = np.asarray(stepped.units[upgd.UPGD_ETA.name])
+    assert np.allclose(after, sentinel), "v0 forward clobbered the broadcast eta"
+
+    local_net, local_static, local_state = _build(local=True)
+    local_state.units = {
+        **local_state.units,
+        upgd.UPGD_ETA.name: jnp.full_like(
+            local_state.units[upgd.UPGD_ETA.name], sentinel
+        ),
+    }
+    local_after = np.asarray(
+        _run_one_step(local_net, local_static, local_state).state.units[
+            upgd.UPGD_ETA.name
+        ]
+    )
+    assert not np.allclose(local_after, sentinel), "v1 forward must write its own eta"
+
+
+def test_eta_mode_changes_the_weights() -> None:
+    """The two eta modes must reach different weights, or v0 is unreachable.
+
+    Same seed, same net, same step: only the utility-scaling denominator
+    differs, so any difference at all proves the mode selection is wired
+    through.
+    """
+    seen = []
+    for local in (False, True):
+        net, static, state = _build(local=local, sigma=0.0)
+        state.units = {
+            **state.units,
+            upgd.UPGD_ETA.name: jnp.full_like(state.units[upgd.UPGD_ETA.name], 0.5),
+        }
+        seen.append(_live_edges(_run_one_step(net, static, state).state))
+    assert seen[0].keys() == seen[1].keys()
+    assert any(seen[0][k] != pytest.approx(seen[1][k], abs=1e-9) for k in seen[0])

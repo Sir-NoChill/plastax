@@ -204,18 +204,22 @@ def test_jaccard_does_not_score_empty_agreement() -> None:
 
 
 @pytest.mark.slow
-def test_v1_local_threshold_fails_its_gate_on_rate() -> None:
-    """RL_PLAN's 0.9 Jaccard bar for the two-hop local threshold is NOT met.
+def test_v1_local_threshold_agrees_with_the_oracle_on_rate() -> None:
+    """The two-hop local bar now matches v0's replacement RATE, not just its rank.
 
-    Asserting the FAILURE is deliberate. The measured number lived only in a
-    stdout that was never captured, and the plan's fallback (ship v0, report v1
-    open) depends on it, so the state has to be pinned somewhere that breaks
-    loudly when v1 is fixed rather than rediscovered each session.
+    History, because the numbers are the point. v1 first compared each unit
+    against a fraction of its neighbourhood's mean utility -- a threshold on a
+    VALUE, which cannot express "the lowest rho". It fired 4-5x more resets than
+    v0 and the agreement gate sat at 0.20 here (0.393 at (128,128)). Replacing
+    the bar with the analytic log-normal rho-quantile of the neighbourhood's log
+    moments, and carrying v0's fractional count the way the authors' code does,
+    took the rate to within ~10% and the gate to ~0.80.
 
-    The diagnosis is the second half: v1 fires several times more resets than
-    v0, so the disagreement is a RATE mismatch, not the two-hop rule ranking
-    units differently. v0 selects a fixed rho by rank; v1's bar is a fraction of
-    a neighbourhood mean and controls nothing.
+    RL_PLAN's bar is 0.9 and is still NOT met. What remains is genuine ranking
+    disagreement on the marginal unit, not rate: at moment_decay 0.5 the two
+    fire within 4% of each other and the gate does not move. Asserted as a
+    regression floor rather than an equality, since a further improvement should
+    pass.
     """
     scores, sizes = cbp.jaccard_gate(
         d=16, hidden_layers=(32, 32), classes=4, num_cycles=30, steps_per_cycle=50
@@ -223,8 +227,47 @@ def test_v1_local_threshold_fails_its_gate_on_rate() -> None:
     settled = scores[8:]
     assert settled, "no churn scored -- the gate measured nothing"
     mean_score = float(np.mean(settled))
-    assert mean_score < 0.5, f"v1 now agrees with v0 at {mean_score:.3f}: re-gate it"
+    assert mean_score > 0.7, f"local threshold regressed to {mean_score:.3f}"
 
     n0 = float(np.mean([a for a, _ in sizes[8:]]))
     n1 = float(np.mean([b for _, b in sizes[8:]]))
-    assert n1 > 2.0 * n0, f"v1 no longer over-fires ({n1:.1f} vs {n0:.1f}): re-diagnose"
+    assert n1 < 1.3 * n0, f"v1 over-fires again: {n1:.2f} vs v0 {n0:.2f}"
+    assert n1 > 0.7 * n0, f"v1 under-fires: {n1:.2f} vs v0 {n0:.2f}"
+
+
+def test_oracle_count_carries_its_fractional_remainder() -> None:
+    """v0 hits rho on average instead of flooring it away every churn.
+
+    gnt.py:151-153 carries the fractional part of `rho * |eligible|` across
+    steps. Flooring instead is a STANDING rate error, not rounding noise: at
+    rho=0.05 over 26 mature units the target is 1.3 per churn and a floor gives
+    1, a 23% under-replacement that never corrects. The accumulator has to be
+    threaded per level, so the test uses two levels with different populations.
+    """
+    optimizer = px.optim.sgd(0.1, cbp.GradPreAct)
+    static, state, _ = cbp.build(optimizer, (5, 12, 7, 3), 0)
+    ages = np.full(static.num_units, 50, dtype=np.int32)
+    state.units = {**state.units, cbp.CBP_AGE.name: jnp.asarray(ages)}
+    rng = np.random.default_rng(0)
+
+    replaceable = cbp.hidden_ids(static)
+    levels = np.asarray(state.units[px.LEVEL.name])
+    hidden_levels = np.unique(levels[replaceable])
+    per_level = [int((levels[replaceable] == lv).sum()) for lv in hidden_levels]
+    rho, churns = 0.3, 60
+    accumulator: dict[int, float] = {}
+    selected = 0
+    for _ in range(churns):
+        utility = jnp.asarray(rng.random(static.num_units).astype(np.float32))
+        state.units = {**state.units, cbp.CBP_UTIL_HAT.name: utility}
+        marked = cbp.set_oracle_threshold(
+            static, state, rho, maturity=5, accumulator=accumulator
+        )
+        selected += int((np.asarray(marked.units[cbp.CBP_THRESH.name]) > 0).sum())
+
+    target = sum(rho * n for n in per_level) * churns
+    floored = sum(int(rho * n) for n in per_level) * churns
+    assert target > floored, "test is vacuous unless the count has a fractional part"
+    assert abs(selected - target) <= len(per_level), (
+        f"carried count {selected} strayed from the target {target:.1f}"
+    )

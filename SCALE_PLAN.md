@@ -231,7 +231,17 @@ Design (refined in iteration 1, from the C++ sampled path in
   every bucket nearly full after a resort (seen in the equivalence test).
   Thread the headroom through, so a resort is not followed by an
   overflow → grow → retrace.
-- [ ] 2.3 Find the largest E that fits on 32 GB, and record it.
+- [ ] 2.3 Find the largest E that fits on 32 GB. **Blocked by host memory,
+  not GPU memory.**
+  - At 600M edges, `from_edges` (host numpy: levels, then a per-bucket
+    lexsort with int64 indices) took host RAM from about 57 GB free to about
+    1 GB in under a second. It crashed the session twice.
+  - Do not retry until 2.7 lands. 300M is the tested ceiling on cdol01.
+- [ ] 2.7 `perf(builder)`: a lower-memory build.
+  - Use int32 indices, and one argsort per bucket over a packed key instead of
+    `lexsort` plus fancy-index copies.
+  - Levels via device `recompute_levels`, or a chunked host pass.
+  - Target: under 20 B of host RAM per edge.
 
 ### P3: driver without per-step sync
 
@@ -318,6 +328,11 @@ the log below:
   wrapped). That is the price of correctness. Grid-path users at that scale
   should move to `propose` once P1 lands.
 
+- **plastax's host build is the scale limit on this box.**
+  - At 600M edges, `NetworkBuilder.from_edges` needs more than 60 GB of host
+    RAM, over 100 B per edge. The session crashed twice trying it, so it is
+    not retried (P2.7 first).
+  - The device state itself would have been about 14 GB.
 - **Memory headroom beyond C++.** plastax holds 300M edges in 7.0 GB, against
   27 GB for C++ Plastix. The C++ side's 97 B per slot is mostly scratch
   (radix buffers, keys, perm) kept resident. It could probably be cut to about

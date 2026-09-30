@@ -179,6 +179,9 @@ def main() -> None:
     ap.add_argument("--m", type=int, default=64, help="shortlist side")
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--headroom", type=float, default=0.05)
+    ap.add_argument(
+        "--align", type=int, default=None, help="capacity rounding (None: pow2)"
+    )
     ap.add_argument("--grow", choices=("grid", "propose"), default="grid")
     ap.add_argument("--dedupe", action="store_true", help="propose: exact dedupe")
     ap.add_argument("--json", help="append one JSON line of results here")
@@ -203,6 +206,7 @@ def main() -> None:
         output_ids=list(range(2 * args.width, 3 * args.width)),
         globals_={"step": jnp.int32(0)},
         capacity_headroom=args.headroom,
+        capacity_align=args.align,
     )
     del frm, to
     state_gb = sum(a.nbytes for a in jax.tree.leaves(state0)) / 1e9

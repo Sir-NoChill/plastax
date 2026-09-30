@@ -8,6 +8,7 @@ reset_global.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import cast
 
@@ -433,6 +434,11 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+# jnp.searchsorted's default method ("scan") is a while loop, one tiny kernel
+# launch per halving step on GPU; unrolled, the whole search fuses. At 5.4M
+# edges this took the add phase from 0.34 to 0.07 ms per step.
+_SEARCH = "scan_unrolled"
+
 # Largest num_units whose pair id `src * num_units + dst` still fits in int32.
 _INT32_PAIR_UNITS = 46340
 
@@ -473,7 +479,9 @@ def live_pair_member(
         live_pair = jnp.where(dead, jnp.int32(-1), src * jnp.int32(num_units) + dst)
         sorted_live = jnp.sort(live_pair)
         cand_pair = cand_src * jnp.int32(num_units) + cand_dst
-        pos = jnp.minimum(jnp.searchsorted(sorted_live, cand_pair), last)
+        pos = jnp.minimum(
+            jnp.searchsorted(sorted_live, cand_pair, method=_SEARCH), last
+        )
         hit: Bool[Array, " p"] = sorted_live[pos] == cand_pair
         return hit
     # Past the bound, the same search on a uint64 pair id. x64 is enabled
@@ -487,7 +495,9 @@ def live_pair_member(
         )
         sorted_live64 = jnp.sort(live_pair64)
         cand_pair64 = cand_src.astype(jnp.uint64) * n + cand_dst.astype(jnp.uint64)
-        pos = jnp.minimum(jnp.searchsorted(sorted_live64, cand_pair64), last)
+        pos = jnp.minimum(
+            jnp.searchsorted(sorted_live64, cand_pair64, method=_SEARCH), last
+        )
         wide_hit: Bool[Array, " p"] = sorted_live64[pos] == cand_pair64
     return wide_hit
 
@@ -583,14 +593,16 @@ def nth_free_slot(
     cap = dead.shape[0]
     target = rank + jnp.int32(1)
     b = jnp.minimum(
-        jnp.searchsorted(free_blocks, target).astype(jnp.int32),
+        jnp.searchsorted(free_blocks, target, method=_SEARCH).astype(jnp.int32),
         jnp.int32(free_blocks.shape[0] - 1),
     )
     before = jnp.where(b > 0, free_blocks[jnp.maximum(b - 1, 0)], jnp.int32(0))
     idx = b[:, None] * jnp.int32(block) + jnp.arange(block, dtype=jnp.int32)[None, :]
     in_block = jnp.where(idx < cap, dead[jnp.minimum(idx, cap - 1)], False)
     running = jnp.cumsum(in_block.astype(jnp.int32), axis=1)
-    offset = jax.vmap(jnp.searchsorted)(running, target - before).astype(jnp.int32)
+    offset = jax.vmap(functools.partial(jnp.searchsorted, method=_SEARCH))(
+        running, target - before
+    ).astype(jnp.int32)
     slot: Int32[Array, " k"] = jnp.minimum(b * jnp.int32(block) + offset, cap - 1)
     return slot
 

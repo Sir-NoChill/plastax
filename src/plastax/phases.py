@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -54,13 +54,14 @@ class StepInputs:
     """Clamped inputs + targets for one step; fixed pytree structure.
 
     Attributes:
-        inputs: the (num_inputs,) values scattered to input unit ids.
-        targets: the (num_outputs,) loss targets, or None when the net
-            has no loss phase.
+        inputs: the (num_inputs,) values scattered to input unit ids, or
+            (B, num_inputs) for a batched step (make_step's batch_size).
+        targets: the (num_outputs,) loss targets -- (B, num_outputs) when
+            batched -- or None when the net has no loss phase.
     """
 
-    inputs: Float[Array, " num_inputs"]
-    targets: Float[Array, " num_outputs"] | None
+    inputs: Float[Array, "*batch num_inputs"]
+    targets: Float[Array, "*batch num_outputs"] | None
 
 
 def build_phases[GS](
@@ -104,6 +105,212 @@ def build_phases[GS](
     if net.reset_global is not None:
         phases.append(_build_reset_global_phase(net))
     return tuple(phases)
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchedPhases[GS]:
+    """The phases of a batched step, split by how they see the batch.
+
+    Attributes:
+        per_sample: forward, loss, and backward: run once per sample (vmapped
+            over the batch) against shared connections and globals.
+        update_conn: the batched connection update, or None when the net has
+            no update_conn: `(state, batched_units) -> state`, reducing the
+            per-sample contributions to one update per connection.
+        structural: prune_conn, add_conn, and reset_global: run once, on the
+            batch-mean unit state.
+    """
+
+    per_sample: tuple[Phase[GS], ...]
+    update_conn: Callable[[NetworkState[GS], Columns], NetworkState[GS]] | None
+    structural: tuple[Phase[GS], ...]
+
+
+def build_batched_phases[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    *,
+    overflow_sink: list[Bool[Array, ""]] | None = None,
+) -> BatchedPhases[GS]:
+    """Assemble a batched step's phases (see `BatchedPhases`).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying each phase's callbacks.
+        static: static network configuration giving the arena shapes.
+        overflow_sink: as for `build_phases`.
+
+    Returns:
+        The per-sample, update, and structural phases.
+    """
+    per_sample: list[Phase[GS]] = [_build_forward_phase(net, static)]
+    if net.loss is not None:
+        per_sample.append(_build_loss_phase(net, static))
+    if net.backward_pass is not None:
+        per_sample.append(_build_backward_phase(net, static))
+    structural: list[Phase[GS]] = []
+    if net.prune_conn is not None:
+        structural.append(build_prune_conn_phase(net, static))
+    if net.add_conn is not None:
+        structural.append(
+            build_add_conn_phase(net, static, overflow_sink=overflow_sink)
+        )
+    if net.reset_global is not None:
+        structural.append(_build_reset_global_phase(net))
+    update = build_batched_update_conn(net) if net.update_conn is not None else None
+    return BatchedPhases(tuple(per_sample), update, tuple(structural))
+
+
+def batch_mean_units(units: Columns) -> Columns:
+    """Reduce batched unit columns `(B, num_units)` to one `(num_units,)` view.
+
+    Floating columns take the batch mean; any other column (levels, counters,
+    flags) must agree across the batch and takes sample 0.
+
+    Args:
+        units: Unit columns with a leading batch axis.
+
+    Returns:
+        The unbatched unit columns.
+    """
+    return {
+        name: col.mean(axis=0).astype(col.dtype)
+        if jnp.issubdtype(col.dtype, jnp.floating)
+        else col[0]
+        for name, col in units.items()
+    }
+
+
+def build_batched_update_conn[GS](
+    net: type[Network[GS]],
+) -> Callable[[NetworkState[GS], Columns], NetworkState[GS]]:
+    """One connection update per step from a batch of unit states.
+
+    Two reductions, chosen by what the UpdateConn declares:
+
+    - **Exact** (`per_sample` + `incoming_batched`, e.g. every `optim/`
+      bundle): `per_sample` is evaluated per edge for every sample and
+      averaged, then `incoming_batched` applies the rule once with that
+      average -- an optimizer step on the batch-mean gradient.
+    - **Mean of writes** (any other UpdateConn): the incoming and outgoing
+      passes run once per sample against the unchanged connections and each
+      written floating column is averaged over the batch. This equals the
+      batch-mean update for rules linear in the per-sample term (SGD,
+      momentum, plain delta rules), not for rules nonlinear in it (Adam's
+      second moment, for one).
+
+    Both accumulate over the batch in a loop, so memory stays O(capacity)
+    rather than O(batch * capacity).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying the update_conn policy.
+
+    Returns:
+        `(state, batched_units) -> state` with updated connections.
+    """
+    uc = net.update_conn
+    assert uc is not None  # only built when set
+    per_sample_fn = getattr(uc, "per_sample", None)
+    incoming_batched_fn = getattr(uc, "incoming_batched", None)
+    incoming = build_incoming_conn_update(uc.incoming)
+    outgoing = build_outgoing_conn_update(uc.outgoing)
+
+    def sample(units: Columns, b: jax.Array) -> Columns:
+        return {name: col[b] for name, col in units.items()}
+
+    def exact(state: NetworkState[GS], units_b: Columns) -> NetworkState[GS]:
+        assert per_sample_fn is not None and incoming_batched_fn is not None
+        batch = next(iter(units_b.values())).shape[0]
+        g = state.globals_
+        mean_units = batch_mean_units(units_b)
+
+        def bucket_update(bucket: Columns) -> Columns:
+            c_view = ConnView(bucket)
+            to_id, from_id = bucket[TO_ID.name], bucket[FROM_ID.name]
+            cids = jnp.arange(to_id.shape[0])
+
+            def stat_of(units: Columns) -> Any:
+                u_view = UnitView(units)
+
+                def one(d: jax.Array, s_: jax.Array, cid: jax.Array) -> Any:
+                    return per_sample_fn(
+                        u_view, UnitIdx(d), UnitIdx(s_), c_view, ConnIdx(cid), g
+                    )
+
+                return jax.vmap(one)(to_id, from_id, cids)
+
+            total = jax.lax.fori_loop(
+                1,
+                batch,
+                lambda b, acc: jax.tree.map(jnp.add, acc, stat_of(sample(units_b, b))),
+                stat_of(sample(units_b, jnp.int32(0))),
+            )
+            mean_stat = jax.tree.map(lambda x: x / jnp.float32(batch), total)
+            u_view = UnitView(mean_units)
+
+            def apply(
+                d: jax.Array, s_: jax.Array, cid: jax.Array, stat: Any
+            ) -> dict[str, jax.Array]:
+                write = incoming_batched_fn(
+                    u_view, UnitIdx(d), UnitIdx(s_), c_view, ConnIdx(cid), g, stat
+                )
+                return dict(write.fields)
+
+            writes = jax.vmap(apply)(to_id, from_id, cids, mean_stat)
+            dead = bucket[DEAD.name]
+            out: Columns = dict(bucket)
+            for name, written in writes.items():
+                out[name] = jnp.where(dead, bucket[name], written)
+            return out
+
+        conns = tuple(bucket_update(bucket) for bucket in state.conns)
+        conns = tuple(outgoing(mean_units, bucket, g) for bucket in conns)
+        return dataclasses.replace(state, conns=conns)
+
+    def mean_of_writes(state: NetworkState[GS], units_b: Columns) -> NetworkState[GS]:
+        batch = next(iter(units_b.values())).shape[0]
+        g = state.globals_
+
+        def one_sample(units: Columns) -> tuple[Columns, ...]:
+            conns = tuple(incoming(units, bucket, g) for bucket in state.conns)
+            return tuple(outgoing(units, bucket, g) for bucket in conns)
+
+        def floats(conns: tuple[Columns, ...]) -> tuple[Columns, ...]:
+            return tuple(
+                {
+                    k: v
+                    for k, v in bucket.items()
+                    if jnp.issubdtype(v.dtype, jnp.floating)
+                }
+                for bucket in conns
+            )
+
+        first = one_sample(sample(units_b, jnp.int32(0)))
+        total = jax.lax.fori_loop(
+            1,
+            batch,
+            lambda b, acc: jax.tree.map(
+                jnp.add, acc, floats(one_sample(sample(units_b, b)))
+            ),
+            floats(first),
+        )
+        conns = tuple(
+            {
+                **bucket,
+                **{k: (v / jnp.float32(batch)).astype(v.dtype) for k, v in f.items()},
+            }
+            for bucket, f in zip(first, total, strict=True)
+        )
+        return dataclasses.replace(state, conns=conns)
+
+    if per_sample_fn is not None and incoming_batched_fn is not None:
+        return exact
+    return mean_of_writes
 
 
 def _shard_axis(static: NetworkStatic) -> str | None:

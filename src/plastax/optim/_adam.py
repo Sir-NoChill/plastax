@@ -27,6 +27,7 @@ import dataclasses
 
 import jax.numpy as jnp
 import numpy as np
+from jaxtyping import Array, Float
 
 from plastax._types import ACTIVATION, WEIGHT, ConnIdx, FieldSpec, UnitIdx
 from plastax.views import ConnView, ConnWrite, UnitView
@@ -92,8 +93,69 @@ class _AdamUpdateConn:
             The ConnWrite updating this connection's weight and Adam state.
         """
         del g
+        return self._step(c, cid, self._grad(u, dst, src))
+
+    def per_sample(
+        self,
+        u: UnitView,
+        dst: UnitIdx,
+        src: UnitIdx,
+        c: ConnView,
+        cid: ConnIdx,
+        g: object,
+    ) -> Float[Array, ""]:
+        """This sample's gradient ``dL/dz[dst] * activation[src]``.
+
+        The batched step averages it over the batch and hands the mean to
+        `incoming_batched`, so a batched step is one optimizer step on the
+        batch-mean gradient.
+
+        Args:
+            u: the unit view (one sample's unit state).
+            dst: index of the destination unit.
+            src: index of the source unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state (unused).
+
+        Returns:
+            The per-connection gradient for this sample.
+        """
+        del c, cid, g
+        return self._grad(u, dst, src)
+
+    def incoming_batched(
+        self,
+        u: UnitView,
+        dst: UnitIdx,
+        src: UnitIdx,
+        c: ConnView,
+        cid: ConnIdx,
+        g: object,
+        stat: Float[Array, ""],
+    ) -> ConnWrite:
+        """Apply one optimizer step with the batch-mean gradient `stat`.
+
+        Args:
+            u: the unit view (batch-mean unit state; unused).
+            dst: index of the destination unit.
+            src: index of the source unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state (unused).
+            stat: the batch mean of `per_sample`.
+
+        Returns:
+            The ConnWrite for this connection.
+        """
+        del u, dst, src, g
+        return self._step(c, cid, stat)
+
+    def _grad(self, u: UnitView, dst: UnitIdx, src: UnitIdx) -> Float[Array, ""]:
+        return u[self.grad_field, dst] * u[ACTIVATION, src]
+
+    def _step(self, c: ConnView, cid: ConnIdx, grad: Float[Array, ""]) -> ConnWrite:
         weight = c[WEIGHT, cid]
-        grad = u[self.grad_field, dst] * u[ACTIVATION, src]
         step = c[self.t, cid] + jnp.float32(1.0)
         m = jnp.float32(self.b1) * c[self.m, cid] + jnp.float32(1.0 - self.b1) * grad
         v = jnp.float32(self.b2) * c[self.v, cid] + jnp.float32(1.0 - self.b2) * (

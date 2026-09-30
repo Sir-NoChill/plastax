@@ -2,8 +2,9 @@
 
 The C++ rows are from plastix-synth-bench (REEVAL_RESULTS.md, in-place
 section); the plastax rows are churn_probe.py at --width 387298 --edges
-300000000 on an RTX 5000 Ada (2026-09-30). "Projected" rows are the plan's
-estimates, not measurements.
+300000000 on an RTX 5000 Ada (2026-09-30), at a145691 (grid growth) and at
+9e6fbea (--grow propose, source-major buckets). The "projected" row is the
+plan's estimate for P2 (exact-headroom capacities), not a measurement.
 
     uv run --with matplotlib python examples/benchmarks/plot_step_300M.py
 """
@@ -21,9 +22,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 ROWS = [
     ("C++ tuned CSR\n(rebuild)", 4.98, 5.13, 55.4),
     ("C++ Plastix\nin place", 7.69, 5.13, 0.01),
-    ("plastax today", 29.7, 9.8, 104.9),
-    ("plastax after P1\n(projected)", 29.7, 9.8, 1.0),
-    ("plastax after P1+P2\n(projected)", 17.0, 6.0, 1.0),
+    ("plastax a145691\n(grid growth)", 29.7, 9.8, 104.9),
+    ("plastax 9e6fbea\n(proposals, source-major)", 9.66, 10.23, 8.01),
+    ("plastax + P2\n(projected)", 5.5, 5.8, 1.5),
 ]
 COLORS = ("#4C72B0", "#DD8452", "#8C8C8C")
 PHASES = ("forward", "prune", "structure update")

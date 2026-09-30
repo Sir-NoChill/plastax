@@ -152,15 +152,23 @@ def make_net(
 def random_layers(
     width: int, edges: int, rng: np.random.Generator
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Distinct random (src, dst) pairs, half between each adjacent layer pair."""
-    src, dst = [], []
+    """Random (src, dst) pairs, half between each adjacent layer pair.
+
+    Drawn independently, so a pair can repeat (a parallel edge) with
+    probability about the density; plastax allows parallel edges, and this
+    keeps host memory to the two int32 output columns (a de-duplicating draw
+    needs several int64 copies of the pair ids, tens of GB at 600M edges).
+    """
     per = edges // 2
+    src = np.empty(2 * per, dtype=np.int32)
+    dst = np.empty(2 * per, dtype=np.int32)
     for layer in range(2):
-        ids = np.unique(rng.integers(0, width * width, int(per * 1.3), np.int64))
-        ids = rng.permutation(ids)[:per]
-        src.append(layer * width + ids // width)
-        dst.append((layer + 1) * width + ids % width)
-    return np.concatenate(src).astype(np.int32), np.concatenate(dst).astype(np.int32)
+        lo = layer * per
+        src[lo : lo + per] = rng.integers(0, width, per, dtype=np.int32)
+        src[lo : lo + per] += layer * width
+        dst[lo : lo + per] = rng.integers(0, width, per, dtype=np.int32)
+        dst[lo : lo + per] += (layer + 1) * width
+    return src, dst
 
 
 def main() -> None:

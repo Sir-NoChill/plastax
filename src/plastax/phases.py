@@ -849,20 +849,12 @@ def build_add_conn_phase[GS](
             # offset == 0 when unsharded, leaving that path byte-identical.
             local_capacity = capacity_b // num_shards
             dead_b = bucket_conns[DEAD.name]
-            local_free = jnp.sum(dead_b.astype(jnp.int32))
-            # local_slot_for_rank[j] = position (within this shard's slice) of
-            # its j-th free slot, or local_capacity when it has fewer than j+1.
-            # `sink_len = max(local_capacity, k)` keeps the scatter and the
-            # index below in bounds even if k > local_capacity.
-            rank = jnp.cumsum(dead_b.astype(jnp.int32)) - 1
-            positions = jnp.arange(local_capacity, dtype=jnp.int32)
-            sink_len = max(local_capacity, k)
-            scatter_target = jnp.where(dead_b, rank, jnp.int32(sink_len))
-            local_slot_for_rank = (
-                jnp.full((sink_len,), local_capacity, dtype=jnp.int32)
-                .at[scatter_target]
-                .set(positions, mode="drop")
-            )
+            # free_through[i] = free (dead) slots in this shard's slice up to
+            # and including position i, so the (r+1)-th free slot is the first
+            # position where it reaches r+1: a binary search per candidate,
+            # O(k log capacity), with no capacity-sized scatter.
+            free_through = jnp.cumsum(dead_b.astype(jnp.int32))
+            local_free = free_through[-1]
             # This shard's offset into the global free-slot space, and the total
             # free count. The offset is an exclusive prefix of the per-shard
             # free counts (an all-gather -- a prefix is not a plain all-reduce)
@@ -897,9 +889,10 @@ def build_add_conn_phase[GS](
             local_rank = growth_rank - offset
             mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
             safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-            target_slot = jnp.where(
-                mine, local_slot_for_rank[safe_rank], jnp.int32(local_capacity)
+            free_slot = jnp.searchsorted(free_through, safe_rank + jnp.int32(1)).astype(
+                jnp.int32
             )
+            target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
 
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it

@@ -430,6 +430,78 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+# Largest num_units whose pair id `src * num_units + dst` still fits in int32.
+_INT32_PAIR_UNITS = 46340
+
+
+def live_pair_member(
+    from_id: Int32[Array, " cap"],
+    to_id: Int32[Array, " cap"],
+    dead: Bool[Array, " cap"],
+    cand_src: Int32[Array, " p"],
+    cand_dst: Int32[Array, " p"],
+    num_units: int,
+) -> Bool[Array, " p"]:
+    """Whether each candidate `(src, dst)` is already a live edge of the bucket.
+
+    Exact for every `num_units`. While a pair id `src * num_units + dst` fits
+    in int32 (num_units <= 46340) the live ids are sorted once and each
+    candidate is binary-searched. Past that bound the id would wrap, so the
+    live edges are instead sorted lexicographically by `(src, dst)` with two
+    stable single-key sorts (each a radix sort on GPU, unlike a multi-operand
+    comparison sort) and each candidate runs a vectorized binary search on the
+    pair. Dead rows sort to the end under the `num_units` sentinel, which no
+    candidate id reaches. Cost is O((P + cap) log cap) either way.
+
+    Args:
+        from_id: The bucket's source column.
+        to_id: The bucket's destination column.
+        dead: The bucket's tombstone mask.
+        cand_src: Candidate source ids.
+        cand_dst: Candidate destination ids, parallel to `cand_src`.
+        num_units: Total unit count, the id bound.
+
+    Returns:
+        A mask over the candidates, True where the pair is live in the bucket.
+    """
+    cap = from_id.shape[0]
+    last = jnp.int32(cap - 1)
+    src = from_id.astype(jnp.int32)
+    dst = to_id.astype(jnp.int32)
+    if num_units <= _INT32_PAIR_UNITS:
+        live_pair = jnp.where(dead, jnp.int32(-1), src * jnp.int32(num_units) + dst)
+        sorted_live = jnp.sort(live_pair)
+        cand_pair = cand_src * jnp.int32(num_units) + cand_dst
+        pos = jnp.minimum(jnp.searchsorted(sorted_live, cand_pair), last)
+        hit: Bool[Array, " p"] = sorted_live[pos] == cand_pair
+        return hit
+    src = jnp.where(dead, jnp.int32(num_units), src)
+    order = jnp.arange(cap, dtype=jnp.int32)
+    _, order = jax.lax.sort_key_val(dst, order, is_stable=True)
+    _, order = jax.lax.sort_key_val(src[order], order, is_stable=True)
+    s_src, s_dst = src[order], dst[order]
+    lo = jnp.zeros_like(cand_src)
+    hi = jnp.full_like(cand_src, cap)
+
+    def halve(
+        _: Int32[Array, ""], bounds: tuple[jax.Array, jax.Array]
+    ) -> tuple[jax.Array, jax.Array]:
+        # Lower-bound search: the first position whose pair is >= the candidate.
+        lo, hi = bounds
+        mid = (lo + hi) // 2
+        m = jnp.minimum(mid, last)
+        below = (s_src[m] < cand_src) | ((s_src[m] == cand_src) & (s_dst[m] < cand_dst))
+        active = lo < hi
+        return (
+            jnp.where(active & below, mid + 1, lo),
+            jnp.where(active & ~below, mid, hi),
+        )
+
+    lo, _ = jax.lax.fori_loop(0, max(cap, 1).bit_length(), halve, (lo, hi))
+    pos = jnp.minimum(lo, last)
+    return (s_src[pos] == cand_src) & (s_dst[pos] == cand_dst)
+
+
 @dataclasses.dataclass(frozen=True)
 class ShortlistCoverage:
     """How much of one bucket's destination population a shortlist can reach.
@@ -729,27 +801,18 @@ def build_add_conn_phase[GS](
                 else src_level == bucket_idx
             )
             # Exclude candidates already present as a live edge in this
-            # bucket, so growth never regrows an existing pair as a duplicate.
-            # Each edge has a pair id `src * num_units + dst`; sort the live
-            # edges' pair ids (dead slots sent to -1, which no candidate id
-            # matches) and binary-search each candidate against them. Bounded
-            # by the candidate count and the bucket capacity -- O((P + cap) *
-            # log cap), with no num_units**2 occupancy grid -- so a
+            # bucket, so growth never regrows an existing pair as a duplicate:
+            # a sort of the live pairs plus a binary search per candidate,
+            # O((P + cap) * log cap) with no num_units**2 occupancy grid, so a
             # shortlisted phase stays free of any num_units**2 term.
-            dead_bucket = bucket_conns[DEAD.name]
-            live_pair = jnp.where(
-                dead_bucket,
-                jnp.int32(-1),
-                bucket_conns[FROM_ID.name].astype(jnp.int32) * jnp.int32(num_units)
-                + bucket_conns[TO_ID.name].astype(jnp.int32),
+            not_duplicate = ~live_pair_member(
+                bucket_conns[FROM_ID.name],
+                bucket_conns[TO_ID.name],
+                bucket_conns[DEAD.name],
+                flat_src,
+                flat_dst,
+                num_units,
             )
-            sorted_live = jnp.sort(live_pair)
-            candidate_pair = flat_src * jnp.int32(num_units) + flat_dst
-            pos = jnp.minimum(
-                jnp.searchsorted(sorted_live, candidate_pair),
-                jnp.int32(sorted_live.shape[0] - 1),
-            )
-            not_duplicate = sorted_live[pos] != candidate_pair
             if shard_axis is not None:
                 # Under Scheme-A the live edges are split across shards, so the
                 # binary search above only sees THIS shard's slice. A candidate

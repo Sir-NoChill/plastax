@@ -583,3 +583,58 @@ def test_per_level_shortlist_serves_a_transition_the_global_starves() -> None:
         (_IN[0], _HID[1]),
         (_IN[1], _HID[0]),
     }
+
+
+# Wide-id regression: past 46340 units the int32 pair id `src * n + dst` wraps.
+# With n = 70000, (61357, 0) and (0, 22704) share the wrapped id 22704
+# (61357 * 70000 = 2**32 + 22704), so a pair-id search reported the absent
+# (61357, 0) as already live and silently dropped it.
+_WIDE_UNITS = 70_000
+
+
+def test_live_pair_member_is_exact_past_the_int32_pair_id_bound() -> None:
+    from_id = jnp.asarray([0, 5, 9], dtype=jnp.int32)
+    to_id = jnp.asarray([22704, 6, 9], dtype=jnp.int32)
+    dead = jnp.asarray([False, False, True])
+    cand_src = jnp.asarray([61357, 0, 5, 9, 69999], dtype=jnp.int32)
+    cand_dst = jnp.asarray([0, 22704, 6, 9, 69999], dtype=jnp.int32)
+
+    member = phases.live_pair_member(
+        from_id, to_id, dead, cand_src, cand_dst, _WIDE_UNITS
+    )
+
+    # The colliding pair is absent; the live pairs are found; a dead row is not
+    # live; the maximal id pair is absent.
+    assert np.asarray(member).tolist() == [False, True, True, False, False]
+
+
+def test_live_pair_member_matches_a_set_oracle_on_both_id_paths() -> None:
+    rng = np.random.default_rng(3)
+    for num_units in (1_000, 200_000):
+        cap, num_cand = 512, 256
+        src = rng.integers(0, num_units, cap).astype(np.int32)
+        dst = rng.integers(0, num_units, cap).astype(np.int32)
+        dead = rng.random(cap) < 0.3
+        live = {
+            (int(s), int(d)) for s, d, x in zip(src, dst, dead, strict=True) if not x
+        }
+        # Half the candidates are drawn from the bucket (live or dead), half fresh.
+        pick = rng.integers(0, cap, num_cand // 2)
+        c_src = np.concatenate(
+            [src[pick], rng.integers(0, num_units, num_cand // 2)]
+        ).astype(np.int32)
+        c_dst = np.concatenate(
+            [dst[pick], rng.integers(0, num_units, num_cand // 2)]
+        ).astype(np.int32)
+
+        member = phases.live_pair_member(
+            jnp.asarray(src),
+            jnp.asarray(dst),
+            jnp.asarray(dead),
+            jnp.asarray(c_src),
+            jnp.asarray(c_dst),
+            num_units,
+        )
+
+        want = [(int(s), int(d)) in live for s, d in zip(c_src, c_dst, strict=True)]
+        assert np.asarray(member).tolist() == want, num_units

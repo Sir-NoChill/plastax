@@ -9,11 +9,15 @@ the live edge multiset.
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import plastax as px
+import plastax.driver
 
 _WIDTH = 24  # units per layer; three layers (input, hidden, output)
 _NUM_UNITS = 3 * _WIDTH
@@ -89,6 +93,12 @@ class _ChurnNet(px.Network[dict[str, jax.Array]]):
 
 
 def _build() -> tuple[px.NetworkStatic, px.NetworkState[dict[str, jax.Array]]]:
+    return _build_with(_ChurnNet, headroom=0.5)
+
+
+def _build_with(
+    net: type[px.Network[dict[str, jax.Array]]], *, headroom: float
+) -> tuple[px.NetworkStatic, px.NetworkState[dict[str, jax.Array]]]:
     rng = np.random.default_rng(11)
     src, dst = [], []
     for layer in range(2):
@@ -98,7 +108,7 @@ def _build() -> tuple[px.NetworkStatic, px.NetworkState[dict[str, jax.Array]]]:
     frm = np.concatenate(src).astype(np.int32)
     to = np.concatenate(dst).astype(np.int32)
     return px.NetworkBuilder.from_edges(
-        _ChurnNet,
+        net,
         _NUM_UNITS,
         frm,
         to,
@@ -106,7 +116,7 @@ def _build() -> tuple[px.NetworkStatic, px.NetworkState[dict[str, jax.Array]]]:
         input_ids=list(range(_WIDTH)),
         output_ids=list(range(2 * _WIDTH, 3 * _WIDTH)),
         globals_={"step": jnp.int32(0)},
-        capacity_headroom=0.5,
+        capacity_headroom=headroom,
     )
 
 
@@ -154,3 +164,118 @@ def test_forward_is_exact_on_buckets_scrambled_by_in_place_churn() -> None:
     want = _reference_forward(state, x)
     got = np.asarray(step(state, inputs).state.units[px.ACTIVATION.name])
     np.testing.assert_allclose(got[_WIDTH:], want[_WIDTH:], rtol=1e-5, atol=1e-5)
+
+
+# --- Equivalence under the Driver: in place vs rebuilt from the live edges ---
+#
+# The plastax counterpart of plastix's `--validate-every` check. Proposal growth
+# runs through the Driver long enough to overflow buckets (grow_bucket) and to
+# commit same-level edges (needs_resort -> topo.resort); afterwards the forward
+# on the churned arena must equal the forward on a net rebuilt from scratch
+# from its live edge multiset (parallel edges included).
+
+_FANOUT = 2
+
+
+class _FanoutGrow(px.ProposeAddConn[dict[str, jax.Array]]):
+    """Each unit proposes _FANOUT random partners; only src < dst (a DAG)."""
+
+    max_candidates = 24
+    num_proposals = _NUM_UNITS * _FANOUT
+
+    def propose(
+        self, u: px.UnitView, j: jax.Array, g: dict[str, jax.Array]
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del u
+        src = j // _FANOUT
+        dst = (_hash01(j, g["step"], jnp.int32(5)) * _NUM_UNITS).astype(jnp.int32)
+        score = jnp.where(src < dst, _hash01(dst, j, g["step"]), -jnp.inf)
+        return src, dst, score
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: dict[str, jax.Array]
+    ) -> px.ConnWrite:
+        del u
+        return px.ConnWrite.of((px.WEIGHT, _hash01(dst, src, g["step"]) - 0.5))
+
+
+class _SlowPrune(px.PruneConn):
+    def predicate(
+        self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: dict[str, jax.Array]
+    ) -> jax.Array:
+        del u
+        return _hash01(c[px.FROM_ID, cid], c[px.TO_ID, cid], g["step"]) < 0.03
+
+
+class _GrowingNet(px.Network[dict[str, jax.Array]]):
+    forward_pass = _SumForward()
+    prune_conn = _SlowPrune()
+    add_conn = _FanoutGrow()
+    reset_global = _Tick()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+class _ForwardOnly(px.Network[dict[str, jax.Array]]):
+    forward_pass = _SumForward()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def _live_edges(
+    state: px.NetworkState[dict[str, jax.Array]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    frm, to, w = [], [], []
+    for bucket in state.conns:
+        live = ~np.asarray(bucket[px.DEAD.name])
+        frm.append(np.asarray(bucket[px.FROM_ID.name])[live])
+        to.append(np.asarray(bucket[px.TO_ID.name])[live])
+        w.append(np.asarray(bucket[px.WEIGHT.name])[live])
+    return np.concatenate(frm), np.concatenate(to), np.concatenate(w)
+
+
+def test_in_place_churn_matches_a_rebuild_through_overflow_and_resort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"grow": 0, "resort": 0}
+    grow, resort = plastax.driver.grow_bucket, plastax.driver.topo.resort
+
+    def counted_grow(*a: Any) -> Any:
+        calls["grow"] += 1
+        return grow(*a)
+
+    def counted_resort(*a: Any) -> Any:
+        calls["resort"] += 1
+        return resort(*a)
+
+    monkeypatch.setattr(plastax.driver, "grow_bucket", counted_grow)
+    monkeypatch.setattr(plastax.driver.topo, "resort", counted_resort)
+
+    static, state = _build_with(_GrowingNet, headroom=0.0)
+    driver = px.Driver(_GrowingNet, static, state)
+    x = np.linspace(-1.0, 1.0, _WIDTH).astype(np.float32)
+    inputs = px.StepInputs(inputs=jnp.asarray(x), targets=None)
+    # Run until both structural paths have fired: a bucket overflowed
+    # (grow_bucket) and a same-level src < dst edge forced a resort.
+    for _ in range(40):
+        driver.step(inputs)
+        if calls["grow"] and calls["resort"]:
+            break
+    assert calls["grow"] and calls["resort"], calls
+
+    frm, to, w = _live_edges(driver.state)
+    assert len(set(zip(frm.tolist(), to.tolist(), strict=True))) < frm.size  # parallel
+    fwd = px.make_step(_ForwardOnly, driver.static)
+    got = np.asarray(fwd(driver.state, inputs).state.units[px.ACTIVATION.name])
+
+    r_static, r_state = px.NetworkBuilder.from_edges(
+        _ForwardOnly,
+        _NUM_UNITS,
+        frm,
+        to,
+        weights=w,
+        input_ids=list(range(_WIDTH)),
+        output_ids=list(range(2 * _WIDTH, 3 * _WIDTH)),
+        globals_={"step": jnp.int32(0)},
+    )
+    rebuilt = px.make_step(_ForwardOnly, r_static)(r_state, inputs)
+    want = np.asarray(rebuilt.state.units[px.ACTIVATION.name])
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)

@@ -212,22 +212,25 @@ Design (refined in iteration 1, from the C++ sampled path in
 
 ### P2: capacity and forward bandwidth
 
-- [ ] 2.1 `feat(topo)`: `capacity_policy(..., align=)` with no power-of-two
+- [x] 2.1 `feat(topo)` (landed as `feat(api)` 9550d59): `capacity_policy(..., align=)` with no power-of-two
   rounding (alignment keeps Scheme-A divisibility). Thread it through
   `from_edges` / `grow_bucket` / `resort`.
 - [ ] 2.2 Profile the edge-list forward with nsys: materialisation of the
   vmapped `map` output, and gather/scatter fusion. Fix what is fixable in XLA.
   (Partly superseded: the source-major layout already brought the forward to
   9.7 ms at 300M, against 7.7 ms for C++.)
-- [ ] 2.4 `perf(phases)`: a two-level free-slot search.
+- [x] 2.4 `perf(phases)`: a two-level free-slot search (e901255; growth
+  went from +4.7 to +1.0 ms at 300M).
   - Use a per-block dead count (a reduction reading 1 B per slot), a cumsum
     over the blocks, and a within-block search for the k claimed ranks.
   - This replaces the full `cumsum(dead)`, which writes 4 B per slot. It is
     most of the 8 ms add phase at 300M.
-- [ ] 2.5 `perf(phases)`: prune costs 10.2 ms at 300M, against 5.1 ms for C++.
+- [x] 2.5 (no change needed) Prune is at the DRAM roofline: 6.0 ms at 300M
+  with aligned capacities, reading about 10 B per slot. The rest of this item
+  is superseded. Prune costs 10.2 ms at 300M, against 5.1 ms for C++.
   Check whether the predicate's vmap plus the `dead | should_die` write fuse
   into a single pass.
-- [ ] 2.6 `fix(topo)`: resort sizes capacities with `headroom=0`, which leaves
+- [x] 2.6 (in 9550d59) resort sizes capacities with `headroom=0`, which leaves
   every bucket nearly full after a resort (seen in the equivalence test).
   Thread the headroom through, so a resort is not followed by an
   overflow → grow → retrace.
@@ -441,7 +444,37 @@ the log below:
   - P1.5 (DeepR port) remains, because it lives in the bench repo.
   - Ran a `plastax-review` pass over the branch.
 
-### Iteration 3 (2026-09-30): P2 start and the P6 spike (in progress)
+### Iteration 3 (2026-09-30): review fixes, P2, and the P6 spike
+
+- **Review** (`plastax-review` agent; 1 high, 2 medium, 3 low, 2 nits, all
+  fixed):
+  - The **high** finding: the eager num_units² grid, fixed in d5bc16b. It also
+    explains the "autotuner" allocation errors.
+  - Within-step repeats consuming top-k slots.
+  - Stale comments.
+  - Missing PIPELINE and Scheme-A proposal tests (8570cf3).
+  - `num_proposals` validation (ca0c74e, d98f626).
+  - Doc drift.
+- **Build:**
+  - 9550d59: aligned capacities, with one sizing policy recorded in
+    `NetworkStatic`.
+  - e901255: the two-level free-slot search.
+  - e097eb2: the lean probe generator.
+  - The fast suite now has 289 tests.
+- **Document:** a49d0f9, 49ef383 (the glossary and the Deviations entries).
+- **Explore:**
+  - 600M edges crashed the session twice through host RAM (P2.7); it is not
+    retried.
+  - 300M with `--align 256`: the state is 4.10 GB and the churn step went
+    18.3 → **14.0 ms** after P2.4.
+    - Forward 7.59 ms (C++ 7.69).
+    - Prune 6.0 ms, at roofline.
+    - Growth +1.0 ms (C++ 0.01).
+  - 50M: 3.37 ms before P2.4.
+  - The P6 Pallas spike is described below.
+- **Plan:** P2 is done except 2.7 (host build memory). The next order is P3
+  (driver, small) → P4 (batching) → P5 (CSR view) → P6 (Pallas) → P2.7 →
+  P1.5 / P7 (DeepR and synth-bench parity).
 
 - **Explore (P6.1 spike, `.bench/pallas_spike.py`, `.bench/pallas_batched.py`).**
   - A Pallas-on-Triton edge-list forward (gather `act[src]`, multiply by the

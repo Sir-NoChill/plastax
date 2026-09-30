@@ -1,6 +1,6 @@
 """Builder -> finalize invariants (M1).
 
-Levels correct; buckets sorted by (dead, to_id); capacities obey
+Levels correct; buckets sorted by (dead, from_id, to_id); capacities obey
 capacity_policy. Implemented when M1 lands.
 """
 
@@ -62,14 +62,16 @@ class _ExtraFieldsNet(px.Network[None]):
     extra_conn_fields = (Tag,)
 
 
-def _assert_bucket_sorted_by_dead_then_to_id(cols: Columns) -> None:
+def _assert_bucket_sorted_by_dead_then_src(cols: Columns) -> None:
     dead = np.asarray(cols["dead"])
-    to_id = np.asarray(cols["to_id"])
+    from_id = np.asarray(cols["from_id"]).astype(np.int64)
+    to_id = np.asarray(cols["to_id"]).astype(np.int64)
     # dead is False (0) before True (1): non-decreasing.
     assert np.all(dead[:-1] <= dead[1:])
     live = int((~dead).sum())
-    # ascending to_id within the live prefix.
-    assert np.all(to_id[:live][:-1] <= to_id[:live][1:])
+    # ascending (from_id, to_id) within the live prefix: source-major order.
+    pair = from_id[:live] * (int(to_id.max(initial=0)) + 1) + to_id[:live]
+    assert np.all(pair[:-1] <= pair[1:])
     assert np.all(dead[live:])  # every slot past the live prefix is dead
 
 
@@ -100,7 +102,7 @@ def test_topological_levels_and_bucket_count() -> None:
 def test_buckets_sorted_and_live_counts() -> None:
     static, state = _build_diamond(_TopoNet)
     for bucket in state.conns:
-        _assert_bucket_sorted_by_dead_then_to_id(bucket)
+        _assert_bucket_sorted_by_dead_then_src(bucket)
 
     assert int(px.state.live_conn_count(state, 0)) == 2
     assert int(px.state.live_conn_count(state, 1)) == 2
@@ -135,14 +137,14 @@ def test_capacity_policy_grows_past_min_bucket_for_a_large_bucket() -> None:
     assert int(px.state.live_conn_count(state, 0)) == 100
     assert static.level_capacities[0] == 128
     assert static.level_capacities[0] == topo.capacity_policy(100)
-    _assert_bucket_sorted_by_dead_then_to_id(state.conns[0])
+    _assert_bucket_sorted_by_dead_then_src(state.conns[0])
 
 
 def test_pipeline_mode_uses_a_single_bucket_but_still_computes_levels() -> None:
     static, state = _build_diamond(_PipelineNet)
     assert len(static.level_capacities) == 1
     assert int(px.state.live_conn_count(state)) == 4
-    _assert_bucket_sorted_by_dead_then_to_id(state.conns[0])
+    _assert_bucket_sorted_by_dead_then_src(state.conns[0])
     # LEVEL is still the topological depth, independent of bucketing mode.
     assert list(np.asarray(state.units["level"])) == [0, 1, 1, 2]
 
@@ -504,7 +506,7 @@ def test_from_edges_capacity_headroom_pre_allocates_dead_slots() -> None:
             np.asarray(state_r.conns[0][name])[:live],
         )
     assert bool(np.all(np.asarray(state_r.conns[0]["dead"])[live:]))
-    _assert_bucket_sorted_by_dead_then_to_id(state_r.conns[0])
+    _assert_bucket_sorted_by_dead_then_src(state_r.conns[0])
 
 
 def test_finalize_capacity_headroom_matches_from_edges() -> None:

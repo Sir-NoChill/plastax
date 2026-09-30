@@ -221,6 +221,12 @@ flags it returns — the **retrace protocol**:
   rebuild the step, return.
 - else commit.
 
+`Driver(..., check_every=N)` with N > 1 reads the flags back only every N
+steps (overflow OR-accumulated on device; `needs_resort` is sticky in state):
+no retry of an overflowing step (buckets short of `max_candidates` free slots
+grow at the check) and a resort deferred to the check. Opt-in, for launch-
+bound small nets; N = 1 is the exact protocol above.
+
 `topo.resort` (`topo.py:149`) recomputes levels (`recompute_levels`,
 Bellman-Ford relaxation bounded by `kahn_max_depth`), redistributes edges into
 new per-level buckets (prefix-sum compacting scatter + stable sort on

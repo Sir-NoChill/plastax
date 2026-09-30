@@ -3,8 +3,9 @@
 The C++ rows are from plastix-synth-bench (REEVAL_RESULTS.md, in-place
 section); the plastax rows are churn_probe.py at --width 387298 --edges
 300000000 on an RTX 5000 Ada (2026-09-30), at a145691 (grid growth) and at
-9e6fbea (--grow propose, source-major buckets). The "projected" row is the
-plan's estimate for P2 (exact-headroom capacities), not a measurement.
+9e6fbea (--grow propose, source-major buckets) and at e901255 (--align 256,
+two-level free-slot search). Phase costs difference the probe's variants:
+forward, (fwd+prune) - fwd, churn - (fwd+prune).
 
     uv run --with matplotlib python examples/benchmarks/plot_step_300M.py
 """
@@ -24,7 +25,7 @@ ROWS = [
     ("C++ Plastix\nin place", 7.69, 5.13, 0.01),
     ("plastax a145691\n(grid growth)", 29.7, 9.8, 104.9),
     ("plastax 9e6fbea\n(proposals, source-major)", 9.66, 10.23, 8.01),
-    ("plastax + P2\n(projected)", 5.5, 5.8, 1.5),
+    ("plastax e901255\n(+ aligned caps, 2-level claim)", 7.59, 6.00, 0.44),
 ]
 COLORS = ("#4C72B0", "#DD8452", "#8C8C8C")
 PHASES = ("forward", "prune", "structure update")
@@ -52,9 +53,7 @@ def main() -> None:
     ax.set_xlabel("ms per step, E = 300M live edges, k = 64 churned per level")
     ax.legend(frameon=False, loc="lower right")
     ax.spines[["top", "right"]].set_visible(False)
-    ax.set_title(
-        "One churn step at 300M edges (projected rows are estimates)", fontsize=10
-    )
+    ax.set_title("One churn step at 300M edges, RTX 5000 Ada", fontsize=10)
     plt.tight_layout()
     plt.savefig(OUT, dpi=150)
 

@@ -279,3 +279,57 @@ def test_in_place_churn_matches_a_rebuild_through_overflow_and_resort(
     rebuilt = px.make_step(_ForwardOnly, r_static)(r_state, inputs)
     want = np.asarray(rebuilt.state.units[px.ACTIVATION.name])
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_deferred_checks_still_grow_and_resort_and_stay_exact_at_a_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"grow": 0, "resort": 0}
+    grow, resort = plastax.driver.grow_bucket, plastax.driver.topo.resort
+
+    def counted_grow(*a: Any) -> Any:
+        calls["grow"] += 1
+        return grow(*a)
+
+    def counted_resort(*a: Any) -> Any:
+        calls["resort"] += 1
+        return resort(*a)
+
+    monkeypatch.setattr(plastax.driver, "grow_bucket", counted_grow)
+    monkeypatch.setattr(plastax.driver.topo, "resort", counted_resort)
+
+    check_every = 4
+    static, state = _build_with(_GrowingNet, headroom=0.0)
+    driver = px.Driver(_GrowingNet, static, state, check_every=check_every)
+    x = np.linspace(-1.0, 1.0, _WIDTH).astype(np.float32)
+    inputs = px.StepInputs(inputs=jnp.asarray(x), targets=None)
+    for _ in range(15):  # up to 60 steps, always ending on a check boundary
+        for _ in range(check_every):
+            driver.step(inputs)
+        if calls["grow"] and calls["resort"]:
+            break
+    assert calls["grow"] and calls["resort"], calls
+    assert not bool(driver.state.needs_resort)  # resolved at the check
+
+    frm, to, w = _live_edges(driver.state)
+    fwd = px.make_step(_ForwardOnly, driver.static)
+    got = np.asarray(fwd(driver.state, inputs).state.units[px.ACTIVATION.name])
+    r_static, r_state = px.NetworkBuilder.from_edges(
+        _ForwardOnly,
+        _NUM_UNITS,
+        frm,
+        to,
+        weights=w,
+        input_ids=list(range(_WIDTH)),
+        output_ids=list(range(2 * _WIDTH, 3 * _WIDTH)),
+        globals_={"step": jnp.int32(0)},
+    )
+    rebuilt = px.make_step(_ForwardOnly, r_static)(r_state, inputs)
+    want = np.asarray(rebuilt.state.units[px.ACTIVATION.name])
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_check_every_must_be_positive() -> None:
+    static, state = _build_with(_GrowingNet, headroom=0.0)
+    with pytest.raises(ValueError, match="check_every"):
+        px.Driver(_GrowingNet, static, state, check_every=0)

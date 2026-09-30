@@ -644,6 +644,12 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   backends ignore it, and on GPU the unsorted reduction measured no slower.
 - phases.py add_conn duplicate check: the int32 pair id `src * num_units +
   dst` wrapped past 46340 units; `live_pair_member` is exact at any size.
+- builder/topo bucket order [D:3]: (dead, to_id) -> (dead, from_id, to_id),
+  source-major. With no sorted hint, a destination-sorted bucket serialises
+  the forward's scatter-add on atomics (forward 4.83 -> 1.47 ms at 50M edges
+  on GPU; 1.4x on CPU).
+- traits/phases: `ProposeAddConn` (additive): growth from policy-emitted
+  proposals; parallel edges allowed unless `dedupe = True`.
 
 ## Handoff conventions
 

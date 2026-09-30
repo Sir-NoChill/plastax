@@ -643,10 +643,12 @@ def build_add_conn_phase[GS](
     single bucket accepts a source at any level, since every live conn
     lives in one flat arena regardless of source level -- the level
     window itself is still consulted in both modes, only the destination
-    bucket differs. Candidates already present as a live edge in the bucket
+    bucket differs. With `dedupe` (the default for grid growth, opt-in for
+    ProposeAddConn) candidates already present as a live edge in the bucket
     are masked out (each candidate's pair id binary-searched against the
-    sorted live pair ids -- no num_units**2 occupancy grid) so growth never
-    regrows an existing pair as a duplicate. Each bucket runs an independent
+    sorted live pair ids -- no num_units**2 occupancy grid), and repeated
+    proposals within the step keep only their highest-scored copy, so growth
+    never regrows an existing pair as a duplicate. Each bucket runs an independent
     top_k (static k) over its own scored, windowed candidates, with no
     cross-bucket sequencing. A candidate scored -inf is never committed -- the
     framework scores every invalid candidate -inf, and a growth policy returns
@@ -743,15 +745,16 @@ def build_add_conn_phase[GS](
     pool = num_proposals if use_propose else pool_side * pool_side
     k = max(0, min(ac.max_candidates, pool))
 
-    unit_ids = jnp.arange(num_units, dtype=jnp.int32)
-    # Full (src, dst) grid, built once when not shortlisting; the shortlisted
-    # grid is rebuilt per step inside the phase (importance is state-dependent).
-    _full_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
-    _full_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
+    # Every candidate grid is built inside the traced phase, never here: this
+    # builder runs eagerly (outside jit), where a num_units^2 grid would be a
+    # real allocation held by the phase closure -- even for a proposal or
+    # shortlist policy that never reads it (4 * num_units^2 bytes per column,
+    # terabytes at a million units). Traced, an unused grid is dead code.
 
     def importance_scores(u_view: UnitView, g: GS) -> jax.Array:
         """The per-unit importance vector (num_units,), for either shortlist."""
         assert importance_fn is not None  # only called when shortlisting
+        unit_ids = jnp.arange(num_units, dtype=jnp.int32)
 
         def one(i: jax.Array) -> jax.Array:
             score = importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
@@ -762,7 +765,10 @@ def build_add_conn_phase[GS](
     def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
         """The global (flat_src, flat_dst) grid: full num_units^2 or top-M^2."""
         if not use_shortlist:
-            return _full_src, _full_dst
+            unit_ids = jnp.arange(num_units, dtype=jnp.int32)
+            full_src = jnp.repeat(unit_ids, num_units, total_repeat_length=num_units**2)
+            full_dst = jnp.tile(unit_ids, num_units)
+            return full_src, full_dst
         _, top = jax.lax.top_k(importance_scores(u_view, g), pool_side)
         src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
         dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
@@ -898,6 +904,17 @@ def build_add_conn_phase[GS](
                 valid = valid & not_live_duplicate(bucket_conns, flat_src, flat_dst)
             if use_propose:
                 flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
+                if dedupe:
+                    # Proposals, unlike grid cells, can repeat within a step.
+                    # Keep each pair's highest-scored copy and veto the rest
+                    # BEFORE top_k, so repeats never take a bucket's k slots.
+                    by_score = jnp.argsort(-flat_scores, stable=True)
+                    repeat = (
+                        jnp.zeros_like(valid)
+                        .at[by_score]
+                        .set(repeats_earlier(flat_src[by_score], flat_dst[by_score]))
+                    )
+                    flat_scores = jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
             _, top_idx = jax.lax.top_k(flat_scores, k)
@@ -915,12 +932,6 @@ def build_add_conn_phase[GS](
             # vetoed edges, since top_k still surfaces them and `has_room`
             # alone would admit them.
             top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
-            if use_propose and dedupe:
-                # Proposals, unlike grid cells, can repeat within a step: keep
-                # the first (highest-ranked) copy of each pair. top_k returns
-                # scores descending, so a stable sort by pair keeps rank order
-                # within a run of equal pairs.
-                top_growable = top_growable & ~repeats_earlier(top_src, top_dst)
 
             # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
             # dead mask is this shard's capacity slice (size capacity_b //

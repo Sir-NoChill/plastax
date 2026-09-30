@@ -167,3 +167,132 @@ class _BothSources(_TableProposals):
 def test_add_conn_must_be_exactly_one_of_grid_or_propose() -> None:
     with pytest.raises(TypeError, match="exactly one"):
         _net(_BothSources([(1, 5, 1.0)], 1))
+
+
+def test_within_step_repeats_do_not_consume_top_k_slots_under_dedupe() -> None:
+    # Two copies of (1, 4) outscore (2, 4); with k = 2 the repeat must be
+    # vetoed before top_k so (2, 4) still grows.
+    table = [(1, 4, 1.0), (1, 4, 1.0), (2, 4, 0.5)]
+    (bucket0, _) = _grow(table, max_candidates=2, dedupe=True)
+    assert bucket0 == [(1, 4), (2, 4)]
+
+
+def test_num_proposals_must_be_positive() -> None:
+    policy = _TableProposals([(1, 4, 1.0)], 1)
+    policy.num_proposals = 0
+    with pytest.raises(TypeError, match="num_proposals"):
+        _net(policy)
+
+
+class _WideProposals(px.ProposeAddConn[None]):
+    max_candidates = 4
+    num_proposals = 8
+
+    def propose(
+        self, u: px.UnitView, j: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del u, g
+        return j, j + 1, jnp.float32(1.0)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+def test_building_a_proposal_phase_allocates_no_candidate_grid() -> None:
+    # Regression: the builder eagerly materialised the num_units^2 grid (two
+    # int32 columns) for every add_conn policy, including proposal ones.
+    num_units = 3000
+    net = _net(_WideProposals())
+    static, state = px.NetworkBuilder.from_edges(
+        net,
+        num_units,
+        np.asarray([0], dtype=np.int32),
+        np.asarray([1], dtype=np.int32),
+        input_ids=[0],
+        output_ids=[num_units - 1],
+        globals_=None,
+    )
+    before = sum(a.nbytes for a in jax.live_arrays())
+    phase = phases.build_add_conn_phase(net, static)
+    held = sum(a.nbytes for a in jax.live_arrays()) - before
+    assert held < 1 << 20, held  # a grid would be 2 * 3000**2 * 4 = 72 MB
+    del phase
+
+
+class _PipelineNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _TableProposals([(1, 4, 1.0), (5, 8, 1.0), (4, 1, 1.0)], 3)
+    propagation = px.Propagation.PIPELINE
+
+
+def test_pipeline_proposals_land_in_the_single_bucket() -> None:
+    static, state = px.NetworkBuilder.from_edges(
+        _PipelineNet,
+        12,
+        np.asarray(_BASE_SRC, dtype=np.int32),
+        np.asarray(_BASE_DST, dtype=np.int32),
+        input_ids=[0, 1, 2, 3],
+        output_ids=[8, 9, 10, 11],
+        globals_=None,
+    )
+    new_state, _ = phases.build_add_conn_phase(_PipelineNet, static)(
+        state, _DUMMY_INPUTS
+    )
+    (bucket,) = new_state.conns
+    dead = np.asarray(bucket[px.DEAD.name])
+    pairs = {
+        (int(f), int(t))
+        for f, t, d in zip(
+            np.asarray(bucket[px.FROM_ID.name]),
+            np.asarray(bucket[px.TO_ID.name]),
+            dead,
+            strict=True,
+        )
+        if not d
+    }
+    # All three are within the window (|level gap| <= 1), including the
+    # backward (4, 1): pipeline propagation takes any source level.
+    assert {(1, 4), (5, 8), (4, 1)} <= pairs
+    assert len(pairs) == len(_BASE_SRC) + 3
+
+
+def test_new_edges_fill_interleaved_holes_and_leave_live_edges_intact() -> None:
+    net = _net(_TableProposals([(1, 4, 3.0), (2, 4, 2.0), (3, 4, 1.0)], 3))
+    static, state = px.NetworkBuilder.from_edges(
+        net,
+        12,
+        np.asarray(_BASE_SRC, dtype=np.int32),
+        np.asarray(_BASE_DST, dtype=np.int32),
+        weights=np.arange(1, 9, dtype=np.float32),
+        input_ids=[0, 1, 2, 3],
+        output_ids=[8, 9, 10, 11],
+        globals_=None,
+    )
+    # Tombstone slots 1 and 3 of bucket 0, leaving live slots 0 and 2
+    # between holes (and the padding from slot 4 on).
+    b0 = dict(state.conns[0])
+    b0[px.DEAD.name] = b0[px.DEAD.name].at[jnp.asarray([1, 3])].set(True)
+    before = {k: np.asarray(v) for k, v in b0.items()}
+    state = px.NetworkState(
+        units=state.units,
+        conns=(b0, state.conns[1]),
+        globals_=None,
+        needs_resort=state.needs_resort,
+    )
+    new_state, _ = phases.build_add_conn_phase(net, static)(state, _DUMMY_INPUTS)
+    after = {k: np.asarray(v) for k, v in new_state.conns[0].items()}
+
+    for slot in (0, 2):  # surviving live edges are untouched
+        for name in (px.FROM_ID.name, px.TO_ID.name, px.WEIGHT.name, px.DEAD.name):
+            assert after[name][slot] == before[name][slot], (slot, name)
+    # The three new edges take the first three free slots, in top_k order.
+    grown = [
+        (int(after[px.FROM_ID.name][i]), int(after[px.TO_ID.name][i]))
+        for i in (1, 3, 4)
+    ]
+    assert grown == [(1, 4), (2, 4), (3, 4)]
+    assert not after[px.DEAD.name][[1, 3, 4]].any()
+    assert after[px.DEAD.name][5:].all()

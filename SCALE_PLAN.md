@@ -136,38 +136,66 @@ One scope per commit (SCOPES.md).
 
 ### P0: correctness and harness
 
-- [ ] 0.1 `build(packaging)`: add a `cuda13` extra and a `gpu13` alias, plus a
+- [x] 0.1 `build(packaging)`: add a `cuda13` extra and a `gpu13` alias, plus a
   TOOLING note.
-- [ ] 0.2 `fix(phases)`: fix the int32 pair-id overflow in the growth phase's
+- [x] 0.2 `fix(phases)`: fix the int32 pair-id overflow in the growth phase's
   duplicate check. Add a regression test with `num_units` above 2¹⁶ where
   wrapped ids collide.
-- [ ] 0.3 `fix(phases)`: drop the `indices_are_sorted=True` hint on the
+- [x] 0.3 `fix(phases)`: drop the `indices_are_sorted=True` hint on the
   topological forward and backward. Add a test that churns and then compares
   the forward against an unsorted reference.
-- [ ] 0.4 `feat(examples)`: add `examples/benchmarks/` with the churn probe and
+- [x] 0.4 `feat(examples)`: add `examples/benchmarks/` with the churn probe and
   the layout probe (GPU-only, not collected by pytest), plus a README on how to
   run them.
 
+- [x] 0.5 `perf(phases)`: the wide duplicate check uses one uint64 radix sort
+  under a scoped `jax.enable_x64` instead of two stable passes.
+
 ### P1: growth at O(churn)
 
-- [ ] 1.1 `feat(traits)`: add an optional `AddConn.propose(u, j, g) ->
-  (src, dst, ok)` for proposal `j` of `max_candidates`.
-  - It is O(k) sampling with no candidate grid.
-  - Seed with step-dependent state (the C++ salt lesson).
-  - Validation: the `score` path and the `propose` path are mutually
-    exclusive.
-- [ ] 1.2 `feat(traits)`: add `AddConn.dedupe ∈ {"exact", "none"}`.
-  - The grid path keeps `"exact"` (today's behaviour). The propose path
-    defaults to `"none"`.
-  - `"exact"` on the propose path checks proposals against the live pairs of
-    their bucket, which keeps the O(capacity log capacity) sort.
-  - Docstrings state the multigraph semantics.
-- [ ] 1.3 `feat(phases)`: build the propose path.
-  - Proposals are routed to the bucket of their source level, with a level
-    check that vetoes a proposal breaking the leveling invariant, or sets
-    `needs_resort` as today.
-  - The slot claim uses `searchsorted` on `cumsum(dead)` for the first k free
-    slots, with no capacity-sized scatter. It must stay Scheme-A-aware.
+Design (refined in iteration 1, from the C++ sampled path in
+`dispatch_gpu.hpp:653` and `cuda_kernels.hpp:498`):
+
+- **How C++ does it.** C++ `GrowFanout` draws k random partners per unit
+  (O(N·k)). An accept predicate decides each one, and accepted proposals
+  commit with no dedupe, since "duplicates are harmless parallel edges".
+- **What plastax changes.** plastax generalises the *candidate source* and
+  keeps everything downstream:
+  - A policy declares a static `num_proposals` and
+    `propose(u, j, g) -> (src, dst, score)` for `j in [0, num_proposals)`.
+  - `score = -inf` vetoes, exactly as on the grid.
+  - The framework vmaps `propose`, routes each proposal to the bucket of its
+    source level, and applies the level window.
+  - It then optionally dedupes, and runs the same per-bucket
+    `top_k(max_candidates)`, free-slot claim and `init` as the grid path.
+- **Proposal granularity is the policy's choice.**
+  - `num_proposals = num_units * fanout` with `j // fanout` as the unit gives
+    C++ `GrowFanout`.
+  - `num_proposals = k` gives direct uniform sampling.
+- **Dedupe.** `dedupe: bool`, default True on the grid path (today's
+  behaviour) and False on the propose path.
+  - `dedupe=True` on the propose path checks against the live edges
+    (`live_pair_member`, O(capacity log capacity)).
+  - It also drops repeats within the step's own top-k (O(k log k)); the grid
+    never has these.
+- **Free-slot claim.**
+  - Today the first-k free slots come from a capacity-sized scatter (the
+    `local_slot_for_rank` array).
+  - They will instead come from
+    `searchsorted(cumsum(dead), arange(1, k + 1))`: an O(capacity) scan plus
+    O(k log capacity), with no capacity-sized write.
+  - The grid path benefits too.
+
+- [ ] 1.1 `perf(phases)`: free-slot claim via `searchsorted` on
+  `cumsum(dead)`. Keep it Scheme-A-aware, and keep existing tests green.
+- [ ] 1.2 `feat(traits)`: the `ProposeAddConn` protocol (`num_proposals`,
+  `propose`) and the `dedupe` attribute.
+  - Validation: a policy defines either `score` (grid) or `propose`.
+  - Docstrings state the multigraph semantics and the step-dependent seeding
+    requirement (the C++ salt lesson).
+- [ ] 1.3 `feat(phases)`: the propose path, with routing, window, optional
+  dedupe (live plus within-step), top-k, claim and init. Scheme-A: proposals
+  are replicated, as the grid is.
 - [ ] 1.4 `test(phases)`: equivalence test in the spirit of the C++
   `--validate-every`.
   - Run N in-place churn steps, then rebuild with `from_edges` from the live
@@ -254,6 +282,11 @@ the log below:
 
 ## 6. Surfaced for review
 
+- **Exact dedupe on the grid path now costs about 2.5× more past 46,340
+  units** (+24 ms at 50M, against +9.5 ms for the old check that silently
+  wrapped). That is the price of correctness. Grid-path users at that scale
+  should move to `propose` once P1 lands.
+
 - **Memory headroom beyond C++.** plastax holds 300M edges in 7.0 GB, against
   27 GB for C++ Plastix. The C++ side's 97 B per slot is mostly scratch
   (radix buffers, keys, perm) kept resident. It could probably be cut to about
@@ -269,6 +302,24 @@ the log below:
 ## 7. Loop log
 
 (Entries are appended per iteration, newest last.)
+
+### Iteration 1 (2026-09-30): P0
+
+- **Build:** P0.1-P0.4 committed: `bef72e4` (cuda13 extra), `8abf3a5`
+  (pair-id overflow), `2003ff5` (sorted hint), `8d0a839` (probes). The fast
+  suite went from 268 to 271 tests.
+- **Document:** `cee4dd0`, `5eff59e`, `e09ec35`: the resort-order docstring,
+  the architecture note, and the Deviations entry.
+- **Explore.** The exact wide-id check was correct but slow: +57 ms per step
+  at 50M edges, against +9.5 ms for the old, wrapping int32 check.
+  - A uint64 pair id under a scoped `jax.enable_x64(True)` gives one radix
+    sort, at 11 ms per 33M-slot bucket against 29 ms for two passes.
+  - Committed as `8e9a2fb`: the add phase is now +24 ms at 50M (churn step
+    30.2 ms).
+  - None of the existing examples or bench defaults exceed 46,340 units
+    (CIFAR is about 4.1K), so past results are unaffected by the bug.
+- **Plan.** P1 was refined into the propose-source design above. It mirrors
+  C++ `GrowFanout` (per-unit fan-out sampling, commit without dedupe).
 
 ## Deviations
 

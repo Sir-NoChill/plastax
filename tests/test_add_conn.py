@@ -173,8 +173,8 @@ def test_prefix_sum_slot_claim_lands_new_edges_in_the_bucket_dead_slots() -> Non
     to_id = np.asarray(bucket[px.TO_ID.name])
     weight = np.asarray(bucket[px.WEIGHT.name])
 
-    # Positions 0-4 held the 5 pre-existing ANCHOR edges (builder-sorted by
-    # to_id, IMPLEMENTATION_PLAN.md [D:3]) and must be untouched by the add.
+    # Positions 0-4 held the 5 pre-existing ANCHOR edges (builder source-major
+    # order, so with one source by to_id) and must be untouched by the add.
     np.testing.assert_array_equal(from_id[:5], np.full(5, _ANCHOR))
     np.testing.assert_array_equal(to_id[:5], np.array(_DST))
     np.testing.assert_allclose(weight[:5], np.array(_ANCHOR_WEIGHTS))

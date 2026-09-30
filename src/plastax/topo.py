@@ -234,7 +234,7 @@ def resort[GS](
     """Recompute levels, redistribute conns into new buckets, and resort.
 
     Host-driven: recompute levels, redistribute conns into new buckets
-    (gather per level), stable sort each bucket by (dead, to_id) via
+    (gather per level), stable sort each bucket by (dead, from_id) via
     lax.sort_key_val -- doubles as compaction -- then derive new
     level_capacities via capacity_policy. Per-level live counts are the
     only host transfer. Returns new (static, state); caller retraces.
@@ -255,13 +255,15 @@ def resort[GS](
     from capacity_policy, sized off the live count that same predicate
     yields -- so every match provably fits and the scatter's "no such rank"
     sink, one past capacity_b, only ever catches non-matches); (2) a stable
-    lax.sort_key_val over a single combined `dead * num_units + to_id` key
-    (to_id < num_units always, so the two key ranges never collide) that
-    restores the (dead, to_id) order: live edges first, grouped by
-    destination -- step (1) preserves each match's OLD relative order, not
-    to_id order, so this second pass is not redundant with it. The order is
-    a locality nicety, not a precondition: in-place prune and add break it
-    on the next step, so no sweep passes a sorted-segment hint.
+    lax.sort_key_val over a single combined `dead * num_units + from_id` key
+    (from_id < num_units always, so the two key ranges never collide) that
+    restores the builder's source-major order: live edges first, grouped by
+    source -- step (1) preserves each match's OLD relative order, not
+    from_id order, so this second pass is not redundant with it. The order
+    is for performance, not a precondition: grouping by source keeps
+    consecutive scatter-adds off a single destination (see
+    NetworkBuilder._assemble), and in-place prune and add loosen it on the
+    next step, so no sweep passes a sorted-segment hint.
 
     Type Args:
         GS: Growth-state type parameter carried by NetworkState.
@@ -326,7 +328,7 @@ def resort[GS](
 
         sort_key = bucket_cols[DEAD.name].astype(jnp.int32) * jnp.int32(
             num_units
-        ) + bucket_cols[TO_ID.name].astype(jnp.int32)
+        ) + bucket_cols[FROM_ID.name].astype(jnp.int32)
         _, perm = jax.lax.sort_key_val(
             sort_key, jnp.arange(capacity_b, dtype=jnp.int32), is_stable=True
         )

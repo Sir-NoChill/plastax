@@ -145,9 +145,10 @@ These follow from the above but are worth stating for anyone touching `topo`,
 - **`-inf` AddConn score is a hard veto** — never committed even with free
   slots — distinct from a merely-low finite score. The same holds for a
   `ProposeAddConn` proposal's score.
-- **Duplicates:** the grid path (`AddConn`) never grows a copy of a live edge.
-  The proposal path (`ProposeAddConn`) does by default — parallel edges, each
-  contributing independently — unless the policy sets `dedupe = True`.
+- **Duplicates follow `dedupe`:** it defaults to True for the grid path
+  (`AddConn`), which then never grows a copy of a live edge, and to False for
+  the proposal path (`ProposeAddConn`), which then grows parallel edges (each
+  contributing independently). Either policy may set it explicitly.
 - **Reserved field names** (`from_id`, `to_id`, `dead`, `weight`, `activation`,
   `level`) cannot be reused by `extra_unit_fields`/`extra_conn_fields`; enforced
   at subclass definition (`traits._validate_field_names`).

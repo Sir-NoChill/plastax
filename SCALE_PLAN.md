@@ -248,7 +248,16 @@ Design (refined in iteration 1, from the C++ sampled path in
 
 ### P3: driver without per-step sync
 
-- [ ] 3.1 `feat(driver)`: add `Driver(check_every=N)`.
+- [x] 3.1 `feat(driver)`: add `Driver(check_every=N)` (8260c4f). This landed
+  without a state change: overflow is OR-accumulated on device by the Driver.
+  - Measured: 0.515 → 0.406 ms per step at 100K edges, and 0.697 → 0.547 ms
+    at 5.4M, with N = 16.
+- [x] 3.2 (explored, not adopted) A `lax.scan` over T steps in one jit. Past
+  `check_every` it gains only 0.406 → 0.338 ms at 100K edges and nothing at
+  5.4M, so the floor is device work, not Python dispatch.
+- [x] 3.3 `perf(phases)` (407ccb1): unrolled `searchsorted`. The default
+  method is a while loop, one kernel launch per halving.
+  - The add phase at 5.4M went 0.34 → 0.07 ms.
   - Overflow becomes sticky in state (a design check first: adding a
     `NetworkState` field is a pytree change).
   - Check every N steps; the default N = 1 is unchanged behaviour.
@@ -348,6 +357,14 @@ the log below:
    put anything the user should weigh under "Surfaced for review".
 
 ## 6. Surfaced for review
+
+- **plastax now roughly matches the hand-written C++ in-place path** (within
+  6-10% from 5.4M to 300M edges) at 6.6× less GPU memory. It is 4.8× faster
+  than the tuned CSR rebuild at 300M.
+  - For the paper this changes the story: the JAX library is the practical
+    vehicle, not only the reference.
+  - The C++ remains ahead only by constant factors: prune reads fewer bytes,
+    and growth is free of kernel launches.
 
 - **Bucket layout changed from destination-sorted to source-major**
   (`d720ece`).
@@ -500,6 +517,26 @@ the log below:
     - aggregate same-destination atomics within a block (destination-sorted
       tiles, as C++ `WarpAtomicAddKeyed` does);
     - try the Mosaic GPU backend for relaxed atomics.
+
+### Iteration 4 (2026-09-30): P3 and the small-net floor
+
+- **Build:** 8260c4f (`Driver(check_every=N)`), 407ccb1 (unrolled searches).
+  The fast suite now has 291 tests, and the Scheme-A churn check passes.
+- **Explore:**
+  - A scan over steps was not worth adopting (see 3.2).
+  - Found the while-loop `searchsorted` launch cost.
+  - **The churn step is now within 6-10% of C++ Plastix in place at every
+    size:**
+
+    | edges | plastax | C++ in place |
+    |---|---|---|
+    | 5.4M | 0.259 ms | 0.24 ms |
+    | 50M | 2.42 ms | 2.19 ms |
+    | 300M | 13.7 ms | 12.9 ms |
+
+  - GPU memory is 4.1 GB against 27 GB at 300M.
+  - Forward and prune are at the DRAM roofline.
+- **Plan:** next is P4 (batched inputs), with the design drafted above.
 
 ## Deviations
 

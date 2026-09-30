@@ -257,9 +257,11 @@ def resort[GS](
     sink, one past capacity_b, only ever catches non-matches); (2) a stable
     lax.sort_key_val over a single combined `dead * num_units + to_id` key
     (to_id < num_units always, so the two key ranges never collide) that
-    restores the (dead, to_id) order the segment reductions' `indices_are_
-    sorted=True` needs -- step (1) preserves each match's OLD relative
-    order, not to_id order, so this second pass is not redundant with it.
+    restores the (dead, to_id) order: live edges first, grouped by
+    destination -- step (1) preserves each match's OLD relative order, not
+    to_id order, so this second pass is not redundant with it. The order is
+    a locality nicety, not a precondition: in-place prune and add break it
+    on the next step, so no sweep passes a sorted-segment hint.
 
     Type Args:
         GS: Growth-state type parameter carried by NetworkState.

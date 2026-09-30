@@ -186,17 +186,17 @@ Design (refined in iteration 1, from the C++ sampled path in
     O(k log capacity), with no capacity-sized write.
   - The grid path benefits too.
 
-- [ ] 1.1 `perf(phases)`: free-slot claim via `searchsorted` on
+- [x] 1.1 `perf(phases)`: free-slot claim via `searchsorted` on
   `cumsum(dead)`. Keep it Scheme-A-aware, and keep existing tests green.
-- [ ] 1.2 `feat(traits)`: the `ProposeAddConn` protocol (`num_proposals`,
+- [x] 1.2 `feat(traits)`: the `ProposeAddConn` protocol (`num_proposals`,
   `propose`) and the `dedupe` attribute.
   - Validation: a policy defines either `score` (grid) or `propose`.
   - Docstrings state the multigraph semantics and the step-dependent seeding
     requirement (the C++ salt lesson).
-- [ ] 1.3 `feat(phases)`: the propose path, with routing, window, optional
+- [x] 1.3 `feat(phases)`: the propose path, with routing, window, optional
   dedupe (live plus within-step), top-k, claim and init. Scheme-A: proposals
   are replicated, as the grid is.
-- [ ] 1.4 `test(phases)`: equivalence test in the spirit of the C++
+- [x] 1.4 `test(phases)`: equivalence test in the spirit of the C++
   `--validate-every`.
   - Run N in-place churn steps, then rebuild with `from_edges` from the live
     multiset.
@@ -206,6 +206,10 @@ Design (refined in iteration 1, from the C++ sampled path in
   `propose`, run it on the real MultiMNIST stream, and scale to the memory
   bound.
 
+- [x] 1.6 `perf(builder)` / `perf(topo)` (found in iteration 2): source-major
+  bucket layout. The forward at 50M dropped from 4.83 to 1.47 ms on GPU, and
+  forward+backward is 1.4× faster on CPU.
+
 ### P2: capacity and forward bandwidth
 
 - [ ] 2.1 `feat(topo)`: `capacity_policy(..., align=)` with no power-of-two
@@ -213,6 +217,20 @@ Design (refined in iteration 1, from the C++ sampled path in
   `from_edges` / `grow_bucket` / `resort`.
 - [ ] 2.2 Profile the edge-list forward with nsys: materialisation of the
   vmapped `map` output, and gather/scatter fusion. Fix what is fixable in XLA.
+  (Partly superseded: the source-major layout already brought the forward to
+  9.7 ms at 300M, against 7.7 ms for C++.)
+- [ ] 2.4 `perf(phases)`: a two-level free-slot search.
+  - Use a per-block dead count (a reduction reading 1 B per slot), a cumsum
+    over the blocks, and a within-block search for the k claimed ranks.
+  - This replaces the full `cumsum(dead)`, which writes 4 B per slot. It is
+    most of the 8 ms add phase at 300M.
+- [ ] 2.5 `perf(phases)`: prune costs 10.2 ms at 300M, against 5.1 ms for C++.
+  Check whether the predicate's vmap plus the `dead | should_die` write fuse
+  into a single pass.
+- [ ] 2.6 `fix(topo)`: resort sizes capacities with `headroom=0`, which leaves
+  every bucket nearly full after a resort (seen in the equivalence test).
+  Thread the headroom through, so a resort is not followed by an
+  overflow → grow → retrace.
 - [ ] 2.3 Find the largest E that fits on 32 GB, and record it.
 
 ### P3: driver without per-step sync
@@ -282,6 +300,19 @@ the log below:
 
 ## 6. Surfaced for review
 
+- **Bucket layout changed from destination-sorted to source-major**
+  (`d720ece`).
+  - It gives 1.7-3.3× on the GPU forward and 1.4× on CPU. Results change only
+    in floating-point summation order.
+  - A hash-shuffled layout is fastest on GPU for training (fwd+bwd), but 2×
+    slower on CPU. A per-backend layout choice is possible later, and moot
+    once the CSR and Pallas backends exist.
+- **The Driver's overflow retry replays the whole step** (forward, update,
+  prune) on the already-stepped state. This is documented in `Driver.step`.
+  For stateful rules (a decaying update, a Langevin step) it applies them
+  twice. P3 (sticky overflow, drop the growth instead of retrying) would
+  remove this.
+
 - **Exact dedupe on the grid path now costs about 2.5× more past 46,340
   units** (+24 ms at 50M, against +9.5 ms for the old check that silently
   wrapped). That is the price of correctness. Grid-path users at that scale
@@ -320,6 +351,38 @@ the log below:
     (CIFAR is about 4.1K), so past results are unaffected by the bug.
 - **Plan.** P1 was refined into the propose-source design above. It mirrors
   C++ `GrowFanout` (per-unit fan-out sampling, commit without dedupe).
+
+### Iteration 2 (2026-09-30): P1
+
+- **Build:**
+  - `07eb1eb`: free-slot claim by binary search (-1.3 ms at 50M).
+  - `b2eb326`: `ProposeAddConn`, with the protocol, the phase path, 5 propose
+    tests, and the Driver equivalence test.
+  - The equivalence test runs through overflow → `grow_bucket` and resort, and
+    matches a network rebuilt from the live multiset, parallel edges included.
+  - The fast suite now has 277 tests.
+- **Document:** `f4982a9`, `cd4ad3e`, `b123eb0`, `9df71a6`.
+  - Covers the agent docs, the scaffold template, the review checklist, the
+    Deviations entries, and the `__all__` count, which is now 40 (it was
+    already stale at 33).
+- **Explore.**
+  - At 50M, proposal growth costs +1.2 ms against +22.7 ms for grid growth.
+  - Found a forward regression from P0.3: a destination-sorted bucket without
+    the hint serialises scatter-add atomics (4.83 ms against 3.96 ms with the
+    hint).
+  - Measured bucket orders at 50M:
+    - source-major: 1.47 ms fwd, 3.26 ms fwd+bwd (CPU fwd+bwd 9.2 ms);
+    - hash-shuffled: 1.72 / 2.53 ms (CPU 24.4 ms);
+    - destination-sorted: 4.83 / 5.67 ms (CPU 12.8 ms).
+  - Committed source-major as `d720ece` / `9e6fbea`.
+  - **300M churn step: 144 → 27.9 ms** (forward 9.7, prune 10.2, growth 8.0).
+    C++ in place is 12.9 ms; tuned CSR is 65.5 ms. **50M: 4.0 ms**, against
+    2.19 ms for C++.
+- **Plan.**
+  - Added P2.4 (two-level free-slot search), P2.5 (prune fusion) and P2.6
+    (headroom through resort).
+  - P1.5 (DeepR port) remains, because it lives in the bench repo.
+  - Ran a `plastax-review` pass over the branch.
 
 ## Deviations
 

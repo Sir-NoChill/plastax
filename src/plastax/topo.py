@@ -257,9 +257,10 @@ def resort[GS](
     sink, one past capacity_b, only ever catches non-matches); (2) a stable
     lax.sort_key_val over a single combined `dead * num_units + from_id` key
     (from_id < num_units always, so the two key ranges never collide) that
-    restores the builder's source-major order: live edges first, grouped by
-    source -- step (1) preserves each match's OLD relative order, not
-    from_id order, so this second pass is not redundant with it. The order
+    groups the live edges by source, first -- step (1) preserves each
+    match's OLD relative order, not from_id order, so this second pass is
+    not redundant with it; within a source the old relative order is kept
+    (not the builder's to_id tie-break). The order
     is for performance, not a precondition: grouping by source keeps
     consecutive scatter-adds off a single destination (see
     NetworkBuilder._assemble), and in-place prune and add loosen it on the

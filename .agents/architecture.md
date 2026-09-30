@@ -209,6 +209,20 @@ the whole state pytree, so the step **must be shape-preserving** on every leaf
 > `StepResult.overflow`. This is safe only because `jax.jit` traces the body
 > once (`step.py:141`).
 
+### Batched step (`step.py` `make_step(..., batch_size=B)`, `phases.build_batched_phases`)
+
+Streaming (B = None) is the primary mode. With a batch size, the phases split
+three ways: **per-sample** (forward, loss, backward) vmapped over the batch
+with conns/globals broadcast; the **update** reduced over the batch
+(`build_batched_update_conn`: the exact `per_sample` + `incoming_batched` pair
+if the UpdateConn declares it -- every `optim/` bundle does -- else the mean of
+the per-sample writes; both accumulate in a `fori_loop`, O(capacity) memory);
+and **structural** (prune, add, reset) run once on `batch_mean_units`. Unit
+columns in the state stay `(num_units,)` and hold the batch mean. PIPELINE nets
+are rejected. Measured on GPU the per-sample cost falls only ~2x from B = 1 to
+128 on the edge-list layout (each pass touches every edge once per sample);
+the CSR / Pallas backends are the plan for that.
+
 ### Host loop (`driver.py`)
 
 `Driver.step(inputs)` (`driver.py:51`) runs the jitted step and reacts to the

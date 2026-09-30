@@ -657,6 +657,10 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   gains `align`; the builders gain `capacity_align`. `topo.resort` now sizes
   buckets with the recorded headroom instead of none, so a net built with
   headroom keeps it across resorts.
+- step/phases/optim: `make_step(..., batch_size=B)` (additive): batched
+  StepInputs (`*batch` axes in the annotations); optional structural
+  `per_sample` / `incoming_batched` on UpdateConn, implemented by every optim
+  bundle (their `incoming` now delegates to `_step(c, cid, grad)`).
 
 ## Handoff conventions
 

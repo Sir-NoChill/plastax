@@ -252,7 +252,43 @@ Design (refined in iteration 1, from the C++ sampled path in
 
 ### P4: batched inputs
 
-- [ ] 4.1 Design note first.
+Design (drafted in iteration 3):
+
+- **Shape.**
+  - `StepInputs.inputs` is `(B, num_inputs)` and `targets` is
+    `(B, num_outputs)`.
+  - A static `batch_size` in `NetworkStatic` (a jit key) allocates unit
+    columns as `(B, num_units)`, so per-sample unit state persists like
+    streaming state does.
+  - Connections and globals are unbatched.
+- **Forward, loss, backward.** The existing phase functions are `jax.vmap`ped
+  over the unit axis, with connections and globals broadcast. They write no
+  connections, so `out_axes=None` holds for them.
+  - The COO forward then materialises an (E, B) intermediate. At B ≥ 32 the
+    CSR view (P5) takes over; at small B, the edge-once Pallas kernel (P6).
+- **Connection updates: the hard part.** One update per step must see the
+  batch.
+  - The default reduction is the **mean of the per-sample writes**. It is exact
+    for rules linear in the per-sample term: SGD, momentum, plain delta rules.
+  - It is **not** exact for Adam or RMSprop, because `mean(g²) ≠ mean(g)²`
+    inside v.
+  - Exact path: an optional structural pair on `UpdateConn`:
+    - `per_sample(u, dst, src, c, cid, g) -> pytree`, which the framework
+      vmaps over B and averages (typically the gradient `grad_pre_act[dst] ·
+      act[src]`);
+    - `incoming_batched(u_mean, dst, src, c, cid, g, stat) -> ConnWrite`,
+      which applies the optimizer once to the averaged statistic.
+  - The `optim/` bundles implement the pair, so SGD, momentum, Adam, AdamW and
+    RMSprop are exact batched. They are tested against optax on averaged
+    gradients.
+  - A user rule without the pair gets the mean-of-writes default, and the
+    docstrings say where that is exact.
+- **Prune and add.** They see the batch-mean unit view, so importance and
+  scores use mean activity.
+- **Docs.** State plainly that the library is primarily streaming (B = 1),
+  and that batching is a convenience for evaluation and mini-batch training.
+
+- [ ] 4.1 Design note first (the draft above).
   - Batched `StepInputs` of shape `(B, num_inputs)`, and unit columns of shape
     `(B, num_units)` during forward and backward only.
   - Connection updates reduce over B. Pinning this down (is it the mean of
@@ -398,6 +434,33 @@ the log below:
     (headroom through resort).
   - P1.5 (DeepR port) remains, because it lives in the bench repo.
   - Ran a `plastax-review` pass over the branch.
+
+### Iteration 3 (2026-09-30): P2 start and the P6 spike (in progress)
+
+- **Explore (P6.1 spike, `.bench/pallas_spike.py`, `.bench/pallas_batched.py`).**
+  - A Pallas-on-Triton edge-list forward (gather `act[src]`, multiply by the
+    weight, `atomic_add` into `out[dst]`, with the null slot for dead edges)
+    runs correctly on jax 0.11.2 and cuda13, to 1e-5 against `segment_sum`.
+  - **At B = 1 it is 3× slower than XLA** at 25M edges: 1.72 against 0.58 ms.
+    XLA is at the DRAM roofline (about 12 B per edge at about 520 GB/s; the
+    `act` gathers hit L2). Block size (256 to 16K) and `num_warps` (2 to 16)
+    do not move it.
+  - The likely cause is that `plt.atomic_add` exposes no memory order, so
+    Triton emits acquire-release atomics where XLA's scatter uses relaxed
+    reductions.
+  - **Edge-once batched, at 10M edges:**
+    - B = 8: 0.053 ms per sample against 0.149 for XLA (**2.8×**);
+    - B = 32: 0.093 against 0.103, where the E·B atomics dominate.
+  - cuSPARSE CSR at B = 128 was 0.054 ms per sample at 25M.
+  - **Takeaway:**
+    - Pallas pays for small batches, and for fusing arbitrary `map`
+      functions, which cuSPARSE cannot do.
+    - CSR/cuSPARSE pays for large batches of linear passes.
+    - Plain XLA is already optimal for the streaming B = 1 linear case.
+  - Next Pallas steps:
+    - aggregate same-destination atomics within a block (destination-sorted
+      tiles, as C++ `WarpAtomicAddKeyed` does);
+    - try the Mosaic GPU backend for relaxed atomics.
 
 ## Deviations
 

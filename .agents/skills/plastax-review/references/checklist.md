@@ -40,8 +40,9 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
 ## Structural contracts
 
 - **Topological ordering:** for TOPOLOGICAL nets, does the change preserve
-  "source level < destination level", the `(dead, to_id)` bucket sort
-  (`indices_are_sorted=True`), and "deletion/level-preserving-add never resort"?
+  "source level < destination level", and "deletion/level-preserving-add never
+  resort"? No segment reduction may pass `indices_are_sorted=True`: bucket order
+  (source-major after build/resort) is a performance layout, not a contract.
 - **Phase order assumptions:** does new code rely on a read that the fixed phase
   order (forward → loss → backward → update_conn → prune_conn → add_conn →
   reset_global) actually guarantees? (e.g. an update reading a grad the backward

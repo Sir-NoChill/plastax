@@ -135,7 +135,9 @@ These follow from the above but are worth stating for anyone touching `topo`,
   all depend on it. PIPELINE mode drops this (cycles allowed; levels cosmetic,
   1 bucket).
 - **Bucket ordering is not an invariant.** `builder.finalize` and
-  `topo.resort` leave each bucket sorted by `(dead, to_id)`, but in-place prune
+  `topo.resort` leave each bucket live-first in source-major `(from_id, to_id)`
+  order (for scatter-add performance: no run of atomics on one destination),
+  but in-place prune
   and add break that order on the next step, so no segment reduction may pass
   `indices_are_sorted=True` (a violated hint is undefined in XLA).
 - **Deletion never resorts. Level-preserving adds never resort.** `resort` runs

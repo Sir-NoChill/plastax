@@ -176,6 +176,17 @@ class Loss[GS](Protocol):
 class UpdateConn[GS](Protocol):
     """Connection update policy: two full passes, incoming then outgoing.
 
+    Under a batched step (`make_step(..., batch_size=B)`) the update is reduced
+    over the batch. By default each sample's writes are averaged (exact for
+    rules linear in the per-sample term, e.g. SGD). A policy may instead
+    declare, structurally (read with getattr, not part of this Protocol), the
+    exact pair: `per_sample(u, dst, src, c, cid, g) -> pytree`, evaluated per
+    sample and averaged over the batch, and `incoming_batched(u, dst, src, c,
+    cid, g, stat) -> ConnWrite`, applied once with that average (and the
+    batch-mean unit view) in place of `incoming`. Every `plastax.optim`
+    bundle declares it, so a batched optimizer step is one step on the
+    batch-mean gradient.
+
     Type Args:
         GS: the global state type threaded through the network.
     """

@@ -51,10 +51,13 @@ dependencies = [
 # cuda12`) pulls the CUDA-12 jaxlib + plugin in place of the default CPU wheel;
 # `gpu` is a friendly alias for it. plastax is backend-agnostic pure Python --
 # the extra only swaps which jax wheel resolves, nothing in src/plastax changes.
-# Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). Set
+# Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). `cuda13` is
+# the CUDA-13 counterpart (validated with jax[cuda13]==0.11.0 on an RTX 5000
+# Ada, driver 615); the two are mutually exclusive ([tool.uv] conflicts). Set
 # XLA_PYTHON_CLIENT_PREALLOCATE=false on a shared GPU (see TOOLING.md).
 [project.optional-dependencies]
 cuda12 = ["jax[cuda12]>=0.10.2"]
+cuda13 = ["jax[cuda13]>=0.11.0"]
 gpu = ["plastax[cuda12]"]
 
 [project.urls]
@@ -157,3 +160,8 @@ filterwarnings = [
   # donation failure must be an error, rung0 design section 6
   "error:.*Some donated buffers were not usable.*",
 ]
+
+# cuda12 and cuda13 swap in different jaxlib/plugin wheels and cannot resolve
+# together; declaring the conflict lets uv lock both extras independently.
+[tool.uv]
+conflicts = [[{ extra = "cuda12" }, { extra = "cuda13" }]]

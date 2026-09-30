@@ -16,6 +16,3 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false                # shared GPU
 | `layouts_probe.py` | One sparse layer as COO `segment_sum`, BCOO, BCSR (cuSPARSE) and dense: forward at batch 1 and B, plus the CSR rebuild. |
 | `sort_probe.py` | Which sort formulation XLA lowers to a radix sort. |
 | `plot_step_300M.py` | Regenerates `docs/scale_plan/step_300M.png` for `SCALE_PLAN.md`. |
-
-At large sizes XLA's sort autotuner logs failed allocations of many GB (up to
-TiB) while it probes workspace sizes; it falls back and the runs are correct.

@@ -149,6 +149,69 @@ def _check_churn_step_shards(
         raise AssertionError("churn: rewired conn columns differ sharded vs single")
 
 
+class _HashPropose(px.ProposeAddConn[None]):
+    """Two random deeper partners per unit (plastix's sampled GrowFanout)."""
+
+    def __init__(self, num_units: int, *, dedupe: bool) -> None:
+        self.num_units = num_units
+        self.num_proposals = 2 * num_units
+        self.max_candidates = 16
+        self.dedupe = dedupe
+
+    def propose(
+        self, u: px.UnitView, j: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del g
+        src = j // 2
+        h = (j.astype(jnp.uint32) * jnp.uint32(0x9E3779B1)) ^ jnp.uint32(0x85EBCA77)
+        h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE3D)
+        dst = (h % jnp.uint32(self.num_units)).astype(jnp.int32)
+        deeper = u[px.LEVEL, px.UnitIdx(dst)] > u[px.LEVEL, px.UnitIdx(src)]
+        score = (h >> jnp.uint32(8)).astype(jnp.float32)
+        return src, dst, jnp.where(deeper, score, -jnp.inf)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.01)))
+
+
+def _check_propose_churn_shards(
+    static: px.NetworkStatic, static_s: px.NetworkStatic, state: px.NetworkState[None]
+) -> None:
+    """Prune + ProposeAddConn growth shards byte-identically, dedupe on and off.
+
+    Proposals read only replicated units/globals, so every shard proposes the
+    same candidates; the live-duplicate mask is all-reduced as on the grid path.
+    """
+    for dedupe in (False, True):
+
+        class _ProposeNet(px.Network[None]):
+            forward_pass = MagnitudeStats(0.3)
+            prune_conn = SetPrune()
+            add_conn = _HashPropose(sum(_LAYERS), dedupe=dedupe)
+            extra_unit_fields = _EXTRA_UNIT_FIELDS
+            extra_conn_fields = _OPT.state_fields
+            propagation = px.Propagation.TOPOLOGICAL
+
+        sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
+        single = px.make_step(_ProposeNet, static)(_copy(state), sp).state
+        sharded = px.make_step(_ProposeNet, static_s)(_copy(state), sp).state
+        if int(px.state.live_conn_count(single)) != int(
+            px.state.live_conn_count(sharded)
+        ):
+            raise AssertionError(f"propose(dedupe={dedupe}): live count differs")
+        if not _conns_allclose(single, sharded):
+            raise AssertionError(f"propose(dedupe={dedupe}): conn columns differ")
+        grown = sum(
+            int(((b[px.WEIGHT.name] == 0.01) & ~b[px.DEAD.name]).sum())
+            for b in single.conns
+        )
+        if grown == 0:
+            raise AssertionError(f"propose(dedupe={dedupe}): nothing grew")
+
+
 def main() -> None:
     """Run every DST-phase sharding check and print the pass sentinel."""
     if len(jax.devices()) < N_SHARDS:
@@ -164,6 +227,8 @@ def main() -> None:
     print("OK prune step shards")
     _check_churn_step_shards(static, static_s, state)
     print("OK churn step shards (prune + device-resident add_conn growth)")
+    _check_propose_churn_shards(static, static_s, state)
+    print("OK proposal churn step shards (dedupe off and on)")
     print("CHURN SHARDING CHECK PASS")
 
 

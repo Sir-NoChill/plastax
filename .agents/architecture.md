@@ -226,7 +226,8 @@ Bellman-Ford relaxation bounded by `kahn_max_depth`), redistributes edges into
 new per-level buckets (prefix-sum compacting scatter + stable sort on
 `dead*num_units + from_id` to restore the builder's source-major order -- live
 edges first, grouped by source, for scatter-add performance; in-place churn
-loosens it again, so no sweep relies on it), and sizes new capacities via `capacity_policy`. It returns a
+loosens it again, so no sweep relies on it), and sizes new capacities via `capacity_policy` with the build's
+recorded headroom and alignment (`static.capacity_headroom` / `capacity_align`). It returns a
 **new** `(static, state)` — the caller must retrace.
 
 ---

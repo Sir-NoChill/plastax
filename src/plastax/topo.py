@@ -309,7 +309,16 @@ def resort[GS](
         # docstring), sliced to just the buckets that will actually exist.
         live_counts = [int(c) for c in np.asarray(histogram[:new_num_buckets])]
 
-    new_level_capacities = tuple(capacity_policy(live) for live in live_counts)
+    # The build-time sizing policy (headroom and rounding, recorded in the
+    # static config) carries through: a resort sized to the bare live count
+    # would leave every bucket full and turn the next growth into an
+    # overflow -> grow_bucket -> retrace.
+    new_level_capacities = tuple(
+        capacity_policy(
+            live, headroom=static.capacity_headroom, align=static.capacity_align
+        )
+        for live in live_counts
+    )
 
     new_conns: list[Columns] = []
     for bucket_idx in range(new_num_buckets):
@@ -345,7 +354,13 @@ def resort[GS](
     return new_static, new_state
 
 
-def capacity_policy(live: int, *, min_bucket: int = 64, headroom: float = 0.0) -> int:
+def capacity_policy(
+    live: int,
+    *,
+    min_bucket: int = 64,
+    headroom: float = 0.0,
+    align: int | None = None,
+) -> int:
     """Compute a bucket capacity with headroom above the live count.
 
     Default policy: max(next_pow2(live), min_bucket). `headroom` pre-allocates
@@ -358,22 +373,36 @@ def capacity_policy(live: int, *, min_bucket: int = 64, headroom: float = 0.0) -
     (a full doubling). headroom=0.0 is the historical policy; constants are an
     open tuning item.
 
+    With `align` set, the target is instead rounded up to a multiple of
+    `align` (and of at least `min_bucket`), so capacity tracks
+    `live * (1 + headroom)` to within `align` slots. Power-of-two rounding can
+    leave up to half a bucket empty, and every pass that streams the whole
+    bucket (forward, backward, prune, the growth free-slot scan) pays for the
+    empty half. Under Scheme-A, `align` must be a multiple of the shard count.
+
     Args:
         live: Number of live conns the bucket must hold.
         min_bucket: Minimum capacity to allocate regardless of live count.
         headroom: Extra dead-slot fraction to pre-allocate above `live`
             (0.0 = none, 1.0 = at least double). Must be non-negative.
+        align: Round up to a multiple of this instead of to a power of two,
+            or None for the power-of-two policy. Must be positive.
 
     Returns:
         The capacity to allocate for the bucket.
 
     Raises:
-        ValueError: If `headroom` is negative.
+        ValueError: If `headroom` is negative or `align` is not positive.
     """
     if headroom < 0.0:
         raise ValueError(f"capacity_policy: headroom must be >= 0, got {headroom}")
+    if align is not None and align < 1:
+        raise ValueError(f"capacity_policy: align must be >= 1, got {align}")
+    target = math.ceil(max(live, 0) * (1.0 + headroom))
+    if align is not None:
+        target = max(target, min_bucket)
+        return -(-target // align) * align
     if live <= 0:
         return min_bucket
-    target = math.ceil(live * (1.0 + headroom))
     next_pow2 = 1 << (target - 1).bit_length()
     return max(next_pow2, min_bucket)

@@ -579,6 +579,13 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
                 f"{cls.__name__}.add_conn must satisfy exactly one of AddConn "
                 f"(score) or ProposeAddConn (propose); got {cls.add_conn!r}"
             )
+        if isinstance(cls.add_conn, ProposeAddConn) and not grid:
+            n = cls.add_conn.num_proposals
+            if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+                raise TypeError(
+                    f"{cls.__name__}.add_conn.num_proposals must be an int >= 1; "
+                    f"got {n!r}"
+                )
 
     if cls.reset_global is not None and not isinstance(cls.reset_global, ResetGlobal):
         raise TypeError(

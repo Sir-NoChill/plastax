@@ -637,6 +637,14 @@ AddConn window, the retrace-count contract):
   predict-previous baseline with a 2x margin, is seed-deterministic, and
   uses Pipeline propagation.
 
+Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
+- phases.py forward sweeps: indices_are_sorted=True -> False (pipeline and
+  topological). The builder's (dead, to_id) order [D:3] only holds until the
+  first in-place prune or add; a violated hint is undefined in XLA. Current
+  backends ignore it, and on GPU the unsorted reduction measured no slower.
+- phases.py add_conn duplicate check: the int32 pair id `src * num_units +
+  dst` wrapped past 46340 units; `live_pair_member` is exact at any size.
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

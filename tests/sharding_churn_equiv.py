@@ -34,6 +34,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 # The DST example is the real churn/train code the experiment uses; load it by
 # path (examples/ is not importable by default), matching how the acceptance
@@ -212,6 +213,21 @@ def _check_propose_churn_shards(
             raise AssertionError(f"propose(dedupe={dedupe}): nothing grew")
 
 
+def _check_batched_train_step_shards(
+    static: px.NetworkStatic, static_s: px.NetworkStatic, state: px.NetworkState[None]
+) -> None:
+    """A batched (B = 5) train step shards like the streaming one."""
+    train_net = make_net(_OPT, method="set", mode="train")
+    rng = np.random.default_rng(0)
+    xs = jnp.asarray(rng.standard_normal((5, _LAYERS[0])).astype(np.float32))
+    ys = jax.nn.one_hot(jnp.asarray(rng.integers(0, _LAYERS[-1], 5)), _LAYERS[-1])
+    sp = px.StepInputs(inputs=xs, targets=ys)
+    single = px.make_step(train_net, static, batch_size=5)(_copy(state), sp)
+    sharded = px.make_step(train_net, static_s, batch_size=5)(_copy(state), sp)
+    if not _conns_allclose(single.state, sharded.state):
+        raise AssertionError("batched train: conn columns differ sharded vs single")
+
+
 def main() -> None:
     """Run every DST-phase sharding check and print the pass sentinel."""
     if len(jax.devices()) < N_SHARDS:
@@ -229,6 +245,8 @@ def main() -> None:
     print("OK churn step shards (prune + device-resident add_conn growth)")
     _check_propose_churn_shards(static, static_s, state)
     print("OK proposal churn step shards (dedupe off and on)")
+    _check_batched_train_step_shards(static, static_s, state)
+    print("OK batched train step shards")
     print("CHURN SHARDING CHECK PASS")
 
 

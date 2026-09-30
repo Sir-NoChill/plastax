@@ -650,6 +650,8 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   on GPU; 1.4x on CPU).
 - traits/phases: `ProposeAddConn` (additive): growth from policy-emitted
   proposals; parallel edges allowed unless `dedupe = True`.
+  `Network.add_conn` is now typed `AddConn | ProposeAddConn | None`: code
+  that calls `net.add_conn.score` must narrow with isinstance first.
 
 ## Handoff conventions
 

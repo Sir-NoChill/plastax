@@ -638,3 +638,17 @@ def test_live_pair_member_matches_a_set_oracle_on_both_id_paths() -> None:
 
         want = [(int(s), int(d)) in live for s, d in zip(c_src, c_dst, strict=True)]
         assert np.asarray(member).tolist() == want, num_units
+
+
+def test_two_level_free_slot_search_matches_a_numpy_oracle() -> None:
+    rng = np.random.default_rng(5)
+    # 4096 and 1536 take the plain-reshape path (block 1024 / 512); 1030 and
+    # 97 have no power-of-two block >= 64 and take the padded path.
+    for cap in (4096, 1536, 1030, 97):
+        dead = rng.random(cap) < 0.3
+        free = np.flatnonzero(dead)
+        ranks = np.arange(min(len(free), 40), dtype=np.int32)
+        blocks, block = phases.count_free_blocks(jnp.asarray(dead))
+        assert int(blocks[-1]) == len(free)
+        got = phases.nth_free_slot(jnp.asarray(dead), blocks, block, jnp.asarray(ranks))
+        np.testing.assert_array_equal(np.asarray(got), free[ranks], err_msg=str(cap))

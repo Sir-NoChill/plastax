@@ -525,6 +525,76 @@ def repeats_earlier(
     return repeated
 
 
+# Block length for the two-level free-slot search: the largest power of two up
+# to this that divides the bucket, so the per-block counts are a plain reshape.
+_FREE_BLOCK = 1024
+
+
+def count_free_blocks(
+    dead: Bool[Array, " cap"],
+) -> tuple[Int32[Array, " blocks"], int]:
+    """Inclusive running count of free (dead) slots per block of the bucket.
+
+    The first level of the free-slot search: `blocks[b]` counts the dead slots
+    in blocks 0..b. Reads the mask once (a reduction), where a slot-level
+    cumsum would also write 4 bytes per slot.
+
+    Args:
+        dead: The bucket's tombstone mask.
+
+    Returns:
+        The per-block inclusive counts and the (static) block length. The last
+        count is the bucket's total free slots.
+    """
+    cap = dead.shape[0]
+    block = _FREE_BLOCK
+    while block > 1 and cap % block:
+        block //= 2
+    if block < 64:  # an awkward capacity: pad rather than use tiny blocks
+        block = _FREE_BLOCK
+        dead = jnp.pad(dead, (0, -cap % block))
+    counts = dead.reshape(-1, block).sum(axis=1, dtype=jnp.int32)
+    running: Int32[Array, " blocks"] = jnp.cumsum(counts)
+    return running, block
+
+
+def nth_free_slot(
+    dead: Bool[Array, " cap"],
+    free_blocks: Int32[Array, " blocks"],
+    block: int,
+    rank: Int32[Array, " k"],
+) -> Int32[Array, " k"]:
+    """Position of each `rank`-th (0-based) free slot of the bucket.
+
+    The second level: a binary search over the block counts finds each rank's
+    block, then a cumsum over just that block finds the slot -- O(k * block)
+    work, independent of the capacity. Ranks at or beyond the free count return
+    an arbitrary in-bounds position; callers mask them.
+
+    Args:
+        dead: The bucket's tombstone mask.
+        free_blocks: `count_free_blocks(dead)`'s running counts.
+        block: `count_free_blocks(dead)`'s block length.
+        rank: The free-slot ranks to locate.
+
+    Returns:
+        One slot position per rank.
+    """
+    cap = dead.shape[0]
+    target = rank + jnp.int32(1)
+    b = jnp.minimum(
+        jnp.searchsorted(free_blocks, target).astype(jnp.int32),
+        jnp.int32(free_blocks.shape[0] - 1),
+    )
+    before = jnp.where(b > 0, free_blocks[jnp.maximum(b - 1, 0)], jnp.int32(0))
+    idx = b[:, None] * jnp.int32(block) + jnp.arange(block, dtype=jnp.int32)[None, :]
+    in_block = jnp.where(idx < cap, dead[jnp.minimum(idx, cap - 1)], False)
+    running = jnp.cumsum(in_block.astype(jnp.int32), axis=1)
+    offset = jax.vmap(jnp.searchsorted)(running, target - before).astype(jnp.int32)
+    slot: Int32[Array, " k"] = jnp.minimum(b * jnp.int32(block) + offset, cap - 1)
+    return slot
+
+
 @dataclasses.dataclass(frozen=True)
 class ShortlistCoverage:
     """How much of one bucket's destination population a shortlist can reach.
@@ -946,12 +1016,10 @@ def build_add_conn_phase[GS](
             # offset == 0 when unsharded, leaving that path byte-identical.
             local_capacity = capacity_b // num_shards
             dead_b = bucket_conns[DEAD.name]
-            # free_through[i] = free (dead) slots in this shard's slice up to
-            # and including position i, so the (r+1)-th free slot is the first
-            # position where it reaches r+1: a binary search per candidate,
-            # O(k log capacity), with no capacity-sized scatter.
-            free_through = jnp.cumsum(dead_b.astype(jnp.int32))
-            local_free = free_through[-1]
+            # Per-block free counts over this shard's slice: one reduction
+            # reading the dead mask, instead of a capacity-sized cumsum.
+            free_blocks, block_len = count_free_blocks(dead_b)
+            local_free = free_blocks[-1]
             # This shard's offset into the global free-slot space, and the total
             # free count. The offset is an exclusive prefix of the per-shard
             # free counts (an all-gather -- a prefix is not a plain all-reduce)
@@ -986,9 +1054,7 @@ def build_add_conn_phase[GS](
             local_rank = growth_rank - offset
             mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
             safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-            free_slot = jnp.searchsorted(free_through, safe_rank + jnp.int32(1)).astype(
-                jnp.int32
-            )
+            free_slot = nth_free_slot(dead_b, free_blocks, block_len, safe_rank)
             target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
 
             # A committed candidate whose destination is not strictly

@@ -373,10 +373,16 @@ the log below:
   27 GB for C++ Plastix. The C++ side's 97 B per slot is mostly scratch
   (radix buffers, keys, perm) kept resident. It could probably be cut to about
   30 B, which would let C++ reach about 1B edges too.
-- **XLA autotuner noise.** At large E, XLA's sort autotuning tries allocations
-  of 9 GB to 4.9 TiB, fails, and falls back. The runs are correct, but the
-  logs are noisy and the first compile is slow. It is worth documenting an
-  `XLA_FLAGS` setting.
+- **Correction: the huge failed allocations were a bug, not autotuner noise.**
+  The 9 GiB / 838 GiB / 4.91 TiB allocation errors at 5.4M, 50M and 300M
+  edges were exactly 4·N² bytes: the add_conn builder eagerly materialised
+  the num_units² candidate grid for *every* policy.
+  - The allocation failed asynchronously, and the proposal and shortlist
+    paths never read the array, so the runs completed. The numbers are
+    unaffected.
+  - At smaller sizes where the grid *fits*, it silently held 8·N² bytes of
+    device memory.
+  - The plastax-review pass found it; it is fixed in iteration 3.
 - **`jax.experimental.sparse` needs `jax_bcoo_cusparse_lowering`** to use
   cuSPARSE at all. Any user-level BCSR comparison without the flag is
   30-80× pessimistic.

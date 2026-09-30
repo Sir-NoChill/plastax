@@ -99,13 +99,43 @@ class HashGrow(px.AddConn):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.01)))
 
 
+class ProposeGrow(px.ProposeAddConn):
+    """Uniform proposals: 4k per bucket, a random (src, dst) between layers."""
+
+    def __init__(self, k: int, width: int, *, dedupe: bool) -> None:
+        self.max_candidates = k
+        self.num_proposals = 2 * 4 * k  # two buckets, 4x oversampled
+        self.width = width
+        self.dedupe = dedupe
+
+    def propose(
+        self, u: px.UnitView, j: jax.Array, g: Globals
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        del u
+        layer = j % 2
+        w = jnp.float32(self.width)
+        src = layer * self.width + (hash01(j, g["step"], jnp.int32(1)) * w).astype(
+            jnp.int32
+        )
+        dst = (layer + 1) * self.width + (
+            hash01(j, g["step"], jnp.int32(2)) * w
+        ).astype(jnp.int32)
+        return src, dst, hash01(j, g["step"], jnp.int32(3))
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Globals
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.01)))
+
+
 class Tick(px.ResetGlobal):
     def reset(self, g: Globals) -> Globals:
         return {"step": g["step"] + 1}
 
 
 def make_net(
-    *, prune: px.PruneConn | None, add: px.AddConn | None
+    *, prune: px.PruneConn | None, add: px.AddConn | px.ProposeAddConn | None
 ) -> type[px.Network[Globals]]:
     """A churn-net variant; every variant shares the same field layout."""
 
@@ -141,13 +171,19 @@ def main() -> None:
     ap.add_argument("--m", type=int, default=64, help="shortlist side")
     ap.add_argument("--steps", type=int, default=20)
     ap.add_argument("--headroom", type=float, default=0.05)
+    ap.add_argument("--grow", choices=("grid", "propose"), default="grid")
+    ap.add_argument("--dedupe", action="store_true", help="propose: exact dedupe")
     ap.add_argument("--json", help="append one JSON line of results here")
     args = ap.parse_args()
 
     rng = np.random.default_rng(0)
     frm, to = random_layers(args.width, args.edges, rng)
     prune = HashPrune(args.k / (args.edges / 2))
-    grow = HashGrow(args.k, args.m)
+    grow: px.AddConn | px.ProposeAddConn = (
+        HashGrow(args.k, args.m)
+        if args.grow == "grid"
+        else ProposeGrow(args.k, args.width, dedupe=args.dedupe)
+    )
     full = make_net(prune=prune, add=grow)
     static, state0 = px.NetworkBuilder.from_edges(
         full,
@@ -164,6 +200,7 @@ def main() -> None:
     state_gb = sum(a.nbytes for a in jax.tree.leaves(state0)) / 1e9
     print(
         f"width={args.width} edges={args.edges} k={args.k} m={args.m} "
+        f"grow={args.grow}{'+dedupe' if args.dedupe else ''} "
         f"caps={static.level_capacities} state={state_gb:.2f} GB",
         flush=True,
     )

@@ -448,14 +448,12 @@ def live_pair_member(
 ) -> Bool[Array, " p"]:
     """Whether each candidate `(src, dst)` is already a live edge of the bucket.
 
-    Exact for every `num_units`. While a pair id `src * num_units + dst` fits
-    in int32 (num_units <= 46340) the live ids are sorted once and each
-    candidate is binary-searched. Past that bound the id would wrap, so the
-    live edges are instead sorted lexicographically by `(src, dst)` with two
-    stable single-key sorts (each a radix sort on GPU, unlike a multi-operand
-    comparison sort) and each candidate runs a vectorized binary search on the
-    pair. Dead rows sort to the end under the `num_units` sentinel, which no
-    candidate id reaches. Cost is O((P + cap) log cap) either way.
+    Exact for every `num_units`: the live pair ids `src * num_units + dst`
+    are sorted once and each candidate is binary-searched. While the id fits
+    in int32 (num_units <= 46340) it is computed in int32; past that it would
+    wrap, so it is computed in uint64 under a scoped `jax.enable_x64` (still a
+    single-key radix sort on GPU, about 3x the int32 cost). Dead rows get an
+    id no candidate can have. Cost is O((P + cap) log cap).
 
     Args:
         from_id: The bucket's source column.
@@ -479,31 +477,20 @@ def live_pair_member(
         pos = jnp.minimum(jnp.searchsorted(sorted_live, cand_pair), last)
         hit: Bool[Array, " p"] = sorted_live[pos] == cand_pair
         return hit
-    src = jnp.where(dead, jnp.int32(num_units), src)
-    order = jnp.arange(cap, dtype=jnp.int32)
-    _, order = jax.lax.sort_key_val(dst, order, is_stable=True)
-    _, order = jax.lax.sort_key_val(src[order], order, is_stable=True)
-    s_src, s_dst = src[order], dst[order]
-    lo = jnp.zeros_like(cand_src)
-    hi = jnp.full_like(cand_src, cap)
-
-    def halve(
-        _: Int32[Array, ""], bounds: tuple[jax.Array, jax.Array]
-    ) -> tuple[jax.Array, jax.Array]:
-        # Lower-bound search: the first position whose pair is >= the candidate.
-        lo, hi = bounds
-        mid = (lo + hi) // 2
-        m = jnp.minimum(mid, last)
-        below = (s_src[m] < cand_src) | ((s_src[m] == cand_src) & (s_dst[m] < cand_dst))
-        active = lo < hi
-        return (
-            jnp.where(active & below, mid + 1, lo),
-            jnp.where(active & ~below, mid, hi),
+    # Past the bound, the same search on a uint64 pair id. x64 is enabled
+    # only while tracing these ops; nothing 64-bit escapes (the result is a
+    # bool mask), so the rest of the step keeps the default 32-bit types.
+    with jax.enable_x64(True):
+        n = jnp.uint64(num_units)
+        sentinel = jnp.uint64(num_units) * n  # above every real pair id
+        live_pair64 = jnp.where(
+            dead, sentinel, src.astype(jnp.uint64) * n + dst.astype(jnp.uint64)
         )
-
-    lo, _ = jax.lax.fori_loop(0, max(cap, 1).bit_length(), halve, (lo, hi))
-    pos = jnp.minimum(lo, last)
-    return (s_src[pos] == cand_src) & (s_dst[pos] == cand_dst)
+        sorted_live64 = jnp.sort(live_pair64)
+        cand_pair64 = cand_src.astype(jnp.uint64) * n + cand_dst.astype(jnp.uint64)
+        pos = jnp.minimum(jnp.searchsorted(sorted_live64, cand_pair64), last)
+        wide_hit: Bool[Array, " p"] = sorted_live64[pos] == cand_pair64
+    return wide_hit
 
 
 @dataclasses.dataclass(frozen=True)

@@ -652,6 +652,11 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   proposals; parallel edges allowed unless `dedupe = True`.
   `Network.add_conn` is now typed `AddConn | ProposeAddConn | None`: code
   that calls `net.add_conn.score` must narrow with isinstance first.
+- state/topo/builder: `NetworkStatic` gains `capacity_headroom` and
+  `capacity_align` (defaults 0.0 / None, the old policy); `capacity_policy`
+  gains `align`; the builders gain `capacity_align`. `topo.resort` now sizes
+  buckets with the recorded headroom instead of none, so a net built with
+  headroom keeps it across resorts.
 
 ## Handoff conventions
 

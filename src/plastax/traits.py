@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int32
 
 from plastax._types import (
     ACTIVATION,
@@ -267,6 +267,11 @@ class AddConn[GS](Protocol):
     of O(num_units^2). They are read structurally (getattr), so omitting them
     keeps the exhaustive grid; they are not part of the required protocol.
 
+    A candidate that is already a live edge is excluded (`dedupe`, read
+    structurally, defaults to True here), so this path never grows a parallel
+    edge. For growth whose cost follows the churn rather than the arena, see
+    `ProposeAddConn`.
+
     Type Args:
         GS: the global state type threaded through the network.
 
@@ -288,6 +293,79 @@ class AddConn[GS](Protocol):
 
         Returns:
             The candidate score.
+        """
+        ...
+
+    def init(self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS) -> ConnWrite:
+        """Initialize a new connection selected for growth.
+
+        Args:
+            u: the unit view.
+            src: index of the source unit.
+            dst: index of the destination unit.
+            g: the global state.
+
+        Returns:
+            The ConnWrite for the new edge.
+        """
+        ...
+
+
+@runtime_checkable
+class ProposeAddConn[GS](Protocol):
+    """Connection growth policy: K-bounded growth from sampled proposals.
+
+    The counterpart of `AddConn` whose cost follows the churn, not the arena.
+    Instead of scoring a candidate grid, the policy emits `num_proposals`
+    candidates itself, one per proposal index `j`: typically a few random
+    partners per unit (plastix's sampled `GrowFanout`), or k uniform draws. The
+    phase then routes each proposal to its source level's bucket, applies the
+    level window, and keeps each bucket's `max_candidates` best finite-scored
+    proposals, exactly as on the grid. A score of -inf vetoes a proposal.
+
+    **Duplicates.** By default nothing checks a proposal against the live
+    edges, so a proposal that repeats a live pair grows a *parallel edge* (the
+    network becomes a multigraph; parallel edges contribute independently, so
+    a weighted-sum forward sees their weights add). With random proposals at
+    density d, about a fraction d of proposals repeat a live pair. A policy
+    that must never grow a duplicate either proposes only absent pairs by
+    construction (the fast route) or sets `dedupe = True`, which checks every
+    proposal against its bucket's live edges and the step's other proposals at
+    O(capacity log capacity) per step.
+
+    **Seeding.** Proposals must vary between steps -- derive them from a
+    step-dependent value in the globals or unit state (a step counter, a
+    per-unit cursor). A proposal stream that depends only on structure that
+    in-place growth holds fixed (for example the live edge count) re-proposes
+    the same candidates every step.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        max_candidates: the maximum number of connections grown per bucket
+            per step.
+        num_proposals: how many proposals `propose` is called for each step,
+            a static int.
+    """
+
+    max_candidates: int
+    num_proposals: int
+
+    def propose(
+        self, u: UnitView, j: Int32[Array, ""], g: GS
+    ) -> tuple[Int32[Array, ""], Int32[Array, ""], Float[Array, ""]]:
+        """Emit proposal `j` of this step.
+
+        Args:
+            u: the unit view.
+            j: the proposal index, in [0, num_proposals).
+            g: the global state.
+
+        Returns:
+            `(src, dst, score)`: the proposed edge's unit ids and its priority
+            within its bucket. -inf vetoes it; ids outside [0, num_units)
+            are vetoed too.
         """
         ...
 
@@ -356,7 +434,7 @@ class Network[GS]:
     loss: Loss[GS] | None = None
     update_conn: UpdateConn[GS] | None = None
     prune_conn: PruneConn[GS] | None = None
-    add_conn: AddConn[GS] | None = None
+    add_conn: AddConn[GS] | ProposeAddConn[GS] | None = None
     reset_global: ResetGlobal[GS] | None = None
 
     extra_unit_fields: tuple[FieldSpec[np.generic], ...] = ()
@@ -493,10 +571,14 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.prune_conn must satisfy PruneConn; got {cls.prune_conn!r}"
         )
 
-    if cls.add_conn is not None and not isinstance(cls.add_conn, AddConn):
-        raise TypeError(
-            f"{cls.__name__}.add_conn must satisfy AddConn; got {cls.add_conn!r}"
-        )
+    if cls.add_conn is not None:
+        grid = isinstance(cls.add_conn, AddConn)
+        proposed = isinstance(cls.add_conn, ProposeAddConn)
+        if grid == proposed:
+            raise TypeError(
+                f"{cls.__name__}.add_conn must satisfy exactly one of AddConn "
+                f"(score) or ProposeAddConn (propose); got {cls.add_conn!r}"
+            )
 
     if cls.reset_global is not None and not isinstance(cls.reset_global, ResetGlobal):
         raise TypeError(

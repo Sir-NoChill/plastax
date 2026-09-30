@@ -31,7 +31,7 @@ from plastax.sweep import (
     identity_accumulator,
     unit_id_mask,
 )
-from plastax.traits import Network
+from plastax.traits import AddConn, Network, ProposeAddConn
 from plastax.views import ConnView, UnitView
 
 # PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
@@ -493,6 +493,39 @@ def live_pair_member(
     return wide_hit
 
 
+def repeats_earlier(
+    src: Int32[Array, " k"], dst: Int32[Array, " k"]
+) -> Bool[Array, " k"]:
+    """Mark each `(src, dst)` pair that also occurs at an earlier position.
+
+    Two stable single-key sorts (dst, then src) order the pairs
+    lexicographically while keeping equal pairs in their original order, so
+    in every run of equal pairs all but the first-positioned copy is marked.
+    O(k log k), for the (small) per-step top-k.
+
+    Args:
+        src: Source ids.
+        dst: Destination ids, parallel to `src`.
+
+    Returns:
+        True where the same pair occurs at a lower index.
+    """
+    order = jnp.arange(src.shape[0], dtype=jnp.int32)
+    _, order = jax.lax.sort_key_val(dst, order, is_stable=True)
+    _, order = jax.lax.sort_key_val(src[order], order, is_stable=True)
+    s_src, s_dst = src[order], dst[order]
+    same_as_prev = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.bool_),
+            (s_src[1:] == s_src[:-1]) & (s_dst[1:] == s_dst[:-1]),
+        ]
+    )
+    repeated: Bool[Array, " k"] = (
+        jnp.zeros_like(same_as_prev).at[order].set(same_as_prev)
+    )
+    return repeated
+
+
 @dataclasses.dataclass(frozen=True)
 class ShortlistCoverage:
     """How much of one bucket's destination population a shortlist can reach.
@@ -681,10 +714,21 @@ def build_add_conn_phase[GS](
     # hence topological only (pipeline keeps the global shortlist), and forward
     # only (its destinations are strictly deeper), matching how growth policies
     # veto non-deeper edges anyway.
+    # Proposal growth (ProposeAddConn) replaces the grid as the candidate
+    # source: the policy emits `num_proposals` (src, dst, score) triples and
+    # everything downstream -- routing, window, top_k, slot claim, init -- is
+    # shared with the grid path. The live-edge duplicate check defaults on for
+    # the grid and off for proposals (parallel edges allowed; see
+    # ProposeAddConn).
+    use_propose = isinstance(ac, ProposeAddConn)
+    dedupe = bool(getattr(ac, "dedupe", not use_propose))
+    num_proposals = ac.num_proposals if isinstance(ac, ProposeAddConn) else 0
+
     max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
     importance_fn = getattr(ac, "importance", None)
     use_shortlist = (
-        max_candidate_units is not None
+        not use_propose
+        and max_candidate_units is not None
         and importance_fn is not None
         and 0 < max_candidate_units < num_units
     )
@@ -697,7 +741,8 @@ def build_add_conn_phase[GS](
     assert pool_side is not None  # use_shortlist implies max_candidate_units set
     # Static (Python-int) candidate-pool bound: top_k requires k <= pool size,
     # and a small test network's pool can undercut a generous max_candidates.
-    k = max(0, min(ac.max_candidates, pool_side * pool_side))
+    pool = num_proposals if use_propose else pool_side * pool_side
+    k = max(0, min(ac.max_candidates, pool))
 
     unit_ids = jnp.arange(num_units, dtype=jnp.int32)
     # Full (src, dst) grid, built once when not shortlisting; the shortlisted
@@ -758,9 +803,33 @@ def build_add_conn_phase[GS](
         # top-M grid and goes unused, dead-code-eliminated -- never the
         # num_units^2 full grid.
         imp = importance_scores(u_view, g) if use_per_level else None
-        global_src, global_dst = candidate_grid(u_view, g)
+        if isinstance(ac, ProposeAddConn):
+            # The proposals are this step's global candidate list: computed
+            # once, filtered per bucket in the loop. An out-of-range id is
+            # vetoed and clamped to 0 so every gather below stays in bounds.
+            def propose_one(
+                j: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                s_, d_, score_ = ac.propose(u_view, j, g)
+                return (
+                    jnp.asarray(s_, jnp.int32),
+                    jnp.asarray(d_, jnp.int32),
+                    jnp.asarray(score_, jnp.float32),
+                )
+
+            p_src, p_dst, p_score = jax.vmap(propose_one)(
+                jnp.arange(num_proposals, dtype=jnp.int32)
+            )
+            in_range = (
+                (p_src >= 0) & (p_src < num_units) & (p_dst >= 0) & (p_dst < num_units)
+            )
+            global_src = jnp.where(in_range, p_src, jnp.int32(0))
+            global_dst = jnp.where(in_range, p_dst, jnp.int32(0))
+        else:
+            global_src, global_dst = candidate_grid(u_view, g)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
+            assert isinstance(ac, AddConn)  # the grid path only
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
             return jnp.where(ok, raw.astype(jnp.float32), jnp.float32(-jnp.inf))
 
@@ -770,6 +839,38 @@ def build_add_conn_phase[GS](
             # _apply_masked's UnitWrite handling in sweep.py.
             write = ac.init(u_view, UnitIdx(s), UnitIdx(d), g)
             return dict(write.fields)
+
+        def not_live_duplicate(
+            bucket_conns: Columns, cand_src: jax.Array, cand_dst: jax.Array
+        ) -> jax.Array:
+            """Candidates that are not already a live edge of this bucket.
+
+            A sort of the live pairs plus a binary search per candidate,
+            O((P + cap) * log cap) with no num_units**2 occupancy grid, so a
+            shortlisted or proposal phase stays free of any num_units**2 term.
+            """
+            not_duplicate = ~live_pair_member(
+                bucket_conns[FROM_ID.name],
+                bucket_conns[TO_ID.name],
+                bucket_conns[DEAD.name],
+                cand_src,
+                cand_dst,
+                num_units,
+            )
+            if shard_axis is None:
+                return not_duplicate
+            # Under Scheme-A the live edges are split across shards, so the
+            # binary search above only sees THIS shard's slice. A candidate
+            # already live on any other shard must count as a duplicate
+            # everywhere -- otherwise shards would score a different candidate
+            # set, top_k differently, and disagree on the global slot
+            # assignment below. All-reduce the local duplicate mask (pmax ==
+            # boolean OR) so valid/scores/top_k are identical on every shard.
+            dup_any = monoid.max_.collective(
+                (~not_duplicate).astype(jnp.int32), shard_axis
+            )
+            nowhere_live: jax.Array = dup_any == jnp.int32(0)
+            return nowhere_live
 
         new_conns: list[Columns] = []
         overflow = jnp.bool_(False)
@@ -791,35 +892,15 @@ def build_add_conn_phase[GS](
                 if is_pipeline
                 else src_level == bucket_idx
             )
-            # Exclude candidates already present as a live edge in this
-            # bucket, so growth never regrows an existing pair as a duplicate:
-            # a sort of the live pairs plus a binary search per candidate,
-            # O((P + cap) * log cap) with no num_units**2 occupancy grid, so a
-            # shortlisted phase stays free of any num_units**2 term.
-            not_duplicate = ~live_pair_member(
-                bucket_conns[FROM_ID.name],
-                bucket_conns[TO_ID.name],
-                bucket_conns[DEAD.name],
-                flat_src,
-                flat_dst,
-                num_units,
-            )
-            if shard_axis is not None:
-                # Under Scheme-A the live edges are split across shards, so the
-                # binary search above only sees THIS shard's slice. A candidate
-                # already live on any other shard must count as a duplicate
-                # everywhere -- otherwise shards would score a different
-                # candidate set, top_k differently, and disagree on the global
-                # slot assignment below. All-reduce the local duplicate mask
-                # (pmax == boolean OR) so valid/scores/top_k are identical on
-                # every shard.
-                dup_any = monoid.max_.collective(
-                    (~not_duplicate).astype(jnp.int32), shard_axis
-                )
-                not_duplicate = dup_any == jnp.int32(0)
-            valid = window_ok & src_ok & not_duplicate
-
-            flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
+            valid = window_ok & src_ok
+            if use_propose:
+                valid = valid & in_range
+            if dedupe:
+                valid = valid & not_live_duplicate(bucket_conns, flat_src, flat_dst)
+            if use_propose:
+                flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
+            else:
+                flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
             _, top_idx = jax.lax.top_k(flat_scores, k)
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
@@ -835,6 +916,12 @@ def build_add_conn_phase[GS](
             # vetoed edges, since top_k still surfaces them and `has_room`
             # alone would admit them.
             top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
+            if use_propose and dedupe:
+                # Proposals, unlike grid cells, can repeat within a step: keep
+                # the first (highest-ranked) copy of each pair. top_k returns
+                # scores descending, so a stable sort by pair keeps rank order
+                # within a run of equal pairs.
+                top_growable = top_growable & ~repeats_earlier(top_src, top_dst)
 
             # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
             # dead mask is this shard's capacity slice (size capacity_b //

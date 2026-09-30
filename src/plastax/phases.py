@@ -115,10 +115,11 @@ def _build_forward_phase[GS](
 ) -> Phase[GS]:
     if net.propagation is Propagation.PIPELINE:
         # level_capacities is a 1-tuple -- the single flat bucket is
-        # state.conns[0]. Not indices_are_sorted: the (dead, to_id) order the
-        # builder and resort leave is broken in place by the first prune
-        # (a tombstone's null target lands mid-array) or add (a new edge
-        # lands in any dead slot), and a violated hint is undefined in XLA.
+        # state.conns[0]. Not indices_are_sorted: buckets are laid out
+        # source-major (builder, resort), so TO_ID is not sorted, and in-place
+        # prune (a tombstone's null target) and add (a new edge in any dead
+        # slot) would break any order anyway; a violated hint is undefined
+        # in XLA.
         sweep = build_forward_sweep(
             net.forward_pass,
             num_units=static.num_units,
@@ -159,8 +160,7 @@ def _build_forward_topological_phase[GS](
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     fp = net.forward_pass
-    # Not indices_are_sorted, for the same reason as the pipeline forward: the
-    # per-bucket to_id order only holds until the first in-place prune or add.
+    # Not indices_are_sorted, for the same reason as the pipeline forward.
     accumulate = build_forward_accumulate(
         fp,
         num_units=num_units,
@@ -196,9 +196,8 @@ def _build_backward_phase[GS](
         # No level structure, one flat bucket, every unit Applied
         # unconditionally (build_backward_sweep takes no input_ids -- see
         # its docstring). indices_are_sorted=False: backward indexes
-        # segments by FROM_ID, but finalize sorts each bucket by (dead,
-        # TO_ID), so those indices are not sorted -- correct on CPU either
-        # way, honest for GPU/TPU, matching the topological backward.
+        # segments by FROM_ID, and although buckets start source-major,
+        # dead slots' null targets and in-place adds break that order.
         sweep = build_backward_sweep(
             bp,
             num_units=static.num_units,

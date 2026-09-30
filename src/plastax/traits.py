@@ -580,7 +580,8 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
                 f"(score) or ProposeAddConn (propose); got {cls.add_conn!r}"
             )
         if isinstance(cls.add_conn, ProposeAddConn) and not grid:
-            n = cls.add_conn.num_proposals
+            # Typed int, but a user attribute: check it really is one.
+            n: object = cls.add_conn.num_proposals
             if not isinstance(n, int) or isinstance(n, bool) or n < 1:
                 raise TypeError(
                     f"{cls.__name__}.add_conn.num_proposals must be an int >= 1; "

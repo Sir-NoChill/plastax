@@ -20,17 +20,20 @@ current dependency floor).
 
 The default `uv sync` installs the **CPU** jax wheel. For an NVIDIA GPU, add the
 `cuda12` extra (declared in `[project.optional-dependencies]`; `gpu` is an
-alias) so a CUDA-enabled jaxlib + plugin resolves instead:
+alias) so a CUDA-enabled jaxlib + plugin resolves instead, or `cuda13` for a
+CUDA-13 driver stack (the two extras are mutually exclusive):
 
 ```
 uv sync --extra cuda12                 # or: pip install "plastax[cuda12]"
+uv sync --extra cuda13                 # or: pip install "plastax[cuda13]"
 ```
 
 plastax itself is backend-agnostic pure Python — the extra only swaps the jax
 wheel. On a **shared** GPU, set `XLA_PYTHON_CLIENT_PREALLOCATE=false` so jax
 grabs only what it needs rather than pre-reserving ~75 % of VRAM. The
 dynamic-sparse CIFAR example (`examples/cifar_dst.py`) is the main GPU workload;
-validated with `jax[cuda12]==0.11.0` on an RTX 3060 Ti.
+validated with `jax[cuda12]==0.11.0` on an RTX 3060 Ti and with
+`jax[cuda13]==0.11.0` on an RTX 5000 Ada.
 
 ## Lint + format: ruff
 

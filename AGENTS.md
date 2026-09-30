@@ -95,7 +95,7 @@ These are design decisions already made. Violating one is a failed change
 | `shard.py` | `shard`* | Scheme-B band-partition math (`balanced_level_cut`). Pure numpy. (*commit under `topo`/`step` per SCOPES.md — `shard` has no dedicated scope; ask if unsure.) |
 | `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = an `UpdateConn` policy + per-connection `state_fields` (`opt/…` columns). |
 
-**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (33
+**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (40
 names). Breaking any of them is a `type(scope)!:` change with a
 `BREAKING CHANGE:` footer and an IMPLEMENTATION_PLAN.md Deviations entry.
 Names reachable only via submodule import (`plastax.topo.*`, `plastax.shard.*`,

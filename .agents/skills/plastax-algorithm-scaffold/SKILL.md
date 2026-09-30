@@ -109,6 +109,16 @@ class MyGrow:
     # max_candidate_units: int; def importance(self, u, i, g) -> Float[Array, ""]: ...
     # shortlist_per_level: bool = True
 
+# ProposeAddConn[GS]: growth from sampled proposals (cost follows the churn)
+class MyProposeGrow:
+    max_candidates: int = ...        # grown per bucket per step, at most
+    num_proposals: int = ...         # static; e.g. num_units * fanout
+    def propose(self, u, j, g) -> tuple[Int32, Int32, Float]: ...  # (src, dst, score)
+    def init(self, u, src, dst, g) -> ConnWrite: ...
+    # dedupe: bool = False  -> parallel edges allowed; True = exact check,
+    #   O(capacity log capacity) per step. Seed proposals from a step-dependent
+    #   value (step counter / per-unit cursor) or they repeat every step.
+
 # ResetGlobal[GS]
 class MyReset:
     def reset(self, g) -> GS: ...
@@ -140,7 +150,10 @@ Direction & ordering facts to get right:
   (e.g. `grad_pre_act`), and `prune_conn` sees `update_conn`'s fresh weights.
 - `UpdateConn` runs *all* incoming writes across every bucket before *any*
   outgoing pass, so the two sub-passes never race.
-- A `-inf` `AddConn.score` is a hard veto, distinct from a low finite score.
+- A `-inf` `AddConn.score` (or proposal score) is a hard veto, distinct from a
+  low finite score.
+- Grid growth never duplicates a live edge; proposal growth does unless
+  `dedupe = True`. Prefer proposals that are distinct by construction.
   For dynamic-sparse (SET/RigL), read `examples/dst_sparse.py`: SET and RigL are
   the same class differing only in `score` (random hash vs delta-rule gradient).
 

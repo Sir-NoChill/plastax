@@ -153,13 +153,21 @@ The policy Protocols:
 | `Loss[GS]` | `per_output(u,i,target,g)→(scalar, UnitWrite)` | output units |
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
-| `AddConn[GS]` | attr `max_candidates:int`; `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite` | grows edges |
+| `AddConn[GS]` | attr `max_candidates:int`; `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite` | grows edges (grid) |
+| `ProposeAddConn[GS]` | attrs `max_candidates:int`, `num_proposals:int`; `propose(u,j,g)→(src,dst,score)`, `init(...)→ConnWrite` | grows edges (proposals) |
 | `ResetGlobal[GS]` | `reset(g)→GS` | globals, between episodes |
 
 `AddConn` may *structurally* (via `getattr`, not in the Protocol) also declare
 `max_candidate_units:int` + `importance(u,i,g)→Float` to switch from the
 `O(num_units²)` full grid to an `O(num_units + M²)` shortlist, and
 `shortlist_per_level:bool` for a per-bucket grid.
+
+`ProposeAddConn` replaces the grid as the candidate source: `propose` is
+vmapped over `j in [0, num_proposals)` and everything downstream (routing to
+the source level's bucket, the window, top-k, slot claim, `init`) is shared.
+`add_conn` must satisfy exactly one of the two Protocols. Either may set
+`dedupe:bool` structurally (grid default True, proposals default False: the
+proposal path grows parallel edges unless asked not to).
 
 ### Assembly (`phases.py`)
 

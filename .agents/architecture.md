@@ -216,8 +216,9 @@ flags it returns — the **retrace protocol**:
 `topo.resort` (`topo.py:149`) recomputes levels (`recompute_levels`,
 Bellman-Ford relaxation bounded by `kahn_max_depth`), redistributes edges into
 new per-level buckets (prefix-sum compacting scatter + stable sort on
-`dead*num_units + to_id` to restore the `(dead, to_id)` order the segment
-reductions need), and sizes new capacities via `capacity_policy`. It returns a
+`dead*num_units + to_id` to restore the `(dead, to_id)` order -- live edges
+first, grouped by destination; in-place churn breaks it again, so no sweep
+relies on it), and sizes new capacities via `capacity_policy`. It returns a
 **new** `(static, state)` — the caller must retrace.
 
 ---

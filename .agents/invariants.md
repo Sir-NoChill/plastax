@@ -134,13 +134,18 @@ These follow from the above but are worth stating for anyone touching `topo`,
   level. Forward/backward bucket walks and `add_conn`'s `needs_resort` decision
   all depend on it. PIPELINE mode drops this (cycles allowed; levels cosmetic,
   1 bucket).
-- **Bucket ordering:** each bucket is sorted by `(dead, to_id)` so
-  `indices_are_sorted=True` holds for the segment reductions. `builder.finalize`
-  establishes it; `topo.resort` restores it after redistribution.
+- **Bucket ordering is not an invariant.** `builder.finalize` and
+  `topo.resort` leave each bucket sorted by `(dead, to_id)`, but in-place prune
+  and add break that order on the next step, so no segment reduction may pass
+  `indices_are_sorted=True` (a violated hint is undefined in XLA).
 - **Deletion never resorts. Level-preserving adds never resort.** `resort` runs
   only when `add_conn` set `needs_resort` (a non-level-preserving commit).
 - **`-inf` AddConn score is a hard veto** — never committed even with free
-  slots — distinct from a merely-low finite score.
+  slots — distinct from a merely-low finite score. The same holds for a
+  `ProposeAddConn` proposal's score.
+- **Duplicates:** the grid path (`AddConn`) never grows a copy of a live edge.
+  The proposal path (`ProposeAddConn`) does by default — parallel edges, each
+  contributing independently — unless the policy sets `dedupe = True`.
 - **Reserved field names** (`from_id`, `to_id`, `dead`, `weight`, `activation`,
   `level`) cannot be reused by `extra_unit_fields`/`extra_conn_fields`; enforced
   at subclass definition (`traits._validate_field_names`).

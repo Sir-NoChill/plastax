@@ -128,6 +128,7 @@ class NetworkBuilder[GS]:
         *,
         globals_: GS,
         capacity_headroom: float = 0.0,
+        capacity_align: int | None = None,
         sharding: ShardSpec | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Expand a plastax.topology spec into arenas.
@@ -142,6 +143,8 @@ class NetworkBuilder[GS]:
             globals_: The network's globals value.
             capacity_headroom: Extra dead-slot fraction to pre-allocate per
                 bucket (see from_edges); 0.0 sizes buckets to the live count.
+            capacity_align: Round bucket capacities up to a multiple of this
+                (see from_edges); None keeps the power-of-two rounding.
             sharding: Scheme-A ShardSpec to build a distributed state directly
                 (see from_edges), or None for a single-device state.
 
@@ -159,6 +162,7 @@ class NetworkBuilder[GS]:
             output_ids=spec.output_ids,
             globals_=globals_,
             capacity_headroom=capacity_headroom,
+            capacity_align=capacity_align,
             sharding=sharding,
         )
 
@@ -176,6 +180,7 @@ class NetworkBuilder[GS]:
         globals_: GS,
         extra_conn_columns: Mapping[str, np.ndarray] | None = None,
         capacity_headroom: float = 0.0,
+        capacity_align: int | None = None,
         sharding: ShardSpec | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Build arenas from whole edge-column arrays, no per-edge Python.
@@ -209,8 +214,15 @@ class NetworkBuilder[GS]:
             capacity_headroom: Extra dead-slot fraction to pre-allocate per
                 bucket above its live count (0.0 = size to live). Reserves
                 slots add_conn can grow into device-resident, cutting overflow
-                -> host grow_bucket rebuilds; capacity stays a power of two, so
-                Scheme-A divisibility holds. See topo.capacity_policy.
+                -> host grow_bucket rebuilds. See topo.capacity_policy.
+            capacity_align: None (default) rounds each capacity up to a power
+                of two, which can leave up to half a bucket empty. An int
+                rounds up to a multiple of it instead, so capacity tracks
+                ``live * (1 + capacity_headroom)`` closely (less memory, and
+                less bandwidth for the passes that stream every slot). Under
+                Scheme-A it must be a multiple of the shard count. The policy
+                is recorded in the static config, so grow_bucket and resort
+                size buckets the same way.
             sharding: Scheme-A ShardSpec to build a distributed state directly.
                 When set, each process materialises only its own capacity-axis
                 band per bucket and assembles a global ``jax.Array`` (conns
@@ -274,6 +286,7 @@ class NetworkBuilder[GS]:
             tuple(input_ids),
             tuple(output_ids),
             capacity_headroom=capacity_headroom,
+            capacity_align=capacity_align,
             sharding=sharding,
         )
 
@@ -334,7 +347,11 @@ class NetworkBuilder[GS]:
         self._output_ids.append(unit_id)
 
     def finalize(
-        self, *, capacity_headroom: float = 0.0, sharding: ShardSpec | None = None
+        self,
+        *,
+        capacity_headroom: float = 0.0,
+        capacity_align: int | None = None,
+        sharding: ShardSpec | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Freeze the accumulated units and connections into arenas.
 
@@ -348,6 +365,8 @@ class NetworkBuilder[GS]:
             capacity_headroom: Extra dead-slot fraction to pre-allocate per
                 bucket for device-resident growth (see from_edges); 0.0 sizes
                 each bucket to its live count.
+            capacity_align: Round bucket capacities up to a multiple of this
+                (see from_edges); None keeps the power-of-two rounding.
             sharding: Scheme-A ShardSpec to build a distributed state directly
                 (see from_edges), or None for a single-device state.
 
@@ -381,6 +400,7 @@ class NetworkBuilder[GS]:
             tuple(self._input_ids),
             tuple(self._output_ids),
             capacity_headroom=capacity_headroom,
+            capacity_align=capacity_align,
             sharding=sharding,
         )
 
@@ -395,6 +415,7 @@ class NetworkBuilder[GS]:
         output_ids: tuple[int, ...],
         *,
         capacity_headroom: float = 0.0,
+        capacity_align: int | None = None,
         sharding: ShardSpec | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Bucket, sort, and pad whole edge columns into frozen arenas.
@@ -423,6 +444,8 @@ class NetworkBuilder[GS]:
             output_ids: Output unit ids.
             capacity_headroom: Extra dead-slot fraction passed to
                 capacity_policy for each bucket (0.0 = size to live).
+            capacity_align: Capacity rounding passed to capacity_policy (None
+                = power of two).
             sharding: Scheme-A ShardSpec for per-shard distributed assembly, or
                 None to build a single-device state (falling back to
                 ``net.sharding``).
@@ -506,7 +529,9 @@ class NetworkBuilder[GS]:
             # edges the GPU forward+backward is 1.7x faster, the CPU 1.4x.
             order = idx[np.lexsort((dst_arr[idx], src_arr[idx]))]
             live = int(order.size)
-            capacity = topo.capacity_policy(live, headroom=capacity_headroom)
+            capacity = topo.capacity_policy(
+                live, headroom=capacity_headroom, align=capacity_align
+            )
 
             # Materialise only this process's addressable band when sharded, so
             # no process holds the whole padded column; the full [0, capacity)
@@ -562,6 +587,8 @@ class NetworkBuilder[GS]:
             input_ids=input_ids,
             output_ids=output_ids,
             sharding=effective,
+            capacity_headroom=capacity_headroom,
+            capacity_align=capacity_align,
         )
         state = NetworkState(
             units=unit_cols,

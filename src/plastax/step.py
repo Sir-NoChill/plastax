@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -20,6 +20,7 @@ from jaxtyping import Array, Bool, Float
 from plastax._types import ACTIVATION, Propagation
 from plastax.distributed import scheme_a_mesh
 from plastax.phases import (
+    Phase,
     StepInputs,
     batch_mean_units,
     build_batched_phases,
@@ -57,7 +58,11 @@ StepFn = Callable[[NetworkState[GS], StepInputs], StepResult[GS]]
 
 
 def make_step[GS](
-    net: type[Network[GS]], static: NetworkStatic, *, batch_size: int | None = None
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    *,
+    batch_size: int | None = None,
+    layout: Literal["auto", "edge_list", "csr"] = "auto",
 ) -> StepFn[GS]:
     """Assemble the present phases and jit them with donate_argnums=0.
 
@@ -74,6 +79,15 @@ def make_step[GS](
     batch-mean unit state, which is also what the returned state holds; and
     `StepResult.loss` is the batch mean.
 
+    `layout` picks how a batched step runs a *linear* forward or backward pass
+    (one declaring `linear_input`, see `phases.linear_input_field`):
+    "edge_list" runs it per sample over the edge arena; "csr" builds each
+    bucket's CSR view on device every step (one radix sort) and runs the
+    whole batch as one cuSPARSE sparse-dense product; "auto" picks "csr" for
+    `batch_size >= 16` on a GPU backend, where it measured faster (5.8x at
+    B = 128, slower at B = 8, on a 5.4M-edge net). Non-linear passes, and
+    every streaming step, use the edge list.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -81,6 +95,7 @@ def make_step[GS](
         net: The network subclass to assemble phases for.
         static: The network's static configuration.
         batch_size: Samples per step, or None for the streaming step.
+        layout: The batched linear-pass layout: "auto", "edge_list", or "csr".
 
     Returns:
         A jitted step function for the given network and static config.
@@ -97,12 +112,18 @@ def make_step[GS](
                 "make_step: batch_size is for TOPOLOGICAL (feed-forward) nets; a "
                 "PIPELINE net carries per-sample recurrent state between steps"
             )
+    if layout not in ("auto", "edge_list", "csr"):
+        raise ValueError(f"make_step: unknown layout {layout!r}")
+    csr = batch_size is not None and (
+        layout == "csr"
+        or (layout == "auto" and batch_size >= 16 and jax.default_backend() == "gpu")
+    )
     # mypy false positive: a parameterized generic base class fails the
     # structural Hashable check, though a class is always hashable by
     # identity; hence the cast.
     return cast(
         StepFn[GS],
-        _cached_make_step(net, static, batch_size),  # type: ignore[arg-type]
+        _cached_make_step(net, static, batch_size, csr),  # type: ignore[arg-type]
     )
 
 
@@ -169,33 +190,50 @@ def _batched_step(
     static: NetworkStatic,
     overflow_sink: list[Bool[Array, ""]],
     input_ids: jax.Array,
+    batch_size: int,
+    csr: bool,
 ) -> StepFn[Any]:
-    """The jitted batched step (see `make_step`'s `batch_size`)."""
-    phases = build_batched_phases(net, static, overflow_sink=overflow_sink)
+    """The jitted batched step (see `make_step`'s `batch_size` and `layout`)."""
+    phases = build_batched_phases(net, static, overflow_sink=overflow_sink, csr=csr)
 
-    def one_sample(
-        state: NetworkState[Any], x: jax.Array, target: jax.Array | None
+    def per_sample(
+        phase: Phase[Any],
+        state: NetworkState[Any],
+        units_b: Any,
+        inputs: StepInputs,
     ) -> tuple[Any, jax.Array]:
-        activation = state.units[ACTIVATION.name].at[input_ids].set(x)
-        state = dataclasses.replace(
-            state, units={**state.units, ACTIVATION.name: activation}
-        )
-        inputs = StepInputs(inputs=x, targets=target)
-        total_loss = jnp.float32(0.0)
-        for phase in phases.per_sample:
-            state, contribution = phase(state, inputs)
-            total_loss = total_loss + contribution
-        return state.units, total_loss
+        def one(units: Any, x: jax.Array, t: jax.Array | None) -> tuple[Any, jax.Array]:
+            out, contribution = phase(
+                dataclasses.replace(state, units=units), StepInputs(inputs=x, targets=t)
+            )
+            return out.units, contribution
+
+        if inputs.targets is None:
+            return jax.vmap(lambda u, x: one(u, x, None))(units_b, inputs.inputs)
+        return jax.vmap(one)(units_b, inputs.inputs, inputs.targets)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
-        if inputs.targets is None:
-            units_b, losses = jax.vmap(lambda x: one_sample(state, x, None), in_axes=0)(
-                inputs.inputs
-            )
+        units_b = {
+            name: jnp.broadcast_to(col, (batch_size, *col.shape))
+            for name, col in state.units.items()
+        }
+        units_b[ACTIVATION.name] = (
+            units_b[ACTIVATION.name].at[:, input_ids].set(inputs.inputs)
+        )
+        losses = jnp.zeros((batch_size,), jnp.float32)
+        if phases.csr_forward is not None:
+            units_b = phases.csr_forward(state, units_b)
         else:
-            units_b, losses = jax.vmap(
-                lambda x, t: one_sample(state, x, t), in_axes=(0, 0)
-            )(inputs.inputs, inputs.targets)
+            units_b, c = per_sample(phases.forward, state, units_b, inputs)
+            losses = losses + c
+        if phases.loss is not None:
+            units_b, c = per_sample(phases.loss, state, units_b, inputs)
+            losses = losses + c
+        if phases.csr_backward is not None:
+            units_b = phases.csr_backward(state, units_b)
+        elif phases.backward is not None:
+            units_b, c = per_sample(phases.backward, state, units_b, inputs)
+            losses = losses + c
         if phases.update_conn is not None:
             state = phases.update_conn(state, units_b)
         state = dataclasses.replace(state, units=batch_mean_units(units_b))
@@ -204,7 +242,32 @@ def _batched_step(
         return StepResult(state=state, overflow=overflow_sink[0], loss=losses.mean())
 
     traced = step if static.sharding is None else _shard_map_step(step, static)
-    return cast(StepFn[Any], jax.jit(traced, donate_argnums=0))
+    jitted = cast(StepFn[Any], jax.jit(traced, donate_argnums=0))
+    if not csr:
+        return jitted
+    return _with_cusparse(jitted)
+
+
+def _with_cusparse(fn: StepFn[Any]) -> StepFn[Any]:
+    """Run `fn` with jax.experimental.sparse lowering to cuSPARSE.
+
+    The switch is a global jax config flag read at lowering time (off by
+    default, when BCSR products fall back to generic kernels 30-80x slower);
+    it is scoped to this step's calls so nothing else in the process changes.
+    If the private config handle moves in a future jax, the step still runs,
+    on the default lowering.
+    """
+    try:
+        from jax._src.config import bcoo_cusparse_lowering
+    except ImportError:  # pragma: no cover - depends on the jax version
+        return fn
+
+    @functools.wraps(fn)
+    def call(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        with bcoo_cusparse_lowering(True):
+            return fn(state, inputs)
+
+    return call
 
 
 # jax.util.weakref_lru_cache is not cleanly importable off the pinned jax
@@ -214,7 +277,10 @@ def _batched_step(
 # process-lifetime pairs.
 @functools.cache
 def _cached_make_step(
-    net: type[Network[Any]], static: NetworkStatic, batch_size: int | None = None
+    net: type[Network[Any]],
+    static: NetworkStatic,
+    batch_size: int | None = None,
+    csr: bool = False,
 ) -> StepFn[Any]:
     # overflow_sink (see build_phases): a length-1 out-parameter
     # build_add_conn_phase (when net.add_conn is set) overwrites on every
@@ -225,7 +291,7 @@ def _cached_make_step(
     overflow_sink: list[Bool[Array, ""]] = [jnp.bool_(False)]
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
     if batch_size is not None:
-        return _batched_step(net, static, overflow_sink, input_ids)
+        return _batched_step(net, static, overflow_sink, input_ids, batch_size, csr)
     phases = build_phases(net, static, overflow_sink=overflow_sink)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:

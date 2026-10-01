@@ -368,13 +368,22 @@ Design (drafted in iteration 3):
 
 ### P6: Pallas kernel (extension avenue)
 
-- [ ] 6.1 Spike: a Pallas GPU (Triton) kernel for the edge-list forward.
+- [x] 6.1 Spike (iteration 3): a Pallas GPU (Triton) kernel for the
+  edge-list forward.
   - The user's per-edge `map` is traced inside the kernel, combined with a
     named monoid via atomics, over one bucket.
   - Measure it against XLA `segment_sum`.
-- [ ] 6.2 If it wins: an edge-once batched variant (each edge read once, all B
-  samples).
-- [ ] 6.3 Place it as an opt-in backend next to CSR.
+- [x] 6.2 (09fd6d4) The edge-once batched variant, as `layout="pallas"` for
+  linear passes.
+  - At 5.4M edges: 2.4× the edge list at B = 8, 2.7× at 16, and a tie with
+    CSR at 32.
+  - At 50M edges it beats CSR at 32.
+- [x] 6.3 It is an opt-in backend next to CSR. "auto" uses it for
+  2 ≤ B ≤ 32. Under Scheme-A it falls back to CSR (fc2cefb).
+- [ ] 6.4 A generic-map Pallas kernel. Trace the user's `map` inside the
+  kernel with a kernel-side `UnitView`/`ConnView` that gathers from refs.
+  This lifts the linear-only restriction, and is the real extension avenue.
+- [ ] 6.5 SDDMM for the batched update's per-sample gradient (P5.5).
 
 ### P7: parity and write-up
 
@@ -397,6 +406,12 @@ the log below:
    put anything the user should weigh under "Surfaced for review".
 
 ## 6. Surfaced for review
+
+- **Pallas + `shard_map`:** jax 0.11.2's interpret-mode Pallas fails the
+  varying-manual-axes check inside `shard_map` (jax suggests reporting it).
+  - Real multi-GPU Pallas under Scheme-A is untested; there is one GPU here.
+  - Sharded steps use CSR instead.
+  - Worth a jax issue, or a check on a multi-GPU node (Narval).
 
 - **plastax now roughly matches the hand-written C++ in-place path** (within
   6-10% from 5.4M to 300M edges) at 6.6× less GPU memory. It is 4.8× faster
@@ -607,6 +622,32 @@ the log below:
   - (a) an edge-once batched kernel for *any* map, covering B in 2..16 where
     CSR loses and non-linear maps CSR cannot run;
   - (b) the update's SDDMM.
+
+### Iteration 7 (2026-10-01): P6, the Pallas layout
+
+- **Build:** 09fd6d4 (the Pallas engine plus `layout="pallas"`, with "auto"
+  re-tuned), fc2cefb (sharded fallback), 430bd9f. 304 fast tests.
+- **Explore:** batched SGD training, ms per sample (edge list / Pallas / CSR):
+
+  | edges | B | edge list | Pallas | CSR |
+  |---|---|---|---|---|
+  | 5.4M | 2 | 0.440 | 0.386 | 1.204 |
+  | 5.4M | 8 | 0.350 | 0.148 | 0.352 |
+  | 5.4M | 16 | 0.318 | 0.116 | 0.206 |
+  | 5.4M | 32 | 0.294 | 0.131 | 0.128 |
+  | 5.4M | 64 | | 0.156 | 0.090 |
+  | 5.4M | 128 | | 0.489 | 0.077 |
+  | 50M | 8 | 4.36 | 2.49 | 7.64 |
+  | 50M | 32 | 3.94 | 2.35 | 3.16 |
+
+  - At B = 128 Pallas falls off: E·B atomics dominate.
+  - GPU weights match the edge list to 1.5e-8.
+  - Pallas interpret mode inside `shard_map` fails jax's varying-axes check;
+    this is surfaced.
+- **Plan.**
+  - Remaining work: P6.4 (generic-map Pallas), P6.5 / P5.5 (SDDMM update),
+    P2.7 (host build memory), and P1.5 / P7 (DeepR and synth-bench parity).
+  - Next: P2.7, so the 600M+ evidence becomes possible, then P7.
 
 ## Deviations
 

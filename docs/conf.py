@@ -40,4 +40,4 @@ intersphinx_mapping = {
 
 html_theme = "furo"
 
-exclude_patterns = ["_build", "internal", "parallel_mnist_plan.md"]
+exclude_patterns = ["_build", "internal", "parallel_mnist_plan.md", "scale_plan"]

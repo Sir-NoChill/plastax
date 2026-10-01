@@ -91,7 +91,8 @@ def make_step[GS](
     edges Pallas is 2.4x the edge list at B = 8 and ties CSR at 32, while CSR
     is 6x Pallas at 128; at 50M edges Pallas still beats CSR at 32, whose
     per-step sort then dominates), else the edge list. Non-linear passes,
-    and every streaming step, use the edge list.
+    and every streaming step, use the edge list. Under Scheme-A sharding,
+    "pallas" falls back to "csr".
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -129,6 +130,10 @@ def make_step[GS](
             engine = "csr"
         elif layout == "pallas":
             engine = "pallas" if gpu else "pallas_interpret"
+        # The Pallas kernel is not yet validated inside shard_map (interpret
+        # mode trips jax's varying-axes check there); sharded steps use CSR.
+        if engine in ("pallas", "pallas_interpret") and static.sharding is not None:
+            engine = "csr"
     # mypy false positive: a parameterized generic base class fails the
     # structural Hashable check, though a class is always hashable by
     # identity; hence the cast.

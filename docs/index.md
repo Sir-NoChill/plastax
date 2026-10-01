@@ -20,7 +20,10 @@ pip install plastax
 
 The default install pulls the CPU wheel of JAX. For accelerators, install
 the matching JAX distribution yourself (for instance `pip install
-"jax[cuda12]"`); plastax is backend-agnostic pure Python.
+"jax[cuda12]"`); plastax is backend-agnostic pure Python. Optional extras:
+`plastax[cuda12]` / `plastax[cuda13]` (the CUDA jaxlib), `plastax[triton]`
+(the batched Triton kernel on NVIDIA GPUs, via jax-triton) and
+`plastax[tpu]` (libtpu).
 
 ```{toctree}
 :maxdepth: 1
@@ -28,4 +31,5 @@ the matching JAX distribution yourself (for instance `pip install
 
 optimizers
 api
+changelog
 ```

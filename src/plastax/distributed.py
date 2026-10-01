@@ -156,8 +156,9 @@ def distribute_state[GS](
 
     Args:
         static: static config carrying the ShardSpec; its `level_capacities`
-            must each be divisible by the shard count (Scheme-A capacities are
-            powers of two, so this holds for shard counts in {1, 2, 4, ...}).
+            must each be divisible by the shard count (power-of-two capacities
+            are for power-of-two shard counts; an aligned policy needs
+            `capacity_align` to be a multiple of the shard count).
         state: host-built network state, identical across processes.
 
     Returns:

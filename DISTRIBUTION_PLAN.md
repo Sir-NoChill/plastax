@@ -204,6 +204,18 @@ phase-item cluster, e.g. `build(packaging): dynamic version via hatch-vcs`,
   exercisable now. `fail_on_warning` is temporarily `false` until Phase 3
   replaces the placeholder API page; P3.4 flips it. The CI docs job (P3.5)
   and `sphinx-build -W` acceptance remain outstanding.
+- 2026-10-01 (P1.5 reversed: passthrough extras kept). `cuda12`, `gpu`
+  (alias), `cuda13` and `tpu` stay as thin passthroughs to JAX's extras, and
+  `triton` (jax-triton, plastax's own optional kernel dependency) is added.
+  Rationale: without a CUDA jaxlib JAX silently falls back to CPU, so the
+  documentation-only route turns a missed install step into an invisible
+  slowdown. The accelerator-only paths (cuSPARSE CSR, the Triton kernel,
+  libtpu AOT) also need these wheels. Mitigation for the churn risk P1.5
+  named: each extra documents the JAX version it was validated with
+  (`docs/installation.md`), RELEASING.md re-checks that every extra still
+  resolves before a release, and an extra whose JAX name disappears is
+  removed rather than left stale. P1.5's "record the rationale on the
+  installation page" is done, with the opposite conclusion.
 - 2026-08-21 (RTD install method): docs deps install via
   `pip install --group docs .` (pip >= 25.1 PEP 735 support) rather than a
   uv-on-RTD setup -- fewer moving parts on the builder image. Revisit if

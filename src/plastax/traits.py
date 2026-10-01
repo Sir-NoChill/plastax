@@ -177,8 +177,10 @@ class UpdateConn[GS](Protocol):
     """Connection update policy: two full passes, incoming then outgoing.
 
     Under a batched step (`make_step(..., batch_size=B)`) the update is reduced
-    over the batch. By default each sample's writes are averaged (exact for
-    rules linear in the per-sample term, e.g. SGD). A policy may instead
+    over the batch. By default each sample's change to every floating
+    connection column is averaged (exact for rules linear in the per-sample
+    term, e.g. SGD; unwritten columns stay untouched), and a non-floating
+    column takes sample 0's write. A policy may instead
     declare, structurally (read with getattr, not part of this Protocol), the
     exact pair: `per_sample(u, dst, src, c, cid, g) -> pytree`, evaluated per
     sample and averaged over the batch, and `incoming_batched(u, dst, src, c,

@@ -173,8 +173,8 @@ def test_prefix_sum_slot_claim_lands_new_edges_in_the_bucket_dead_slots() -> Non
     to_id = np.asarray(bucket[px.TO_ID.name])
     weight = np.asarray(bucket[px.WEIGHT.name])
 
-    # Positions 0-4 held the 5 pre-existing ANCHOR edges (builder-sorted by
-    # to_id, IMPLEMENTATION_PLAN.md [D:3]) and must be untouched by the add.
+    # Positions 0-4 held the 5 pre-existing ANCHOR edges (builder source-major
+    # order, so with one source by to_id) and must be untouched by the add.
     np.testing.assert_array_equal(from_id[:5], np.full(5, _ANCHOR))
     np.testing.assert_array_equal(to_id[:5], np.array(_DST))
     np.testing.assert_allclose(weight[:5], np.array(_ANCHOR_WEIGHTS))
@@ -436,3 +436,229 @@ def test_add_conn_candidate_shortlist_restricts_growth_to_top_m_units() -> None:
     new_edges = set(live) - {(_ANCHOR, dst) for dst in _DST}
     assert new_edges == {(_SRC, 6)}
     assert len(live) == len(set(live))
+
+
+class _DeeperOnlyAddConn(px.AddConn[None]):
+    """Scores deeper candidates finite and vetoes every non-deeper candidate
+    with -inf. max_candidates (10) exceeds the number of deeper candidates
+    (5: SRC -> each DST), and the bucket has many free dead slots, so the veto
+    is the only thing keeping growth to deeper edges: without it, top_k would
+    back-fill the surplus slots with the -inf-scored same-level candidates it
+    surfaces once the finite ones run out (setting needs_resort)."""
+
+    max_candidates = 10
+
+    def score(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> jax.Array:
+        del g
+        deeper = u[px.LEVEL, dst] > u[px.LEVEL, src]
+        return jnp.where(deeper, jnp.float32(1.0), -jnp.inf)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+class _DeeperOnlyNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _DeeperOnlyAddConn()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def test_veto_score_is_never_committed_even_with_free_slots() -> None:
+    static, state = _build_net(_DeeperOnlyNet)
+    state = _with_marker_activations(state)
+
+    phase = phases.build_add_conn_phase(_DeeperOnlyNet, static)
+    new_state, _ = phase(state, _DUMMY_INPUTS)
+
+    bucket = new_state.conns[0]
+    dead = np.asarray(bucket[px.DEAD.name])
+    from_id = np.asarray(bucket[px.FROM_ID.name])
+    to_id = np.asarray(bucket[px.TO_ID.name])
+    live = {
+        (int(f), int(t)) for f, t, d in zip(from_id, to_id, dead, strict=True) if not d
+    }
+    new_edges = live - {(_ANCHOR, dst) for dst in _DST}
+
+    # Only the deeper (SRC, dst) edges grow; the vetoed (-inf) non-deeper
+    # candidates are never committed, even though free dead slots remain and
+    # max_candidates leaves room for them.
+    assert new_edges == {(_SRC, dst) for dst in _DST}
+    # No non-deeper edge was back-filled, so leveling is preserved.
+    assert bool(new_state.needs_resort) is False
+
+
+# ids for a 3-level net: two inputs, two hidden, two outputs.
+_IN, _HID, _OUT = (0, 1), (2, 3), (4, 5)
+
+
+def _build_3level(
+    net: type[px.Network[None]],
+) -> tuple[px.NetworkStatic, px.NetworkState[None]]:
+    """A→H0, B→H1, H0→O0, H1→O1: three levels, two source-level buckets."""
+    builder = px.NetworkBuilder(net, None)
+    for _ in range(6):
+        builder.add_unit()
+    for i in _IN:
+        builder.mark_input(i)
+    for o in _OUT:
+        builder.mark_output(o)
+    builder.add_conn(_IN[0], _HID[0], weight=1.0)
+    builder.add_conn(_IN[1], _HID[1], weight=1.0)
+    builder.add_conn(_HID[0], _OUT[0], weight=1.0)
+    builder.add_conn(_HID[1], _OUT[1], weight=1.0)
+    return builder.finalize()
+
+
+class _DeepestImportanceGrow(px.AddConn[None]):
+    """Importance favours the deepest level, so a GLOBAL top-M (M=2) shortlist
+    fills with the two output units -- among which no deeper edge exists -- and
+    the shallow input->hidden transition grows nothing. score grows any deeper
+    candidate; init tags it. Subclasses only toggle `shortlist_per_level`."""
+
+    max_candidates = 4
+    max_candidate_units = 2
+
+    def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
+        del g
+        return jnp.where(
+            u[px.LEVEL, i] == jnp.int32(2), jnp.float32(10.0), jnp.float32(1.0)
+        )
+
+    def score(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> jax.Array:
+        del g
+        deeper = u[px.LEVEL, dst] > u[px.LEVEL, src]
+        return jnp.where(deeper, jnp.float32(1.0), -jnp.inf)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
+
+
+class _GlobalShortlistNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _DeepestImportanceGrow()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+class _PerLevelGrow(_DeepestImportanceGrow):
+    shortlist_per_level = True
+
+
+class _PerLevelShortlistNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _PerLevelGrow()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def _bucket0_new_edges(
+    net: type[px.Network[None]],
+) -> set[tuple[int, int]]:
+    static, state = _build_3level(net)
+    phase = phases.build_add_conn_phase(net, static)
+    new_state, _ = phase(state, _DUMMY_INPUTS)
+    bucket = new_state.conns[0]  # source-level-0 edges: the input->hidden transition
+    dead = np.asarray(bucket[px.DEAD.name])
+    frm = np.asarray(bucket[px.FROM_ID.name])
+    to = np.asarray(bucket[px.TO_ID.name])
+    live = {(int(f), int(t)) for f, t, d in zip(frm, to, dead, strict=True) if not d}
+    return live - {(_IN[0], _HID[0]), (_IN[1], _HID[1])}  # minus the two seeds
+
+
+def test_per_level_shortlist_serves_a_transition_the_global_starves() -> None:
+    # Importance concentrates the global top-M on the two output units, so the
+    # input->hidden bucket sees no shortlisted source and grows nothing.
+    assert _bucket0_new_edges(_GlobalShortlistNet) == set()
+    # Per-level draws that bucket its own (top-M level-0 sources x top-M level-1
+    # destinations) grid, so the shallow transition grows the two cross edges.
+    assert _bucket0_new_edges(_PerLevelShortlistNet) == {
+        (_IN[0], _HID[1]),
+        (_IN[1], _HID[0]),
+    }
+
+
+# Wide-id regression: past 46340 units the int32 pair id `src * n + dst` wraps.
+# With n = 70000, (61357, 0) and (0, 22704) share the wrapped id 22704
+# (61357 * 70000 = 2**32 + 22704), so a pair-id search reported the absent
+# (61357, 0) as already live and silently dropped it.
+_WIDE_UNITS = 70_000
+
+
+def test_live_pair_member_is_exact_past_the_int32_pair_id_bound() -> None:
+    from_id = jnp.asarray([0, 5, 9], dtype=jnp.int32)
+    to_id = jnp.asarray([22704, 6, 9], dtype=jnp.int32)
+    dead = jnp.asarray([False, False, True])
+    cand_src = jnp.asarray([61357, 0, 5, 9, 69999], dtype=jnp.int32)
+    cand_dst = jnp.asarray([0, 22704, 6, 9, 69999], dtype=jnp.int32)
+
+    member = phases.live_pair_member(
+        from_id, to_id, dead, cand_src, cand_dst, _WIDE_UNITS
+    )
+
+    # The colliding pair is absent; the live pairs are found; a dead row is not
+    # live; the maximal id pair is absent.
+    assert np.asarray(member).tolist() == [False, True, True, False, False]
+
+
+def test_live_pair_member_matches_a_set_oracle_on_both_id_paths() -> None:
+    rng = np.random.default_rng(3)
+    for num_units in (1_000, 200_000):
+        cap, num_cand = 512, 256
+        src = rng.integers(0, num_units, cap).astype(np.int32)
+        dst = rng.integers(0, num_units, cap).astype(np.int32)
+        dead = rng.random(cap) < 0.3
+        live = {
+            (int(s), int(d)) for s, d, x in zip(src, dst, dead, strict=True) if not x
+        }
+        # Half the candidates are drawn from the bucket (live or dead), half fresh.
+        pick = rng.integers(0, cap, num_cand // 2)
+        c_src = np.concatenate(
+            [src[pick], rng.integers(0, num_units, num_cand // 2)]
+        ).astype(np.int32)
+        c_dst = np.concatenate(
+            [dst[pick], rng.integers(0, num_units, num_cand // 2)]
+        ).astype(np.int32)
+
+        member = phases.live_pair_member(
+            jnp.asarray(src),
+            jnp.asarray(dst),
+            jnp.asarray(dead),
+            jnp.asarray(c_src),
+            jnp.asarray(c_dst),
+            num_units,
+        )
+
+        want = [(int(s), int(d)) in live for s, d in zip(c_src, c_dst, strict=True)]
+        assert np.asarray(member).tolist() == want, num_units
+
+
+def test_two_level_free_slot_search_matches_a_numpy_oracle() -> None:
+    rng = np.random.default_rng(5)
+    # 4096 / 1536 / 3136 take the plain-reshape path (blocks 1024 / 512 / 64);
+    # 1030 and 97 have no power-of-two block >= 64 and take the padded path.
+    for cap in (4096, 1536, 3136, 1030, 97):
+        for rate in (0.002, 0.3, 0.99):
+            dead = rng.random(cap) < rate
+            if cap >= 2048:
+                dead[:1024] = False  # a whole block with no free slot
+                dead[-1] = True  # the last slot is free: rank == total - 1
+            free = np.flatnonzero(dead)
+            if free.size == 0:
+                continue
+            ranks = np.arange(free.size, dtype=np.int32)  # every rank
+            blocks, block = phases.count_free_blocks(jnp.asarray(dead))
+            assert int(blocks[-1]) == free.size
+            got = phases.nth_free_slot(
+                jnp.asarray(dead), blocks, block, jnp.asarray(ranks)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(got), free, err_msg=f"cap={cap} rate={rate}"
+            )

@@ -205,3 +205,58 @@ def test_optimizer_matches_optax_on_mnist(
     xs = images[:n_steps]
     ys = np.asarray(jax.nn.one_hot(ytr[:n_steps], 10))
     _assert_parity(make_plastax, optax_opt, sizes, weights, xs, ys)
+
+
+BATCH = 8
+BATCH_STEPS = 20
+
+
+@pytest.mark.parametrize(("make_plastax", "optax_opt"), _PARAMS, ids=_IDS)
+def test_batched_optimizer_matches_optax_on_the_mean_loss(
+    make_plastax: OptFactory, optax_opt: optax.GradientTransformation
+) -> None:
+    """make_step(batch_size=B): one optimizer step on the batch-mean gradient.
+
+    The optax side minimises the batch-mean loss, so its gradient is the mean
+    of the per-sample gradients -- what the bundles' per_sample /
+    incoming_batched pair computes. Adam and RMSprop are nonlinear in the
+    gradient, so this also pins that the exact path (not mean-of-writes) ran.
+    """
+    rng = np.random.default_rng(1)
+    sizes = [12, 6, 4]
+    weights = _glorot(sizes, rng)
+    xs = (rng.standard_normal((BATCH_STEPS, BATCH, sizes[0])) * 0.5).astype(np.float32)
+    labels = rng.integers(0, sizes[-1], size=(BATCH_STEPS, BATCH))
+    ys = np.asarray(jax.nn.one_hot(labels, sizes[-1]))
+
+    cls, static, state = _build_plastax(
+        make_plastax(mlp_xor.GradPreAct), sizes, weights
+    )
+    step = px.make_step(cls, static, batch_size=BATCH)
+    params = [jnp.asarray(w) for w in weights]
+    opt_state = optax_opt.init(params)
+
+    def loss_fn(p: list[jax.Array], x: jax.Array, y: jax.Array) -> jax.Array:
+        a = x
+        for w in p:
+            a = jax.nn.sigmoid(a @ w)
+        return jnp.mean(0.5 * jnp.sum((a - y) ** 2, axis=-1))
+
+    @jax.jit
+    def jax_step(
+        p: list[jax.Array], os: optax.OptState, x: jax.Array, y: jax.Array
+    ) -> tuple[list[jax.Array], optax.OptState, jax.Array]:
+        loss, grad = jax.value_and_grad(loss_fn)(p, x, y)
+        updates, os = optax_opt.update(grad, os, p)
+        return optax.apply_updates(p, updates), os, loss
+
+    for x, y in zip(xs, ys, strict=True):
+        xj, yj = jnp.asarray(x), jnp.asarray(y)
+        result = step(state, px.StepInputs(inputs=xj, targets=yj))
+        state = result.state
+        params, opt_state, jax_loss = jax_step(params, opt_state, xj, yj)
+        np.testing.assert_allclose(
+            float(result.loss), float(jax_loss), rtol=RTOL, atol=ATOL
+        )
+    for got, want in zip(_plastax_weights(state, sizes), params, strict=True):
+        np.testing.assert_allclose(got, np.asarray(want), rtol=RTOL, atol=ATOL)

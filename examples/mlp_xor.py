@@ -52,6 +52,9 @@ class SigmoidForward(px.ForwardPass):
     SigmoidForwardPass)."""
 
     combine = px.monoid.sum_
+    # map is exactly WEIGHT * activation[src]: the CSR layout may run it as a
+    # sparse product (make_step's layout).
+    linear_input = px.ACTIVATION
 
     def map(
         self,
@@ -88,17 +91,19 @@ class SigmoidBackward(px.BackwardPass):
     """
 
     combine = px.monoid.sum_
+    # map is exactly WEIGHT * grad_pre_act[dst] (see make_step's layout).
+    linear_input = GradPreAct
 
     def map(
         self,
         u: px.UnitView,
-        dst: px.UnitIdx,
         src: px.UnitIdx,
+        dst: px.UnitIdx,
         c: px.ConnView,
         cid: px.ConnIdx,
         g: None,
     ) -> jnp.ndarray:
-        return c[px.WEIGHT, cid] * u[GradPreAct, src]
+        return c[px.WEIGHT, cid] * u[GradPreAct, dst]
 
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray

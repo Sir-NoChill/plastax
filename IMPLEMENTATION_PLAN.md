@@ -7,9 +7,9 @@ rename or restructure without recording the deviation (see "Deviations").
 
 ## Required reading, in order
 
-1. `../plastix-jax-rung0-design.md` — the design this package implements.
+1. `../docs/design/plastix-jax-rung0-design.md` — the design this package implements.
    Sections are cited below as [D:n].
-2. `../plastix-jax-lowering-analysis.md` — wider context (rung ladder);
+2. `../docs/design/plastix-jax-lowering-analysis.md` — wider context (rung ladder);
    v1 is "rung 0" only, but phase bodies must remain separately traced
    functions so rung 1 composite wrapping stays a local change [D:7].
 3. C++ semantics oracle, local clone at `../plastix`:
@@ -177,6 +177,70 @@ Tooling / infrastructure (2026-08-17, scaffolding handoff):
   globally (jaxtyping shape strings read as forward refs to ruff only).
 - repo: no repo-local commit wrapper — contributors attribute and sign with
   their own agents (per user, review 2026-08-17).
+
+Tooling / infrastructure (2026-08-29, jax floor widening):
+
+- pyproject (packaging): `jax>=0.11.0` -> `jax>=0.10.2` (and the `cuda12`
+  extra likewise). plastax uses only APIs stable at 0.10.2 —
+  `jax.tree_util.register_dataclass`, `jax.shard_map` (top-level since 0.8.0;
+  `jax.experimental.shard_map` is the deprecated alias), `jax.sharding.Mesh`/
+  `PartitionSpec`, `make_array_from_process_local_data` — and the fast suite,
+  including the Scheme-A sharding-equivalence test, passes on jax 0.10.2.
+  Reason: Alliance Canada's Narval wheelhouse ships a version-consistent
+  CUDA JAX only at 0.10.2 (the cuda12 plugin/pjrt top out there), so the
+  multi-GPU scaling experiments run on 0.10.2; the 0.11 floor was the
+  conservative dev/validation version, not a hard dependency.
+
+Multi-controller sharding (2026-08-30, `sparse` branch):
+
+- distributed.py (new): `distribute_state(static, state)` places a host-built
+  NetworkState onto the Scheme-A mesh as a global `jax.Array` — conn columns
+  sharded on the capacity axis, units/globals/needs_resort replicated — via
+  `make_array_from_process_local_data`, so the state can enter the sharded step
+  under true multi-controller (jax.distributed, one process per device-group),
+  where no single process holds every device. Single-controller `shard_map`
+  slices a host array implicitly and needs no placement; this makes it explicit
+  and is a no-op when `static.sharding is None`. `scheme_a_mesh(static)` factors
+  the mesh construction out of `step._shard_map_step` (single source of truth).
+- Finding: the earlier "multi-controller resort/overflow unhandled" note was
+  only untested, not unimplemented. Once the state is a global array, the
+  Driver's eager host-side transforms (grow_bucket pad+retrace, topo.resort)
+  run as collective SPMD ops — scalar reads (`live_conn_count`, overflow) reduce
+  globally, and resort's per-level live histogram comes back replicated because
+  the reduced axis is not the sharded one — so no change to driver.py /
+  grow_bucket / resort was needed.
+- tests: `tests/mc_sharding_equiv.py` (train + SET/RigL churn) and
+  `tests/mc_driver_equiv.py` (overflow->grow, resort + a sharded step on the
+  resorted state) launch one process per shard via jax.distributed (gloo on
+  CPU, one device each) and assert byte-identical equivalence to single-device
+  plus cross-process host-read consistency; `slow`-marked subprocess wrappers
+  `test_mc_sharding.py` / `test_mc_driver.py`. This is the local stand-in for a
+  one-process-per-node Narval run (closes the local scope of follow-up #15).
+
+Per-shard construction (2026-08-30, `sparse` branch):
+
+- builder.py: `from_edges`/`from_topology`/`finalize` gain `sharding: ShardSpec
+  | None`. When set, `_assemble` computes the same plan (levels, per-bucket sort
+  order, capacities) but materialises only each process's addressable
+  capacity-axis band per bucket via the new `_window_column`, then assembles a
+  global `jax.Array` (conns sharded, units/globals/needs_resort replicated) with
+  the distributed placement helpers. So no process ever holds the full padded
+  arena -- previously even `distribute_state` needed the whole state built first
+  (and `_assemble`'s `jnp.asarray` put a full column on one device). The window
+  is `capacity / num_shards`; the single-controller path (`sharding=None`) is
+  unchanged and byte-identical (fast suite still green).
+- distributed.py: factored `_shardings_for_spec` / `_place` /
+  `_addressable_window`, shared by `distribute_state` and the builder.
+- tests: `test_builder.py` pins the windowed materialiser (G windows tile back
+  to the full column) and single-controller `from_edges(sharding=)` ==
+  `distribute_state`; `tests/mc_construct_equiv.py` (slow wrapper
+  `test_mc_construct.py`) builds one shard per process and asserts the window is
+  exactly `cap/num_shards`, the assembled state matches the full build sliced,
+  and a sharded forward on it matches single-device.
+- Scope: Level 1 -- each process still generates the full edge list transiently
+  to compute global sort ranks, but materialises only its `cap/G` columns.
+  Generating only `~E/G` edges per process (a distributed sort) is a larger,
+  separate change, unneeded for single-node multi-GPU.
 
 Scaffold type-cleanliness (2026-08-17, `src/plastax/`, no bodies implemented):
 
@@ -572,6 +636,45 @@ AddConn window, the retrace-count contract):
   test in M3, so ipc gets the same treatment): asserts the example beats the
   predict-previous baseline with a 2x margin, is seed-deterministic, and
   uses Pipeline propagation.
+
+Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
+- phases.py forward sweeps: indices_are_sorted=True -> False (pipeline and
+  topological). The builder's (dead, to_id) order [D:3] only holds until the
+  first in-place prune or add; a violated hint is undefined in XLA. Current
+  backends ignore it, and on GPU the unsorted reduction measured no slower.
+- phases.py add_conn duplicate check: the int32 pair id `src * num_units +
+  dst` wrapped past 46340 units; `live_pair_member` is exact at any size.
+- builder/topo bucket order [D:3]: (dead, to_id) -> (dead, from_id, to_id),
+  source-major. With no sorted hint, a destination-sorted bucket serialises
+  the forward's scatter-add on atomics (forward 4.83 -> 1.47 ms at 50M edges
+  on GPU; 1.4x on CPU).
+- traits/phases: `ProposeAddConn` (additive): growth from policy-emitted
+  proposals; parallel edges allowed unless `dedupe = True`.
+  `Network.add_conn` is now typed `AddConn | ProposeAddConn | None`: code
+  that calls `net.add_conn.score` must narrow with isinstance first.
+- state/topo/builder: `NetworkStatic` gains `capacity_headroom` and
+  `capacity_align` (defaults 0.0 / None, the old policy); `capacity_policy`
+  gains `align`; the builders gain `capacity_align`. `topo.resort` now sizes
+  buckets with the recorded headroom instead of none, so a net built with
+  headroom keeps it across resorts.
+- step/phases/optim: `make_step(..., batch_size=B)` (additive): batched
+  StepInputs (`*batch` axes in the annotations); optional structural
+  `per_sample` / `incoming_batched` on UpdateConn, implemented by every optim
+  bundle (their `incoming` now delegates to `_step(c, cid, grad)`).
+- step/phases: `make_step(..., layout=)` (additive) and the structural
+  `linear_input` on forward/backward passes; batched linear passes may run
+  through a per-step CSR view and cuSPARSE (jax.experimental.sparse, a
+  dependency already inside jax -- no new package).
+- phases/step: `layout="triton"` (it briefly shipped as `layout="pallas"` on
+  this branch): an edge-once Triton kernel for batched linear passes on
+  NVIDIA GPUs, through `jax_triton` -- a new optional dependency, the
+  `plastax[triton]` extra; the core install is unchanged. The Pallas Triton
+  lowering it replaces is deprecated in jax; Pallas' Mosaic GPU backend cannot
+  express the kernel's scatter-add at the Pallas level. Off NVIDIA the layout
+  runs an XLA edge-once product. mypy: an `ignore_missing_imports` override
+  for the untyped triton / jax_triton modules (the strict gate is otherwise
+  unchanged). ty: `unresolved-import` ignores on the two lazy `jax_triton`
+  imports (the extra is absent from the dev venv).
 
 ## Handoff conventions
 

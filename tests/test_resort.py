@@ -187,7 +187,7 @@ def test_resort_redistributes_sorts_and_compacts_after_a_pruning_relevel() -> No
     bucket 0 (3's new one), landing alongside 0->2 and the 0->4 skip in an
     order NEITHER the original arena position NOR pure to_id-of-arrival
     would produce by accident -- the real exercise of "gather per level,
-    then stable-sort by (dead, to_id)" (topo.py's resort docstring), not
+    then stable-sort by (dead, from_id)" (topo.py's resort docstring), not
     just of compaction alone.
     """
     static, state = _build_prune_relevel_graph()
@@ -196,14 +196,14 @@ def test_resort_redistributes_sorts_and_compacts_after_a_pruning_relevel() -> No
     np.testing.assert_array_equal(got_level, [0, 0, 1, 1, 2])
 
     # Pre-resort bucket 0 layout the rest of this test's hand-derivation
-    # assumes (builder-sorted by to_id: 0->2, 1->3, 0->4).
+    # assumes (builder source-major order: 0->2, 0->4, 1->3).
     from_id0 = np.asarray(state.conns[0][px.FROM_ID.name])
     to_id0 = np.asarray(state.conns[0][px.TO_ID.name])
-    np.testing.assert_array_equal(from_id0[:3], [0, 1, 0])
-    np.testing.assert_array_equal(to_id0[:3], [2, 3, 4])
+    np.testing.assert_array_equal(from_id0[:3], [0, 0, 1])
+    np.testing.assert_array_equal(to_id0[:3], [2, 4, 3])
 
     dead0 = np.asarray(state.conns[0][px.DEAD.name]).copy()
-    dead0[1] = True  # tombstone 1->3
+    dead0[2] = True  # tombstone 1->3
     pruned_conns0 = {**state.conns[0], px.DEAD.name: jnp.asarray(dead0)}
     pruned_state = dataclasses.replace(state, conns=(pruned_conns0, state.conns[1]))
 
@@ -225,7 +225,7 @@ def test_resort_redistributes_sorts_and_compacts_after_a_pruning_relevel() -> No
     weight_b0 = np.asarray(bucket0[px.WEIGHT.name])
     assert dead_b0.shape == (topo.capacity_policy(3),)
     np.testing.assert_array_equal(from_b0[:3], [0, 0, 3])
-    np.testing.assert_array_equal(to_b0[:3], [2, 4, 4])  # sorted by to_id
+    np.testing.assert_array_equal(to_b0[:3], [2, 4, 4])  # sorted by from_id
     np.testing.assert_allclose(weight_b0[:3], [0.1, 0.5, 0.4])
     assert bool((~dead_b0[:3]).all())
     assert bool(dead_b0[3:].all())  # padding: real compaction, not a full copy

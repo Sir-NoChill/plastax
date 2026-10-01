@@ -22,6 +22,10 @@ which forces the smoke test onto the CPU backend of the runners.
 
 1. Full suite green: `uv run pytest` (including `slow`), `uv run mypy
    --strict src`, `uv run ruff check src tests examples`.
+   Optional extras still resolve: `uv lock` (it resolves every extra; a JAX
+   extra that no longer exists shows up here) -- see `docs/installation.md`.
+   Local `uv build` + `uvx twine check dist/*` pass (the sdist is an
+   explicit allowlist in pyproject).
 2. Docs build clean: `uv run sphinx-build -b html docs docs/_build`
    (add `-W` once P3.4 flips fail_on_warning).
 3. Cut a CHANGELOG section for the version (P1.4).
@@ -39,4 +43,6 @@ Release candidates: tag `vX.Y.ZrcN`; the workflow routes any tag containing
 `rc` to TestPyPI instead of PyPI (requires the pending TestPyPI publisher).
 
 First release sequence (P4.4): `v0.1.0rc1` -> TestPyPI -> install check ->
-`v0.1.0` -> PyPI.
+`v0.1.0` -> PyPI. Status 2026-10-01: iterating on `v0.1.0rc2` (branch
+`release/v0.1.0rc2`) before `v0.1.0`; the PyPI / TestPyPI publishers and
+environments above still need their human setup.

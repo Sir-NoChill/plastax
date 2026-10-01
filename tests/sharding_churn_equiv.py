@@ -222,10 +222,15 @@ def _check_batched_train_step_shards(
     xs = jnp.asarray(rng.standard_normal((5, _LAYERS[0])).astype(np.float32))
     ys = jax.nn.one_hot(jnp.asarray(rng.integers(0, _LAYERS[-1], 5)), _LAYERS[-1])
     sp = px.StepInputs(inputs=xs, targets=ys)
-    single = px.make_step(train_net, static, batch_size=5)(_copy(state), sp)
-    sharded = px.make_step(train_net, static_s, batch_size=5)(_copy(state), sp)
-    if not _conns_allclose(single.state, sharded.state):
-        raise AssertionError("batched train: conn columns differ sharded vs single")
+    for layout in ("edge_list", "csr"):
+        single = px.make_step(train_net, static, batch_size=5, layout=layout)(
+            _copy(state), sp
+        )
+        sharded = px.make_step(train_net, static_s, batch_size=5, layout=layout)(
+            _copy(state), sp
+        )
+        if not _conns_allclose(single.state, sharded.state):
+            raise AssertionError(f"batched {layout}: conns differ sharded vs single")
 
 
 def main() -> None:

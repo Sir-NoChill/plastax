@@ -665,10 +665,16 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   `linear_input` on forward/backward passes; batched linear passes may run
   through a per-step CSR view and cuSPARSE (jax.experimental.sparse, a
   dependency already inside jax -- no new package).
-- phases/step: `layout="pallas"`: an edge-once Pallas kernel for batched
-  linear passes (jax.experimental.pallas, also inside jax). Pallas is rung 2
-  of the lowering ladder (docs/design), arriving early as an opt-in backend
-  for one primitive (the linear bucket product), not as the general lowering.
+- phases/step: `layout="triton"` (it briefly shipped as `layout="pallas"` on
+  this branch): an edge-once Triton kernel for batched linear passes on
+  NVIDIA GPUs, through `jax_triton` -- a new optional dependency, the
+  `plastax[triton]` extra; the core install is unchanged. The Pallas Triton
+  lowering it replaces is deprecated in jax; Pallas' Mosaic GPU backend cannot
+  express the kernel's scatter-add at the Pallas level. Off NVIDIA the layout
+  runs an XLA edge-once product. mypy: an `ignore_missing_imports` override
+  for the untyped triton / jax_triton modules (the strict gate is otherwise
+  unchanged). ty: `unresolved-import` ignores on the two lazy `jax_triton`
+  imports (the extra is absent from the dev venv).
 
 ## Handoff conventions
 

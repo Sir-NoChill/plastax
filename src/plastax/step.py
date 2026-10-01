@@ -7,6 +7,7 @@ pattern.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable
@@ -91,11 +92,13 @@ def make_step[GS](
     GPU with the `plastax[triton]` extra, and as the same edge-once product in
     plain XLA anywhere else. "auto" picks, on an NVIDIA GPU, "triton" for
     `2 <= batch_size <= 32` (when jax_triton is installed) and "csr" above
-    it -- at 25M edges the Triton kernel is 3.9x XLA's segment sum at B = 8
-    and 32, and CSR wins at large B -- and the XLA edge list on every other
-    backend (AMD GPUs, TPU, CPU). Non-linear passes, and every streaming
-    step, use the edge list. Under Scheme-A sharding, "triton" uses the XLA
-    edge-once product (jax_triton is not validated inside shard_map).
+    it -- in batched training at 5.4M edges Triton is 2.4x the edge list at
+    B = 8 and CSR edges ahead at 128 -- and on every other backend (AMD GPUs,
+    TPU, CPU) the XLA edge-once product for `batch_size >= 2` (the speed of
+    the per-sample edge list, with far smaller temporaries). Non-linear
+    passes, and every streaming step, use the edge list. Under Scheme-A
+    sharding, "triton" uses the XLA edge-once product (jax_triton is not
+    validated inside shard_map).
 
     In a batched step a non-floating unit column (a flag, a count) is stored
     from sample 0 rather than averaged, and so is a non-floating connection
@@ -140,6 +143,13 @@ def make_step[GS](
                 engine = "csr"
             elif batch_size >= 2 and triton_ok:
                 engine = "triton"
+        elif layout == "auto" and batch_size >= 2:
+            # Off NVIDIA (AMD GPU, TPU, CPU): the XLA edge-once product. Same
+            # speed as the per-sample edge list on GPU, but it does not
+            # materialise per-sample edge temporaries: compiled for TPU v5e,
+            # a B = 32 Adam step at 5.4M edges needs 1.5 GB of temporaries
+            # against 4.1 GB.
+            engine = "xla"
         elif layout == "csr":
             engine = "csr"
         elif layout == "triton":
@@ -290,9 +300,11 @@ def _batched_step(
 
     traced = step if static.sharding is None else _shard_map_step(step, static)
     jitted = cast(StepFn[Any], jax.jit(traced, donate_argnums=0))
-    if engine != "csr":
+    if engine != "csr" or not _nvidia_gpu():
+        # cuSPARSE exists only on NVIDIA GPUs; elsewhere BCSR uses XLA's
+        # generic lowering and the flag would do nothing.
         return jitted
-    return _with_cusparse(jitted)
+    return cast(StepFn[Any], _CusparseStep(jitted))
 
 
 def _nvidia_gpu() -> bool:
@@ -305,26 +317,56 @@ def _nvidia_gpu() -> bool:
         return False
 
 
-def _with_cusparse(fn: StepFn[Any]) -> StepFn[Any]:
-    """Run `fn` with jax.experimental.sparse lowering to cuSPARSE.
+class _CusparseStep:
+    """A jitted step whose calls (and AOT trace/lower) lower BCSR to cuSPARSE.
 
     The switch is a global jax config flag read at lowering time (off by
     default, when BCSR products fall back to generic kernels 30-80x slower);
-    it is scoped to this step's calls so nothing else in the process changes.
-    If the private config handle moves in a future jax, the step still runs,
-    on the default lowering.
+    it is scoped to this step's calls -- and to `.trace` / `.lower`, so the
+    AOT API keeps working -- so nothing else in the process changes. If the
+    private config handle moves in a future jax, the step still runs, on the
+    default lowering.
     """
-    try:
-        from jax._src.config import bcoo_cusparse_lowering
-    except ImportError:  # pragma: no cover - depends on the jax version
-        return fn
 
-    @functools.wraps(fn)
-    def call(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
-        with bcoo_cusparse_lowering(True):
-            return fn(state, inputs)
+    def __init__(self, jitted: Any) -> None:
+        self._jitted = jitted
+        try:
+            from jax._src.config import bcoo_cusparse_lowering
+        except ImportError:  # pragma: no cover - depends on the jax version
+            self._flag: Any = None
+        else:
+            self._flag = bcoo_cusparse_lowering
 
-    return call
+    def _scoped(self) -> Any:
+        return self._flag(True) if self._flag is not None else contextlib.nullcontext()
+
+    def __call__(self, state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        with self._scoped():
+            result: StepResult[Any] = self._jitted(state, inputs)
+            return result
+
+    def trace(self, *args: Any, **kwargs: Any) -> Any:
+        with self._scoped():
+            return _ScopedStage(self._jitted.trace(*args, **kwargs), self._scoped)
+
+    def lower(self, *args: Any, **kwargs: Any) -> Any:
+        with self._scoped():
+            return self._jitted.lower(*args, **kwargs)
+
+
+class _ScopedStage:
+    """A traced stage whose `.lower()` runs under the cuSPARSE flag."""
+
+    def __init__(self, traced: Any, scoped: Any) -> None:
+        self._traced = traced
+        self._scoped = scoped
+
+    def lower(self, *args: Any, **kwargs: Any) -> Any:
+        with self._scoped():
+            return self._traced.lower(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._traced, name)
 
 
 # jax.util.weakref_lru_cache is not cleanly importable off the pinned jax

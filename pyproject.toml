@@ -123,6 +123,21 @@ fallback_version = "0.1.0.dev0"
 [tool.hatch.build.targets.wheel]
 packages = ["src/plastax"]
 
+# Sdist contents are an explicit allowlist (DISTRIBUTION_PLAN.md P1.3): the
+# library, its tests and examples, and the metadata files. Without it hatchling
+# packs every un-ignored file in the tree -- including local virtualenvs such
+# as .venv-gpu (several GB), which carry only their own nested .gitignore.
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/plastax",
+  "/tests",
+  "/examples",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
+
 # ty is the fast pre-commit checker; mypy --strict is the authoritative
 # CI/pre-push gate (TOOLING.md). jax and jaxtyping ship py.typed, so mypy
 # resolves jax.Array to the real class and erases jaxtyping's dtype[array,shape]

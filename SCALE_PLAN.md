@@ -300,7 +300,8 @@ Design (drafted in iteration 3):
 - **Docs.** State plainly that the library is primarily streaming (B = 1),
   and that batching is a convenience for evaluation and mini-batch training.
 
-- [ ] 4.1 Design note first (the draft above).
+- [x] 4.1 Design note (above). As built, unit columns stay `(num_units,)`
+  and hold the batch mean, so no batched unit state is persisted.
   - Batched `StepInputs` of shape `(B, num_inputs)`, and unit columns of shape
     `(B, num_units)` during forward and backward only.
   - Connection updates reduce over B. Pinning this down (is it the mean of
@@ -308,15 +309,38 @@ Design (drafted in iteration 3):
     state must see one update per step.
   - Decide the API: `make_step(..., batch=B)` or a separate
     `make_batched_step`.
-- [ ] 4.2 Build it: a vmapped forward/backward over the unit axis, with shared
-  connections.
-- [ ] 4.3 Tests: B = 1 matches the streaming step; B > 1 matches the mean of B
-  streaming gradient computations for SGD.
+- [x] 4.2 Built: 997480a (optim pair), 347e655 (`make_step(batch_size=)`),
+  edd86e2 (Scheme-A check).
+- [x] 4.3 Tests: B = 1 equals streaming; SGD batched equals the mean of
+  per-sample steps; all five optim bundles match optax on the batch-mean loss.
 
 ### P5: CSR layout view (cuSPARSE)
 
-- [ ] 5.1 Design note: a static per-bucket `BucketLayout ∈ {EDGE_LIST, CSR}` in
-  `NetworkStatic`.
+- [ ] 5.1 Design note. Refined in iteration 5:
+  - **Scope.** Only *linear* passes take the view. A `ForwardPass` or
+    `BackwardPass` declares, structurally, `linear_input: FieldSpec`: its map
+    is `WEIGHT · u[linear_input, other]` and its combine is `sum`. Its `apply`
+    stays arbitrary and per-unit. `mlp_xor`'s sigmoid passes and the optim
+    MLPs all qualify.
+  - **Forward.** A destination-major CSR over the live edges: `perm`
+    (arena slot per CSR position), `indptr (num_units + 1)` and `indices`.
+    The values are `weight[perm]`, gathered per step, so the weights stay in
+    the arena.
+  - **Backward.** It reduces into sources. The arena is already
+    source-major after a build or resort, so the transpose view is the same
+    construction keyed on `from_id`.
+  - **Freshness.** The view is rebuilt on device in the jitted step, with one
+    radix sort, whenever structure changed since the last rebuild (tracked by
+    a step counter in state), or every R steps with a COO delta between.
+    First cut: rebuild on any structural change. Batched training on a
+    static structure is the case that pays.
+  - **Selection.** A trait `Network.layout = "edge_list" | "csr"`. With
+    "csr" the view columns live in the state (static shapes: capacity +
+    `num_units + 1`).
+- [ ] 5.1b Measure first: cuSPARSE SpMM through `jax.experimental.sparse`
+  inside a vmapped per-sample phase does not apply directly. The batched
+  forward must call `BCSR @ X` with the batch as columns, which means
+  restructuring the per-sample vmap for linear passes.
   - Only for a built-in `LinearForward`/`LinearBackward`.
   - The view is `perm/indices/indptr` plus the values `weight[perm]`
     (tombstones give 0), plus a COO delta for edges grown since the last
@@ -537,6 +561,23 @@ the log below:
   - GPU memory is 4.1 GB against 27 GB at 300M.
   - Forward and prune are at the DRAM roofline.
 - **Plan:** next is P4 (batched inputs), with the design drafted above.
+
+### Iteration 5 (2026-09-30): P4, batched inputs
+
+- **Build:** 997480a, 347e655, edd86e2. There are 297 fast tests and 15 slow
+  (all optimizers match optax batched).
+- **Document:** 155e675 (README: streaming-first), 8e27272, 5bf06a3.
+- **Explore:**
+  - A batched training step (SGD, 3 layers, 5.4M edges) costs 0.537 ms per
+    sample at B = 1, 0.347 at 8, 0.295 at 32, and 0.252 at 128. That is only
+    2.1×, because the edge list touches every edge once per sample.
+  - Fusing the batch mean (`vmap` + `mean`) instead of a `fori_loop` was
+    worse at large B (38.9 against 32.3 ms at B = 128), because XLA
+    materialises E×B. Reverted.
+  - For comparison, cuSPARSE CSR at B = 128 measured 9.5× over COO for a
+    single layer (iteration 1). **That is P5's case.**
+- **Plan:** P5 refined above. The key design step is routing linear passes to
+  one batched SpMM instead of a per-sample vmap.
 
 ## Deviations
 

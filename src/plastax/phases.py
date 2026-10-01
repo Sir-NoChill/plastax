@@ -1549,7 +1549,14 @@ def build_add_conn_phase[GS](
                     flat_scores = jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
-            _, top_idx = jax.lax.top_k(flat_scores, k)
+            if k == flat_scores.shape[0]:
+                # Every candidate fits the budget, so selection is moot: skip
+                # the (full-sort) top_k. Order only decides which free slot a
+                # candidate takes, and growth_rank below tolerates vetoed
+                # (-inf) candidates anywhere.
+                top_idx = jnp.arange(k, dtype=jnp.int32)
+            else:
+                _, top_idx = jax.lax.top_k(flat_scores, k)
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]
@@ -1581,8 +1588,16 @@ def build_add_conn_phase[GS](
             dead_b = bucket_conns[DEAD.name]
             # Per-block free counts over this shard's slice: one reduction
             # reading the dead mask, instead of a capacity-sized cumsum.
-            free_blocks, block_len = count_free_blocks(dead_b)
-            local_free = free_blocks[-1]
+            # Two-level search for a small claim (O(k * block) past one
+            # reduction); for a claim large next to the bucket that gather
+            # outgrows one capacity-sized cumsum, which is then used instead.
+            small_claim = k * _FREE_BLOCK <= local_capacity
+            if small_claim:
+                free_blocks, block_len = count_free_blocks(dead_b)
+                local_free = free_blocks[-1]
+            else:
+                free_through = jnp.cumsum(dead_b.astype(jnp.int32))
+                local_free = free_through[-1]
             # This shard's offset into the global free-slot space, and the total
             # free count. The offset is an exclusive prefix of the per-shard
             # free counts (an all-gather -- a prefix is not a plain all-reduce)
@@ -1617,7 +1632,12 @@ def build_add_conn_phase[GS](
             local_rank = growth_rank - offset
             mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
             safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-            free_slot = nth_free_slot(dead_b, free_blocks, block_len, safe_rank)
+            if small_claim:
+                free_slot = nth_free_slot(dead_b, free_blocks, block_len, safe_rank)
+            else:
+                free_slot = jnp.searchsorted(
+                    free_through, safe_rank + jnp.int32(1), method=_SEARCH
+                ).astype(jnp.int32)
             target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
 
             # A committed candidate whose destination is not strictly

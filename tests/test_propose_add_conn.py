@@ -296,3 +296,42 @@ def test_new_edges_fill_interleaved_holes_and_leave_live_edges_intact() -> None:
     assert grown == [(1, 4), (2, 4), (3, 4)]
     assert not after[px.DEAD.name][[1, 3, 4]].any()
     assert after[px.DEAD.name][5:].all()
+
+
+def test_a_small_claim_in_a_large_bucket_uses_the_two_level_search() -> None:
+    # k * 1024 <= capacity selects the two-level free-slot search inside the
+    # phase (smaller tests take the cumsum path): holes scattered through a
+    # 4096-slot bucket must be filled first-free-first, live edges untouched.
+    rng = np.random.default_rng(9)
+    n_src, n_dst = 64, 64
+    pairs = rng.choice(n_src * n_dst, 3000, replace=False)
+    frm = (pairs // n_dst).astype(np.int32)
+    to = (n_src + pairs % n_dst).astype(np.int32)
+    net = _net(_TableProposals([(1, 70, 2.0), (2, 71, 1.0)], 2))
+    static, state = px.NetworkBuilder.from_edges(
+        net,
+        n_src + n_dst,
+        frm,
+        to,
+        weights=np.ones(frm.size, np.float32),
+        input_ids=list(range(n_src)),
+        output_ids=list(range(n_src, n_src + n_dst)),
+        globals_=None,
+    )
+    assert static.level_capacities[0] == 4096
+    b0 = dict(state.conns[0])
+    holes = np.sort(rng.choice(3000, 50, replace=False))
+    b0[px.DEAD.name] = b0[px.DEAD.name].at[jnp.asarray(holes)].set(True)
+    before = {k: np.asarray(v) for k, v in b0.items()}
+    state = px.NetworkState(
+        units=state.units, conns=(b0,), globals_=None, needs_resort=state.needs_resort
+    )
+    new_state, _ = phases.build_add_conn_phase(net, static)(state, _DUMMY_INPUTS)
+    after = {k: np.asarray(v) for k, v in new_state.conns[0].items()}
+    filled = holes[:2]
+    assert [
+        (int(after[px.FROM_ID.name][i]), int(after[px.TO_ID.name][i])) for i in filled
+    ] == [(1, 70), (2, 71)]
+    untouched = np.setdiff1d(np.arange(4096), filled)
+    for name in (px.FROM_ID.name, px.TO_ID.name, px.WEIGHT.name, px.DEAD.name):
+        np.testing.assert_array_equal(after[name][untouched], before[name][untouched])

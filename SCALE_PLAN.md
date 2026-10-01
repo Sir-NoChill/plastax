@@ -415,6 +415,15 @@ the log below:
 
 ## 6. Surfaced for review
 
+- **Resort no longer shrinks buckets** (e1afaff). This fixes the
+  regrow/retrace loop, but memory freed by heavy pruning is only reclaimed
+  by rebuilding the network. Say if you would rather resort shrink, with a
+  floor at `live + max_candidates`.
+- **A CSR-layout step must be called directly.** cuSPARSE lowering is a jax
+  config flag scoped to the step's own calls. Wrapping the step in an outer
+  `jax.jit` or `lax.scan` lowers it on the generic kernel: correct, but
+  30-80× slower. This is documented in `make_step`.
+
 - **The plastax DeepR port (`15_deepr_multimnist/plastax/deepr.py`, your WIP)
   has two issues at scale:**
   - (a) `DeepRConnUpdate` keys its Langevin noise on an int32
@@ -699,6 +708,23 @@ the log below:
     hyperparameters or semantics, and predates this work (surfaced).
 - **Plan:** remaining are P6.4 (generic-map Pallas), P5.5 / P6.5 (SDDMM
   update), and P7 (the write-up). Next: P7.2, the results write-up.
+
+### Iteration 9 (2026-10-01): P7.2 write-up, second review
+
+- **Write-up:** `docs/scale_plan/RESULTS.md` with three new figures (666eaa7,
+  69e5f7f).
+- **Second `plastax-review`** (d98f626..HEAD): 0 blockers, 0 high, 4 medium,
+  5 low, 2 nits. All addressed:
+  - cc187ec: mean-of-writes float drift, Pallas block collapse on aligned
+    capacities, the CSR null row, and a stronger free-slot test;
+  - e1afaff: resort no longer undoes `grow_bucket`;
+  - 3f7ec96: an align/shard check;
+  - 51d6195: batched input-shape validation and the reduction docs;
+  - 9e9f6ec, 39bde36, 7bcee53: docs.
+  - The suite is now 308 fast and 15 slow, and Scheme-A passes. GPU
+    re-check: CSR and Pallas weights match the edge list to 1.5e-8.
+- **Remaining:** P6.4 (a generic-map Pallas kernel) and P5.5 / P6.5 (SDDMM
+  for the batched update).
 
 ## Deviations
 

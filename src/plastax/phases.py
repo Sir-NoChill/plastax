@@ -415,6 +415,19 @@ def bucket_csr(
     )
 
 
+def _shard_sum(static: NetworkStatic) -> Callable[[jax.Array], jax.Array]:
+    """All-reduce a per-shard partial under Scheme-A; identity when unsharded.
+
+    Each shard's CSR view covers only its slice of the bucket's edges, so the
+    sparse products are partial sums, combined exactly like the edge-list
+    sweep's segment reductions.
+    """
+    axis = _shard_axis(static)
+    if axis is None:
+        return lambda x: x
+    return lambda x: monoid.sum_.collective(x, axis)
+
+
 def build_csr_forward[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Callable[[NetworkState[GS], Columns], Columns]:
@@ -440,6 +453,7 @@ def build_csr_forward[GS](
     num_units = static.num_units
     apply = build_forward_apply(fp, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
+    reduce_shards = _shard_sum(static)
 
     def forward(state: NetworkState[GS], units_b: Columns) -> Columns:
         level = state.units[LEVEL.name]
@@ -447,7 +461,7 @@ def build_csr_forward[GS](
         acc = jnp.zeros((batch, num_units), jnp.float32)
         for level_idx, bucket in enumerate(state.conns):
             matrix = bucket_csr(bucket, num_units, rows=TO_ID, cols=FROM_ID)
-            acc = acc + (matrix @ units_b[field.name].T).T
+            acc = acc + reduce_shards((matrix @ units_b[field.name].T).T)
             finalize = (level == level_idx + 1) & not_input
             units_b, acc = jax.vmap(apply, in_axes=(0, 0, None, None))(
                 units_b, acc, state.globals_, finalize
@@ -484,6 +498,7 @@ def build_csr_backward[GS](
     apply = build_backward_apply(bp, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
     vapply = jax.vmap(apply, in_axes=(0, 0, None, None))
+    reduce_shards = _shard_sum(static)
 
     def backward(state: NetworkState[GS], units_b: Columns) -> Columns:
         level = state.units[LEVEL.name]
@@ -496,7 +511,7 @@ def build_csr_backward[GS](
             matrix = bucket_csr(
                 state.conns[level_idx], num_units, rows=FROM_ID, cols=TO_ID
             )
-            acc = acc + (matrix @ units_b[field.name].T).T
+            acc = acc + reduce_shards((matrix @ units_b[field.name].T).T)
             finalize = (level == level_idx) & not_input
             units_b, acc = vapply(units_b, acc, state.globals_, finalize)
         return units_b

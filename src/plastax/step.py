@@ -25,6 +25,7 @@ from plastax.phases import (
     batch_mean_units,
     build_batched_phases,
     build_phases,
+    nvidia_triton_available,
 )
 from plastax.state import NetworkState, NetworkStatic
 from plastax.traits import Network
@@ -62,7 +63,7 @@ def make_step[GS](
     static: NetworkStatic,
     *,
     batch_size: int | None = None,
-    layout: Literal["auto", "edge_list", "csr", "pallas"] = "auto",
+    layout: Literal["auto", "edge_list", "csr", "triton"] = "auto",
 ) -> StepFn[GS]:
     """Assemble the present phases and jit them with donate_argnums=0.
 
@@ -83,16 +84,18 @@ def make_step[GS](
     (one declaring `linear_input`, see `phases.linear_input_field`):
     "edge_list" runs it per sample over the edge arena; "csr" builds each
     bucket's CSR view on device every step (one radix sort) and runs the
-    whole batch as one cuSPARSE sparse-dense product; "pallas" runs each
-    bucket as one edge-once Pallas kernel (every edge read once for the whole
-    batch, atomics into the targets; GPU, or interpret mode elsewhere);
-    "auto" picks, on a GPU backend, "pallas" for `2 <= batch_size <= 32` and
-    "csr" above (measured on an RTX 5000 Ada, batched SGD training: at 5.4M
-    edges Pallas is 2.4x the edge list at B = 8 and ties CSR at 32, while CSR
-    is 6x Pallas at 128; at 50M edges Pallas still beats CSR at 32, whose
-    per-step sort then dominates), else the edge list. Non-linear passes,
-    and every streaming step, use the edge list. Under Scheme-A sharding,
-    "pallas" falls back to "csr".
+    whole batch as one cuSPARSE sparse-dense product (fast on NVIDIA GPUs
+    only; elsewhere jax falls back to generic kernels); "triton" runs each
+    bucket as one edge-once Triton kernel through jax_triton (every edge read
+    once for the whole batch, relaxed atomics into the targets) on an NVIDIA
+    GPU with the `plastax[triton]` extra, and as the same edge-once product in
+    plain XLA anywhere else. "auto" picks, on an NVIDIA GPU, "triton" for
+    `2 <= batch_size <= 32` (when jax_triton is installed) and "csr" above
+    it -- at 25M edges the Triton kernel is 3.9x XLA's segment sum at B = 8
+    and 32, and CSR wins at large B -- and the XLA edge list on every other
+    backend (AMD GPUs, TPU, CPU). Non-linear passes, and every streaming
+    step, use the edge list. Under Scheme-A sharding, "triton" uses the XLA
+    edge-once product (jax_triton is not validated inside shard_map).
 
     In a batched step a non-floating unit column (a flag, a count) is stored
     from sample 0 rather than averaged, and so is a non-floating connection
@@ -110,7 +113,7 @@ def make_step[GS](
         static: The network's static configuration.
         batch_size: Samples per step, or None for the streaming step.
         layout: The batched linear-pass layout: "auto", "edge_list", "csr",
-            or "pallas".
+            or "triton".
 
     Returns:
         A jitted step function for the given network and static config.
@@ -127,21 +130,24 @@ def make_step[GS](
                 "make_step: batch_size is for TOPOLOGICAL (feed-forward) nets; a "
                 "PIPELINE net carries per-sample recurrent state between steps"
             )
-    if layout not in ("auto", "edge_list", "csr", "pallas"):
+    if layout not in ("auto", "edge_list", "csr", "triton"):
         raise ValueError(f"make_step: unknown layout {layout!r}")
-    gpu = jax.default_backend() == "gpu"
     engine: str | None = None
     if batch_size is not None:
-        if layout == "auto" and gpu:
-            engine = "csr" if batch_size > 32 else "pallas" if batch_size >= 2 else None
+        triton_ok = nvidia_triton_available()
+        if layout == "auto" and _nvidia_gpu():
+            if batch_size > 32:
+                engine = "csr"
+            elif batch_size >= 2 and triton_ok:
+                engine = "triton"
         elif layout == "csr":
             engine = "csr"
-        elif layout == "pallas":
-            engine = "pallas" if gpu else "pallas_interpret"
-        # The Pallas kernel is not yet validated inside shard_map (interpret
-        # mode trips jax's varying-axes check there); sharded steps use CSR.
-        if engine in ("pallas", "pallas_interpret") and static.sharding is not None:
-            engine = "csr"
+        elif layout == "triton":
+            engine = "triton" if triton_ok else "xla"
+        # jax_triton is not validated inside shard_map; the portable XLA
+        # edge-once product is (it all-reduces like every other sweep).
+        if engine == "triton" and static.sharding is not None:
+            engine = "xla"
     # mypy false positive: a parameterized generic base class fails the
     # structural Hashable check, though a class is always hashable by
     # identity; hence the cast.
@@ -287,6 +293,16 @@ def _batched_step(
     if engine != "csr":
         return jitted
     return _with_cusparse(jitted)
+
+
+def _nvidia_gpu() -> bool:
+    """Whether the default backend is an NVIDIA (CUDA) GPU."""
+    if jax.default_backend() != "gpu":
+        return False
+    try:
+        return "cuda" in jax.devices()[0].client.platform_version.lower()
+    except Exception:  # noqa: BLE001 - unknown client: not known to be CUDA
+        return False
 
 
 def _with_cusparse(fn: StepFn[Any]) -> StepFn[Any]:

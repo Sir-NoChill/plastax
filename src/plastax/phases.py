@@ -150,7 +150,7 @@ def build_batched_phases[GS](
     static: NetworkStatic,
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
-    csr: bool = False,
+    engine: str | None = None,
 ) -> BatchedPhases[GS]:
     """Assemble a batched step's phases (see `BatchedPhases`).
 
@@ -161,8 +161,9 @@ def build_batched_phases[GS](
         net: the network's trait class, supplying each phase's callbacks.
         static: static network configuration giving the arena shapes.
         overflow_sink: as for `build_phases`.
-        csr: route each linear pass (see `linear_input_field`) through the CSR
-            layout; non-linear passes keep the per-sample edge list.
+        engine: route each linear pass (see `linear_input_field`) through this
+            bucket product (`bucket_product`), or None for the per-sample edge
+            list; non-linear passes always keep the edge list.
 
     Returns:
         The per-sample, update, and structural phases.
@@ -173,13 +174,13 @@ def build_batched_phases[GS](
         _build_backward_phase(net, static) if net.backward_pass is not None else None
     )
     csr_forward = (
-        build_csr_forward(net, static)
-        if csr and linear_input_field(net.forward_pass) is not None
+        build_csr_forward(net, static, engine=engine)
+        if engine is not None and linear_input_field(net.forward_pass) is not None
         else None
     )
     csr_backward = (
-        build_csr_backward(net, static)
-        if csr
+        build_csr_backward(net, static, engine=engine)
+        if engine is not None
         and net.backward_pass is not None
         and linear_input_field(net.backward_pass) is not None
         else None
@@ -415,6 +416,83 @@ def bucket_csr(
     )
 
 
+# Edges per Pallas program (the largest power of two up to this that divides
+# the bucket capacity is used).
+_PALLAS_BLOCK = 256
+
+
+def pallas_bucket_product(
+    bucket: Columns,
+    x: Float[Array, "num_units batch"],
+    num_units: int,
+    *,
+    rows: FieldSpec[Any],
+    cols: FieldSpec[Any],
+    interpret: bool,
+) -> Float[Array, "num_units batch"]:
+    """`sum over live edges e of WEIGHT[e] * x[cols[e], :]` into row `rows[e]`.
+
+    The same product as `bucket_csr(...) @ x`, as one edge-once Pallas kernel:
+    each program loads a block of edges, gathers its `(block, batch)` slab of
+    x once, and atomically adds `weight * slab` into the output rows -- no
+    sort, and every edge is read once for the whole batch. Dead edges target
+    an extra null row that is sliced off. The batch is padded to a power of
+    two (a Triton tile constraint).
+
+    Args:
+        bucket: The bucket's columns.
+        x: `(num_units, batch)` input values.
+        num_units: Total unit count.
+        rows: TO_ID (forward) or FROM_ID (backward): the accumulation target.
+        cols: The other endpoint: the gathered row of x.
+        interpret: Run the kernel in Pallas interpret mode (CPU, tests).
+
+    Returns:
+        The `(num_units, batch)` product.
+    """
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import triton as pl_triton
+
+    cap = bucket[DEAD.name].shape[0]
+    batch = x.shape[1]
+    width = 1 << max(batch - 1, 0).bit_length()
+    block = _PALLAS_BLOCK
+    while block > 1 and cap % block:
+        block //= 2
+    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
+    source = bucket[cols.name].astype(jnp.int32)
+    weight = bucket[WEIGHT.name].astype(jnp.float32)
+    x_pad = jnp.zeros((num_units, width), jnp.float32).at[:, :batch].set(x)
+    out0 = jnp.zeros((num_units + 1, width), jnp.float32)
+
+    def kernel(
+        tgt_ref: Any, src_ref: Any, w_ref: Any, x_ref: Any, _: Any, out_ref: Any
+    ) -> None:
+        span = pl.ds(pl.program_id(0) * block, block)
+        tgt, src, w = tgt_ref[span], src_ref[span], w_ref[span]
+        lanes = jnp.arange(width, dtype=jnp.int32)
+        if interpret:
+            slab = x_ref[src[:, None], lanes[None, :]]
+            out_ref[...] = (
+                out_ref[...].at[tgt[:, None], lanes[None, :]].add(w[:, None] * slab)
+            )
+        else:
+            slab = pl_triton.load(x_ref.at[src[:, None], lanes[None, :]])
+            pl_triton.atomic_add(
+                out_ref, (tgt[:, None], lanes[None, :]), w[:, None] * slab
+            )
+
+    out = pl.pallas_call(
+        kernel,
+        grid=(cap // block,),
+        out_shape=jax.ShapeDtypeStruct(out0.shape, jnp.float32),  # type: ignore[no-untyped-call]
+        input_output_aliases={4: 0},
+        interpret=interpret,
+    )(target, source, weight, x_pad, out0)
+    product: Float[Array, "num_units batch"] = out[:num_units, :batch]
+    return product
+
+
 def _shard_sum(static: NetworkStatic) -> Callable[[jax.Array], jax.Array]:
     """All-reduce a per-shard partial under Scheme-A; identity when unsharded.
 
@@ -428,8 +506,44 @@ def _shard_sum(static: NetworkStatic) -> Callable[[jax.Array], jax.Array]:
     return lambda x: monoid.sum_.collective(x, axis)
 
 
+def bucket_product(
+    engine: str, num_units: int
+) -> Callable[..., Float[Array, "num_units batch"]]:
+    """The per-bucket sparse product `(bucket, x, rows, cols) -> (N, B)`.
+
+    Args:
+        engine: "csr" (cuSPARSE via a per-step CSR view), "pallas" (the
+            edge-once Pallas kernel), or "pallas_interpret" (that kernel in
+            interpret mode, for CPU tests).
+        num_units: Total unit count.
+
+    Returns:
+        The product function.
+    """
+
+    def csr(
+        bucket: Columns, x: jax.Array, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
+    ) -> jax.Array:
+        product: jax.Array = bucket_csr(bucket, num_units, rows=rows, cols=cols) @ x
+        return product
+
+    def pallas(
+        bucket: Columns, x: jax.Array, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
+    ) -> jax.Array:
+        return pallas_bucket_product(
+            bucket,
+            x,
+            num_units,
+            rows=rows,
+            cols=cols,
+            interpret=engine == "pallas_interpret",
+        )
+
+    return csr if engine == "csr" else pallas
+
+
 def build_csr_forward[GS](
-    net: type[Network[GS]], static: NetworkStatic
+    net: type[Network[GS]], static: NetworkStatic, *, engine: str = "csr"
 ) -> Callable[[NetworkState[GS], Columns], Columns]:
     """Batched topological forward with each bucket as one sparse product.
 
@@ -443,6 +557,7 @@ def build_csr_forward[GS](
     Args:
         net: the network's trait class; its forward pass must be linear.
         static: static network configuration.
+        engine: the bucket product (see `bucket_product`).
 
     Returns:
         `(state, batched_units) -> batched_units` after the forward.
@@ -454,14 +569,15 @@ def build_csr_forward[GS](
     apply = build_forward_apply(fp, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
     reduce_shards = _shard_sum(static)
+    product = bucket_product(engine, num_units)
 
     def forward(state: NetworkState[GS], units_b: Columns) -> Columns:
         level = state.units[LEVEL.name]
         batch = units_b[field.name].shape[0]
         acc = jnp.zeros((batch, num_units), jnp.float32)
         for level_idx, bucket in enumerate(state.conns):
-            matrix = bucket_csr(bucket, num_units, rows=TO_ID, cols=FROM_ID)
-            acc = acc + reduce_shards((matrix @ units_b[field.name].T).T)
+            x = units_b[field.name].T
+            acc = acc + reduce_shards(product(bucket, x, rows=TO_ID, cols=FROM_ID).T)
             finalize = (level == level_idx + 1) & not_input
             units_b, acc = jax.vmap(apply, in_axes=(0, 0, None, None))(
                 units_b, acc, state.globals_, finalize
@@ -472,7 +588,7 @@ def build_csr_forward[GS](
 
 
 def build_csr_backward[GS](
-    net: type[Network[GS]], static: NetworkStatic
+    net: type[Network[GS]], static: NetworkStatic, *, engine: str = "csr"
 ) -> Callable[[NetworkState[GS], Columns], Columns]:
     """Batched topological backward with each bucket as one sparse product.
 
@@ -486,6 +602,7 @@ def build_csr_backward[GS](
     Args:
         net: the network's trait class; its backward pass must be linear.
         static: static network configuration.
+        engine: the bucket product (see `bucket_product`).
 
     Returns:
         `(state, batched_units) -> batched_units` after the backward.
@@ -499,6 +616,7 @@ def build_csr_backward[GS](
     not_input = ~unit_id_mask(static.input_ids, num_units)
     vapply = jax.vmap(apply, in_axes=(0, 0, None, None))
     reduce_shards = _shard_sum(static)
+    product = bucket_product(engine, num_units)
 
     def backward(state: NetworkState[GS], units_b: Columns) -> Columns:
         level = state.units[LEVEL.name]
@@ -508,10 +626,9 @@ def build_csr_backward[GS](
             units_b, acc, state.globals_, (level == num_levels) & not_input
         )
         for level_idx in range(num_levels - 1, 0, -1):
-            matrix = bucket_csr(
-                state.conns[level_idx], num_units, rows=FROM_ID, cols=TO_ID
-            )
-            acc = acc + reduce_shards((matrix @ units_b[field.name].T).T)
+            x = units_b[field.name].T
+            bucket = state.conns[level_idx]
+            acc = acc + reduce_shards(product(bucket, x, rows=FROM_ID, cols=TO_ID).T)
             finalize = (level == level_idx) & not_input
             units_b, acc = vapply(units_b, acc, state.globals_, finalize)
         return units_b

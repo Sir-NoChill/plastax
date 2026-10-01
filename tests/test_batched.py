@@ -225,13 +225,14 @@ def test_structural_phases_run_once_per_batched_step() -> None:
         lambda: px.optim.adam(0.01, mlp_xor.GradPreAct),
     ],
 )
-def test_csr_layout_matches_the_edge_list(make: object) -> None:
+@pytest.mark.parametrize("layout", ["csr", "pallas"])
+def test_linear_layouts_match_the_edge_list(make: object, layout: str) -> None:
     # mlp_xor's sigmoid passes declare linear_input, so layout="csr" runs both
     # the forward and the backward as sparse products.
     opt = make()  # type: ignore[operator]
     net, static, state = _mlp(opt.update_conn(), opt.state_fields)
     edge = px.make_step(net, static, batch_size=4, layout="edge_list")
-    csr = px.make_step(net, static, batch_size=4, layout="csr")
+    csr = px.make_step(net, static, batch_size=4, layout=layout)  # type: ignore[arg-type]
     s_edge, s_csr = state, jax.tree.map(jnp.copy, state)
     xs, ys = _data(4, 5)
     for x, y in zip(xs, ys, strict=True):
@@ -252,7 +253,8 @@ def test_csr_layout_matches_the_edge_list(make: object) -> None:
         )
 
 
-def test_csr_forward_is_exact_on_a_churned_arena() -> None:
+@pytest.mark.parametrize("layout", ["csr", "pallas"])
+def test_linear_forward_is_exact_on_a_churned_arena(layout: str) -> None:
     spec = importlib.util.spec_from_file_location(
         "_churn2", Path(__file__).parent / "test_inplace_churn.py"
     )
@@ -277,7 +279,7 @@ def test_csr_forward_is_exact_on_a_churned_arena() -> None:
     )
     inputs = px.StepInputs(inputs=xb, targets=None)
     edge = px.make_step(_Fwd, static, batch_size=3, layout="edge_list")
-    csr = px.make_step(_Fwd, static, batch_size=3, layout="csr")
+    csr = px.make_step(_Fwd, static, batch_size=3, layout=layout)  # type: ignore[arg-type]
     a = edge(jax.tree.map(jnp.copy, state), inputs).state
     b = csr(state, inputs).state
     np.testing.assert_allclose(

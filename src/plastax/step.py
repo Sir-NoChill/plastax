@@ -62,7 +62,7 @@ def make_step[GS](
     static: NetworkStatic,
     *,
     batch_size: int | None = None,
-    layout: Literal["auto", "edge_list", "csr"] = "auto",
+    layout: Literal["auto", "edge_list", "csr", "pallas"] = "auto",
 ) -> StepFn[GS]:
     """Assemble the present phases and jit them with donate_argnums=0.
 
@@ -83,10 +83,15 @@ def make_step[GS](
     (one declaring `linear_input`, see `phases.linear_input_field`):
     "edge_list" runs it per sample over the edge arena; "csr" builds each
     bucket's CSR view on device every step (one radix sort) and runs the
-    whole batch as one cuSPARSE sparse-dense product; "auto" picks "csr" for
-    `batch_size >= 16` on a GPU backend, where it measured faster (5.8x at
-    B = 128, slower at B = 8, on a 5.4M-edge net). Non-linear passes, and
-    every streaming step, use the edge list.
+    whole batch as one cuSPARSE sparse-dense product; "pallas" runs each
+    bucket as one edge-once Pallas kernel (every edge read once for the whole
+    batch, atomics into the targets; GPU, or interpret mode elsewhere);
+    "auto" picks, on a GPU backend, "pallas" for `2 <= batch_size <= 32` and
+    "csr" above (measured on an RTX 5000 Ada, batched SGD training: at 5.4M
+    edges Pallas is 2.4x the edge list at B = 8 and ties CSR at 32, while CSR
+    is 6x Pallas at 128; at 50M edges Pallas still beats CSR at 32, whose
+    per-step sort then dominates), else the edge list. Non-linear passes,
+    and every streaming step, use the edge list.
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -95,7 +100,8 @@ def make_step[GS](
         net: The network subclass to assemble phases for.
         static: The network's static configuration.
         batch_size: Samples per step, or None for the streaming step.
-        layout: The batched linear-pass layout: "auto", "edge_list", or "csr".
+        layout: The batched linear-pass layout: "auto", "edge_list", "csr",
+            or "pallas".
 
     Returns:
         A jitted step function for the given network and static config.
@@ -112,18 +118,23 @@ def make_step[GS](
                 "make_step: batch_size is for TOPOLOGICAL (feed-forward) nets; a "
                 "PIPELINE net carries per-sample recurrent state between steps"
             )
-    if layout not in ("auto", "edge_list", "csr"):
+    if layout not in ("auto", "edge_list", "csr", "pallas"):
         raise ValueError(f"make_step: unknown layout {layout!r}")
-    csr = batch_size is not None and (
-        layout == "csr"
-        or (layout == "auto" and batch_size >= 16 and jax.default_backend() == "gpu")
-    )
+    gpu = jax.default_backend() == "gpu"
+    engine: str | None = None
+    if batch_size is not None:
+        if layout == "auto" and gpu:
+            engine = "csr" if batch_size > 32 else "pallas" if batch_size >= 2 else None
+        elif layout == "csr":
+            engine = "csr"
+        elif layout == "pallas":
+            engine = "pallas" if gpu else "pallas_interpret"
     # mypy false positive: a parameterized generic base class fails the
     # structural Hashable check, though a class is always hashable by
     # identity; hence the cast.
     return cast(
         StepFn[GS],
-        _cached_make_step(net, static, batch_size, csr),  # type: ignore[arg-type]
+        _cached_make_step(net, static, batch_size, engine),  # type: ignore[arg-type]
     )
 
 
@@ -191,10 +202,12 @@ def _batched_step(
     overflow_sink: list[Bool[Array, ""]],
     input_ids: jax.Array,
     batch_size: int,
-    csr: bool,
+    engine: str | None,
 ) -> StepFn[Any]:
     """The jitted batched step (see `make_step`'s `batch_size` and `layout`)."""
-    phases = build_batched_phases(net, static, overflow_sink=overflow_sink, csr=csr)
+    phases = build_batched_phases(
+        net, static, overflow_sink=overflow_sink, engine=engine
+    )
 
     def per_sample(
         phase: Phase[Any],
@@ -243,7 +256,7 @@ def _batched_step(
 
     traced = step if static.sharding is None else _shard_map_step(step, static)
     jitted = cast(StepFn[Any], jax.jit(traced, donate_argnums=0))
-    if not csr:
+    if engine != "csr":
         return jitted
     return _with_cusparse(jitted)
 
@@ -280,7 +293,7 @@ def _cached_make_step(
     net: type[Network[Any]],
     static: NetworkStatic,
     batch_size: int | None = None,
-    csr: bool = False,
+    engine: str | None = None,
 ) -> StepFn[Any]:
     # overflow_sink (see build_phases): a length-1 out-parameter
     # build_add_conn_phase (when net.add_conn is set) overwrites on every
@@ -291,7 +304,7 @@ def _cached_make_step(
     overflow_sink: list[Bool[Array, ""]] = [jnp.bool_(False)]
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
     if batch_size is not None:
-        return _batched_step(net, static, overflow_sink, input_ids, batch_size, csr)
+        return _batched_step(net, static, overflow_sink, input_ids, batch_size, engine)
     phases = build_phases(net, static, overflow_sink=overflow_sink)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:

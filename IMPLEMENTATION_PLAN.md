@@ -665,6 +665,10 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   `linear_input` on forward/backward passes; batched linear passes may run
   through a per-step CSR view and cuSPARSE (jax.experimental.sparse, a
   dependency already inside jax -- no new package).
+- phases/step: `layout="pallas"`: an edge-once Pallas kernel for batched
+  linear passes (jax.experimental.pallas, also inside jax). Pallas is rung 2
+  of the lowering ladder (docs/design), arriving early as an opt-in backend
+  for one primitive (the linear bucket product), not as the general lowering.
 
 ## Handoff conventions
 

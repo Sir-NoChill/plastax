@@ -51,10 +51,20 @@ dependencies = [
 # cuda12`) pulls the CUDA-12 jaxlib + plugin in place of the default CPU wheel;
 # `gpu` is a friendly alias for it. plastax is backend-agnostic pure Python --
 # the extra only swaps which jax wheel resolves, nothing in src/plastax changes.
-# Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). Set
+# Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). `cuda13` is
+# the CUDA-13 counterpart (validated with jax[cuda13]==0.11.0 on an RTX 5000
+# Ada, driver 615); the two are mutually exclusive ([tool.uv] conflicts). Set
 # XLA_PYTHON_CLIENT_PREALLOCATE=false on a shared GPU (see TOOLING.md).
 [project.optional-dependencies]
 cuda12 = ["jax[cuda12]>=0.10.2"]
+cuda13 = ["jax[cuda13]>=0.11.0"]
+# The edge-once Triton kernel behind make_step(layout="triton" / "auto") on
+# NVIDIA GPUs, called through jax_triton (validated 0.4.1 with triton 3.8.0,
+# jax 0.11.2). Optional: without it batched linear passes use XLA / cuSPARSE.
+triton = ["jax-triton>=0.4.1"]
+# libtpu, for TPU hosts -- and, without one, for ahead-of-time compilation
+# against a TPU topology description (examples/benchmarks/tpu_aot_check.py).
+tpu = ["jax[tpu]>=0.11.0"]
 gpu = ["plastax[cuda12]"]
 
 [project.urls]
@@ -113,6 +123,21 @@ fallback_version = "0.1.0.dev0"
 [tool.hatch.build.targets.wheel]
 packages = ["src/plastax"]
 
+# Sdist contents are an explicit allowlist (DISTRIBUTION_PLAN.md P1.3): the
+# library, its tests and examples, and the metadata files. Without it hatchling
+# packs every un-ignored file in the tree -- including local virtualenvs such
+# as .venv-gpu (several GB), which carry only their own nested .gitignore.
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/plastax",
+  "/tests",
+  "/examples",
+  "/README.md",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/pyproject.toml",
+]
+
 # ty is the fast pre-commit checker; mypy --strict is the authoritative
 # CI/pre-push gate (TOOLING.md). jax and jaxtyping ship py.typed, so mypy
 # resolves jax.Array to the real class and erases jaxtyping's dtype[array,shape]
@@ -122,6 +147,13 @@ strict = true
 files = ["src"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr"]
+
+# triton / jax_triton (the optional `triton` extra, imported lazily inside the
+# NVIDIA edge kernel) ship no type information; the strict gate stays on for
+# everything else.
+[[tool.mypy.overrides]]
+module = ["triton", "triton.*", "jax_triton", "jax_triton.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 88
@@ -156,4 +188,13 @@ markers = ["slow: excluded from the pre-push fast suite"]
 filterwarnings = [
   # donation failure must be an error, rung0 design section 6
   "error:.*Some donated buffers were not usable.*",
+]
+
+# cuda12, cuda13 and tpu swap in different jaxlib/plugin wheels and are not
+# installed together; declaring the conflicts lets uv lock each independently.
+[tool.uv]
+conflicts = [
+  [{ extra = "cuda12" }, { extra = "cuda13" }],
+  [{ extra = "cuda12" }, { extra = "tpu" }],
+  [{ extra = "cuda13" }, { extra = "tpu" }],
 ]

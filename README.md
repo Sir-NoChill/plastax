@@ -18,8 +18,15 @@ Design documents (read in order):
 3. `IMPLEMENTATION_PLAN.md` — milestone plan and acceptance criteria for the
    initial implementation.
 
-v1 scope: pipeline and topological propagation, AddConn/PruneConn dynamics,
+v1 scope: pipeline and topological propagation, AddConn/PruneConn dynamics
+(grid or proposal growth, in place, at a cost that follows the churn),
 named-monoid combines, single device, donation-based in-place state.
+
+plastax is built for **streaming**: one sample per step, with structure
+changing between steps. For mini-batch training or evaluation of feed-forward
+(topological) nets, `make_step(net, static, batch_size=B)` runs B samples per
+step against shared connections and reduces the connection update over the
+batch (exactly, for the `plastax.optim` bundles); see its docstring.
 Deferred: AddUnit/PruneUnit, generic associative combines, jax.Ref arena,
 hijax-based primitive surface, multi-device sharding.
 

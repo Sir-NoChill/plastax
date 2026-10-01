@@ -27,8 +27,18 @@ group, ordered roughly by how fundamental they are.
   has one bucket per source level (`level_capacities`); PIPELINE mode has
   exactly one flat bucket.
 - **Capacity / headroom** — a bucket is over-allocated beyond its live edges so
-  growth doesn't retrace every add. `capacity_policy` = `max(next_pow2(live),
-  min_bucket)`.
+  growth doesn't retrace every add. `capacity_policy` sizes it from
+  `live * (1 + headroom)`: rounded up to a power of two by default, or to a
+  multiple of `align` (tight: less memory and bandwidth). The build records
+  both in `NetworkStatic` (`capacity_headroom`, `capacity_align`), so
+  `grow_bucket` and `topo.resort` size buckets the same way.
+- **Linear pass** — a forward/backward pass declaring `linear_input = F`:
+  its map is `WEIGHT * u[F, other]` and its combine is `sum_`, so its
+  accumulation is a sparse matrix product (the CSR layout).
+- **Parallel edge** — two live connections with the same `(src, dst)`, each
+  contributing independently. `ProposeAddConn` growth can create them unless
+  the policy sets `dedupe = True`; grid growth (`AddConn`) never does by
+  default.
 
 ## State & compilation
 

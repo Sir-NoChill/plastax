@@ -35,6 +35,10 @@ class NetworkStatic:
         output_ids: builder-recorded unit ids that the loss clamps targets
             to.
         sharding: Scheme-A sharding config, or None for a single device.
+        capacity_headroom: the dead-slot fraction every bucket sizing
+            (build, grow_bucket, resort) reserves above the live count.
+        capacity_align: the capacity rounding for that sizing: None for a
+            power of two, an int for a multiple of it (topo.capacity_policy).
     """
 
     num_units: int = dataclasses.field(metadata=dict(static=True))
@@ -50,6 +54,12 @@ class NetworkStatic:
     input_ids: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
     output_ids: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
     sharding: ShardSpec | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
+    capacity_headroom: float = dataclasses.field(
+        default=0.0, metadata=dict(static=True)
+    )
+    capacity_align: int | None = dataclasses.field(
         default=None, metadata=dict(static=True)
     )
 
@@ -163,9 +173,20 @@ def grow_bucket[GS](
     old_capacity = static.level_capacities[level]
     live = int(live_conn_count(state, level))
     # Seeding the policy with live+1 seeks headroom for one more live slot;
-    # the old_capacity*2 floor guarantees genuine growth even when grow_bucket
-    # is invoked well before the bucket is actually full.
-    new_capacity = max(capacity_policy(live + 1), old_capacity * 2)
+    # the geometric floor (2x for power-of-two rounding, 1.5x for aligned
+    # rounding, which exists to keep memory tight) guarantees genuine growth
+    # even when grow_bucket is invoked well before the bucket is full, so
+    # repeated overflows cost O(log) retraces.
+    policy = capacity_policy(
+        live + 1, headroom=static.capacity_headroom, align=static.capacity_align
+    )
+    if static.capacity_align is None:
+        floor = old_capacity * 2
+    else:
+        floor = capacity_policy(
+            old_capacity + old_capacity // 2, align=static.capacity_align
+        )
+    new_capacity = max(policy, floor)
     pad = new_capacity - old_capacity
 
     old_columns = state.conns[level]
@@ -187,17 +208,7 @@ def grow_bucket[GS](
         for i, capacity in enumerate(static.level_capacities)
     )
 
-    new_static = NetworkStatic(
-        num_units=static.num_units,
-        propagation=static.propagation,
-        unit_fields=static.unit_fields,
-        conn_fields=static.conn_fields,
-        level_capacities=new_level_capacities,
-        kahn_max_depth=static.kahn_max_depth,
-        input_ids=static.input_ids,
-        output_ids=static.output_ids,
-        sharding=static.sharding,
-    )
+    new_static = dataclasses.replace(static, level_capacities=new_level_capacities)
     new_state = NetworkState(
         units=state.units,
         conns=new_conns,

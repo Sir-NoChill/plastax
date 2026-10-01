@@ -153,13 +153,21 @@ The policy Protocols:
 | `Loss[GS]` | `per_output(u,i,target,g)→(scalar, UnitWrite)` | output units |
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
-| `AddConn[GS]` | attr `max_candidates:int`; `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite` | grows edges |
+| `AddConn[GS]` | attr `max_candidates:int`; `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite` | grows edges (grid) |
+| `ProposeAddConn[GS]` | attrs `max_candidates:int`, `num_proposals:int`; `propose(u,j,g)→(src,dst,score)`, `init(...)→ConnWrite` | grows edges (proposals) |
 | `ResetGlobal[GS]` | `reset(g)→GS` | globals, between episodes |
 
 `AddConn` may *structurally* (via `getattr`, not in the Protocol) also declare
 `max_candidate_units:int` + `importance(u,i,g)→Float` to switch from the
 `O(num_units²)` full grid to an `O(num_units + M²)` shortlist, and
 `shortlist_per_level:bool` for a per-bucket grid.
+
+`ProposeAddConn` replaces the grid as the candidate source: `propose` is
+vmapped over `j in [0, num_proposals)` and everything downstream (routing to
+the source level's bucket, the window, top-k, slot claim, `init`) is shared.
+`add_conn` must satisfy exactly one of the two Protocols. Either may set
+`dedupe:bool` structurally (grid default True, proposals default False: the
+proposal path grows parallel edges unless asked not to).
 
 ### Assembly (`phases.py`)
 
@@ -201,6 +209,48 @@ the whole state pytree, so the step **must be shape-preserving** on every leaf
 > `StepResult.overflow`. This is safe only because `jax.jit` traces the body
 > once (`step.py:141`).
 
+### Batched step (`step.py` `make_step(..., batch_size=B)`, `phases.build_batched_phases`)
+
+Streaming (B = None) is the primary mode. With a batch size, the phases split
+three ways: **per-sample** (forward, loss, backward) vmapped over the batch
+with conns/globals broadcast; the **update** reduced over the batch
+(`build_batched_update_conn`: the exact `per_sample` + `incoming_batched` pair
+if the UpdateConn declares it -- every `optim/` bundle does -- else the mean of
+the per-sample writes; both accumulate in a `fori_loop`, O(capacity) memory);
+and **structural** (prune, add, reset) run once on `batch_mean_units`. Unit
+columns in the state stay `(num_units,)` and hold the batch mean. PIPELINE nets
+are rejected. Measured on GPU the per-sample cost falls only ~2x from B = 1 to
+128 on the edge-list layout (each pass touches every edge once per sample);
+the CSR layout addresses that for linear passes:
+
+- **CSR layout** (`make_step(..., layout="auto" | "edge_list" | "csr")`,
+  `phases.build_csr_forward` / `build_csr_backward`): a pass declaring
+  `linear_input` (map == `WEIGHT * u[F, other]`, combine == `sum_`, read by
+  `phases.linear_input_field`) runs as one cuSPARSE sparse-dense product per
+  bucket over the batch. The view is rebuilt on device every step from the
+  arena (`bucket_csr`: one radix sort; dead slots as explicit zeros), so it
+  never goes stale under in-place churn; under Scheme-A the per-shard partial
+  products are all-reduced. cuSPARSE lowering is a jax config flag scoped to
+  the step's calls (`step._with_cusparse`).
+- **Triton layout** (`layout="triton"`, `phases.triton_bucket_product`): the
+  same linear passes as one edge-once Triton kernel per bucket, called
+  through `jax_triton` (the optional `plastax[triton]` extra; triton is
+  imported lazily) -- each edge read once for the whole batch, relaxed
+  atomics into the targets, no sort. NVIDIA GPUs only
+  (`phases.nvidia_triton_available`); anywhere else, and under Scheme-A,
+  "triton" runs `phases.xla_bucket_product`, the same edge-once product in
+  plain XLA (how the CPU tests exercise the layout). It replaced a Pallas
+  Triton kernel: that lowering is deprecated in jax, and Pallas' Mosaic GPU
+  backend cannot express a scatter-add into arbitrary rows (a low-level
+  `inline_mgpu` prototype ran 1.03-1.6x slower than Triton, scale plan).
+  `bucket_product(engine)` is the seam the layouts share with the level walks.
+- **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 32 (when jax_triton is
+  installed) and CSR above; on every other backend (AMD GPU, TPU, CPU) the
+  XLA edge-once product for B >= 2 (same speed as the per-sample edge list,
+  about 2.6x smaller temporaries compiled for TPU); the edge list at B = 1
+  and for every non-linear pass. The CSR step keeps jit's `.trace`/`.lower`
+  (`step._CusparseStep`), so every layout AOT-compiles (TOOLING.md, TPU).
+
 ### Host loop (`driver.py`)
 
 `Driver.step(inputs)` (`driver.py:51`) runs the jitted step and reacts to the
@@ -213,11 +263,19 @@ flags it returns — the **retrace protocol**:
   rebuild the step, return.
 - else commit.
 
+`Driver(..., check_every=N)` with N > 1 reads the flags back only every N
+steps (overflow OR-accumulated on device; `needs_resort` is sticky in state):
+no retry of an overflowing step (buckets short of `max_candidates` free slots
+grow at the check) and a resort deferred to the check. Opt-in, for launch-
+bound small nets; N = 1 is the exact protocol above.
+
 `topo.resort` (`topo.py:149`) recomputes levels (`recompute_levels`,
 Bellman-Ford relaxation bounded by `kahn_max_depth`), redistributes edges into
 new per-level buckets (prefix-sum compacting scatter + stable sort on
-`dead*num_units + to_id` to restore the `(dead, to_id)` order the segment
-reductions need), and sizes new capacities via `capacity_policy`. It returns a
+`dead*num_units + from_id` to restore the builder's source-major order -- live
+edges first, grouped by source, for scatter-add performance; in-place churn
+loosens it again, so no sweep relies on it), and sizes new capacities via `capacity_policy` with the build's
+recorded headroom and alignment (`static.capacity_headroom` / `capacity_align`). It returns a
 **new** `(static, state)` — the caller must retrace.
 
 ---

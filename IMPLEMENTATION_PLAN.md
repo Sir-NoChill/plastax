@@ -637,6 +637,45 @@ AddConn window, the retrace-count contract):
   predict-previous baseline with a 2x margin, is seed-deterministic, and
   uses Pipeline propagation.
 
+Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
+- phases.py forward sweeps: indices_are_sorted=True -> False (pipeline and
+  topological). The builder's (dead, to_id) order [D:3] only holds until the
+  first in-place prune or add; a violated hint is undefined in XLA. Current
+  backends ignore it, and on GPU the unsorted reduction measured no slower.
+- phases.py add_conn duplicate check: the int32 pair id `src * num_units +
+  dst` wrapped past 46340 units; `live_pair_member` is exact at any size.
+- builder/topo bucket order [D:3]: (dead, to_id) -> (dead, from_id, to_id),
+  source-major. With no sorted hint, a destination-sorted bucket serialises
+  the forward's scatter-add on atomics (forward 4.83 -> 1.47 ms at 50M edges
+  on GPU; 1.4x on CPU).
+- traits/phases: `ProposeAddConn` (additive): growth from policy-emitted
+  proposals; parallel edges allowed unless `dedupe = True`.
+  `Network.add_conn` is now typed `AddConn | ProposeAddConn | None`: code
+  that calls `net.add_conn.score` must narrow with isinstance first.
+- state/topo/builder: `NetworkStatic` gains `capacity_headroom` and
+  `capacity_align` (defaults 0.0 / None, the old policy); `capacity_policy`
+  gains `align`; the builders gain `capacity_align`. `topo.resort` now sizes
+  buckets with the recorded headroom instead of none, so a net built with
+  headroom keeps it across resorts.
+- step/phases/optim: `make_step(..., batch_size=B)` (additive): batched
+  StepInputs (`*batch` axes in the annotations); optional structural
+  `per_sample` / `incoming_batched` on UpdateConn, implemented by every optim
+  bundle (their `incoming` now delegates to `_step(c, cid, grad)`).
+- step/phases: `make_step(..., layout=)` (additive) and the structural
+  `linear_input` on forward/backward passes; batched linear passes may run
+  through a per-step CSR view and cuSPARSE (jax.experimental.sparse, a
+  dependency already inside jax -- no new package).
+- phases/step: `layout="triton"` (it briefly shipped as `layout="pallas"` on
+  this branch): an edge-once Triton kernel for batched linear passes on
+  NVIDIA GPUs, through `jax_triton` -- a new optional dependency, the
+  `plastax[triton]` extra; the core install is unchanged. The Pallas Triton
+  lowering it replaces is deprecated in jax; Pallas' Mosaic GPU backend cannot
+  express the kernel's scatter-add at the Pallas level. Off NVIDIA the layout
+  runs an XLA edge-once product. mypy: an `ignore_missing_imports` override
+  for the untyped triton / jax_triton modules (the strict gate is otherwise
+  unchanged). ty: `unresolved-import` ignores on the two lazy `jax_triton`
+  imports (the extra is absent from the dev venv).
+
 ## Handoff conventions
 
 - Commits: Conventional Commits with a mandatory scope (TAGS.md / SCOPES.md),

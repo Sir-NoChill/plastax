@@ -118,8 +118,12 @@ accumulators); donation-based in-place state; host driver retrace protocol;
 Scheme-A multi-device sharding.
 
 - *Why:* v1 is "rung 0" — the trace-time metaprogramming rung. Later rungs
-  (composites, Pallas, FFI) are deliberately deferred; premature scope creep
-  breaks the clean lowering ladder (see the design docs).
+  (composites, Pallas, FFI) are deliberately deferred as the *general*
+  lowering; premature scope creep breaks the clean lowering ladder (see the
+  design docs). The one exception is opt-in: `layout="triton"` runs a single
+  primitive (the batched linear bucket product) as a hand-written Triton
+  kernel via jax_triton on NVIDIA GPUs (IMPLEMENTATION_PLAN.md Deviations,
+  scale plan P6). No Pallas kernel ships today.
 - *Enforced by:* code review, the plan docs, and `monoid.UnsupportedMonoidError`
   guards (`monoid.py`).
 
@@ -134,13 +138,21 @@ These follow from the above but are worth stating for anyone touching `topo`,
   level. Forward/backward bucket walks and `add_conn`'s `needs_resort` decision
   all depend on it. PIPELINE mode drops this (cycles allowed; levels cosmetic,
   1 bucket).
-- **Bucket ordering:** each bucket is sorted by `(dead, to_id)` so
-  `indices_are_sorted=True` holds for the segment reductions. `builder.finalize`
-  establishes it; `topo.resort` restores it after redistribution.
+- **Bucket ordering is not an invariant.** `builder.finalize` and
+  `topo.resort` leave each bucket live-first in source-major `(from_id, to_id)`
+  order (for scatter-add performance: no run of atomics on one destination),
+  but in-place prune
+  and add break that order on the next step, so no segment reduction may pass
+  `indices_are_sorted=True` (a violated hint is undefined in XLA).
 - **Deletion never resorts. Level-preserving adds never resort.** `resort` runs
   only when `add_conn` set `needs_resort` (a non-level-preserving commit).
 - **`-inf` AddConn score is a hard veto** — never committed even with free
-  slots — distinct from a merely-low finite score.
+  slots — distinct from a merely-low finite score. The same holds for a
+  `ProposeAddConn` proposal's score.
+- **Duplicates follow `dedupe`:** it defaults to True for the grid path
+  (`AddConn`), which then never grows a copy of a live edge, and to False for
+  the proposal path (`ProposeAddConn`), which then grows parallel edges (each
+  contributing independently). Either policy may set it explicitly.
 - **Reserved field names** (`from_id`, `to_id`, `dead`, `weight`, `activation`,
   `level`) cannot be reused by `extra_unit_fields`/`extra_conn_fields`; enforced
   at subclass definition (`traits._validate_field_names`).

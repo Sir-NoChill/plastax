@@ -8,16 +8,28 @@ reset_global.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsparse
 from jaxtyping import Array, Bool, Float, Int32, Shaped
 
 from plastax import monoid
-from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, ConnIdx, Propagation, UnitIdx
+from plastax._types import (
+    DEAD,
+    FROM_ID,
+    LEVEL,
+    TO_ID,
+    WEIGHT,
+    ConnIdx,
+    FieldSpec,
+    Propagation,
+    UnitIdx,
+)
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.sweep import (
     build_backward_accumulate,
@@ -31,7 +43,7 @@ from plastax.sweep import (
     identity_accumulator,
     unit_id_mask,
 )
-from plastax.traits import Network
+from plastax.traits import AddConn, Network, ProposeAddConn
 from plastax.views import ConnView, UnitView
 
 # PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
@@ -53,13 +65,14 @@ class StepInputs:
     """Clamped inputs + targets for one step; fixed pytree structure.
 
     Attributes:
-        inputs: the (num_inputs,) values scattered to input unit ids.
-        targets: the (num_outputs,) loss targets, or None when the net
-            has no loss phase.
+        inputs: the (num_inputs,) values scattered to input unit ids, or
+            (B, num_inputs) for a batched step (make_step's batch_size).
+        targets: the (num_outputs,) loss targets -- (B, num_outputs) when
+            batched -- or None when the net has no loss phase.
     """
 
-    inputs: Float[Array, " num_inputs"]
-    targets: Float[Array, " num_outputs"] | None
+    inputs: Float[Array, "*batch num_inputs"]
+    targets: Float[Array, "*batch num_outputs"] | None
 
 
 def build_phases[GS](
@@ -105,6 +118,608 @@ def build_phases[GS](
     return tuple(phases)
 
 
+@dataclasses.dataclass(frozen=True)
+class BatchedPhases[GS]:
+    """The phases of a batched step, split by how they see the batch.
+
+    Attributes:
+        forward: the per-sample forward phase (vmapped over the batch).
+        loss: the per-sample loss phase, or None.
+        backward: the per-sample backward phase, or None.
+        csr_forward: the whole-batch CSR forward replacing `forward`, or None
+            for the edge-list layout (see build_csr_forward).
+        csr_backward: likewise for `backward`.
+        update_conn: the batched connection update, or None when the net has
+            no update_conn: `(state, batched_units) -> state`, reducing the
+            per-sample contributions to one update per connection.
+        structural: prune_conn, add_conn, and reset_global: run once, on the
+            batch-mean unit state.
+    """
+
+    forward: Phase[GS]
+    loss: Phase[GS] | None
+    backward: Phase[GS] | None
+    csr_forward: Callable[[NetworkState[GS], Columns], Columns] | None
+    csr_backward: Callable[[NetworkState[GS], Columns], Columns] | None
+    update_conn: Callable[[NetworkState[GS], Columns], NetworkState[GS]] | None
+    structural: tuple[Phase[GS], ...]
+
+
+def build_batched_phases[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    *,
+    overflow_sink: list[Bool[Array, ""]] | None = None,
+    engine: str | None = None,
+) -> BatchedPhases[GS]:
+    """Assemble a batched step's phases (see `BatchedPhases`).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying each phase's callbacks.
+        static: static network configuration giving the arena shapes.
+        overflow_sink: as for `build_phases`.
+        engine: route each linear pass (see `linear_input_field`) through this
+            bucket product (`bucket_product`), or None for the per-sample edge
+            list; non-linear passes always keep the edge list.
+
+    Returns:
+        The per-sample, update, and structural phases.
+    """
+    forward = _build_forward_phase(net, static)
+    loss = _build_loss_phase(net, static) if net.loss is not None else None
+    backward = (
+        _build_backward_phase(net, static) if net.backward_pass is not None else None
+    )
+    csr_forward = (
+        build_csr_forward(net, static, engine=engine)
+        if engine is not None and linear_input_field(net.forward_pass) is not None
+        else None
+    )
+    csr_backward = (
+        build_csr_backward(net, static, engine=engine)
+        if engine is not None
+        and net.backward_pass is not None
+        and linear_input_field(net.backward_pass) is not None
+        else None
+    )
+    structural: list[Phase[GS]] = []
+    if net.prune_conn is not None:
+        structural.append(build_prune_conn_phase(net, static))
+    if net.add_conn is not None:
+        structural.append(
+            build_add_conn_phase(net, static, overflow_sink=overflow_sink)
+        )
+    if net.reset_global is not None:
+        structural.append(_build_reset_global_phase(net))
+    update = build_batched_update_conn(net) if net.update_conn is not None else None
+    return BatchedPhases(
+        forward,
+        loss,
+        backward,
+        csr_forward,
+        csr_backward,
+        update,
+        tuple(structural),
+    )
+
+
+def batch_mean_units(units: Columns) -> Columns:
+    """Reduce batched unit columns `(B, num_units)` to one `(num_units,)` view.
+
+    Floating columns take the batch mean; any other column (levels, counters,
+    flags) must agree across the batch and takes sample 0.
+
+    Args:
+        units: Unit columns with a leading batch axis.
+
+    Returns:
+        The unbatched unit columns.
+    """
+    return {
+        name: col.mean(axis=0).astype(col.dtype)
+        if jnp.issubdtype(col.dtype, jnp.floating)
+        else col[0]
+        for name, col in units.items()
+    }
+
+
+def build_batched_update_conn[GS](
+    net: type[Network[GS]],
+) -> Callable[[NetworkState[GS], Columns], NetworkState[GS]]:
+    """One connection update per step from a batch of unit states.
+
+    Two reductions, chosen by what the UpdateConn declares:
+
+    - **Exact** (`per_sample` + `incoming_batched`, e.g. every `optim/`
+      bundle): `per_sample` is evaluated per edge for every sample and
+      averaged, then `incoming_batched` applies the rule once with that
+      average -- an optimizer step on the batch-mean gradient.
+    - **Mean of writes** (any other UpdateConn): the incoming and outgoing
+      passes run once per sample against the unchanged connections and each
+      written floating column is averaged over the batch. This equals the
+      batch-mean update for rules linear in the per-sample term (SGD,
+      momentum, plain delta rules), not for rules nonlinear in it (Adam's
+      second moment, for one).
+
+    Both accumulate over the batch in a loop, so memory stays O(capacity)
+    rather than O(batch * capacity).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying the update_conn policy.
+
+    Returns:
+        `(state, batched_units) -> state` with updated connections.
+    """
+    uc = net.update_conn
+    assert uc is not None  # only built when set
+    per_sample_fn = getattr(uc, "per_sample", None)
+    incoming_batched_fn = getattr(uc, "incoming_batched", None)
+    incoming = build_incoming_conn_update(uc.incoming)
+    outgoing = build_outgoing_conn_update(uc.outgoing)
+
+    def sample(units: Columns, b: jax.Array) -> Columns:
+        return {name: col[b] for name, col in units.items()}
+
+    def exact(state: NetworkState[GS], units_b: Columns) -> NetworkState[GS]:
+        assert per_sample_fn is not None and incoming_batched_fn is not None
+        batch = next(iter(units_b.values())).shape[0]
+        g = state.globals_
+        mean_units = batch_mean_units(units_b)
+
+        def bucket_update(bucket: Columns) -> Columns:
+            c_view = ConnView(bucket)
+            to_id, from_id = bucket[TO_ID.name], bucket[FROM_ID.name]
+            cids = jnp.arange(to_id.shape[0])
+
+            def stat_of(units: Columns) -> Any:
+                u_view = UnitView(units)
+
+                def one(d: jax.Array, s_: jax.Array, cid: jax.Array) -> Any:
+                    return per_sample_fn(
+                        u_view, UnitIdx(d), UnitIdx(s_), c_view, ConnIdx(cid), g
+                    )
+
+                return jax.vmap(one)(to_id, from_id, cids)
+
+            total = jax.lax.fori_loop(
+                1,
+                batch,
+                lambda b, acc: jax.tree.map(jnp.add, acc, stat_of(sample(units_b, b))),
+                stat_of(sample(units_b, jnp.int32(0))),
+            )
+            mean_stat = jax.tree.map(lambda x: x / jnp.float32(batch), total)
+            u_view = UnitView(mean_units)
+
+            def apply(
+                d: jax.Array, s_: jax.Array, cid: jax.Array, stat: Any
+            ) -> dict[str, jax.Array]:
+                write = incoming_batched_fn(
+                    u_view, UnitIdx(d), UnitIdx(s_), c_view, ConnIdx(cid), g, stat
+                )
+                return dict(write.fields)
+
+            writes = jax.vmap(apply)(to_id, from_id, cids, mean_stat)
+            dead = bucket[DEAD.name]
+            out: Columns = dict(bucket)
+            for name, written in writes.items():
+                out[name] = jnp.where(dead, bucket[name], written)
+            return out
+
+        conns = tuple(bucket_update(bucket) for bucket in state.conns)
+        conns = tuple(outgoing(mean_units, bucket, g) for bucket in conns)
+        return dataclasses.replace(state, conns=conns)
+
+    def mean_of_writes(state: NetworkState[GS], units_b: Columns) -> NetworkState[GS]:
+        batch = next(iter(units_b.values())).shape[0]
+        g = state.globals_
+
+        def one_sample(units: Columns) -> tuple[Columns, ...]:
+            conns = tuple(incoming(units, bucket, g) for bucket in state.conns)
+            return tuple(outgoing(units, bucket, g) for bucket in conns)
+
+        # Average each floating column's per-sample *change* and add it back:
+        # a column the rule never writes, and every dead slot (keep-old
+        # merge), has an exact zero change and so stays bit-identical --
+        # averaging the absolute values would drift them by an ulp per step
+        # whenever (x + ... + x) / B != x in float32. Non-floating columns take
+        # sample 0's write (see make_step).
+        def deltas(conns: tuple[Columns, ...]) -> tuple[Columns, ...]:
+            return tuple(
+                {
+                    k: v - old[k]
+                    for k, v in bucket.items()
+                    if jnp.issubdtype(v.dtype, jnp.floating)
+                }
+                for bucket, old in zip(conns, state.conns, strict=True)
+            )
+
+        first = one_sample(sample(units_b, jnp.int32(0)))
+        total = jax.lax.fori_loop(
+            1,
+            batch,
+            lambda b, acc: jax.tree.map(
+                jnp.add, acc, deltas(one_sample(sample(units_b, b)))
+            ),
+            deltas(first),
+        )
+        conns = tuple(
+            {
+                **bucket,
+                **{
+                    k: (old[k] + d / jnp.float32(batch)).astype(old[k].dtype)
+                    for k, d in delta.items()
+                },
+            }
+            for bucket, old, delta in zip(first, state.conns, total, strict=True)
+        )
+        return dataclasses.replace(state, conns=conns)
+
+    if per_sample_fn is not None and incoming_batched_fn is not None:
+        return exact
+    return mean_of_writes
+
+
+def linear_input_field(pass_: object) -> FieldSpec[Any] | None:
+    """The unit field a pass declares itself linear in, or None.
+
+    A ForwardPass or BackwardPass may declare, structurally, `linear_input`:
+    a FieldSpec F such that its `map` is exactly `WEIGHT * u[F, other]` (the
+    source unit for forward, the destination for backward) and its `combine`
+    is the plain `monoid.sum_`. Such a pass's accumulation is a sparse matrix
+    product, which the CSR layout computes with cuSPARSE instead of the
+    per-edge map; `apply` is unchanged. The declaration is trusted -- `map` is
+    not consulted on the CSR path -- so it must be true.
+
+    Args:
+        pass_: A forward or backward pass policy.
+
+    Returns:
+        The declared FieldSpec when the pass qualifies, else None.
+    """
+    field = getattr(pass_, "linear_input", None)
+    combine = getattr(pass_, "combine", None)
+    if isinstance(field, FieldSpec) and combine is monoid.sum_:
+        return field
+    return None
+
+
+def bucket_csr(
+    bucket: Columns, num_units: int, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
+) -> jsparse.BCSR:
+    """A `(num_units, num_units)` CSR view of one bucket's live edges.
+
+    Built on device from the arena in one radix sort (by `rows`), so it is
+    always current: in-place churn needs no invalidation. Dead slots stay in
+    the view as explicit zeros in an extra null row `num_units` (the matrix is
+    `(num_units + 1, num_units)`; callers slice the product), keeping every
+    shape static without touching a real unit's row.
+
+    Args:
+        bucket: The bucket's columns.
+        num_units: Total unit count (the matrix side).
+        rows: TO_ID for the forward (rows are destinations), FROM_ID for the
+            backward's transpose.
+        cols: The other endpoint column.
+
+    Returns:
+        The BCSR matrix whose row r < num_units holds the weights of the live
+        edges with `rows == r`, at column `cols`; row num_units is the dead
+        slots' null row.
+    """
+    dead = bucket[DEAD.name]
+    cap = dead.shape[0]
+    row_id = jnp.where(dead, jnp.int32(num_units), bucket[rows.name])
+    _, perm = jax.lax.sort_key_val(row_id, jnp.arange(cap, dtype=jnp.int32))
+    sorted_rows = row_id[perm]
+    counts = jnp.zeros((num_units + 1,), jnp.int32).at[sorted_rows].add(1)
+    indptr = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)])
+    values = jnp.where(dead[perm], jnp.float32(0.0), bucket[WEIGHT.name][perm])
+    return jsparse.BCSR(
+        (values, bucket[cols.name][perm].astype(jnp.int32), indptr),
+        shape=(num_units + 1, num_units),
+        indices_sorted=False,
+        unique_indices=False,
+    )
+
+
+# Elements (edges x batch lanes) per Triton program: the edge block shrinks as
+# the batch widens so a program's tile stays this size (a 512-edge block at
+# B = 32 spilled and ran 25x slower).
+_TRITON_TILE = 2048
+
+
+@functools.cache
+def nvidia_triton_available() -> bool:
+    """Whether the jax_triton kernel can run here.
+
+    That needs an NVIDIA (CUDA) default backend with `jax_triton` and `triton`
+    importable (the `plastax[triton]` extra).
+
+    Returns:
+        True when the Triton edge kernel is usable.
+    """
+    if jax.default_backend() != "gpu":
+        return False
+    try:
+        platform_version = jax.devices()[0].client.platform_version.lower()
+    except Exception:  # noqa: BLE001 - any failure means "not known to be CUDA"
+        return False
+    if "cuda" not in platform_version:
+        return False
+    try:
+        import jax_triton  # noqa: F401  # ty: ignore[unresolved-import]
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@functools.cache
+def _triton_edge_kernel() -> Any:
+    """The Triton kernel, built on first use so plastax never imports triton."""
+    import triton
+    import triton.language as tl
+
+    # Triton kernel arguments are pointers and constexprs, which carry no
+    # Python annotations the type checkers understand.
+    @triton.jit  # type: ignore[untyped-decorator]
+    def edge_product(  # type: ignore[no-untyped-def]  # noqa: ANN202
+        tgt_ptr,  # noqa: ANN001
+        src_ptr,  # noqa: ANN001
+        w_ptr,  # noqa: ANN001
+        x_ptr,  # noqa: ANN001
+        out_ptr,  # noqa: ANN001
+        n_edges,  # noqa: ANN001
+        WIDTH: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n_edges
+        t = tl.load(tgt_ptr + offs, mask=m, other=0)
+        s = tl.load(src_ptr + offs, mask=m, other=0)
+        w = tl.load(w_ptr + offs, mask=m, other=0.0)
+        lanes = tl.arange(0, WIDTH)
+        xv = tl.load(
+            x_ptr + s[:, None] * WIDTH + lanes[None, :], mask=m[:, None], other=0.0
+        )
+        tl.atomic_add(
+            out_ptr + t[:, None] * WIDTH + lanes[None, :],
+            w[:, None] * xv,
+            mask=m[:, None],
+            sem="relaxed",
+        )
+
+    return edge_product
+
+
+def triton_bucket_product(
+    bucket: Columns,
+    x: Float[Array, "num_units batch"],
+    num_units: int,
+    *,
+    rows: FieldSpec[Any],
+    cols: FieldSpec[Any],
+) -> Float[Array, "num_units batch"]:
+    """`bucket_csr(...) @ x` as one edge-once Triton kernel (NVIDIA GPUs).
+
+    Each program loads a block of edges, gathers its `(block, batch)` slab of
+    x once, and adds `weight * slab` into the target rows with relaxed atomics:
+    no sort, every edge read once for the whole batch. Dead edges target an
+    extra null row that is sliced off; the batch is padded to a power of two
+    (a Triton tile constraint). Called through `jax_triton` -- the Pallas
+    Triton lowering this replaces is deprecated in jax.
+
+    Args:
+        bucket: The bucket's columns.
+        x: `(num_units, batch)` input values.
+        num_units: Total unit count.
+        rows: TO_ID (forward) or FROM_ID (backward): the accumulation target.
+        cols: The other endpoint: the gathered row of x.
+
+    Returns:
+        The `(num_units, batch)` product.
+    """
+    import jax_triton  # ty: ignore[unresolved-import]
+
+    cap = bucket[DEAD.name].shape[0]
+    batch = x.shape[1]
+    width = 1 << max(batch - 1, 0).bit_length()
+    block = max(16, _TRITON_TILE // width)
+    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
+    x_pad = x if width == batch else jnp.pad(x, ((0, 0), (0, width - batch)))
+    out = jax_triton.triton_call(
+        target.astype(jnp.int32),
+        bucket[cols.name].astype(jnp.int32),
+        bucket[WEIGHT.name].astype(jnp.float32),
+        x_pad.astype(jnp.float32),
+        kernel=_triton_edge_kernel(),
+        out_shape=jax.ShapeDtypeStruct((num_units + 1, width), jnp.float32),  # type: ignore[no-untyped-call]
+        grid=(-(-cap // block),),
+        zeroed_outputs=(0,),
+        n_edges=cap,
+        WIDTH=width,
+        BLOCK=block,
+    )
+    product: Float[Array, "num_units batch"] = out[:num_units, :batch]
+    return product
+
+
+def xla_bucket_product(
+    bucket: Columns,
+    x: Float[Array, "num_units batch"],
+    num_units: int,
+    *,
+    rows: FieldSpec[Any],
+    cols: FieldSpec[Any],
+) -> Float[Array, "num_units batch"]:
+    """The same edge-once product in plain XLA, for any backend.
+
+    One gather of `(edges, batch)` rows and one segment sum (dead edges to the
+    null row). The portable counterpart of `triton_bucket_product`, used on
+    non-NVIDIA backends.
+
+    Args:
+        bucket: The bucket's columns.
+        x: `(num_units, batch)` input values.
+        num_units: Total unit count.
+        rows: TO_ID (forward) or FROM_ID (backward): the accumulation target.
+        cols: The other endpoint: the gathered row of x.
+
+    Returns:
+        The `(num_units, batch)` product.
+    """
+    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
+    contrib = bucket[WEIGHT.name][:, None] * x[bucket[cols.name]]
+    product: Float[Array, "num_units batch"] = jax.ops.segment_sum(
+        contrib, target, num_units + 1
+    )[:num_units]
+    return product
+
+
+def _shard_sum(static: NetworkStatic) -> Callable[[jax.Array], jax.Array]:
+    """All-reduce a per-shard partial under Scheme-A; identity when unsharded.
+
+    Each shard's CSR view covers only its slice of the bucket's edges, so the
+    sparse products are partial sums, combined exactly like the edge-list
+    sweep's segment reductions.
+    """
+    axis = _shard_axis(static)
+    if axis is None:
+        return lambda x: x
+    return lambda x: monoid.sum_.collective(x, axis)
+
+
+def bucket_product(
+    engine: str, num_units: int
+) -> Callable[..., Float[Array, "num_units batch"]]:
+    """The per-bucket sparse product `(bucket, x, rows, cols) -> (N, B)`.
+
+    Args:
+        engine: "csr" (cuSPARSE via a per-step CSR view), "triton" (the
+            edge-once jax_triton kernel, NVIDIA GPUs), or "xla" (the same
+            edge-once product in plain XLA, any backend).
+        num_units: Total unit count.
+
+    Returns:
+        The product function.
+    """
+
+    def csr(
+        bucket: Columns, x: jax.Array, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
+    ) -> jax.Array:
+        full = bucket_csr(bucket, num_units, rows=rows, cols=cols) @ x
+        product: jax.Array = full[:num_units]
+        return product
+
+    def edge_once(
+        bucket: Columns, x: jax.Array, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
+    ) -> jax.Array:
+        fn = triton_bucket_product if engine == "triton" else xla_bucket_product
+        return fn(bucket, x, num_units, rows=rows, cols=cols)
+
+    return csr if engine == "csr" else edge_once
+
+
+def build_csr_forward[GS](
+    net: type[Network[GS]], static: NetworkStatic, *, engine: str = "csr"
+) -> Callable[[NetworkState[GS], Columns], Columns]:
+    """Batched topological forward with each bucket as one sparse product.
+
+    The level walk of the edge-list forward, but each bucket's accumulation
+    is `CSR(bucket) @ X` with X the `(num_units, B)` linear-input column, and
+    each level's `apply` is vmapped over the batch.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class; its forward pass must be linear.
+        static: static network configuration.
+        engine: the bucket product (see `bucket_product`).
+
+    Returns:
+        `(state, batched_units) -> batched_units` after the forward.
+    """
+    fp = net.forward_pass
+    field = linear_input_field(fp)
+    assert field is not None  # only built for a linear forward
+    num_units = static.num_units
+    apply = build_forward_apply(fp, num_units=num_units)
+    not_input = ~unit_id_mask(static.input_ids, num_units)
+    reduce_shards = _shard_sum(static)
+    product = bucket_product(engine, num_units)
+
+    def forward(state: NetworkState[GS], units_b: Columns) -> Columns:
+        level = state.units[LEVEL.name]
+        batch = units_b[field.name].shape[0]
+        acc = jnp.zeros((batch, num_units), jnp.float32)
+        for level_idx, bucket in enumerate(state.conns):
+            x = units_b[field.name].T
+            acc = acc + reduce_shards(product(bucket, x, rows=TO_ID, cols=FROM_ID).T)
+            finalize = (level == level_idx + 1) & not_input
+            units_b, acc = jax.vmap(apply, in_axes=(0, 0, None, None))(
+                units_b, acc, state.globals_, finalize
+            )
+        return units_b
+
+    return forward
+
+
+def build_csr_backward[GS](
+    net: type[Network[GS]], static: NetworkStatic, *, engine: str = "csr"
+) -> Callable[[NetworkState[GS], Columns], Columns]:
+    """Batched topological backward with each bucket as one sparse product.
+
+    Mirrors `_build_backward_topological_phase` (reverse level walk, the top
+    level primed from the identity), accumulating `CSR^T(bucket) @ G` with G
+    the `(num_units, B)` linear-input column read at the destinations.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class; its backward pass must be linear.
+        static: static network configuration.
+        engine: the bucket product (see `bucket_product`).
+
+    Returns:
+        `(state, batched_units) -> batched_units` after the backward.
+    """
+    bp = net.backward_pass
+    field = linear_input_field(bp)
+    assert bp is not None and field is not None  # only built when linear
+    num_units = static.num_units
+    num_levels = len(static.level_capacities)
+    apply = build_backward_apply(bp, num_units=num_units)
+    not_input = ~unit_id_mask(static.input_ids, num_units)
+    vapply = jax.vmap(apply, in_axes=(0, 0, None, None))
+    reduce_shards = _shard_sum(static)
+    product = bucket_product(engine, num_units)
+
+    def backward(state: NetworkState[GS], units_b: Columns) -> Columns:
+        level = state.units[LEVEL.name]
+        batch = units_b[field.name].shape[0]
+        acc = jnp.zeros((batch, num_units), jnp.float32)
+        units_b, acc = vapply(
+            units_b, acc, state.globals_, (level == num_levels) & not_input
+        )
+        for level_idx in range(num_levels - 1, 0, -1):
+            x = units_b[field.name].T
+            bucket = state.conns[level_idx]
+            acc = acc + reduce_shards(product(bucket, x, rows=FROM_ID, cols=TO_ID).T)
+            finalize = (level == level_idx) & not_input
+            units_b, acc = vapply(units_b, acc, state.globals_, finalize)
+        return units_b
+
+    return backward
+
+
 def _shard_axis(static: NetworkStatic) -> str | None:
     """Return the Scheme-A mesh axis name, or None when unsharded."""
     return static.sharding.axis_name if static.sharding is not None else None
@@ -115,12 +730,15 @@ def _build_forward_phase[GS](
 ) -> Phase[GS]:
     if net.propagation is Propagation.PIPELINE:
         # level_capacities is a 1-tuple -- the single flat bucket is
-        # state.conns[0]. indices_are_sorted=True holds from
-        # NetworkBuilder.finalize's per-bucket (dead, to_id) sort.
+        # state.conns[0]. Not indices_are_sorted: buckets are laid out
+        # source-major (builder, resort), so TO_ID is not sorted, and in-place
+        # prune (a tombstone's null target) and add (a new edge in any dead
+        # slot) would break any order anyway; a violated hint is undefined
+        # in XLA.
         sweep = build_forward_sweep(
             net.forward_pass,
             num_units=static.num_units,
-            indices_are_sorted=True,
+            indices_are_sorted=False,
             input_ids=static.input_ids,
             shard_axis=_shard_axis(static),
         )
@@ -157,10 +775,11 @@ def _build_forward_topological_phase[GS](
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     fp = net.forward_pass
+    # Not indices_are_sorted, for the same reason as the pipeline forward.
     accumulate = build_forward_accumulate(
         fp,
         num_units=num_units,
-        indices_are_sorted=True,
+        indices_are_sorted=False,
         shard_axis=_shard_axis(static),
     )
     apply = build_forward_apply(fp, num_units=num_units)
@@ -192,9 +811,8 @@ def _build_backward_phase[GS](
         # No level structure, one flat bucket, every unit Applied
         # unconditionally (build_backward_sweep takes no input_ids -- see
         # its docstring). indices_are_sorted=False: backward indexes
-        # segments by FROM_ID, but finalize sorts each bucket by (dead,
-        # TO_ID), so those indices are not sorted -- correct on CPU either
-        # way, honest for GPU/TPU, matching the topological backward.
+        # segments by FROM_ID, and although buckets start source-major,
+        # dead slots' null targets and in-place adds break that order.
         sweep = build_backward_sweep(
             bp,
             num_units=static.num_units,
@@ -430,6 +1048,179 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+# jnp.searchsorted's default method ("scan") is a while loop, one tiny kernel
+# launch per halving step on GPU; unrolled, the whole search fuses. At 5.4M
+# edges this took the add phase from 0.34 to 0.07 ms per step.
+_SEARCH = "scan_unrolled"
+
+# Largest num_units whose pair id `src * num_units + dst` still fits in int32.
+_INT32_PAIR_UNITS = 46340
+
+
+def live_pair_member(
+    from_id: Int32[Array, " cap"],
+    to_id: Int32[Array, " cap"],
+    dead: Bool[Array, " cap"],
+    cand_src: Int32[Array, " p"],
+    cand_dst: Int32[Array, " p"],
+    num_units: int,
+) -> Bool[Array, " p"]:
+    """Whether each candidate `(src, dst)` is already a live edge of the bucket.
+
+    Exact for every `num_units`: the live pair ids `src * num_units + dst`
+    are sorted once and each candidate is binary-searched. While the id fits
+    in int32 (num_units <= 46340) it is computed in int32; past that it would
+    wrap, so it is computed in uint64 under a scoped `jax.enable_x64` (still a
+    single-key radix sort on GPU, about 3x the int32 cost). Dead rows get an
+    id no candidate can have. Cost is O((P + cap) log cap).
+
+    Args:
+        from_id: The bucket's source column.
+        to_id: The bucket's destination column.
+        dead: The bucket's tombstone mask.
+        cand_src: Candidate source ids.
+        cand_dst: Candidate destination ids, parallel to `cand_src`.
+        num_units: Total unit count, the id bound.
+
+    Returns:
+        A mask over the candidates, True where the pair is live in the bucket.
+    """
+    cap = from_id.shape[0]
+    last = jnp.int32(cap - 1)
+    src = from_id.astype(jnp.int32)
+    dst = to_id.astype(jnp.int32)
+    if num_units <= _INT32_PAIR_UNITS:
+        live_pair = jnp.where(dead, jnp.int32(-1), src * jnp.int32(num_units) + dst)
+        sorted_live = jnp.sort(live_pair)
+        cand_pair = cand_src * jnp.int32(num_units) + cand_dst
+        pos = jnp.minimum(
+            jnp.searchsorted(sorted_live, cand_pair, method=_SEARCH), last
+        )
+        hit: Bool[Array, " p"] = sorted_live[pos] == cand_pair
+        return hit
+    # Past the bound, the same search on a uint64 pair id. x64 is enabled
+    # only while tracing these ops; nothing 64-bit escapes (the result is a
+    # bool mask), so the rest of the step keeps the default 32-bit types.
+    with jax.enable_x64(True):
+        n = jnp.uint64(num_units)
+        sentinel = jnp.uint64(num_units) * n  # above every real pair id
+        live_pair64 = jnp.where(
+            dead, sentinel, src.astype(jnp.uint64) * n + dst.astype(jnp.uint64)
+        )
+        sorted_live64 = jnp.sort(live_pair64)
+        cand_pair64 = cand_src.astype(jnp.uint64) * n + cand_dst.astype(jnp.uint64)
+        pos = jnp.minimum(
+            jnp.searchsorted(sorted_live64, cand_pair64, method=_SEARCH), last
+        )
+        wide_hit: Bool[Array, " p"] = sorted_live64[pos] == cand_pair64
+    return wide_hit
+
+
+def repeats_earlier(
+    src: Int32[Array, " k"], dst: Int32[Array, " k"]
+) -> Bool[Array, " k"]:
+    """Mark each `(src, dst)` pair that also occurs at an earlier position.
+
+    Two stable single-key sorts (dst, then src) order the pairs
+    lexicographically while keeping equal pairs in their original order, so
+    in every run of equal pairs all but the first-positioned copy is marked.
+    O(k log k), for the (small) per-step top-k.
+
+    Args:
+        src: Source ids.
+        dst: Destination ids, parallel to `src`.
+
+    Returns:
+        True where the same pair occurs at a lower index.
+    """
+    order = jnp.arange(src.shape[0], dtype=jnp.int32)
+    _, order = jax.lax.sort_key_val(dst, order, is_stable=True)
+    _, order = jax.lax.sort_key_val(src[order], order, is_stable=True)
+    s_src, s_dst = src[order], dst[order]
+    same_as_prev = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.bool_),
+            (s_src[1:] == s_src[:-1]) & (s_dst[1:] == s_dst[:-1]),
+        ]
+    )
+    repeated: Bool[Array, " k"] = (
+        jnp.zeros_like(same_as_prev).at[order].set(same_as_prev)
+    )
+    return repeated
+
+
+# Block length for the two-level free-slot search: the largest power of two up
+# to this that divides the bucket, so the per-block counts are a plain reshape.
+_FREE_BLOCK = 1024
+
+
+def count_free_blocks(
+    dead: Bool[Array, " cap"],
+) -> tuple[Int32[Array, " blocks"], int]:
+    """Inclusive running count of free (dead) slots per block of the bucket.
+
+    The first level of the free-slot search: `blocks[b]` counts the dead slots
+    in blocks 0..b. Reads the mask once (a reduction), where a slot-level
+    cumsum would also write 4 bytes per slot.
+
+    Args:
+        dead: The bucket's tombstone mask.
+
+    Returns:
+        The per-block inclusive counts and the (static) block length. The last
+        count is the bucket's total free slots.
+    """
+    cap = dead.shape[0]
+    block = _FREE_BLOCK
+    while block > 1 and cap % block:
+        block //= 2
+    if block < 64:  # an awkward capacity: pad rather than use tiny blocks
+        block = _FREE_BLOCK
+        dead = jnp.pad(dead, (0, -cap % block))
+    counts = dead.reshape(-1, block).sum(axis=1, dtype=jnp.int32)
+    running: Int32[Array, " blocks"] = jnp.cumsum(counts)
+    return running, block
+
+
+def nth_free_slot(
+    dead: Bool[Array, " cap"],
+    free_blocks: Int32[Array, " blocks"],
+    block: int,
+    rank: Int32[Array, " k"],
+) -> Int32[Array, " k"]:
+    """Position of each `rank`-th (0-based) free slot of the bucket.
+
+    The second level: a binary search over the block counts finds each rank's
+    block, then a cumsum over just that block finds the slot -- O(k * block)
+    work, independent of the capacity. Ranks at or beyond the free count return
+    an arbitrary in-bounds position; callers mask them.
+
+    Args:
+        dead: The bucket's tombstone mask.
+        free_blocks: `count_free_blocks(dead)`'s running counts.
+        block: `count_free_blocks(dead)`'s block length.
+        rank: The free-slot ranks to locate.
+
+    Returns:
+        One slot position per rank.
+    """
+    cap = dead.shape[0]
+    target = rank + jnp.int32(1)
+    b = jnp.minimum(
+        jnp.searchsorted(free_blocks, target, method=_SEARCH).astype(jnp.int32),
+        jnp.int32(free_blocks.shape[0] - 1),
+    )
+    before = jnp.where(b > 0, free_blocks[jnp.maximum(b - 1, 0)], jnp.int32(0))
+    idx = b[:, None] * jnp.int32(block) + jnp.arange(block, dtype=jnp.int32)[None, :]
+    in_block = jnp.where(idx < cap, dead[jnp.minimum(idx, cap - 1)], False)
+    running = jnp.cumsum(in_block.astype(jnp.int32), axis=1)
+    offset = jax.vmap(functools.partial(jnp.searchsorted, method=_SEARCH))(
+        running, target - before
+    ).astype(jnp.int32)
+    slot: Int32[Array, " k"] = jnp.minimum(b * jnp.int32(block) + offset, cap - 1)
+    return slot
+
+
 @dataclasses.dataclass(frozen=True)
 class ShortlistCoverage:
     """How much of one bucket's destination population a shortlist can reach.
@@ -548,10 +1339,12 @@ def build_add_conn_phase[GS](
     single bucket accepts a source at any level, since every live conn
     lives in one flat arena regardless of source level -- the level
     window itself is still consulted in both modes, only the destination
-    bucket differs. Candidates already present as a live edge in the bucket
+    bucket differs. With `dedupe` (the default for grid growth, opt-in for
+    ProposeAddConn) candidates already present as a live edge in the bucket
     are masked out (each candidate's pair id binary-searched against the
-    sorted live pair ids -- no num_units**2 occupancy grid) so growth never
-    regrows an existing pair as a duplicate. Each bucket runs an independent
+    sorted live pair ids -- no num_units**2 occupancy grid), and repeated
+    proposals within the step keep only their highest-scored copy, so growth
+    never regrows an existing pair as a duplicate. Each bucket runs an independent
     top_k (static k) over its own scored, windowed candidates, with no
     cross-bucket sequencing. A candidate scored -inf is never committed -- the
     framework scores every invalid candidate -inf, and a growth policy returns
@@ -618,10 +1411,21 @@ def build_add_conn_phase[GS](
     # hence topological only (pipeline keeps the global shortlist), and forward
     # only (its destinations are strictly deeper), matching how growth policies
     # veto non-deeper edges anyway.
+    # Proposal growth (ProposeAddConn) replaces the grid as the candidate
+    # source: the policy emits `num_proposals` (src, dst, score) triples and
+    # everything downstream -- routing, window, top_k, slot claim, init -- is
+    # shared with the grid path. The live-edge duplicate check defaults on for
+    # the grid and off for proposals (parallel edges allowed; see
+    # ProposeAddConn).
+    use_propose = isinstance(ac, ProposeAddConn)
+    dedupe = bool(getattr(ac, "dedupe", not use_propose))
+    num_proposals = ac.num_proposals if isinstance(ac, ProposeAddConn) else 0
+
     max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
     importance_fn = getattr(ac, "importance", None)
     use_shortlist = (
-        max_candidate_units is not None
+        not use_propose
+        and max_candidate_units is not None
         and importance_fn is not None
         and 0 < max_candidate_units < num_units
     )
@@ -634,17 +1438,19 @@ def build_add_conn_phase[GS](
     assert pool_side is not None  # use_shortlist implies max_candidate_units set
     # Static (Python-int) candidate-pool bound: top_k requires k <= pool size,
     # and a small test network's pool can undercut a generous max_candidates.
-    k = max(0, min(ac.max_candidates, pool_side * pool_side))
+    pool = num_proposals if use_propose else pool_side * pool_side
+    k = max(0, min(ac.max_candidates, pool))
 
-    unit_ids = jnp.arange(num_units, dtype=jnp.int32)
-    # Full (src, dst) grid, built once when not shortlisting; the shortlisted
-    # grid is rebuilt per step inside the phase (importance is state-dependent).
-    _full_src = jnp.broadcast_to(unit_ids[:, None], (num_units, num_units)).reshape(-1)
-    _full_dst = jnp.broadcast_to(unit_ids[None, :], (num_units, num_units)).reshape(-1)
+    # Every candidate grid is built inside the traced phase, never here: this
+    # builder runs eagerly (outside jit), where a num_units^2 grid would be a
+    # real allocation held by the phase closure -- even for a proposal or
+    # shortlist policy that never reads it (4 * num_units^2 bytes per column,
+    # terabytes at a million units). Traced, an unused grid is dead code.
 
     def importance_scores(u_view: UnitView, g: GS) -> jax.Array:
         """The per-unit importance vector (num_units,), for either shortlist."""
         assert importance_fn is not None  # only called when shortlisting
+        unit_ids = jnp.arange(num_units, dtype=jnp.int32)
 
         def one(i: jax.Array) -> jax.Array:
             score = importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
@@ -655,7 +1461,10 @@ def build_add_conn_phase[GS](
     def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
         """The global (flat_src, flat_dst) grid: full num_units^2 or top-M^2."""
         if not use_shortlist:
-            return _full_src, _full_dst
+            unit_ids = jnp.arange(num_units, dtype=jnp.int32)
+            full_src = jnp.repeat(unit_ids, num_units, total_repeat_length=num_units**2)
+            full_dst = jnp.tile(unit_ids, num_units)
+            return full_src, full_dst
         _, top = jax.lax.top_k(importance_scores(u_view, g), pool_side)
         src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
         dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
@@ -695,9 +1504,33 @@ def build_add_conn_phase[GS](
         # top-M grid and goes unused, dead-code-eliminated -- never the
         # num_units^2 full grid.
         imp = importance_scores(u_view, g) if use_per_level else None
-        global_src, global_dst = candidate_grid(u_view, g)
+        if isinstance(ac, ProposeAddConn):
+            # The proposals are this step's global candidate list: computed
+            # once, filtered per bucket in the loop. An out-of-range id is
+            # vetoed and clamped to 0 so every gather below stays in bounds.
+            def propose_one(
+                j: jax.Array,
+            ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                s_, d_, score_ = ac.propose(u_view, j, g)
+                return (
+                    jnp.asarray(s_, jnp.int32),
+                    jnp.asarray(d_, jnp.int32),
+                    jnp.asarray(score_, jnp.float32),
+                )
+
+            p_src, p_dst, p_score = jax.vmap(propose_one)(
+                jnp.arange(num_proposals, dtype=jnp.int32)
+            )
+            in_range = (
+                (p_src >= 0) & (p_src < num_units) & (p_dst >= 0) & (p_dst < num_units)
+            )
+            global_src = jnp.where(in_range, p_src, jnp.int32(0))
+            global_dst = jnp.where(in_range, p_dst, jnp.int32(0))
+        else:
+            global_src, global_dst = candidate_grid(u_view, g)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
+            assert isinstance(ac, AddConn)  # the grid path only
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
             return jnp.where(ok, raw.astype(jnp.float32), jnp.float32(-jnp.inf))
 
@@ -707,6 +1540,38 @@ def build_add_conn_phase[GS](
             # _apply_masked's UnitWrite handling in sweep.py.
             write = ac.init(u_view, UnitIdx(s), UnitIdx(d), g)
             return dict(write.fields)
+
+        def not_live_duplicate(
+            bucket_conns: Columns, cand_src: jax.Array, cand_dst: jax.Array
+        ) -> jax.Array:
+            """Candidates that are not already a live edge of this bucket.
+
+            A sort of the live pairs plus a binary search per candidate,
+            O((P + cap) * log cap) with no num_units**2 occupancy grid, so a
+            shortlisted or proposal phase stays free of any num_units**2 term.
+            """
+            not_duplicate = ~live_pair_member(
+                bucket_conns[FROM_ID.name],
+                bucket_conns[TO_ID.name],
+                bucket_conns[DEAD.name],
+                cand_src,
+                cand_dst,
+                num_units,
+            )
+            if shard_axis is None:
+                return not_duplicate
+            # Under Scheme-A the live edges are split across shards, so the
+            # binary search above only sees THIS shard's slice. A candidate
+            # already live on any other shard must count as a duplicate
+            # everywhere -- otherwise shards would score a different candidate
+            # set, top_k differently, and disagree on the global slot
+            # assignment below. All-reduce the local duplicate mask (pmax ==
+            # boolean OR) so valid/scores/top_k are identical on every shard.
+            dup_any = monoid.max_.collective(
+                (~not_duplicate).astype(jnp.int32), shard_axis
+            )
+            nowhere_live: jax.Array = dup_any == jnp.int32(0)
+            return nowhere_live
 
         new_conns: list[Columns] = []
         overflow = jnp.bool_(False)
@@ -728,45 +1593,34 @@ def build_add_conn_phase[GS](
                 if is_pipeline
                 else src_level == bucket_idx
             )
-            # Exclude candidates already present as a live edge in this
-            # bucket, so growth never regrows an existing pair as a duplicate.
-            # Each edge has a pair id `src * num_units + dst`; sort the live
-            # edges' pair ids (dead slots sent to -1, which no candidate id
-            # matches) and binary-search each candidate against them. Bounded
-            # by the candidate count and the bucket capacity -- O((P + cap) *
-            # log cap), with no num_units**2 occupancy grid -- so a
-            # shortlisted phase stays free of any num_units**2 term.
-            dead_bucket = bucket_conns[DEAD.name]
-            live_pair = jnp.where(
-                dead_bucket,
-                jnp.int32(-1),
-                bucket_conns[FROM_ID.name].astype(jnp.int32) * jnp.int32(num_units)
-                + bucket_conns[TO_ID.name].astype(jnp.int32),
-            )
-            sorted_live = jnp.sort(live_pair)
-            candidate_pair = flat_src * jnp.int32(num_units) + flat_dst
-            pos = jnp.minimum(
-                jnp.searchsorted(sorted_live, candidate_pair),
-                jnp.int32(sorted_live.shape[0] - 1),
-            )
-            not_duplicate = sorted_live[pos] != candidate_pair
-            if shard_axis is not None:
-                # Under Scheme-A the live edges are split across shards, so the
-                # binary search above only sees THIS shard's slice. A candidate
-                # already live on any other shard must count as a duplicate
-                # everywhere -- otherwise shards would score a different
-                # candidate set, top_k differently, and disagree on the global
-                # slot assignment below. All-reduce the local duplicate mask
-                # (pmax == boolean OR) so valid/scores/top_k are identical on
-                # every shard.
-                dup_any = monoid.max_.collective(
-                    (~not_duplicate).astype(jnp.int32), shard_axis
-                )
-                not_duplicate = dup_any == jnp.int32(0)
-            valid = window_ok & src_ok & not_duplicate
-
-            flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
-            _, top_idx = jax.lax.top_k(flat_scores, k)
+            valid = window_ok & src_ok
+            if use_propose:
+                valid = valid & in_range
+            if dedupe:
+                valid = valid & not_live_duplicate(bucket_conns, flat_src, flat_dst)
+            if use_propose:
+                flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
+                if dedupe:
+                    # Proposals, unlike grid cells, can repeat within a step.
+                    # Keep each pair's highest-scored copy and veto the rest
+                    # BEFORE top_k, so repeats never take a bucket's k slots.
+                    by_score = jnp.argsort(-flat_scores, stable=True)
+                    repeat = (
+                        jnp.zeros_like(valid)
+                        .at[by_score]
+                        .set(repeats_earlier(flat_src[by_score], flat_dst[by_score]))
+                    )
+                    flat_scores = jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
+            else:
+                flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
+            if k == flat_scores.shape[0]:
+                # Every candidate fits the budget, so selection is moot: skip
+                # the (full-sort) top_k. Order only decides which free slot a
+                # candidate takes, and growth_rank below tolerates vetoed
+                # (-inf) candidates anywhere.
+                top_idx = jnp.arange(k, dtype=jnp.int32)
+            else:
+                _, top_idx = jax.lax.top_k(flat_scores, k)
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]
@@ -784,9 +1638,10 @@ def build_add_conn_phase[GS](
 
             # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
             # dead mask is this shard's capacity slice (size capacity_b //
-            # num_shards; power-of-two capacities keep it exact), so the claim
-            # runs over the LOCAL slice and is coordinated across shards: each
-            # growable candidate takes a GLOBAL free-slot rank and lands on the
+            # num_shards; a capacity divisible by the shard count keeps it
+            # exact), so the claim runs over the LOCAL slice and is
+            # coordinated across shards: each growable candidate takes a
+            # GLOBAL free-slot rank and lands on the
             # one shard that owns it. Because shard g holds arena positions
             # [g*local_capacity, (g+1)*local_capacity), the global free-slot
             # order (shard 0's free slots, then shard 1's, ...) is exactly the
@@ -795,20 +1650,18 @@ def build_add_conn_phase[GS](
             # offset == 0 when unsharded, leaving that path byte-identical.
             local_capacity = capacity_b // num_shards
             dead_b = bucket_conns[DEAD.name]
-            local_free = jnp.sum(dead_b.astype(jnp.int32))
-            # local_slot_for_rank[j] = position (within this shard's slice) of
-            # its j-th free slot, or local_capacity when it has fewer than j+1.
-            # `sink_len = max(local_capacity, k)` keeps the scatter and the
-            # index below in bounds even if k > local_capacity.
-            rank = jnp.cumsum(dead_b.astype(jnp.int32)) - 1
-            positions = jnp.arange(local_capacity, dtype=jnp.int32)
-            sink_len = max(local_capacity, k)
-            scatter_target = jnp.where(dead_b, rank, jnp.int32(sink_len))
-            local_slot_for_rank = (
-                jnp.full((sink_len,), local_capacity, dtype=jnp.int32)
-                .at[scatter_target]
-                .set(positions, mode="drop")
-            )
+            # Per-block free counts over this shard's slice: one reduction
+            # reading the dead mask, instead of a capacity-sized cumsum.
+            # Two-level search for a small claim (O(k * block) past one
+            # reduction); for a claim large next to the bucket that gather
+            # outgrows one capacity-sized cumsum, which is then used instead.
+            small_claim = k * _FREE_BLOCK <= local_capacity
+            if small_claim:
+                free_blocks, block_len = count_free_blocks(dead_b)
+                local_free = free_blocks[-1]
+            else:
+                free_through = jnp.cumsum(dead_b.astype(jnp.int32))
+                local_free = free_through[-1]
             # This shard's offset into the global free-slot space, and the total
             # free count. The offset is an exclusive prefix of the per-shard
             # free counts (an all-gather -- a prefix is not a plain all-reduce)
@@ -843,9 +1696,13 @@ def build_add_conn_phase[GS](
             local_rank = growth_rank - offset
             mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
             safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-            target_slot = jnp.where(
-                mine, local_slot_for_rank[safe_rank], jnp.int32(local_capacity)
-            )
+            if small_claim:
+                free_slot = nth_free_slot(dead_b, free_blocks, block_len, safe_rank)
+            else:
+                free_slot = jnp.searchsorted(
+                    free_through, safe_rank + jnp.int32(1), method=_SEARCH
+                ).astype(jnp.int32)
+            target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
 
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it

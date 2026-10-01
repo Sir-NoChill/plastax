@@ -494,6 +494,14 @@ class NetworkBuilder[GS]:
         if effective is not None:
             _, conn_sharding, repl_sharding = _shardings_for_spec(effective)
             num_shards = effective.num_shards
+            if capacity_align is not None and capacity_align % num_shards:
+                # Checked up front: every capacity is a multiple of the
+                # alignment, but a later grow_bucket or resort would otherwise
+                # produce one the shards cannot split, far from the cause.
+                raise ValueError(
+                    f"from_edges: capacity_align {capacity_align} is not a "
+                    f"multiple of num_shards {num_shards}"
+                )
 
         unit_cols: Columns = {}
         for spec in self._unit_fields:

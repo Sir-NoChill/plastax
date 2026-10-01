@@ -231,7 +231,15 @@ the CSR layout addresses that for linear passes:
   arena (`bucket_csr`: one radix sort; dead slots as explicit zeros), so it
   never goes stale under in-place churn; under Scheme-A the per-shard partial
   products are all-reduced. cuSPARSE lowering is a jax config flag scoped to
-  the step's calls (`step._with_cusparse`). "auto" = CSR for B >= 16 on GPU.
+  the step's calls (`step._with_cusparse`).
+- **Pallas layout** (`layout="pallas"`, `phases.pallas_bucket_product`): the
+  same linear passes as one edge-once Pallas (Triton) kernel per bucket --
+  each edge read once for the whole batch, atomics into the targets, no sort.
+  Interpret mode off GPU (how the CPU tests run it); falls back to CSR under
+  Scheme-A (not validated inside shard_map). `bucket_product(engine)` is the
+  seam both layouts share with the level walks.
+- **"auto"** (GPU only): Pallas for 2 <= B <= 32, CSR above, edge list at
+  B = 1 and for every non-linear pass.
 
 ### Host loop (`driver.py`)
 

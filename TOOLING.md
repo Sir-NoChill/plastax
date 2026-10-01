@@ -28,6 +28,10 @@ uv sync --extra cuda12                 # or: pip install "plastax[cuda12]"
 uv sync --extra cuda13                 # or: pip install "plastax[cuda13]"
 ```
 
+The batched `layout="triton"` kernel (NVIDIA only) needs the `triton` extra:
+`uv sync --extra cuda13 --extra triton` (or `pip install "plastax[cuda13,triton]"`).
+Without it, batched steps use cuSPARSE CSR or the XLA edge list.
+
 plastax itself is backend-agnostic pure Python — the extra only swaps the jax
 wheel. On a **shared** GPU, set `XLA_PYTHON_CLIENT_PREALLOCATE=false` so jax
 grabs only what it needs rather than pre-reserving ~75 % of VRAM. The

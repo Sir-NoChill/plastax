@@ -428,27 +428,92 @@ def bucket_csr(
     )
 
 
-# Edges per Pallas program (the edge columns are padded up to a multiple).
-_PALLAS_BLOCK = 256
+# Elements (edges x batch lanes) per Triton program: the edge block shrinks as
+# the batch widens so a program's tile stays this size (a 512-edge block at
+# B = 32 spilled and ran 25x slower).
+_TRITON_TILE = 2048
 
 
-def pallas_bucket_product(
+@functools.cache
+def nvidia_triton_available() -> bool:
+    """Whether the jax_triton kernel can run here.
+
+    That needs an NVIDIA (CUDA) default backend with `jax_triton` and `triton`
+    importable (the `plastax[triton]` extra).
+
+    Returns:
+        True when the Triton edge kernel is usable.
+    """
+    if jax.default_backend() != "gpu":
+        return False
+    try:
+        platform_version = jax.devices()[0].client.platform_version.lower()
+    except Exception:  # noqa: BLE001 - any failure means "not known to be CUDA"
+        return False
+    if "cuda" not in platform_version:
+        return False
+    try:
+        import jax_triton  # noqa: F401  # ty: ignore[unresolved-import]
+        import triton  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@functools.cache
+def _triton_edge_kernel() -> Any:
+    """The Triton kernel, built on first use so plastax never imports triton."""
+    import triton
+    import triton.language as tl
+
+    # Triton kernel arguments are pointers and constexprs, which carry no
+    # Python annotations the type checkers understand.
+    @triton.jit  # type: ignore[untyped-decorator]
+    def edge_product(  # type: ignore[no-untyped-def]  # noqa: ANN202
+        tgt_ptr,  # noqa: ANN001
+        src_ptr,  # noqa: ANN001
+        w_ptr,  # noqa: ANN001
+        x_ptr,  # noqa: ANN001
+        out_ptr,  # noqa: ANN001
+        n_edges,  # noqa: ANN001
+        WIDTH: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n_edges
+        t = tl.load(tgt_ptr + offs, mask=m, other=0)
+        s = tl.load(src_ptr + offs, mask=m, other=0)
+        w = tl.load(w_ptr + offs, mask=m, other=0.0)
+        lanes = tl.arange(0, WIDTH)
+        xv = tl.load(
+            x_ptr + s[:, None] * WIDTH + lanes[None, :], mask=m[:, None], other=0.0
+        )
+        tl.atomic_add(
+            out_ptr + t[:, None] * WIDTH + lanes[None, :],
+            w[:, None] * xv,
+            mask=m[:, None],
+            sem="relaxed",
+        )
+
+    return edge_product
+
+
+def triton_bucket_product(
     bucket: Columns,
     x: Float[Array, "num_units batch"],
     num_units: int,
     *,
     rows: FieldSpec[Any],
     cols: FieldSpec[Any],
-    interpret: bool,
 ) -> Float[Array, "num_units batch"]:
-    """`sum over live edges e of WEIGHT[e] * x[cols[e], :]` into row `rows[e]`.
+    """`bucket_csr(...) @ x` as one edge-once Triton kernel (NVIDIA GPUs).
 
-    The same product as `bucket_csr(...) @ x`, as one edge-once Pallas kernel:
-    each program loads a block of edges, gathers its `(block, batch)` slab of
-    x once, and atomically adds `weight * slab` into the output rows -- no
-    sort, and every edge is read once for the whole batch. Dead edges target
-    an extra null row that is sliced off. The batch is padded to a power of
-    two (a Triton tile constraint).
+    Each program loads a block of edges, gathers its `(block, batch)` slab of
+    x once, and adds `weight * slab` into the target rows with relaxed atomics:
+    no sort, every edge read once for the whole batch. Dead edges target an
+    extra null row that is sliced off; the batch is padded to a power of two
+    (a Triton tile constraint). Called through `jax_triton` -- the Pallas
+    Triton lowering this replaces is deprecated in jax.
 
     Args:
         bucket: The bucket's columns.
@@ -456,59 +521,64 @@ def pallas_bucket_product(
         num_units: Total unit count.
         rows: TO_ID (forward) or FROM_ID (backward): the accumulation target.
         cols: The other endpoint: the gathered row of x.
-        interpret: Run the kernel in Pallas interpret mode (CPU, tests).
 
     Returns:
         The `(num_units, batch)` product.
     """
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import triton as pl_triton
+    import jax_triton  # ty: ignore[unresolved-import]
 
     cap = bucket[DEAD.name].shape[0]
     batch = x.shape[1]
     width = 1 << max(batch - 1, 0).bit_length()
-    # A fixed block, padding the edge columns up to a multiple of it (padding
-    # targets the null row): aligned capacities are rarely powers of two, and
-    # shrinking the block to divide them would collapse it (to one edge per
-    # program for an odd capacity).
-    block = _PALLAS_BLOCK
-    pad = -cap % block
-    target = jnp.pad(
-        jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name]),
-        (0, pad),
-        constant_values=num_units,
+    block = max(16, _TRITON_TILE // width)
+    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
+    x_pad = x if width == batch else jnp.pad(x, ((0, 0), (0, width - batch)))
+    out = jax_triton.triton_call(
+        target.astype(jnp.int32),
+        bucket[cols.name].astype(jnp.int32),
+        bucket[WEIGHT.name].astype(jnp.float32),
+        x_pad.astype(jnp.float32),
+        kernel=_triton_edge_kernel(),
+        out_shape=jax.ShapeDtypeStruct((num_units + 1, width), jnp.float32),  # type: ignore[no-untyped-call]
+        grid=(-(-cap // block),),
+        zeroed_outputs=(0,),
+        n_edges=cap,
+        WIDTH=width,
+        BLOCK=block,
     )
-    source = jnp.pad(bucket[cols.name].astype(jnp.int32), (0, pad))
-    weight = jnp.pad(bucket[WEIGHT.name].astype(jnp.float32), (0, pad))
-    cap = cap + pad
-    x_pad = jnp.zeros((num_units, width), jnp.float32).at[:, :batch].set(x)
-    out0 = jnp.zeros((num_units + 1, width), jnp.float32)
-
-    def kernel(
-        tgt_ref: Any, src_ref: Any, w_ref: Any, x_ref: Any, _: Any, out_ref: Any
-    ) -> None:
-        span = pl.ds(pl.program_id(0) * block, block)
-        tgt, src, w = tgt_ref[span], src_ref[span], w_ref[span]
-        lanes = jnp.arange(width, dtype=jnp.int32)
-        if interpret:
-            slab = x_ref[src[:, None], lanes[None, :]]
-            out_ref[...] = (
-                out_ref[...].at[tgt[:, None], lanes[None, :]].add(w[:, None] * slab)
-            )
-        else:
-            slab = pl_triton.load(x_ref.at[src[:, None], lanes[None, :]])
-            pl_triton.atomic_add(
-                out_ref, (tgt[:, None], lanes[None, :]), w[:, None] * slab
-            )
-
-    out = pl.pallas_call(
-        kernel,
-        grid=(cap // block,),
-        out_shape=jax.ShapeDtypeStruct(out0.shape, jnp.float32),  # type: ignore[no-untyped-call]
-        input_output_aliases={4: 0},
-        interpret=interpret,
-    )(target, source, weight, x_pad, out0)
     product: Float[Array, "num_units batch"] = out[:num_units, :batch]
+    return product
+
+
+def xla_bucket_product(
+    bucket: Columns,
+    x: Float[Array, "num_units batch"],
+    num_units: int,
+    *,
+    rows: FieldSpec[Any],
+    cols: FieldSpec[Any],
+) -> Float[Array, "num_units batch"]:
+    """The same edge-once product in plain XLA, for any backend.
+
+    One gather of `(edges, batch)` rows and one segment sum (dead edges to the
+    null row). The portable counterpart of `triton_bucket_product`, used on
+    non-NVIDIA backends.
+
+    Args:
+        bucket: The bucket's columns.
+        x: `(num_units, batch)` input values.
+        num_units: Total unit count.
+        rows: TO_ID (forward) or FROM_ID (backward): the accumulation target.
+        cols: The other endpoint: the gathered row of x.
+
+    Returns:
+        The `(num_units, batch)` product.
+    """
+    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
+    contrib = bucket[WEIGHT.name][:, None] * x[bucket[cols.name]]
+    product: Float[Array, "num_units batch"] = jax.ops.segment_sum(
+        contrib, target, num_units + 1
+    )[:num_units]
     return product
 
 
@@ -531,9 +601,9 @@ def bucket_product(
     """The per-bucket sparse product `(bucket, x, rows, cols) -> (N, B)`.
 
     Args:
-        engine: "csr" (cuSPARSE via a per-step CSR view), "pallas" (the
-            edge-once Pallas kernel), or "pallas_interpret" (that kernel in
-            interpret mode, for CPU tests).
+        engine: "csr" (cuSPARSE via a per-step CSR view), "triton" (the
+            edge-once jax_triton kernel, NVIDIA GPUs), or "xla" (the same
+            edge-once product in plain XLA, any backend).
         num_units: Total unit count.
 
     Returns:
@@ -547,19 +617,13 @@ def bucket_product(
         product: jax.Array = full[:num_units]
         return product
 
-    def pallas(
+    def edge_once(
         bucket: Columns, x: jax.Array, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
     ) -> jax.Array:
-        return pallas_bucket_product(
-            bucket,
-            x,
-            num_units,
-            rows=rows,
-            cols=cols,
-            interpret=engine == "pallas_interpret",
-        )
+        fn = triton_bucket_product if engine == "triton" else xla_bucket_product
+        return fn(bucket, x, num_units, rows=rows, cols=cols)
 
-    return csr if engine == "csr" else pallas
+    return csr if engine == "csr" else edge_once
 
 
 def build_csr_forward[GS](

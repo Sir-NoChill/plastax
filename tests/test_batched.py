@@ -225,7 +225,7 @@ def test_structural_phases_run_once_per_batched_step() -> None:
         lambda: px.optim.adam(0.01, mlp_xor.GradPreAct),
     ],
 )
-@pytest.mark.parametrize("layout", ["csr", "pallas"])
+@pytest.mark.parametrize("layout", ["csr", "triton"])
 def test_linear_layouts_match_the_edge_list(make: object, layout: str) -> None:
     # mlp_xor's sigmoid passes declare linear_input, so layout="csr" runs both
     # the forward and the backward as sparse products.
@@ -253,7 +253,7 @@ def test_linear_layouts_match_the_edge_list(make: object, layout: str) -> None:
         )
 
 
-@pytest.mark.parametrize("layout", ["csr", "pallas"])
+@pytest.mark.parametrize("layout", ["csr", "triton"])
 def test_linear_forward_is_exact_on_a_churned_arena(layout: str) -> None:
     spec = importlib.util.spec_from_file_location(
         "_churn2", Path(__file__).parent / "test_inplace_churn.py"

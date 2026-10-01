@@ -9,10 +9,10 @@ C++ template metaprogramming.
 
 Design documents (read in order):
 
-1. `../plastix-jax-lowering-analysis.md` — the rung ladder (trace-time
+1. `../docs/design/plastix-jax-lowering-analysis.md` — the rung ladder (trace-time
    metaprogramming -> composites + HLO transform -> Pallas -> native FFI)
    and how plastax fits the OpenXLA extension surface.
-2. `../plastix-jax-rung0-design.md` — the rung 0 design this package
+2. `../docs/design/plastix-jax-rung0-design.md` — the rung 0 design this package
    implements: state representation, SoA-per-level arenas, retrace protocol,
    donation, monoid combine contract.
 3. `IMPLEMENTATION_PLAN.md` — milestone plan and acceptance criteria for the

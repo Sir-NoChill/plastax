@@ -111,7 +111,7 @@ directory outside the repo (catches accidental reliance on repo files).
   - `concepts/` -- traits and the Network contract; SoA arenas and views;
     named monoids; propagation (PIPELINE vs TOPOLOGICAL, recurrent cycles);
     the retrace/overflow protocol and Driver; donation contract. Distill
-    from `../plastix-jax-rung0-design.md`; link, do not duplicate, the
+    from `../docs/design/plastix-jax-rung0-design.md`; link, do not duplicate, the
     rung-ladder analysis.
   - `examples` -- gallery page linking `examples/` with one-paragraph
     orientation each (mlp_xor, ipc_multilayer, echo_state_network,

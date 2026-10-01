@@ -7,9 +7,9 @@ rename or restructure without recording the deviation (see "Deviations").
 
 ## Required reading, in order
 
-1. `../plastix-jax-rung0-design.md` — the design this package implements.
+1. `../docs/design/plastix-jax-rung0-design.md` — the design this package implements.
    Sections are cited below as [D:n].
-2. `../plastix-jax-lowering-analysis.md` — wider context (rung ladder);
+2. `../docs/design/plastix-jax-lowering-analysis.md` — wider context (rung ladder);
    v1 is "rung 0" only, but phase bodies must remain separately traced
    functions so rung 1 composite wrapping stays a local change [D:7].
 3. C++ semantics oracle, local clone at `../plastix`:

@@ -119,6 +119,11 @@ class MyProposeGrow:
     #   O(capacity log capacity) per step. Seed proposals from a step-dependent
     #   value (step counter / per-unit cursor) or they repeat every step.
 
+# Linear passes (optional): a ForwardPass whose map is exactly
+#   c[WEIGHT, cid] * u[F, src]  (BackwardPass: ... * u[F, dst]) with combine
+#   = px.monoid.sum_ may declare `linear_input = F`; batched steps can then
+#   run it through the CSR layout (cuSPARSE). The declaration is trusted.
+
 # ResetGlobal[GS]
 class MyReset:
     def reset(self, g) -> GS: ...

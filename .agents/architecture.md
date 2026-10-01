@@ -221,7 +221,17 @@ and **structural** (prune, add, reset) run once on `batch_mean_units`. Unit
 columns in the state stay `(num_units,)` and hold the batch mean. PIPELINE nets
 are rejected. Measured on GPU the per-sample cost falls only ~2x from B = 1 to
 128 on the edge-list layout (each pass touches every edge once per sample);
-the CSR / Pallas backends are the plan for that.
+the CSR layout addresses that for linear passes:
+
+- **CSR layout** (`make_step(..., layout="auto" | "edge_list" | "csr")`,
+  `phases.build_csr_forward` / `build_csr_backward`): a pass declaring
+  `linear_input` (map == `WEIGHT * u[F, other]`, combine == `sum_`, read by
+  `phases.linear_input_field`) runs as one cuSPARSE sparse-dense product per
+  bucket over the batch. The view is rebuilt on device every step from the
+  arena (`bucket_csr`: one radix sort; dead slots as explicit zeros), so it
+  never goes stale under in-place churn; under Scheme-A the per-shard partial
+  products are all-reduced. cuSPARSE lowering is a jax config flag scoped to
+  the step's calls (`step._with_cusparse`). "auto" = CSR for B >= 16 on GPU.
 
 ### Host loop (`driver.py`)
 

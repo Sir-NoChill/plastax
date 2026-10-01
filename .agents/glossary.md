@@ -32,6 +32,9 @@ group, ordered roughly by how fundamental they are.
   multiple of `align` (tight: less memory and bandwidth). The build records
   both in `NetworkStatic` (`capacity_headroom`, `capacity_align`), so
   `grow_bucket` and `topo.resort` size buckets the same way.
+- **Linear pass** — a forward/backward pass declaring `linear_input = F`:
+  its map is `WEIGHT * u[F, other]` and its combine is `sum_`, so its
+  accumulation is a sparse matrix product (the CSR layout).
 - **Parallel edge** — two live connections with the same `(src, dst)`, each
   contributing independently. `ProposeAddConn` growth can create them unless
   the policy sets `dedupe = True`; grid growth (`AddConn`) never does by

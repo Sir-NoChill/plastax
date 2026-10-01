@@ -323,14 +323,20 @@ def build_batched_update_conn[GS](
             conns = tuple(incoming(units, bucket, g) for bucket in state.conns)
             return tuple(outgoing(units, bucket, g) for bucket in conns)
 
-        def floats(conns: tuple[Columns, ...]) -> tuple[Columns, ...]:
+        # Average each floating column's per-sample *change* and add it back:
+        # a column the rule never writes, and every dead slot (keep-old
+        # merge), has an exact zero change and so stays bit-identical --
+        # averaging the absolute values would drift them by an ulp per step
+        # whenever (x + ... + x) / B != x in float32. Non-floating columns take
+        # sample 0's write (see make_step).
+        def deltas(conns: tuple[Columns, ...]) -> tuple[Columns, ...]:
             return tuple(
                 {
-                    k: v
+                    k: v - old[k]
                     for k, v in bucket.items()
                     if jnp.issubdtype(v.dtype, jnp.floating)
                 }
-                for bucket in conns
+                for bucket, old in zip(conns, state.conns, strict=True)
             )
 
         first = one_sample(sample(units_b, jnp.int32(0)))
@@ -338,16 +344,19 @@ def build_batched_update_conn[GS](
             1,
             batch,
             lambda b, acc: jax.tree.map(
-                jnp.add, acc, floats(one_sample(sample(units_b, b)))
+                jnp.add, acc, deltas(one_sample(sample(units_b, b)))
             ),
-            floats(first),
+            deltas(first),
         )
         conns = tuple(
             {
                 **bucket,
-                **{k: (v / jnp.float32(batch)).astype(v.dtype) for k, v in f.items()},
+                **{
+                    k: (old[k] + d / jnp.float32(batch)).astype(old[k].dtype)
+                    for k, d in delta.items()
+                },
             }
-            for bucket, f in zip(first, total, strict=True)
+            for bucket, old, delta in zip(first, state.conns, total, strict=True)
         )
         return dataclasses.replace(state, conns=conns)
 
@@ -387,7 +396,9 @@ def bucket_csr(
 
     Built on device from the arena in one radix sort (by `rows`), so it is
     always current: in-place churn needs no invalidation. Dead slots stay in
-    the view as explicit zeros in the last row, keeping every shape static.
+    the view as explicit zeros in an extra null row `num_units` (the matrix is
+    `(num_units + 1, num_units)`; callers slice the product), keeping every
+    shape static without touching a real unit's row.
 
     Args:
         bucket: The bucket's columns.
@@ -397,27 +408,27 @@ def bucket_csr(
         cols: The other endpoint column.
 
     Returns:
-        The BCSR matrix whose row r holds the weights of the live edges with
-        `rows == r`, at column `cols`.
+        The BCSR matrix whose row r < num_units holds the weights of the live
+        edges with `rows == r`, at column `cols`; row num_units is the dead
+        slots' null row.
     """
     dead = bucket[DEAD.name]
     cap = dead.shape[0]
-    row_id = jnp.where(dead, jnp.int32(num_units - 1), bucket[rows.name])
+    row_id = jnp.where(dead, jnp.int32(num_units), bucket[rows.name])
     _, perm = jax.lax.sort_key_val(row_id, jnp.arange(cap, dtype=jnp.int32))
     sorted_rows = row_id[perm]
-    counts = jnp.zeros((num_units,), jnp.int32).at[sorted_rows].add(1)
+    counts = jnp.zeros((num_units + 1,), jnp.int32).at[sorted_rows].add(1)
     indptr = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)])
     values = jnp.where(dead[perm], jnp.float32(0.0), bucket[WEIGHT.name][perm])
     return jsparse.BCSR(
         (values, bucket[cols.name][perm].astype(jnp.int32), indptr),
-        shape=(num_units, num_units),
+        shape=(num_units + 1, num_units),
         indices_sorted=False,
         unique_indices=False,
     )
 
 
-# Edges per Pallas program (the largest power of two up to this that divides
-# the bucket capacity is used).
+# Edges per Pallas program (the edge columns are padded up to a multiple).
 _PALLAS_BLOCK = 256
 
 
@@ -456,12 +467,20 @@ def pallas_bucket_product(
     cap = bucket[DEAD.name].shape[0]
     batch = x.shape[1]
     width = 1 << max(batch - 1, 0).bit_length()
+    # A fixed block, padding the edge columns up to a multiple of it (padding
+    # targets the null row): aligned capacities are rarely powers of two, and
+    # shrinking the block to divide them would collapse it (to one edge per
+    # program for an odd capacity).
     block = _PALLAS_BLOCK
-    while block > 1 and cap % block:
-        block //= 2
-    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
-    source = bucket[cols.name].astype(jnp.int32)
-    weight = bucket[WEIGHT.name].astype(jnp.float32)
+    pad = -cap % block
+    target = jnp.pad(
+        jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name]),
+        (0, pad),
+        constant_values=num_units,
+    )
+    source = jnp.pad(bucket[cols.name].astype(jnp.int32), (0, pad))
+    weight = jnp.pad(bucket[WEIGHT.name].astype(jnp.float32), (0, pad))
+    cap = cap + pad
     x_pad = jnp.zeros((num_units, width), jnp.float32).at[:, :batch].set(x)
     out0 = jnp.zeros((num_units + 1, width), jnp.float32)
 
@@ -524,7 +543,8 @@ def bucket_product(
     def csr(
         bucket: Columns, x: jax.Array, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
     ) -> jax.Array:
-        product: jax.Array = bucket_csr(bucket, num_units, rows=rows, cols=cols) @ x
+        full = bucket_csr(bucket, num_units, rows=rows, cols=cols) @ x
+        product: jax.Array = full[:num_units]
         return product
 
     def pallas(
@@ -1547,9 +1567,10 @@ def build_add_conn_phase[GS](
 
             # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
             # dead mask is this shard's capacity slice (size capacity_b //
-            # num_shards; power-of-two capacities keep it exact), so the claim
-            # runs over the LOCAL slice and is coordinated across shards: each
-            # growable candidate takes a GLOBAL free-slot rank and lands on the
+            # num_shards; a capacity divisible by the shard count keeps it
+            # exact), so the claim runs over the LOCAL slice and is
+            # coordinated across shards: each growable candidate takes a
+            # GLOBAL free-slot rank and lands on the
             # one shard that owns it. Because shard g holds arena positions
             # [g*local_capacity, (g+1)*local_capacity), the global free-slot
             # order (shard 0's free slots, then shard 1's, ...) is exactly the

@@ -104,12 +104,31 @@ def test_grow_bucket_uses_the_recorded_alignment_and_grows_geometrically() -> No
     assert grown.capacity_align == 32
 
 
-def test_resort_keeps_the_build_headroom() -> None:
+def test_resort_sizes_with_the_build_headroom_and_never_shrinks() -> None:
     static, state = _build(1000, capacity_headroom=0.25, capacity_align=16)
-    # Kill 100 edges of bucket 0, then resort: 900 live -> ceil(1125/16)*16.
+    assert static.level_capacities[0] == 1264  # ceil(1250 / 16) * 16
+    # Kill 100 edges of bucket 0, then resort: the policy alone would size
+    # 900 live to ceil(1125 / 16) * 16 = 1136, but a carried-over bucket keeps
+    # its capacity.
     b0 = dict(state.conns[0])
     b0[px.DEAD.name] = b0[px.DEAD.name].at[jnp.arange(100)].set(True)
     state = dataclasses.replace(state, conns=(b0, state.conns[1]))
     new_static, _ = topo.resort(static, state)
-    assert new_static.level_capacities[0] == 1136
+    assert new_static.level_capacities[0] == 1264
     assert new_static.capacity_headroom == 0.25
+
+
+def test_resort_does_not_undo_grow_bucket() -> None:
+    # Regression: with tight (aligned, no-headroom) sizing a resort right after
+    # an overflow grow re-tightened the bucket, so the next growth overflowed
+    # and retraced again.
+    static, state = _build(1000, capacity_align=32)
+    grown, grown_state = grow_bucket(static, state, 0)
+    assert grown.level_capacities[0] == 1536
+    new_static, _ = topo.resort(grown, grown_state)
+    assert new_static.level_capacities[0] == 1536
+
+
+def test_capacity_align_must_divide_by_the_shard_count() -> None:
+    with pytest.raises(ValueError, match="multiple of num_shards"):
+        _build(1000, capacity_align=30, sharding=px.ShardSpec("shard", 4))

@@ -296,3 +296,35 @@ def test_unknown_layout_is_rejected() -> None:
     # ValueError does.
     with pytest.raises((ValueError, TypeError), match="layout"):
         px.make_step(net, static, batch_size=2, layout="dense")  # type: ignore[arg-type]
+
+
+def test_mean_of_writes_leaves_unwritten_columns_and_dead_slots_bit_identical() -> None:
+    # Regression: averaging absolute values over B = 3 drifted every float
+    # column by an ulp per step, including ones the rule never writes.
+    aux = px.FieldSpec.float32("test/aux", 0.1)
+    net, static, state = _mlp(_PlainSGD(), (aux,))
+    step = px.make_step(net, static, batch_size=3)
+    before = [np.asarray(b[aux.name]).copy() for b in state.conns]
+    dead_w = [
+        np.asarray(b[px.WEIGHT.name])[np.asarray(b[px.DEAD.name])].copy()
+        for b in state.conns
+    ]
+    xs, ys = _data(3, 20)
+    for x, y in zip(xs, ys, strict=True):
+        state = step(
+            state, px.StepInputs(inputs=jnp.asarray(x), targets=jnp.asarray(y))
+        ).state
+    for b, a0, w0 in zip(state.conns, before, dead_w, strict=True):
+        np.testing.assert_array_equal(np.asarray(b[aux.name]), a0)
+        dead = np.asarray(b[px.DEAD.name])
+        np.testing.assert_array_equal(np.asarray(b[px.WEIGHT.name])[dead], w0)
+
+
+def test_batched_inputs_must_match_the_batch_size() -> None:
+    net, static, state = _mlp(_PlainSGD())
+    step = px.make_step(net, static, batch_size=4)
+    xs, ys = _data(2, 1)  # a consistent batch of 2 for a B = 4 step
+    with pytest.raises(ValueError, match="inputs must be"):
+        step(
+            state, px.StepInputs(inputs=jnp.asarray(xs[0]), targets=jnp.asarray(ys[0]))
+        )

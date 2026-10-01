@@ -222,7 +222,7 @@ def _check_batched_train_step_shards(
     xs = jnp.asarray(rng.standard_normal((5, _LAYERS[0])).astype(np.float32))
     ys = jax.nn.one_hot(jnp.asarray(rng.integers(0, _LAYERS[-1], 5)), _LAYERS[-1])
     sp = px.StepInputs(inputs=xs, targets=ys)
-    for layout in ("edge_list", "csr"):
+    for layout in ("edge_list", "csr", "pallas"):
         single = px.make_step(train_net, static, batch_size=5, layout=layout)(
             _copy(state), sp
         )

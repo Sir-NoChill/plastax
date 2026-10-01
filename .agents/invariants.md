@@ -118,8 +118,11 @@ accumulators); donation-based in-place state; host driver retrace protocol;
 Scheme-A multi-device sharding.
 
 - *Why:* v1 is "rung 0" — the trace-time metaprogramming rung. Later rungs
-  (composites, Pallas, FFI) are deliberately deferred; premature scope creep
-  breaks the clean lowering ladder (see the design docs).
+  (composites, Pallas, FFI) are deliberately deferred as the *general*
+  lowering; premature scope creep breaks the clean lowering ladder (see the
+  design docs). The one exception is opt-in: `layout="pallas"` runs a single
+  primitive (the batched linear bucket product) as a Pallas kernel
+  (IMPLEMENTATION_PLAN.md Deviations, scale plan P6).
 - *Enforced by:* code review, the plan docs, and `monoid.UnsupportedMonoidError`
   guards (`monoid.py`).
 

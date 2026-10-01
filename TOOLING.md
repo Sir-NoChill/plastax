@@ -32,6 +32,25 @@ The batched `layout="triton"` kernel (NVIDIA only) needs the `triton` extra:
 `uv sync --extra cuda13 --extra triton` (or `pip install "plastax[cuda13,triton]"`).
 Without it, batched steps use cuSPARSE CSR or the XLA edge list.
 
+### TPU without a TPU (ahead-of-time compilation)
+
+The `tpu` extra installs libtpu, which compiles against a TPU *topology
+description* on any host -- no TPU attached. `examples/benchmarks/tpu_aot_check.py`
+lowers and compiles every step type (churn with each growth path, streaming
+and batched training in each layout) for a target generation and prints XLA's
+memory / cost analysis and the scatter, gather and sort ops in the optimized
+HLO. It validates that each path lowers on TPU; timings need hardware.
+
+```
+UV_PROJECT_ENVIRONMENT=.venv-tpu uv sync --extra tpu
+JAX_PLATFORMS=cpu .venv-tpu/bin/python examples/benchmarks/tpu_aot_check.py --topology v5p:2x2x1
+```
+
+Topology names must cover a whole host (v5e:2x2, v6e:2x2, v5p:2x2x1,
+v4:2x2x1). Pallas TPU (TensorCore) kernels can additionally run on CPU in
+interpret mode (`interpret=pltpu.InterpretParams()`); SparseCore (`tpu_sc`)
+kernels have no interpret support and can only be compiled, not run, off TPU.
+
 plastax itself is backend-agnostic pure Python — the extra only swaps the jax
 wheel. On a **shared** GPU, set `XLA_PYTHON_CLIENT_PREALLOCATE=false` so jax
 grabs only what it needs rather than pre-reserving ~75 % of VRAM. The

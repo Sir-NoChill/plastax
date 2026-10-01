@@ -328,3 +328,19 @@ def test_batched_inputs_must_match_the_batch_size() -> None:
         step(
             state, px.StepInputs(inputs=jnp.asarray(xs[0]), targets=jnp.asarray(ys[0]))
         )
+
+
+def test_cusparse_step_wrapper_keeps_the_aot_api() -> None:
+    # Regression: the scoped-cuSPARSE wrapper used to be a plain function, so
+    # a CSR step lost jit's .trace / .lower (needed for AOT compilation, e.g.
+    # examples/benchmarks/tpu_aot_check.py). A toy jitted function stands in
+    # for the step: AOT on a real NetworkState trips this suite's beartype
+    # instrumentation (jax rebuilds the pytree with ArgInfo leaves), the same
+    # test-only artifact that sends the sharding checks to a subprocess.
+    from plastax.step import _CusparseStep
+
+    step = _CusparseStep(jax.jit(lambda s, x: s + x))
+    a = jnp.ones((4,), jnp.float32)
+    compiled = step.trace(a, a).lower().compile()
+    np.testing.assert_allclose(np.asarray(compiled(a, a)), 2.0)
+    np.testing.assert_allclose(np.asarray(step.lower(a, a).compile()(a, a)), 2.0)

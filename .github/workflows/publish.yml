@@ -7,24 +7,25 @@ on:
   push:
     tags: ["v*"]
 
+# Actions and runner image pinned as in ci.yml (Node 24 majors, ubuntu-24.04).
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # hatch-vcs derives the version from tag history (P1.2)
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
       - run: uv build
       - run: uvx twine check dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dist
           path: dist/
 
   verify:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -32,11 +33,11 @@ jobs:
     env:
       JAX_PLATFORMS: cpu
     steps:
-      - uses: actions/checkout@v4 # only for examples/; install is wheel-only
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5 # only for examples/; install is wheel-only
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist
@@ -52,14 +53,14 @@ jobs:
   publish-pypi:
     if: ${{ !contains(github.ref_name, 'rc') }}
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/project/plastax/
     permissions:
       id-token: write # OIDC token for trusted publishing; no stored secrets
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist
@@ -71,14 +72,14 @@ jobs:
   publish-testpypi:
     if: ${{ contains(github.ref_name, 'rc') }}
     needs: verify
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: testpypi
       url: https://test.pypi.org/project/plastax/
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: dist
           path: dist

@@ -3,9 +3,9 @@
 All notable changes to plastax are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/) -- before 1.0, a minor release may
-change the API. Versions come from git tags (hatch-vcs); see RELEASING.md.
+change the API. The first release is iterated as `0.1.0rcN` candidates. Versions come from git tags (hatch-vcs); see RELEASING.md.
 
-## [0.2.0] - Unreleased
+## [0.1.0rc2] - Unreleased
 
 Scale work: in-place structural churn at a cost that follows the churn, a
 leaner and faster arena, batched steps with CSR / Triton backends, and TPU
@@ -80,5 +80,5 @@ named-monoid combines; donation-based in-place state; the host driver's
 grow / resort retrace protocol; Scheme-A multi-device sharding; optimizer
 bundles (SGD, momentum, Adam, AdamW, RMSprop). See `IMPLEMENTATION_PLAN.md`.
 
-[0.2.0]: https://github.com/Sir-NoChill/plastax/compare/v0.1.0rc1...HEAD
+[0.1.0rc2]: https://github.com/Sir-NoChill/plastax/compare/v0.1.0rc1...HEAD
 [0.1.0rc1]: https://github.com/Sir-NoChill/plastax/releases/tag/v0.1.0rc1

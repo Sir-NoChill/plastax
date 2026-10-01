@@ -12,20 +12,19 @@ quickstart, concepts, examples, per-module API reference) is tracked in
 
 ## Installation
 
-Requires Python >= 3.12.
-
 ```
-pip install plastax
+pip install plastax              # CPU
+pip install "plastax[cuda13]"    # NVIDIA GPU (or [cuda12] / [gpu]); [tpu] for TPU
 ```
 
-The default install pulls the CPU wheel of JAX. For accelerators, install
-the matching JAX distribution yourself (for instance `pip install
-"jax[cuda12]"`); plastax is backend-agnostic pure Python.
+See {doc}`installation` for the accelerator extras and why they exist.
 
 ```{toctree}
 :maxdepth: 1
 :hidden:
 
+installation
 optimizers
 api
+changelog
 ```

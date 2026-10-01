@@ -120,9 +120,10 @@ Scheme-A multi-device sharding.
 - *Why:* v1 is "rung 0" — the trace-time metaprogramming rung. Later rungs
   (composites, Pallas, FFI) are deliberately deferred as the *general*
   lowering; premature scope creep breaks the clean lowering ladder (see the
-  design docs). The one exception is opt-in: `layout="pallas"` runs a single
-  primitive (the batched linear bucket product) as a Pallas kernel
-  (IMPLEMENTATION_PLAN.md Deviations, scale plan P6).
+  design docs). The one exception is opt-in: `layout="triton"` runs a single
+  primitive (the batched linear bucket product) as a hand-written Triton
+  kernel via jax_triton on NVIDIA GPUs (IMPLEMENTATION_PLAN.md Deviations,
+  scale plan P6). No Pallas kernel ships today.
 - *Enforced by:* code review, the plan docs, and `monoid.UnsupportedMonoidError`
   guards (`monoid.py`).
 

@@ -232,14 +232,21 @@ the CSR layout addresses that for linear passes:
   never goes stale under in-place churn; under Scheme-A the per-shard partial
   products are all-reduced. cuSPARSE lowering is a jax config flag scoped to
   the step's calls (`step._with_cusparse`).
-- **Pallas layout** (`layout="pallas"`, `phases.pallas_bucket_product`): the
-  same linear passes as one edge-once Pallas (Triton) kernel per bucket --
-  each edge read once for the whole batch, atomics into the targets, no sort.
-  Interpret mode off GPU (how the CPU tests run it); falls back to CSR under
-  Scheme-A (not validated inside shard_map). `bucket_product(engine)` is the
-  seam both layouts share with the level walks.
-- **"auto"** (GPU only): Pallas for 2 <= B <= 32, CSR above, edge list at
-  B = 1 and for every non-linear pass.
+- **Triton layout** (`layout="triton"`, `phases.triton_bucket_product`): the
+  same linear passes as one edge-once Triton kernel per bucket, called
+  through `jax_triton` (the optional `plastax[triton]` extra; triton is
+  imported lazily) -- each edge read once for the whole batch, relaxed
+  atomics into the targets, no sort. NVIDIA GPUs only
+  (`phases.nvidia_triton_available`); anywhere else, and under Scheme-A,
+  "triton" runs `phases.xla_bucket_product`, the same edge-once product in
+  plain XLA (how the CPU tests exercise the layout). It replaced a Pallas
+  Triton kernel: that lowering is deprecated in jax, and Pallas' Mosaic GPU
+  backend cannot express a scatter-add into arbitrary rows (a low-level
+  `inline_mgpu` prototype ran 1.03-1.6x slower than Triton, scale plan).
+  `bucket_product(engine)` is the seam the layouts share with the level walks.
+- **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 32 (when jax_triton is
+  installed) and CSR above; the XLA edge list at B = 1, for every non-linear
+  pass, and on every other backend (AMD GPU, TPU, CPU).
 
 ### Host loop (`driver.py`)
 

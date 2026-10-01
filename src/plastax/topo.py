@@ -79,8 +79,8 @@ def initial_levels(
 
     src = edges[:, 0]
     dst = edges[:, 1]
-    in_degree = np.zeros(num_units, dtype=np.int64)
-    np.add.at(in_degree, dst, 1)
+    # bincount, not np.add.at: the unbuffered ufunc.at scatters are slow.
+    in_degree = np.bincount(dst, minlength=num_units).astype(np.int64)
 
     remaining = in_degree.copy()
     settled = in_degree == 0  # (num_units,) bool: level-0 units start settled
@@ -95,10 +95,14 @@ def initial_levels(
             return _kahn_levels(num_units, edges, allow_cycles=allow_cycles)
         active = newly[src]  # edges leaving the current frontier
         active_dst = dst[active]
-        # level[v] = max(level[v], level[u]+1) over this round's edges; the
-        # unbuffered scatter applies every (possibly duplicate) destination.
-        np.maximum.at(levels, active_dst, levels[src[active]] + np.int32(1))
-        np.add.at(remaining, active_dst, np.int64(-1))
+        # level[v] = max(level[v], level[u] + 1) over this round's edges. Every
+        # frontier unit settled this round sits at level `rounds` (a unit
+        # settles the round after its last predecessor, so by induction its
+        # longest-path level is its settle round), so the max is a plain
+        # assignment of rounds + 1 -- monotone across rounds, duplicates
+        # harmless.
+        levels[active_dst] = np.int32(rounds + 1)
+        remaining -= np.bincount(active_dst, minlength=num_units)
         reached = (remaining == 0) & ~settled
         settled = settled | reached
         newly = reached

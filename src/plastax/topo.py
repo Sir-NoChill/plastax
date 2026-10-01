@@ -317,11 +317,19 @@ def resort[GS](
     # static config) carries through: a resort sized to the bare live count
     # would leave every bucket full and turn the next growth into an
     # overflow -> grow_bucket -> retrace.
+    # Never shrink a bucket that carries over: the space it had (maybe grown
+    # by grow_bucket just before) is what its growth needs, and re-tightening
+    # it to the policy would turn the next growth into another overflow ->
+    # grow -> retrace.
+    old_capacities = static.level_capacities
     new_level_capacities = tuple(
-        capacity_policy(
-            live, headroom=static.capacity_headroom, align=static.capacity_align
+        max(
+            capacity_policy(
+                live, headroom=static.capacity_headroom, align=static.capacity_align
+            ),
+            old_capacities[i] if i < len(old_capacities) else 0,
         )
-        for live in live_counts
+        for i, live in enumerate(live_counts)
     )
 
     new_conns: list[Columns] = []

@@ -642,13 +642,23 @@ def test_live_pair_member_matches_a_set_oracle_on_both_id_paths() -> None:
 
 def test_two_level_free_slot_search_matches_a_numpy_oracle() -> None:
     rng = np.random.default_rng(5)
-    # 4096 and 1536 take the plain-reshape path (block 1024 / 512); 1030 and
-    # 97 have no power-of-two block >= 64 and take the padded path.
-    for cap in (4096, 1536, 1030, 97):
-        dead = rng.random(cap) < 0.3
-        free = np.flatnonzero(dead)
-        ranks = np.arange(min(len(free), 40), dtype=np.int32)
-        blocks, block = phases.count_free_blocks(jnp.asarray(dead))
-        assert int(blocks[-1]) == len(free)
-        got = phases.nth_free_slot(jnp.asarray(dead), blocks, block, jnp.asarray(ranks))
-        np.testing.assert_array_equal(np.asarray(got), free[ranks], err_msg=str(cap))
+    # 4096 / 1536 / 3136 take the plain-reshape path (blocks 1024 / 512 / 64);
+    # 1030 and 97 have no power-of-two block >= 64 and take the padded path.
+    for cap in (4096, 1536, 3136, 1030, 97):
+        for rate in (0.002, 0.3, 0.99):
+            dead = rng.random(cap) < rate
+            if cap >= 2048:
+                dead[:1024] = False  # a whole block with no free slot
+                dead[-1] = True  # the last slot is free: rank == total - 1
+            free = np.flatnonzero(dead)
+            if free.size == 0:
+                continue
+            ranks = np.arange(free.size, dtype=np.int32)  # every rank
+            blocks, block = phases.count_free_blocks(jnp.asarray(dead))
+            assert int(blocks[-1]) == free.size
+            got = phases.nth_free_slot(
+                jnp.asarray(dead), blocks, block, jnp.asarray(ranks)
+            )
+            np.testing.assert_array_equal(
+                np.asarray(got), free, err_msg=f"cap={cap} rate={rate}"
+            )

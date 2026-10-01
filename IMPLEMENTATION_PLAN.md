@@ -661,6 +661,10 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   StepInputs (`*batch` axes in the annotations); optional structural
   `per_sample` / `incoming_batched` on UpdateConn, implemented by every optim
   bundle (their `incoming` now delegates to `_step(c, cid, grad)`).
+- step/phases: `make_step(..., layout=)` (additive) and the structural
+  `linear_input` on forward/backward passes; batched linear passes may run
+  through a per-step CSR view and cuSPARSE (jax.experimental.sparse, a
+  dependency already inside jax -- no new package).
 
 ## Handoff conventions
 

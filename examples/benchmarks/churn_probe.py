@@ -237,9 +237,19 @@ def main() -> None:
         "churn": full,
     }
     result: dict[str, Any] = {**vars(args), "state_gb": state_gb}
+    stats = jax.devices()[0].memory_stats() or {}
     for name, net in variants.items():
         result[name] = run(net)
         print(f"  {name:10s} {result[name]:9.3f} ms/step", flush=True)
+    stats = jax.devices()[0].memory_stats() or {}
+    if "peak_bytes_in_use" in stats:
+        # Peak over the whole run, which holds two copies of the state (the
+        # template state0 plus the stepped copy) and every step's temporaries.
+        result["peak_gb"] = stats["peak_bytes_in_use"] / 1e9
+        print(
+            f"  peak device memory {result['peak_gb']:.2f} GB "
+            f"(includes the state0 template copy, {state_gb:.2f} GB)"
+        )
     if args.json:
         with open(args.json, "a") as f:
             f.write(json.dumps(result) + "\n")

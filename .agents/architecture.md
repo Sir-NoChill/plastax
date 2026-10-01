@@ -245,8 +245,11 @@ the CSR layout addresses that for linear passes:
   `inline_mgpu` prototype ran 1.03-1.6x slower than Triton, scale plan).
   `bucket_product(engine)` is the seam the layouts share with the level walks.
 - **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 32 (when jax_triton is
-  installed) and CSR above; the XLA edge list at B = 1, for every non-linear
-  pass, and on every other backend (AMD GPU, TPU, CPU).
+  installed) and CSR above; on every other backend (AMD GPU, TPU, CPU) the
+  XLA edge-once product for B >= 2 (same speed as the per-sample edge list,
+  about 2.6x smaller temporaries compiled for TPU); the edge list at B = 1
+  and for every non-linear pass. The CSR step keeps jit's `.trace`/`.lower`
+  (`step._CusparseStep`), so every layout AOT-compiles (TOOLING.md, TPU).
 
 ### Host loop (`driver.py`)
 

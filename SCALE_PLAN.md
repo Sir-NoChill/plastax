@@ -395,8 +395,9 @@ Design (drafted in iteration 3):
 
 ### P7: parity and write-up
 
-- [ ] 7.1 A plastax implementation in `plastix-synth-bench`, rerun at 5.4M,
-  50M and 300M, with plastax rows added to the figures.
+- [x] 7.1 (plastix-synth-bench 8cf0070) A plastax implementation in
+  `plastix-synth-bench`, run on the in-place grid (11 comparable cells, all
+  valid). Large-claim fixes: 1f4d9a4.
 - [ ] 7.2 Results Markdown with PNG figures. Keep this plan's log current.
 
 ## 5. Autonomous loop protocol
@@ -447,9 +448,13 @@ the log below:
   - Sharded steps use CSR instead.
   - Worth a jax issue, or a check on a multi-GPU node (Narval).
 
-- **plastax now roughly matches the hand-written C++ in-place path** (within
-  6-10% from 5.4M to 300M edges) at 6.6× less GPU memory. It is 4.8× faster
-  than the tuned CSR rebuild at 300M.
+- **Correction: the parity claim compared different churn volumes.**
+  - `churn_probe` churns about 128 edges per step. The C++ benchmark churns
+    64 units, about 20K edges.
+  - On the benchmark's own workload (P7.1, `impl/plastax/run.py`), plastax is
+    1.3-1.6× slower than C++ in place from 50M to 300M edges, and 2.3-3.2×
+    slower at 5.4M. It uses about 5.8× less peak GPU memory at 300M.
+  - The 6-10% figure holds only for the light-churn probe.
   - For the paper this changes the story: the JAX library is the practical
     vehicle, not only the reference.
   - The C++ remains ahead only by constant factors: prune reads fewer bytes,

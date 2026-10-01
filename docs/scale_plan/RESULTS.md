@@ -8,19 +8,41 @@ numbers come from plastix-synth-bench (`REEVAL_RESULTS.md`) and from
 
 ## Headline
 
-- **plastax's churn step is within 6-10% of the hand-written C++ in-place
-  path, from 5.4M to 300M edges.** It uses about 6.6× less GPU memory: 4.1
-  against 27 GB at 300M. It is 2.8-4.8× faster than the tuned CSR rebuild.
+> **Correction (2026-10-01, after wiring plastax into plastix-synth-bench).**
+> The churn-step comparison below used `churn_probe.py`, which churns 64
+> *edges* per level per step, about 128 edges. The C++ numbers it was set
+> against churn 64 *units* per update, which is about 20K edges pruned and
+> regrown.
+>
+> On the benchmark's own workload (`impl/plastax/run.py`, same topology and
+> churn files, post-churn validation passing on every cell), plastax is
+> **1.3-1.6× slower than C++ in place from 50M to 300M edges**, and
+> **2.3-3.2× slower at 5.4M**, where per-step fixed costs dominate:
+
+| edges | C++ in place | plastax | ratio | C++ peak | plastax single-state peak |
+|---|---|---|---|---|---|
+| 5.4M (s=0.99) | 0.159 ms | 0.508 ms | 3.2× | 1.13 GB | ~0.15 GB |
+| 50M (s=0.999) | 2.157 ms | 2.972 ms | 1.4× | 5.08 GB | ~1.2 GB |
+| 300M (s=0.9999) | 12.85 ms | 16.68 ms | 1.3× | 27.3 GB | ~4.7 GB |
+
+> See plastix-synth-bench `docs/PLASTAX_GRID.md` for all 11 cells. The
+> "within 6-10%" figure is retracted.
+>
+> The bullets below hold for the light-churn probe workload only.
+
+- On the light-churn probe, plastax's churn step is within 6-10% of C++ from
+  5.4M to 300M edges.
+- **Memory:** about 13 B of state per slot against about 91 B for C++, so
+  plastax holds 300M edges in about 4.7 GB at peak, against 27 GB for C++.
+  The arithmetic is the same: fp32 weights and int32 ids.
 - **It started 11× behind:** 144 ms at 300M before this branch, against
-  13.7 ms now.
+  13.7 ms now on the light-churn probe.
 - **Batched training:** `layout="auto"` picks a Pallas edge-once kernel for
   2 ≤ B ≤ 32 and CSR + cuSPARSE above. At 5.4M edges that is up to 3.3× per
   sample over the per-sample edge list.
 - **DEEP R on the real MultiMNIST stream runs at 286M edges** (4.4M hidden
-  units) in 7.3 GB, against 29.4 GB for C++.
-  - It is 1.7× behind C++ in place and 2.9× ahead of C++ append + resort.
-  - The remaining gap is in the DeepR policies (per-edge noise), not the
-    framework.
+  units) in 7.3 GB, against 29.4 GB for C++. It is 1.7× behind C++ in place
+  and 2.9× ahead of append + resort.
 
 ## One churn step
 

@@ -39,7 +39,7 @@ Cross-cutting scopes:
 - `docs-site` — user-facing Sphinx / Read the Docs documentation: docs/ and
   .readthedocs.yaml (its `docs` dependency group lives in pyproject, `packaging`)
 - `plan` — IMPLEMENTATION_PLAN.md, DISTRIBUTION_PLAN.md, SPARSE_PLAN.md,
-  RL_PLAN.md, ECOSYSTEM_ROADMAP.md, SCOPES.md, TAGS.md, README.md,
+  RL_PLAN.md, SCALE_PLAN.md, TPU_PLAN.md, BATCHING_PLAN.md, SCALING_PLAN.md, ECOSYSTEM_ROADMAP.md, SCOPES.md, TAGS.md, README.md,
   distribution-plan.bib
 - `repo` — git plumbing and commit-governance mechanics: scripts/, the
   commit-msg type/scope gate wiring, .git hooks, agent identity

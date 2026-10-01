@@ -212,4 +212,5 @@ Reference docs (agent-facing, deeper than this file):
 Planning/spec docs (human-facing, authoritative on scope and history):
 `IMPLEMENTATION_PLAN.md` (v1 core), `SPARSE_PLAN.md` (dynamic sparse training),
 `ECOSYSTEM_ROADMAP.md` (optim/heuristics/tools tracks), `DISTRIBUTION_PLAN.md`
-(packaging), `TOOLING.md`, `TAGS.md`, `SCOPES.md`.
+(packaging), `SCALE_PLAN.md` (in-place churn, layouts), `TPU_PLAN.md`,
+`BATCHING_PLAN.md`, `SCALING_PLAN.md` (step-time and memory laws), `TOOLING.md`, `TAGS.md`, `SCOPES.md`.

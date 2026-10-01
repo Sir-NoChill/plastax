@@ -442,7 +442,9 @@ the log below:
   remaining gap is the update's per-edge noise and its 6-column read, not
   growth (+0.3 ms) or the forward.
 
-- **Pallas + `shard_map`:** jax 0.11.2's interpret-mode Pallas fails the
+- **Superseded (iteration 10): there is no Pallas kernel any more.** The
+  Triton layout via jax_triton falls back to the XLA product under Scheme-A.
+  Original note on Pallas + `shard_map`: jax 0.11.2's interpret-mode Pallas fails the
   varying-manual-axes check inside `shard_map` (jax suggests reporting it).
   - Real multi-GPU Pallas under Scheme-A is untested; there is one GPU here.
   - Sharded steps use CSR instead.
@@ -730,6 +732,43 @@ the log below:
     re-check: CSR and Pallas weights match the edge list to 1.5e-8.
 - **Remaining:** P6.4 (a generic-map Pallas kernel) and P5.5 / P6.5 (SDDMM
   for the batched update).
+
+### Iteration 10 (2026-10-01): kernel backend, from Pallas Triton to jax_triton
+
+- **Deprecation.** jax 0.11.2 warns that the Pallas Triton backend will be
+  removed: "migrate to the Mosaic GPU backend… or switch to the official
+  Triton bindings and jax_triton".
+- **The Mosaic GPU evaluation.**
+  - Pallas-level Mosaic GPU indexes global memory only with slices, plus
+    TMA `gather4` / `scatter4` (Blackwell, sm_100). `scatter4` has no
+    add-reduction.
+  - So the edge kernel's scatter-add into arbitrary rows cannot be written at
+    the Pallas level on any GPU, and the gather is unavailable on this sm_89
+    card.
+  - A low-level `plgpu.inline_mgpu` prototype (per-element `llvm.load` plus
+    inline PTX `red.relaxed.gpu.global.add.f32`, one (edge, lane) per thread)
+    worked and was exact. It ran 1.44 / 1.6 / 1.25 / 1.03× slower than
+    Triton at B = 1 / 8 / 32 / 128 on 25M edges, and relies on internal APIs.
+  - Per the decision of 2026-10-01 it was not adopted, and has been removed.
+- **Build:** 7459a76 (the `triton` extra), 640304f (the mypy override),
+  4e0d521 (`layout="triton"` via jax_triton, with an XLA edge-once product
+  off NVIDIA, and "auto" only on NVIDIA), 3d3151a (`triton_check.py`),
+  73f8a93, 2f5143f, bd392f5.
+- **Measured** (batched SGD at 5.4M, ms per sample at B = 2 / 8 / 32 / 128):
+
+  | layout | B = 2 | B = 8 | B = 32 | B = 128 |
+  |---|---|---|---|---|
+  | triton | 0.386 | 0.143 | 0.090 | 0.081 |
+  | CSR | 1.208 | 0.353 | 0.130 | 0.077 |
+  | edge list | 0.444 | 0.346 | 0.296 | 0.250 |
+
+  - The XLA edge-once product performs the same as the per-sample edge list,
+    so non-NVIDIA "auto" stays on the edge list.
+  - The earlier "Triton atomics are acquire-release, hence 3× slower at B = 1"
+    explanation was wrong: relaxed and acq_rel time the same.
+- **Next:** TPU testing (the user is setting up an environment). The SparseCore
+  route is `jax.experimental.pallas.tpu_sc` (`load_gather` /
+  `addupdate_scatter`); see plastix-synth-bench `docs/PLASTAX_ANALYSIS.md` §5.
 
 ## Deviations
 

@@ -216,3 +216,81 @@ def test_structural_phases_run_once_per_batched_step() -> None:
         rtol=1e-5,
         atol=1e-6,
     )
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda: px.optim.sgd(_LR, mlp_xor.GradPreAct),
+        lambda: px.optim.adam(0.01, mlp_xor.GradPreAct),
+    ],
+)
+def test_csr_layout_matches_the_edge_list(make: object) -> None:
+    # mlp_xor's sigmoid passes declare linear_input, so layout="csr" runs both
+    # the forward and the backward as sparse products.
+    opt = make()  # type: ignore[operator]
+    net, static, state = _mlp(opt.update_conn(), opt.state_fields)
+    edge = px.make_step(net, static, batch_size=4, layout="edge_list")
+    csr = px.make_step(net, static, batch_size=4, layout="csr")
+    s_edge, s_csr = state, jax.tree.map(jnp.copy, state)
+    xs, ys = _data(4, 5)
+    for x, y in zip(xs, ys, strict=True):
+        inputs = px.StepInputs(inputs=jnp.asarray(x), targets=jnp.asarray(y))
+        r_edge, r_csr = edge(s_edge, inputs), csr(s_csr, inputs)
+        s_edge, s_csr = r_edge.state, r_csr.state
+        np.testing.assert_allclose(
+            float(r_csr.loss), float(r_edge.loss), rtol=1e-5, atol=1e-6
+        )
+    np.testing.assert_allclose(_weights(s_csr), _weights(s_edge), rtol=1e-5, atol=1e-6)
+    for name in s_edge.units:
+        np.testing.assert_allclose(
+            np.asarray(s_csr.units[name]),
+            np.asarray(s_edge.units[name]),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg=name,
+        )
+
+
+def test_csr_forward_is_exact_on_a_churned_arena() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "_churn2", Path(__file__).parent / "test_inplace_churn.py"
+    )
+    assert spec is not None and spec.loader is not None
+    churn = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(churn)
+
+    class _LinearSum(churn._SumForward):  # type: ignore[name-defined, misc]
+        linear_input = px.ACTIVATION
+
+    class _Fwd(px.Network[dict[str, jax.Array]]):
+        forward_pass = _LinearSum()
+        propagation = px.Propagation.TOPOLOGICAL
+
+    static, state = churn._build()
+    churn_step = px.make_step(churn._ChurnNet, static)
+    x1 = px.StepInputs(inputs=jnp.zeros((churn._WIDTH,), jnp.float32), targets=None)
+    for _ in range(6):  # scramble the arena in place
+        state = churn_step(state, x1).state
+    xb = jnp.asarray(
+        np.random.default_rng(4).standard_normal((3, churn._WIDTH)).astype(np.float32)
+    )
+    inputs = px.StepInputs(inputs=xb, targets=None)
+    edge = px.make_step(_Fwd, static, batch_size=3, layout="edge_list")
+    csr = px.make_step(_Fwd, static, batch_size=3, layout="csr")
+    a = edge(jax.tree.map(jnp.copy, state), inputs).state
+    b = csr(state, inputs).state
+    np.testing.assert_allclose(
+        np.asarray(b.units[px.ACTIVATION.name]),
+        np.asarray(a.units[px.ACTIVATION.name]),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_unknown_layout_is_rejected() -> None:
+    net, static, _ = _mlp(_PlainSGD())
+    # Runtime type checking (tests) rejects the literal first; without it the
+    # ValueError does.
+    with pytest.raises((ValueError, TypeError), match="layout"):
+        px.make_step(net, static, batch_size=2, layout="dense")  # type: ignore[arg-type]

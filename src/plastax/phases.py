@@ -15,10 +15,21 @@ from typing import Any, cast
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import sparse as jsparse
 from jaxtyping import Array, Bool, Float, Int32, Shaped
 
 from plastax import monoid
-from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, ConnIdx, Propagation, UnitIdx
+from plastax._types import (
+    DEAD,
+    FROM_ID,
+    LEVEL,
+    TO_ID,
+    WEIGHT,
+    ConnIdx,
+    FieldSpec,
+    Propagation,
+    UnitIdx,
+)
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.sweep import (
     build_backward_accumulate,
@@ -112,8 +123,12 @@ class BatchedPhases[GS]:
     """The phases of a batched step, split by how they see the batch.
 
     Attributes:
-        per_sample: forward, loss, and backward: run once per sample (vmapped
-            over the batch) against shared connections and globals.
+        forward: the per-sample forward phase (vmapped over the batch).
+        loss: the per-sample loss phase, or None.
+        backward: the per-sample backward phase, or None.
+        csr_forward: the whole-batch CSR forward replacing `forward`, or None
+            for the edge-list layout (see build_csr_forward).
+        csr_backward: likewise for `backward`.
         update_conn: the batched connection update, or None when the net has
             no update_conn: `(state, batched_units) -> state`, reducing the
             per-sample contributions to one update per connection.
@@ -121,7 +136,11 @@ class BatchedPhases[GS]:
             batch-mean unit state.
     """
 
-    per_sample: tuple[Phase[GS], ...]
+    forward: Phase[GS]
+    loss: Phase[GS] | None
+    backward: Phase[GS] | None
+    csr_forward: Callable[[NetworkState[GS], Columns], Columns] | None
+    csr_backward: Callable[[NetworkState[GS], Columns], Columns] | None
     update_conn: Callable[[NetworkState[GS], Columns], NetworkState[GS]] | None
     structural: tuple[Phase[GS], ...]
 
@@ -131,6 +150,7 @@ def build_batched_phases[GS](
     static: NetworkStatic,
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
+    csr: bool = False,
 ) -> BatchedPhases[GS]:
     """Assemble a batched step's phases (see `BatchedPhases`).
 
@@ -141,15 +161,29 @@ def build_batched_phases[GS](
         net: the network's trait class, supplying each phase's callbacks.
         static: static network configuration giving the arena shapes.
         overflow_sink: as for `build_phases`.
+        csr: route each linear pass (see `linear_input_field`) through the CSR
+            layout; non-linear passes keep the per-sample edge list.
 
     Returns:
         The per-sample, update, and structural phases.
     """
-    per_sample: list[Phase[GS]] = [_build_forward_phase(net, static)]
-    if net.loss is not None:
-        per_sample.append(_build_loss_phase(net, static))
-    if net.backward_pass is not None:
-        per_sample.append(_build_backward_phase(net, static))
+    forward = _build_forward_phase(net, static)
+    loss = _build_loss_phase(net, static) if net.loss is not None else None
+    backward = (
+        _build_backward_phase(net, static) if net.backward_pass is not None else None
+    )
+    csr_forward = (
+        build_csr_forward(net, static)
+        if csr and linear_input_field(net.forward_pass) is not None
+        else None
+    )
+    csr_backward = (
+        build_csr_backward(net, static)
+        if csr
+        and net.backward_pass is not None
+        and linear_input_field(net.backward_pass) is not None
+        else None
+    )
     structural: list[Phase[GS]] = []
     if net.prune_conn is not None:
         structural.append(build_prune_conn_phase(net, static))
@@ -160,7 +194,15 @@ def build_batched_phases[GS](
     if net.reset_global is not None:
         structural.append(_build_reset_global_phase(net))
     update = build_batched_update_conn(net) if net.update_conn is not None else None
-    return BatchedPhases(tuple(per_sample), update, tuple(structural))
+    return BatchedPhases(
+        forward,
+        loss,
+        backward,
+        csr_forward,
+        csr_backward,
+        update,
+        tuple(structural),
+    )
 
 
 def batch_mean_units(units: Columns) -> Columns:
@@ -311,6 +353,155 @@ def build_batched_update_conn[GS](
     if per_sample_fn is not None and incoming_batched_fn is not None:
         return exact
     return mean_of_writes
+
+
+def linear_input_field(pass_: object) -> FieldSpec[Any] | None:
+    """The unit field a pass declares itself linear in, or None.
+
+    A ForwardPass or BackwardPass may declare, structurally, `linear_input`:
+    a FieldSpec F such that its `map` is exactly `WEIGHT * u[F, other]` (the
+    source unit for forward, the destination for backward) and its `combine`
+    is the plain `monoid.sum_`. Such a pass's accumulation is a sparse matrix
+    product, which the CSR layout computes with cuSPARSE instead of the
+    per-edge map; `apply` is unchanged. The declaration is trusted -- `map` is
+    not consulted on the CSR path -- so it must be true.
+
+    Args:
+        pass_: A forward or backward pass policy.
+
+    Returns:
+        The declared FieldSpec when the pass qualifies, else None.
+    """
+    field = getattr(pass_, "linear_input", None)
+    combine = getattr(pass_, "combine", None)
+    if isinstance(field, FieldSpec) and combine is monoid.sum_:
+        return field
+    return None
+
+
+def bucket_csr(
+    bucket: Columns, num_units: int, *, rows: FieldSpec[Any], cols: FieldSpec[Any]
+) -> jsparse.BCSR:
+    """A `(num_units, num_units)` CSR view of one bucket's live edges.
+
+    Built on device from the arena in one radix sort (by `rows`), so it is
+    always current: in-place churn needs no invalidation. Dead slots stay in
+    the view as explicit zeros in the last row, keeping every shape static.
+
+    Args:
+        bucket: The bucket's columns.
+        num_units: Total unit count (the matrix side).
+        rows: TO_ID for the forward (rows are destinations), FROM_ID for the
+            backward's transpose.
+        cols: The other endpoint column.
+
+    Returns:
+        The BCSR matrix whose row r holds the weights of the live edges with
+        `rows == r`, at column `cols`.
+    """
+    dead = bucket[DEAD.name]
+    cap = dead.shape[0]
+    row_id = jnp.where(dead, jnp.int32(num_units - 1), bucket[rows.name])
+    _, perm = jax.lax.sort_key_val(row_id, jnp.arange(cap, dtype=jnp.int32))
+    sorted_rows = row_id[perm]
+    counts = jnp.zeros((num_units,), jnp.int32).at[sorted_rows].add(1)
+    indptr = jnp.concatenate([jnp.zeros((1,), jnp.int32), jnp.cumsum(counts)])
+    values = jnp.where(dead[perm], jnp.float32(0.0), bucket[WEIGHT.name][perm])
+    return jsparse.BCSR(
+        (values, bucket[cols.name][perm].astype(jnp.int32), indptr),
+        shape=(num_units, num_units),
+        indices_sorted=False,
+        unique_indices=False,
+    )
+
+
+def build_csr_forward[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Callable[[NetworkState[GS], Columns], Columns]:
+    """Batched topological forward with each bucket as one sparse product.
+
+    The level walk of the edge-list forward, but each bucket's accumulation
+    is `CSR(bucket) @ X` with X the `(num_units, B)` linear-input column, and
+    each level's `apply` is vmapped over the batch.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class; its forward pass must be linear.
+        static: static network configuration.
+
+    Returns:
+        `(state, batched_units) -> batched_units` after the forward.
+    """
+    fp = net.forward_pass
+    field = linear_input_field(fp)
+    assert field is not None  # only built for a linear forward
+    num_units = static.num_units
+    apply = build_forward_apply(fp, num_units=num_units)
+    not_input = ~unit_id_mask(static.input_ids, num_units)
+
+    def forward(state: NetworkState[GS], units_b: Columns) -> Columns:
+        level = state.units[LEVEL.name]
+        batch = units_b[field.name].shape[0]
+        acc = jnp.zeros((batch, num_units), jnp.float32)
+        for level_idx, bucket in enumerate(state.conns):
+            matrix = bucket_csr(bucket, num_units, rows=TO_ID, cols=FROM_ID)
+            acc = acc + (matrix @ units_b[field.name].T).T
+            finalize = (level == level_idx + 1) & not_input
+            units_b, acc = jax.vmap(apply, in_axes=(0, 0, None, None))(
+                units_b, acc, state.globals_, finalize
+            )
+        return units_b
+
+    return forward
+
+
+def build_csr_backward[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Callable[[NetworkState[GS], Columns], Columns]:
+    """Batched topological backward with each bucket as one sparse product.
+
+    Mirrors `_build_backward_topological_phase` (reverse level walk, the top
+    level primed from the identity), accumulating `CSR^T(bucket) @ G` with G
+    the `(num_units, B)` linear-input column read at the destinations.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class; its backward pass must be linear.
+        static: static network configuration.
+
+    Returns:
+        `(state, batched_units) -> batched_units` after the backward.
+    """
+    bp = net.backward_pass
+    field = linear_input_field(bp)
+    assert bp is not None and field is not None  # only built when linear
+    num_units = static.num_units
+    num_levels = len(static.level_capacities)
+    apply = build_backward_apply(bp, num_units=num_units)
+    not_input = ~unit_id_mask(static.input_ids, num_units)
+    vapply = jax.vmap(apply, in_axes=(0, 0, None, None))
+
+    def backward(state: NetworkState[GS], units_b: Columns) -> Columns:
+        level = state.units[LEVEL.name]
+        batch = units_b[field.name].shape[0]
+        acc = jnp.zeros((batch, num_units), jnp.float32)
+        units_b, acc = vapply(
+            units_b, acc, state.globals_, (level == num_levels) & not_input
+        )
+        for level_idx in range(num_levels - 1, 0, -1):
+            matrix = bucket_csr(
+                state.conns[level_idx], num_units, rows=FROM_ID, cols=TO_ID
+            )
+            acc = acc + (matrix @ units_b[field.name].T).T
+            finalize = (level == level_idx) & not_input
+            units_b, acc = vapply(units_b, acc, state.globals_, finalize)
+        return units_b
+
+    return backward
 
 
 def _shard_axis(static: NetworkStatic) -> str | None:

@@ -9,10 +9,14 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Actions are pinned to their first Node 24 majors (Node 20 is deprecated on
+# GitHub runners), and the runner image to ubuntu-24.04: ubuntu-latest moves to
+# Ubuntu 26 from 2026-10-19, so the image changes only when this pin is bumped
+# deliberately (after checking the suite and the jax/CUDA wheels on 26.04).
 jobs:
   check:
     name: check (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -21,10 +25,10 @@ jobs:
       # Override .python-version (3.13) so the matrix drives the interpreter.
       UV_PYTHON: ${{ matrix.python-version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 

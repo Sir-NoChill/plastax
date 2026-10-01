@@ -202,7 +202,8 @@ Design (refined in iteration 1, from the C++ sampled path in
     multiset.
   - Assert the same live multiset and the same forward output. Cover
     overflow → grow and resort.
-- [ ] 1.5 Bench, outside this repo: switch the DeepR plastax port to
+- [x] 1.5 (`plastix-bench/15_deepr_multimnist/plastax/deepr_scale.py`, a new
+  file in your untracked WIP dir) Bench, outside this repo: switch the DeepR plastax port to
   `propose`, run it on the real MultiMNIST stream, and scale to the memory
   bound.
 
@@ -240,7 +241,14 @@ Design (refined in iteration 1, from the C++ sampled path in
     lexsort with int64 indices) took host RAM from about 57 GB free to about
     1 GB in under a second. It crashed the session twice.
   - Do not retry until 2.7 lands. 300M is the tested ceiling on cdol01.
-- [ ] 2.7 `perf(builder)`: a lower-memory build.
+- [x] 2.7 (partly) A faster build: c184fd0 (packed-key argsort, 18.5 → 11.4 s
+  at 50M) and 35801f5 (levels without `ufunc.at`).
+  - Host memory is about 45 B per edge with aligned capacities, so 600M
+    would need about 30 GB.
+  - The two crashes came from power-of-two padding (two 537M-slot buckets
+    materialised on the host).
+  - Not re-tested, at your request.
+  - Original plan text: a lower-memory build.
   - Use int32 indices, and one argsort per bucket over a packed key instead of
     `lexsort` plus fancy-index copies.
   - Levels via device `recompute_levels`, or a chunked host pass.
@@ -406,6 +414,23 @@ the log below:
    put anything the user should weigh under "Surfaced for review".
 
 ## 6. Surfaced for review
+
+- **The plastax DeepR port (`15_deepr_multimnist/plastax/deepr.py`, your WIP)
+  has two issues at scale:**
+  - (a) `DeepRConnUpdate` keys its Langevin noise on an int32
+    `from * num_units + to`, which wraps past 46,340 units. At 1M or more
+    hidden units, distinct edges share noise keys (correlated noise). This is
+    the same bug class as P0.2.
+  - (b) At 60 hidden it learns far slower than the C++ run (0.095 against
+    0.43 accuracy at step 300, for both the grid port and the proposal port).
+    That points at a hyperparameter or semantics mismatch with
+    `main_deepr.cpp`, not at the framework.
+  - `deepr_scale.py --hash-noise` avoids (a). Both files are untracked and
+    yours to keep or drop.
+- **The DeepR step is policy-bound.** At 286M edges plastax is 1.7× behind
+  C++ in place but 2.9× ahead of append+resort, at 4× less memory. The
+  remaining gap is the update's per-edge noise and its 6-column read, not
+  growth (+0.3 ms) or the forward.
 
 - **Pallas + `shard_map`:** jax 0.11.2's interpret-mode Pallas fails the
   varying-manual-axes check inside `shard_map` (jax suggests reporting it).
@@ -648,6 +673,32 @@ the log below:
   - Remaining work: P6.4 (generic-map Pallas), P6.5 / P5.5 (SDDMM update),
     P2.7 (host build memory), and P1.5 / P7 (DeepR and synth-bench parity).
   - Next: P2.7, so the 600M+ evidence becomes possible, then P7.
+
+### Iteration 8 (2026-10-01): P2.7 and P1.5, DeepR at scale
+
+- **Build:** c184fd0 and 35801f5 (builder speed). Also `deepr_scale.py` in
+  plastix-bench, a new untracked file, uncommitted:
+  - `ProposeRewire` (same distribution as `DeepRRewire`; `--dedupe` optional);
+  - a vectorized `from_edges` build;
+  - optional `--hash-noise` (a counter-hash Box-Muller Langevin normal in
+    place of threefry).
+- **Explore:** DeepR on the real MultiMNIST stream, 300 steps, GPU:
+
+  | hidden | edges | plastax ms/step | C++ in place | C++ append | plastax state | C++ peak | acc @300 (plastax / C++) |
+  |---|---|---|---|---|---|---|---|
+  | 60 | 3.9K | 1.17 | 0.068 | 0.143 | – | – | 0.095 / 0.43 |
+  | 1M | 65M | 18.0 (threefry), 14.4 → 11.3 step-only (hash) | 7.4 | 35.3 | 1.65 GB | – | 0.43 / – |
+  | 4.4M | 286M | 53.6 (hash noise) | 30.9 | 156.6 | 7.27 GB | 29.4 GB | 0.40 / 0.465 |
+
+  - Phase breakdown at 1M: forward + loss + backward 3.1 ms; update
+    +7.4 ms with threefry (+5.4 hashed); prune +3.5 (+2.4); growth +0.3.
+  - The DeepR cost is in the *policies* (per-edge RNG, plus reading 6
+    columns), not the framework.
+  - At 60 hidden the existing grid-based plastax port also sits at chance
+    after 300 steps (0.095). The accuracy gap to C++ is in the port's
+    hyperparameters or semantics, and predates this work (surfaced).
+- **Plan:** remaining are P6.4 (generic-map Pallas), P5.5 / P6.5 (SDDMM
+  update), and P7 (the write-up). Next: P7.2, the results write-up.
 
 ## Deviations
 

@@ -94,6 +94,14 @@ def make_step[GS](
     and every streaming step, use the edge list. Under Scheme-A sharding,
     "pallas" falls back to "csr".
 
+    In a batched step a non-floating unit column (a flag, a count) is stored
+    from sample 0 rather than averaged, and so is a non-floating connection
+    column written by an UpdateConn without the exact pair: such columns
+    should agree across the batch. With layout "csr", call the step
+    directly: the cuSPARSE lowering is scoped to its own calls, so wrapping
+    it in an outer jit or scan lowers it outside that scope, onto the
+    generic (much slower, still correct) kernel.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -231,6 +239,21 @@ def _batched_step(
         return jax.vmap(one)(units_b, inputs.inputs, inputs.targets)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        # Shapes are static, so a mis-shaped batch fails at trace time instead
+        # of broadcasting (an unbatched input) or vmapping the feature axis.
+        want = (batch_size, len(static.input_ids))
+        if inputs.inputs.shape != want:
+            raise ValueError(
+                f"batched step: inputs must be {want}, got {inputs.inputs.shape}"
+            )
+        if inputs.targets is not None and inputs.targets.shape != (
+            batch_size,
+            len(static.output_ids),
+        ):
+            raise ValueError(
+                f"batched step: targets must be {(batch_size, len(static.output_ids))}"
+                f", got {inputs.targets.shape}"
+            )
         units_b = {
             name: jnp.broadcast_to(col, (batch_size, *col.shape))
             for name, col in state.units.items()

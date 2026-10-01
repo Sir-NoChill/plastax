@@ -770,6 +770,41 @@ the log below:
   route is `jax.experimental.pallas.tpu_sc` (`load_gather` /
   `addupdate_scatter`); see plastix-synth-bench `docs/PLASTAX_ANALYSIS.md` §5.
 
+### Iteration 11 (2026-10-01): TPU readiness without hardware
+
+- **Simulation options found.**
+  - (1) libtpu (`tpu` extra, libtpu 0.0.48 with jax 0.11.2) compiles ahead of
+    time against a topology description on any host: v5e:2x2, v6e:2x2,
+    v5p:2x2x1 and v4:2x2x1 all work.
+  - (2) Pallas TPU interpret mode (`pltpu.InterpretParams`, with race and OOB
+    detection) runs TensorCore kernels on CPU.
+  - (3) SparseCore (`pallas.tpu_sc`) has no interpret support: compile-only
+    off TPU.
+- **Every plastax step type compiles for TPU** (`tpu_aot_check.py`): churn
+  with proposal growth, with dedupe (uint64 sort), and with grid growth;
+  streaming Adam; batched Adam in each layout. CSR first failed
+  (`'function' object has no attribute 'trace'`), fixed in 05c326d.
+- **What the TPU HLO shows.**
+  - The edge-list gather and scatter stay on the TensorCore. There is no
+    SparseCore offload by default on v4, v5p or v6e.
+  - XLA's TPU cost model charges random gather/scatter at tile granularity:
+    the 5.4M forward is estimated at about 70-94 GB of traffic, about 4 KB per
+    index against 4 B on GPU.
+  - So the TensorCore edge list is likely slow on TPU. This is an estimate,
+    to be measured on hardware.
+- **Built:** 05c326d (`_CusparseStep` keeps AOT; non-NVIDIA `auto` uses the
+  XLA edge-once product, 1.57 against 4.13 GB of temporaries at B = 32 on
+  v5p), 84292b0 (`tpu` extra), b3078c2 (`tpu_aot_check.py`), b894cfc and
+  7a210aa (docs).
+- **Next, for TPU: a SparseCore edge kernel. Design notes:**
+  - `tpu_sc.load_gather` / `addupdate_scatter` act on refs in subcore VMEM,
+    not HBM. So each vector subcore must own a destination range whose
+    accumulator fits VMEM, with source activations DMA'd in by range.
+  - That makes it a destination-blocked 2-D tiling of the edge arena (a new
+    bucket layout), not a port.
+  - It can be written and AOT-compiled for v5p/v6e now. Correctness and speed
+    need hardware.
+
 ## Deviations
 
 (none yet)

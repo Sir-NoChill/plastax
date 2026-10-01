@@ -130,6 +130,13 @@ files = ["src"]
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr"]
 
+# triton / jax_triton (the optional `triton` extra, imported lazily inside the
+# NVIDIA edge kernel) ship no type information; the strict gate stays on for
+# everything else.
+[[tool.mypy.overrides]]
+module = ["triton", "triton.*", "jax_triton", "jax_triton.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 88
 src = ["src", "tests"]

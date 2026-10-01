@@ -316,7 +316,9 @@ Design (drafted in iteration 3):
 
 ### P5: CSR layout view (cuSPARSE)
 
-- [ ] 5.1 Design note. Refined in iteration 5:
+- [x] 5.1 Design note. Refined in iteration 5, then simplified in iteration
+  6. A per-step rebuild of the view proved fast enough, so the view is not
+  cached and has no freshness tracking:
   - **Scope.** Only *linear* passes take the view. A `ForwardPass` or
     `BackwardPass` declares, structurally, `linear_input: FieldSpec`: its map
     is `WEIGHT · u[linear_input, other]` and its combine is `sum`. Its `apply`
@@ -337,7 +339,8 @@ Design (drafted in iteration 3):
   - **Selection.** A trait `Network.layout = "edge_list" | "csr"`. With
     "csr" the view columns live in the state (static shapes: capacity +
     `num_units + 1`).
-- [ ] 5.1b Measure first: cuSPARSE SpMM through `jax.experimental.sparse`
+- [x] 5.1b (measured: the CSR rebuild plus SpMM forward was 5.8× faster than
+  the vmapped edge list at B = 128, and slower at B = 8) Measure first: cuSPARSE SpMM through `jax.experimental.sparse`
   inside a vmapped per-sample phase does not apply directly. The batched
   forward must call `BCSR @ X` with the batch as columns, which means
   restructuring the per-sample vmap for linear passes.
@@ -345,10 +348,23 @@ Design (drafted in iteration 3):
   - The view is `perm/indices/indptr` plus the values `weight[perm]`
     (tombstones give 0), plus a COO delta for edges grown since the last
     rebuild, plus a rebuild every R steps or on delta overflow.
-- [ ] 5.2 Build the forward (cuSPARSE `csrmv`/`csrmm` via
+- [x] 5.2 (6d99d7f) Build the forward (cuSPARSE `csrmv`/`csrmm` via
   `jax.experimental.sparse`, with the lowering flag scoped to the call).
-- [ ] 5.3 Backward: the transpose via cuSPARSE, or a CSC view.
-- [ ] 5.4 Tests against the edge-list path; benchmark at B = 1 and B = 128.
+- [x] 5.3 (6d99d7f; Scheme-A all-reduce in d768791) Backward: the transpose via cuSPARSE, or a CSC view.
+- [x] 5.4 Tests against the edge-list path, plus a benchmark.
+  - Batched training at 5.4M edges, ms per sample:
+
+    | B | edge list | CSR |
+    |---|---|---|
+    | 8 | 0.314 | 0.352 |
+    | 32 | 0.279 | 0.130 |
+    | 128 | 0.252 | 0.077 (3.3×) |
+
+- [ ] 5.5 The batched update's per-sample gradient accumulation is now the
+  largest batched cost. It is an SDDMM (Σ_b G[b,dst]·A[b,src] per edge).
+  - cuSPARSE has SDDMM, but jax does not expose it.
+  - Candidates: a Pallas kernel (P6), or a chunked edge-gather of `(N, B)`
+    rows.
 
 ### P6: Pallas kernel (extension avenue)
 
@@ -578,6 +594,19 @@ the log below:
     single layer (iteration 1). **That is P5's case.**
 - **Plan:** P5 refined above. The key design step is routing linear passes to
   one batched SpMM instead of a per-sample vmap.
+
+### Iteration 6 (2026-10-01): P5, the CSR layout
+
+- **Build:** 090bb2f, 6d99d7f, d768791 (Scheme-A all-reduce: without it a
+  sharded CSR step diverged), adc02b4. 301 fast tests and 15 slow.
+- **Document:** 39d0489, 5c063d8.
+- **Explore:** the CSR crossover sits between B = 8 and 32, which supports
+  the "auto" threshold of 16. Batched training is 3.3× at B = 128. The
+  remaining batched cost is the update's per-sample loop (P5.5).
+- **Plan:** P6 next (Pallas). Two targets:
+  - (a) an edge-once batched kernel for *any* map, covering B in 2..16 where
+    CSR loses and non-linear maps CSR cannot run;
+  - (b) the update's SDDMM.
 
 ## Deviations
 

@@ -91,9 +91,10 @@ def make_step[GS](
     once for the whole batch, relaxed atomics into the targets) on an NVIDIA
     GPU with the `plastax[triton]` extra, and as the same edge-once product in
     plain XLA anywhere else. "auto" picks, on an NVIDIA GPU, "triton" for
-    `2 <= batch_size <= 32` (when jax_triton is installed) and "csr" above
-    it -- in batched training at 5.4M edges Triton is 2.4x the edge list at
-    B = 8 and CSR edges ahead at 128 -- and on every other backend (AMD GPUs,
+    `2 <= batch_size <= 64` (when jax_triton is installed) and "csr" above
+    it -- in batched SGD at 5.4M edges Triton is 1.7x the edge list at B = 2
+    and 2.9x at 8, ahead of CSR through 64, and CSR is 4 % ahead at 128 (a
+    tie at 50M) -- and on every other backend (AMD GPUs,
     TPU, CPU) the XLA edge-once product for `batch_size >= 2` (the speed of
     the per-sample edge list, with far smaller temporaries). Non-linear
     passes, and every streaming step, use the edge list. Under Scheme-A
@@ -139,7 +140,7 @@ def make_step[GS](
     if batch_size is not None:
         triton_ok = nvidia_triton_available()
         if layout == "auto" and _nvidia_gpu():
-            if batch_size > 32:
+            if batch_size > 64:
                 engine = "csr"
             elif batch_size >= 2 and triton_ok:
                 engine = "triton"

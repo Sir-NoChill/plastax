@@ -517,7 +517,10 @@ def nvidia_triton_available() -> bool:
     return True
 
 
+# no_type_check keeps jaxtyping's test-time import hook from wrapping the nested
+# kernels, which would hide their closure (`tl`) from Triton.
 @functools.cache
+@no_type_check
 def _triton_edge_kernel() -> Any:
     """The Triton kernel, built on first use so plastax never imports triton."""
     import triton

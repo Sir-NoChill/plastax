@@ -251,6 +251,33 @@ the CSR layout addresses that for linear passes:
   and for every non-linear pass. The CSR step keeps jit's `.trace`/`.lower`
   (`step._CusparseStep`), so every layout AOT-compiles (TOOLING.md, TPU).
 
+### Prune fused into the forward (`make_step(fuse_prune=)`)
+
+A streaming step with a forward and a prune_conn would read every bucket's
+edge columns twice. `phases.plan_prune_fusion` decides once, at the step's
+first trace (it needs the globals' shapes), whether the predicate may run
+inside the forward sweep, by tracing the policies to jaxprs:
+
+- the predicate's reads (plus DEAD) must not be written by loss, backward or
+  update_conn;
+- a unit field it reads that the forward's `apply` writes must depend only on
+  the unit id, the globals and columns the forward does not write -- never
+  on the accumulator. Its post-forward value is then computed up front
+  ("forwarded"); any other forward-written read is not fusable.
+
+A fused step runs `build_fused_forward_prune_phase` in place of the forward
+and `build_prune_merge_phase` at the prune slot, so loss/backward/update_conn
+still see the old dead mask. With an unsharded linear forward on an NVIDIA
+GPU, each bucket is one Triton kernel (`triton_forward_prune`): gather,
+relaxed atomic scatter-add, the predicate translated from its jaxpr by
+`_PredicateTranslator` (exact integer / compare / select ops only), the
+tombstones written in place, and the free-slot block counts that add_conn
+then reuses (`free_sink`). XLA cannot do this in one pass (a scatter is
+never a multi-output fusion root), so `fuse_prune="auto"` keeps the two-pass
+step everywhere else; `"xla"` forces the XLA-lowered fused step (the CPU
+correctness reference, also valid under Scheme-A). Batched steps never fuse.
+The decision is `step.prune_fusion.plan`.
+
 ### Host loop (`driver.py`)
 
 `Driver.step(inputs)` (`driver.py:51`) runs the jitted step and reacts to the

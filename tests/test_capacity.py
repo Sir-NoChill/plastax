@@ -129,6 +129,7 @@ def test_resort_does_not_undo_grow_bucket() -> None:
     assert new_static.level_capacities[0] == 1536
 
 
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs >= 4 devices")
 def test_capacity_align_must_divide_by_the_shard_count() -> None:
     with pytest.raises(ValueError, match="multiple of num_shards"):
         _build(1000, capacity_align=30, sharding=px.ShardSpec("shard", 4))

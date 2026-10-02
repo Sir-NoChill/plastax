@@ -213,6 +213,49 @@ def _check_propose_churn_shards(
             raise AssertionError(f"propose(dedupe={dedupe}): nothing grew")
 
 
+class _HashPrune(px.PruneConn):
+    """Tombstone a hashed fraction of edges: reads only edge columns."""
+
+    def predicate(
+        self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: None
+    ) -> jax.Array:
+        del u, g
+        a = c[px.FROM_ID, cid].astype(jnp.uint32) * jnp.uint32(0x9E3779B1)
+        h = (a ^ c[px.TO_ID, cid].astype(jnp.uint32)) * jnp.uint32(0x85EBCA77)
+        return (h >> jnp.uint32(24)) < jnp.uint32(40)
+
+
+def _check_fused_prune_shards(
+    static: px.NetworkStatic, static_s: px.NetworkStatic, state: px.NetworkState[None]
+) -> None:
+    """The prune-into-forward fusion (XLA lowering) runs under Scheme-A.
+
+    A sharded step with `fuse_prune="xla"` must match the single-device
+    two-pass step: the fused predicate sees each shard's own edge slice, like
+    the separate prune sweep.
+    """
+
+    class _FusedNet(px.Network[None]):
+        forward_pass = MagnitudeStats(0.3)
+        prune_conn = _HashPrune()
+        add_conn = _HashPropose(sum(_LAYERS), dedupe=False)
+        extra_unit_fields = _EXTRA_UNIT_FIELDS
+        extra_conn_fields = _OPT.state_fields
+        propagation = px.Propagation.TOPOLOGICAL
+
+    sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
+    single = px.make_step(_FusedNet, static, fuse_prune="off")(_copy(state), sp).state
+    step_s = px.make_step(_FusedNet, static_s, fuse_prune="xla")
+    sharded = step_s(_copy(state), sp).state
+    plan = step_s.prune_fusion.plan  # type: ignore[attr-defined]
+    if plan is None or not plan.fused:
+        raise AssertionError(f"fused prune: not fused under Scheme-A ({plan})")
+    if int(px.state.live_conn_count(single)) != int(px.state.live_conn_count(sharded)):
+        raise AssertionError("fused prune: live-edge count differs sharded vs single")
+    if not _conns_allclose(single, sharded):
+        raise AssertionError("fused prune: conn columns differ sharded vs single")
+
+
 def _check_batched_train_step_shards(
     static: px.NetworkStatic, static_s: px.NetworkStatic, state: px.NetworkState[None]
 ) -> None:
@@ -250,6 +293,8 @@ def main() -> None:
     print("OK churn step shards (prune + device-resident add_conn growth)")
     _check_propose_churn_shards(static, static_s, state)
     print("OK proposal churn step shards (dedupe off and on)")
+    _check_fused_prune_shards(static, static_s, state)
+    print("OK fused prune step shards (prune predicate in the forward sweep)")
     _check_batched_train_step_shards(static, static_s, state)
     print("OK batched train step shards")
     print("CHURN SHARDING CHECK PASS")

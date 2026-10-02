@@ -80,6 +80,7 @@ def build_phases[GS](
     static: NetworkStatic,
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
+    prune_fusion: PruneFusionPlan | None = None,
 ) -> tuple[Phase[GS], ...]:
     """Assemble the phases present for this net; absent slots trace nothing.
 
@@ -97,12 +98,27 @@ def build_phases[GS](
         overflow_sink: optional length-1 out-parameter that
             build_add_conn_phase overwrites with its computed overflow
             flag on every call.
+        prune_fusion: a fused `plan_prune_fusion` plan to evaluate the prune
+            predicate inside the forward sweep (the prune slot then only
+            commits the tombstones), or None for the separate prune sweep.
 
     Returns:
         The tuple of phase functions to run in order, one per present
         trait slot.
     """
-    phases: list[Phase[GS]] = [_build_forward_phase(net, static)]
+    fused = prune_fusion is not None and prune_fusion.fused
+    num_buckets = len(static.level_capacities)
+    dead_sink: list[Any] = [None] * num_buckets
+    free_sink: list[Any] = [None] * num_buckets
+    if fused:
+        assert prune_fusion is not None
+        phases: list[Phase[GS]] = [
+            build_fused_forward_prune_phase(
+                net, static, prune_fusion, dead_sink=dead_sink, free_sink=free_sink
+            )
+        ]
+    else:
+        phases = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
     if net.backward_pass is not None:
@@ -110,9 +126,20 @@ def build_phases[GS](
     if net.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
     if net.prune_conn is not None:
-        phases.append(build_prune_conn_phase(net, static))
+        phases.append(
+            build_prune_merge_phase(dead_sink)
+            if fused
+            else build_prune_conn_phase(net, static)
+        )
     if net.add_conn is not None:
-        phases.append(build_add_conn_phase(net, static, overflow_sink=overflow_sink))
+        phases.append(
+            build_add_conn_phase(
+                net,
+                static,
+                overflow_sink=overflow_sink,
+                free_sink=free_sink if fused else None,
+            )
+        )
     if net.reset_global is not None:
         phases.append(_build_reset_global_phase(net))
     return tuple(phases)
@@ -1048,6 +1075,952 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+# ---------------------------------------------------------------------------
+# Prune-into-forward fusion (streaming step)
+# ---------------------------------------------------------------------------
+#
+# A streaming step with both a forward and a prune_conn reads every bucket's
+# edge columns twice: once in the forward's gather/scatter, once in the prune
+# predicate's sweep. When the predicate provably sees the same values in both
+# places, `plan_prune_fusion` lets the forward evaluate it during its own edge
+# sweep: on an NVIDIA GPU (jax_triton) one Triton kernel per bucket gathers,
+# scatter-adds, evaluates the predicate, writes the new tombstones and counts
+# each free-slot block for add_conn, reading the edge columns once. Elsewhere
+# the same restructured step runs in plain XLA. The tombstones are only
+# *committed* at the prune_conn slot (`build_prune_merge_phase`), so loss,
+# backward and update_conn still see the step's old dead mask.
+
+
+@dataclasses.dataclass(frozen=True)
+class PruneFusionPlan:
+    """The static decision whether a streaming step fuses prune into forward.
+
+    Attributes:
+        fused: Whether the predicate is evaluated inside the forward sweep.
+        reason: Why (or why not), for tests and debugging.
+        engine: "triton" (one jax_triton kernel per bucket) or "xla" when
+            fused, else None.
+        forwarded: Unit fields the forward writes and the predicate reads.
+            Each was proved to depend only on columns the forward does not
+            write (never on the accumulator), so its post-forward value is
+            computed up front and the predicate reads that.
+        triton_kernels: The translated predicate per bucket (engine "triton"
+            only); excluded from comparison and repr.
+    """
+
+    fused: bool
+    reason: str
+    engine: str | None = None
+    forwarded: tuple[str, ...] = ()
+    # One translated predicate per bucket (engine "triton"); not compared.
+    triton_kernels: tuple[Any, ...] = dataclasses.field(
+        default=(), repr=False, compare=False
+    )
+
+
+@dataclasses.dataclass
+class PruneFusionRecord:
+    """The plan a step chose on its last trace (`make_step`'s `prune_fusion`).
+
+    Attributes:
+        plan: The plan, or None until the step has been traced.
+    """
+
+    plan: PruneFusionPlan | None = None
+
+
+def _sub_jaxpr(eqn: Any) -> Any:
+    """The callee of a call-like equation whose invars/outvars map 1:1."""
+    for key in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
+        sub = eqn.params.get(key)
+        if sub is None:
+            continue
+        inner = getattr(sub, "jaxpr", sub)
+        if len(inner.invars) == len(eqn.invars) and len(inner.outvars) == len(
+            eqn.outvars
+        ):
+            return inner
+    return None
+
+
+def _live_invars(jaxpr: Any, live_out: list[bool]) -> list[bool]:
+    """Which of `jaxpr`'s inputs the selected outputs depend on.
+
+    A backward liveness walk. Call-like equations (pjit, closed_call, custom
+    derivatives) are entered; any other equation with a live output makes all
+    of its inputs live, which over-approximates a read set -- the safe
+    direction for the fusion check.
+    """
+    from jax.extend.core import Literal
+
+    live: set[Any] = {
+        v
+        for v, keep in zip(jaxpr.outvars, live_out, strict=True)
+        if keep and not isinstance(v, Literal)
+    }
+    for eqn in reversed(jaxpr.eqns):
+        outs = [o in live for o in eqn.outvars]
+        if not any(outs):
+            continue
+        sub = _sub_jaxpr(eqn)
+        used = _live_invars(sub, outs) if sub is not None else [True] * len(eqn.invars)
+        for v, keep in zip(eqn.invars, used, strict=True):
+            if keep and not isinstance(v, Literal):
+                live.add(v)
+    return [v in live for v in jaxpr.invars]
+
+
+def _flat_labels(
+    args: tuple[Any, ...], columns: tuple[int, ...] = (0, 1)
+) -> list[tuple[int, Any]]:
+    """`(argument index, key)` for each flattened input of a traced policy.
+
+    The arguments at `columns` are column dicts, keyed by column name; every
+    other argument is keyed by its running leaf index.
+    """
+    labels: list[tuple[int, Any]] = []
+    for pos, arg in enumerate(args):
+        leaves = jax.tree_util.tree_flatten_with_path(arg)[0]
+        for k, (path, _) in enumerate(leaves):
+            key = getattr(path[0], "key", k) if pos in columns else k
+            labels.append((pos, key))
+    return labels
+
+
+def _sds(shape: tuple[int, ...], dtype: Any) -> Any:
+    """A `jax.ShapeDtypeStruct` (untyped in jax's stubs, hence Any)."""
+    return jax.ShapeDtypeStruct(shape, dtype)  # type: ignore[no-untyped-call]
+
+
+def _abstract(tree: Any) -> Any:
+    """ShapeDtypeStructs standing in for every array leaf of `tree`."""
+    return jax.tree.map(lambda x: _sds(jnp.shape(x), jnp.result_type(x)), tree)
+
+
+def _write_keys(fn: Callable[..., Any], *args: Any) -> frozenset[str]:
+    """The field names of the write record `fn` returns (as a dict)."""
+    out = jax.eval_shape(fn, *args)
+    return frozenset(out)
+
+
+def plan_prune_fusion[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    globals_: GS,
+    *,
+    engine: str = "auto",
+) -> PruneFusionPlan:
+    """Decide, statically, whether prune_conn can run inside the forward sweep.
+
+    Fusion is legal when the predicate sees the same values inside the forward
+    sweep as it would at its own slot. The read and write sets come from
+    tracing the policies to jaxprs (a dependency walk, conservative across
+    control flow). The rules:
+
+    - The predicate's reads (plus DEAD, which the prune merges into) must
+      not be written by loss, backward or update_conn, which run in between.
+    - A unit field the predicate reads that the forward's `apply` writes
+      must provably not depend on the accumulator or on any other field the
+      forward writes (only on the unit id, the globals and unwritten unit
+      columns). Its post-forward value is then known before the sweep and is
+      computed up front ("forwarded"); any other forward-written read is
+      illegal.
+    - The forward never writes edge columns (ForwardPass returns only a
+      UnitWrite), so the predicate's edge reads are always current.
+
+    Anything that fails to trace is not fused. The single-pass lowering is
+    the Triton one: on an unsharded NVIDIA GPU with jax_triton, a linear
+    forward (see `linear_input_field`) whose predicate translates to Triton
+    (integer and exact float ops, see `_PredicateTranslator`) runs as one
+    kernel per bucket. XLA cannot fuse a scatter with the predicate's
+    reduction (a scatter is never a multi-output fusion root), so the fused
+    step in plain XLA still reads the edge columns twice: `engine="auto"`
+    therefore fuses only when the Triton kernel applies, `"triton"` falls
+    back to the XLA fused step where it does not, and `"xla"` always takes
+    the XLA fused step (portable; the correctness reference on CPU).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network's trait class.
+        static: The network's static configuration.
+        globals_: The globals pytree (arrays, tracers or ShapeDtypeStructs);
+            only its shapes and dtypes are used.
+        engine: "auto", "triton" or "xla" (see above).
+
+    Returns:
+        The plan: fused or not, why, and how.
+
+    Raises:
+        ValueError: If `engine` is not "auto", "triton" or "xla".
+    """
+    pc = net.prune_conn
+    if pc is None:
+        return PruneFusionPlan(False, "no prune_conn")
+    fp = net.forward_pass
+    n = static.num_units
+    units = {s.name: _sds((n,), np.dtype(s.dtype)) for s in static.unit_fields}
+
+    def conns_at(cap: int) -> dict[str, Any]:
+        return {s.name: _sds((cap,), np.dtype(s.dtype)) for s in static.conn_fields}
+
+    conns0 = conns_at(static.level_capacities[0])
+    g = _abstract(globals_)
+    scalar_i = _sds((), np.dtype(np.int32))
+    acc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), fp.combine)
+
+    def predicate(u: Columns, c: Columns, cid: jax.Array, g_: Any) -> jax.Array:
+        return jnp.asarray(pc.predicate(UnitView(u), ConnView(c), ConnIdx(cid), g_))
+
+    def forward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> dict[str, Any]:
+        return dict(fp.apply(UnitView(u), UnitIdx(i), g_, a).fields)
+
+    try:
+        pred_args = (units, conns0, scalar_i, g)
+        closed = jax.make_jaxpr(predicate)(*pred_args)
+        if closed.out_avals[0].shape != ():
+            return PruneFusionPlan(False, "predicate is not a scalar")
+        live = _live_invars(closed.jaxpr, [True])
+        reads = {
+            ("unit" if pos == 0 else "conn", key)
+            for (pos, key), keep in zip(_flat_labels(pred_args), live, strict=True)
+            if keep and pos in (0, 1)
+        }
+        reads.add(("conn", DEAD.name))
+
+        apply_args = (units, scalar_i, g, acc)
+        fwd_writes = _write_keys(forward_apply, *apply_args)
+        between: set[tuple[str, str]] = set()
+        if net.loss is not None:
+            loss = net.loss
+
+            def loss_write(u: Columns, i: jax.Array, t: jax.Array, g_: Any) -> Any:
+                return dict(loss.per_output(UnitView(u), UnitIdx(i), t, g_)[1].fields)
+
+            target = _sds((), np.dtype(np.float32))
+            between |= {
+                ("unit", k) for k in _write_keys(loss_write, units, scalar_i, target, g)
+            }
+        if net.backward_pass is not None:
+            bp = net.backward_pass
+
+            def backward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> Any:
+                return dict(bp.apply(UnitView(u), UnitIdx(i), g_, a).fields)
+
+            bacc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), bp.combine)
+            between |= {
+                ("unit", k)
+                for k in _write_keys(backward_apply, units, scalar_i, g, bacc)
+            }
+        if net.update_conn is not None:
+            uc = net.update_conn
+            for rule in (uc.incoming, uc.outgoing):
+
+                def conn_write(
+                    u: Columns,
+                    c: Columns,
+                    a: jax.Array,
+                    b: jax.Array,
+                    cid: jax.Array,
+                    g_: Any,
+                    rule: Any = rule,
+                ) -> Any:
+                    return dict(
+                        rule(
+                            UnitView(u),
+                            UnitIdx(a),
+                            UnitIdx(b),
+                            ConnView(c),
+                            ConnIdx(cid),
+                            g_,
+                        ).fields
+                    )
+
+                between |= {
+                    ("conn", k)
+                    for k in _write_keys(
+                        conn_write, units, conns0, scalar_i, scalar_i, scalar_i, g
+                    )
+                }
+        clash = sorted(name for _, name in reads & between)
+        if clash:
+            return PruneFusionPlan(
+                False, f"a phase between forward and prune writes {clash}"
+            )
+
+        forwarded = tuple(
+            sorted(
+                name for kind, name in reads if kind == "unit" and name in fwd_writes
+            )
+        )
+        if forwarded:
+            apply_closed, out_shape = jax.make_jaxpr(forward_apply, return_shape=True)(
+                *apply_args
+            )
+            out_keys = [
+                getattr(path[0], "key", None)
+                for path, _ in jax.tree_util.tree_flatten_with_path(out_shape)[0]
+            ]
+            labels = _flat_labels(apply_args, columns=(0,))
+            for name in forwarded:
+                deps = _live_invars(apply_closed.jaxpr, [k == name for k in out_keys])
+                for (pos, key), keep in zip(labels, deps, strict=True):
+                    if not keep:
+                        continue
+                    if pos == 3:
+                        return PruneFusionPlan(
+                            False,
+                            f"predicate reads {name!r}, which the forward computes "
+                            "from its accumulator",
+                        )
+                    if pos == 0 and key in fwd_writes:
+                        return PruneFusionPlan(
+                            False,
+                            f"predicate reads {name!r}, which the forward computes "
+                            f"from {key!r}, itself written by the forward",
+                        )
+    except Exception as exc:  # noqa: BLE001 - any trace failure: not provably safe
+        return PruneFusionPlan(False, f"could not trace the policies: {exc!r}")
+
+    if engine not in ("auto", "triton", "xla"):
+        raise ValueError(f"plan_prune_fusion: unknown engine {engine!r}")
+
+    def without_triton(why: str) -> PruneFusionPlan:
+        if engine == "auto":
+            return PruneFusionPlan(False, f"legal, but two-pass: {why}")
+        return PruneFusionPlan(True, f"legal; XLA ({why})", "xla", forwarded)
+
+    if engine == "xla":
+        return PruneFusionPlan(True, "legal; XLA (requested)", "xla", forwarded)
+    if static.sharding is not None:
+        return without_triton("jax_triton is not validated inside shard_map")
+    if not nvidia_triton_available():
+        return without_triton("no NVIDIA GPU with jax_triton")
+    field = linear_input_field(fp)
+    if (
+        field is None
+        or np.dtype(field.dtype) != np.float32
+        or np.dtype(WEIGHT.dtype) != np.float32
+    ):
+        return without_triton("the forward is not a float32 linear pass")
+    kernels = []
+    try:
+        for cap in static.level_capacities:
+            args = (units, conns_at(cap), scalar_i, g)
+            kernels.append(
+                _PredicateTranslator(
+                    jax.make_jaxpr(predicate)(*args), _flat_labels(args)
+                ).build()
+            )
+    except _Untranslatable as exc:
+        return without_triton(f"the predicate does not translate to Triton: {exc}")
+    return PruneFusionPlan(True, "legal; Triton", "triton", forwarded, tuple(kernels))
+
+
+class _Untranslatable(Exception):
+    """A predicate jaxpr outside the Triton translator's exact subset."""
+
+
+_TL_DTYPES: dict[np.dtype[Any], str] = {
+    np.dtype(np.bool_): "tl.int1",
+    np.dtype(np.int8): "tl.int8",
+    np.dtype(np.int16): "tl.int16",
+    np.dtype(np.int32): "tl.int32",
+    np.dtype(np.uint8): "tl.uint8",
+    np.dtype(np.uint16): "tl.uint16",
+    np.dtype(np.uint32): "tl.uint32",
+    np.dtype(np.float32): "tl.float32",
+}
+
+# Binary primitives that are exact (bit-identical to XLA) on integers.
+_INT_BINARY = {
+    "add": "({a} + {b})",
+    "sub": "({a} - {b})",
+    "mul": "({a} * {b})",
+    "max": "tl.maximum({a}, {b})",
+    "min": "tl.minimum({a}, {b})",
+}
+_BITWISE = {"and": "({a} & {b})", "or": "({a} | {b})", "xor": "({a} ^ {b})"}
+_COMPARE = {
+    "eq": "({a} == {b})",
+    "ne": "({a} != {b})",
+    "lt": "({a} < {b})",
+    "le": "({a} <= {b})",
+    "gt": "({a} > {b})",
+    "ge": "({a} >= {b})",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class _TritonPredicate:
+    """A predicate translated to Triton: the kernel and its extra inputs.
+
+    Attributes:
+        source: The generated kernel source (the cache key).
+        inputs: `(kind, key)` per extra kernel input, in order: kind is
+            "unit" or "conn" (key a column name) or "g" (key a leaf index).
+    """
+
+    source: str
+    inputs: tuple[tuple[str, Any], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Val:
+    """One translated jaxpr value: a Triton expression and what it is."""
+
+    expr: str
+    dtype: np.dtype[Any]
+    kind: str  # "tensor", "cid" (the edge index), "const", or "array" (an input)
+    const: Any = None
+    shape: tuple[int, ...] = ()
+
+
+class _PredicateTranslator:
+    """Translate a per-edge predicate jaxpr into a fused Triton kernel body.
+
+    Only primitives whose Triton lowering is bit-identical to XLA's are
+    accepted: integer arithmetic and bit ops (shifts by in-range literals),
+    comparisons, selects, integer/bool conversions, float negation, abs,
+    int-to-float conversion and division by a power-of-two literal. Gathers
+    are scalar `dynamic_slice`s of the unit, edge or globals arrays, clamped
+    exactly as XLA clamps them. Anything else raises `_Untranslatable`, and
+    the fused step stays on XLA.
+    """
+
+    def __init__(self, closed: Any, labels: list[tuple[int, Any]]) -> None:
+        self.closed = closed
+        self.labels = labels
+        self.lines: list[str] = []
+        self.consts: dict[str, Any] = {}
+        self.params: list[tuple[str, Any]] = []
+        self.param_names: dict[tuple[str, Any], str] = {}
+        self.count = 0
+
+    def fresh(self, expr: str) -> str:
+        name = f"v{self.count}"
+        self.count += 1
+        self.lines.append(f"    {name} = {expr}")
+        return name
+
+    def const_name(self, value: Any) -> str:
+        name = f"K{len(self.consts)}"
+        self.consts[name] = value
+        return name
+
+    def tensor(self, v: _Val) -> str:
+        if v.kind == "const":
+            k = self.const_name(v.const)
+            return self.fresh(f"tl.full([BLOCK], {k}, {_TL_DTYPES[v.dtype]})")
+        if v.kind == "cid":
+            return "offs"
+        if v.kind == "array" and v.shape == () and v.const[0] == "g":
+            # A scalar global: one load, broadcast over the block.
+            raw = f"tl.load({self.param(v.const)})"
+            if v.dtype == np.dtype(np.bool_):
+                return self.fresh(f"tl.zeros([BLOCK], tl.int1) | ({raw} != 0)")
+            return self.fresh(f"tl.zeros([BLOCK], {_TL_DTYPES[v.dtype]}) + {raw}")
+        if v.kind != "tensor":
+            raise _Untranslatable("an array used as a value")
+        return v.expr
+
+    def param(self, label: tuple[str, Any]) -> str:
+        if label not in self.param_names:
+            self.param_names[label] = f"p{len(self.params)}"
+            self.params.append(label)
+        return self.param_names[label]
+
+    def literal(self, lit: Any) -> _Val:
+        aval = lit.aval
+        dtype = np.dtype(aval.dtype)
+        if aval.shape != () or dtype not in _TL_DTYPES:
+            raise _Untranslatable(f"literal of {aval}")
+        value = np.asarray(lit.val).astype(dtype).item()
+        return _Val("", dtype, "const", value)
+
+    def build(self) -> _TritonPredicate:
+        jaxpr = self.closed.jaxpr
+        if jaxpr.constvars:
+            raise _Untranslatable("closed-over constants")
+        env: dict[Any, _Val] = {}
+        for var, (pos, key) in zip(jaxpr.invars, self.labels, strict=True):
+            aval = var.aval
+            dtype = np.dtype(aval.dtype)
+            if pos == 2:
+                env[var] = _Val("offs", dtype, "cid")
+            else:
+                kind = {0: "unit", 1: "conn", 3: "g"}[pos]
+                env[var] = _Val("", dtype, "array", (kind, key), tuple(aval.shape))
+        out = self.run(jaxpr, env)
+        if out.dtype != np.dtype(np.bool_):
+            raise _Untranslatable("predicate is not boolean")
+        result = self.tensor(out)
+        header = ", ".join(self.param_names[label] for label in self.params)
+        consts = "".join(
+            f"{k} = tl.constexpr({_py_literal(v)})\n" for k, v in self.consts.items()
+        )
+        body = "\n".join(self.lines)
+        source = _FUSED_KERNEL_TEMPLATE.format(
+            consts=consts,
+            params=(header + ", ") if header else "",
+            body=body,
+            result=result,
+        )
+        return _TritonPredicate(source, tuple(self.params))
+
+    def run(self, jaxpr: Any, env: dict[Any, _Val]) -> _Val:
+        from jax.extend.core import Literal
+
+        def read(v: Any) -> _Val:
+            return self.literal(v) if isinstance(v, Literal) else env[v]
+
+        for eqn in jaxpr.eqns:
+            ins = [read(v) for v in eqn.invars]
+            sub = _sub_jaxpr(eqn)
+            if sub is not None and eqn.primitive.name in ("pjit", "closed_call", "jit"):
+                inner_env = dict(zip(sub.invars, ins, strict=True))
+                if len(sub.outvars) != 1:
+                    raise _Untranslatable("multi-output call")
+                env[eqn.outvars[0]] = self.run_nested(sub, inner_env)
+                continue
+            if len(eqn.outvars) != 1:
+                raise _Untranslatable(f"multi-output {eqn.primitive.name}")
+            out = eqn.outvars[0]
+            env[out] = self.eqn(eqn.primitive.name, eqn.params, ins, out.aval)
+        outs = [read(v) for v in jaxpr.outvars]
+        if len(outs) != 1:
+            raise _Untranslatable("multiple outputs")
+        return outs[0]
+
+    def run_nested(self, jaxpr: Any, env: dict[Any, _Val]) -> _Val:
+        if getattr(jaxpr, "constvars", ()):
+            raise _Untranslatable("closed-over constants")
+        return self.run(jaxpr, env)
+
+    def eqn(self, prim: str, params: Any, ins: list[_Val], aval: Any) -> _Val:
+        dtype = np.dtype(aval.dtype)
+        if dtype not in _TL_DTYPES:
+            raise _Untranslatable(f"dtype {dtype}")
+        if prim == "dynamic_slice":
+            return self.gather(ins[0], ins[1:], params, dtype)
+        if aval.shape not in ((), (1,)):
+            raise _Untranslatable(f"{prim} of shape {aval.shape}")
+        if prim in ("squeeze", "reshape", "copy", "copy_p"):
+            if ins[0].kind == "array":
+                raise _Untranslatable(f"{prim} of an array")
+            return ins[0]
+        is_float = dtype.kind == "f"
+        if prim == "lt" and ins[0].kind == "cid" and ins[1].kind == "const":
+            if ins[1].const <= 0:  # the edge index is never negative
+                return _Val("", dtype, "const", False)
+        if prim == "ge" and ins[0].kind == "cid" and ins[1].kind == "const":
+            if ins[1].const <= 0:
+                return _Val("", dtype, "const", True)
+        if prim == "select_n":
+            pred, *cases = ins
+            if pred.kind == "const":
+                return (
+                    cases[int(bool(pred.const))]
+                    if len(cases) == 2
+                    else cases[int(pred.const)]
+                )
+            if pred.dtype != np.dtype(np.bool_) or len(cases) != 2:
+                raise _Untranslatable("non-boolean select_n")
+            p, a, b = (self.tensor(v) for v in (pred, *cases))
+            return _Val(self.fresh(f"tl.where({p}, {b}, {a})"), dtype, "tensor")
+        if prim in _COMPARE:
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(_COMPARE[prim].format(a=a, b=b)), dtype, "tensor")
+        if prim in _BITWISE and not is_float:
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(_BITWISE[prim].format(a=a, b=b)), dtype, "tensor")
+        if prim in _INT_BINARY and not is_float:
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(_INT_BINARY[prim].format(a=a, b=b)), dtype, "tensor")
+        if prim == "not" and not is_float:
+            return _Val(self.fresh(f"~{self.tensor(ins[0])}"), dtype, "tensor")
+        if prim == "neg":
+            return _Val(self.fresh(f"-{self.tensor(ins[0])}"), dtype, "tensor")
+        if prim == "abs":
+            return _Val(self.fresh(f"tl.abs({self.tensor(ins[0])})"), dtype, "tensor")
+        if prim in ("shift_left", "shift_right_logical", "shift_right_arithmetic"):
+            amount = ins[1]
+            bits = dtype.itemsize * 8
+            if is_float or amount.kind != "const" or not 0 <= amount.const < bits:
+                raise _Untranslatable(f"{prim} by a non-literal or out-of-range amount")
+            signed = dtype.kind == "i"
+            if prim == "shift_right_logical" and signed:
+                raise _Untranslatable("logical shift of a signed integer")
+            if prim == "shift_right_arithmetic" and not signed:
+                raise _Untranslatable("arithmetic shift of an unsigned integer")
+            op = "<<" if prim == "shift_left" else ">>"
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(f"({a} {op} {b})"), dtype, "tensor")
+        if prim == "div" and is_float:
+            d = ins[1]
+            if d.kind == "const" and d.const != 0 and np.frexp(abs(d.const))[0] == 0.5:
+                inv = self.const_name(1.0 / d.const)
+                return _Val(
+                    self.fresh(f"({self.tensor(ins[0])} * {inv})"), dtype, "tensor"
+                )
+            raise _Untranslatable("float division by a non-power-of-two")
+        if prim == "convert_element_type":
+            src = ins[0]
+            if src.kind == "const":
+                return _Val(
+                    "", dtype, "const", np.asarray(src.const).astype(dtype).item()
+                )
+            if src.dtype.kind == "f" and dtype.kind != "f":
+                raise _Untranslatable("float to integer conversion")
+            if dtype == src.dtype:
+                return src
+            a = self.tensor(src)
+            if dtype == np.dtype(np.bool_):
+                return _Val(self.fresh(f"({a} != 0)"), dtype, "tensor")
+            return _Val(self.fresh(f"{a}.to({_TL_DTYPES[dtype]})"), dtype, "tensor")
+        raise _Untranslatable(f"primitive {prim}")
+
+    def gather(
+        self, array: _Val, idx: list[_Val], params: Any, dtype: np.dtype[Any]
+    ) -> _Val:
+        if array.kind != "array" or any(s != 1 for s in params["slice_sizes"]):
+            raise _Untranslatable("dynamic_slice that is not a scalar read")
+        kind, key = array.const
+        shape = array.shape
+        if kind == "conn" and len(shape) == 1 and idx[0].kind == "cid":
+            # This edge's own row: the column the kernel already streams.
+            builtin = _FUSED_REGISTERS.get(key)
+            if builtin is not None:
+                return _Val(builtin, dtype, "tensor")
+            ptr = self.param((kind, key))
+            return self.load(f"{ptr} + offs", dtype)
+        ptr = self.param((kind, key))
+        flat = ""
+        stride = 1
+        for dim, i in reversed(list(zip(shape, idx, strict=True))):
+            if i.kind == "const":
+                term = str(min(max(int(i.const), 0), dim - 1) * stride)
+            else:
+                e = self.tensor(i) if i.kind != "cid" else "offs"
+                clamped = self.fresh(f"tl.minimum(tl.maximum({e}, 0), {dim - 1})")
+                term = f"{clamped} * {stride}" if stride != 1 else clamped
+            flat = f"{term} + {flat}" if flat else term
+            stride *= dim
+        return self.load(f"{ptr} + {flat}", dtype)
+
+    def load(self, address: str, dtype: np.dtype[Any]) -> _Val:
+        if dtype == np.dtype(np.bool_):
+            raw = self.fresh(f"tl.load({address}, mask=m, other=0)")
+            return _Val(self.fresh(f"({raw} != 0)"), dtype, "tensor")
+        return _Val(self.fresh(f"tl.load({address}, mask=m, other=0)"), dtype, "tensor")
+
+
+def _py_literal(value: Any) -> str:
+    """A Python expression reproducing `value` exactly (floats via hex)."""
+    if isinstance(value, float):
+        return f"float.fromhex({value.hex()!r})"
+    return repr(value)
+
+
+# Slots per fused-kernel program (a whole number of free-count blocks) and its
+# warps: the best of a sweep at 5M and 50M edges (SCALE_PLAN.md iteration 12;
+# 1024-8192 slots x 2-8 warps, within 3 % of each other at 1024-2048 x 8).
+_FUSED_TILE = 2048
+_FUSED_WARPS = 8
+
+# The edge columns every fused kernel loads anyway, by register name.
+_FUSED_REGISTERS = {
+    FROM_ID.name: "s",
+    TO_ID.name: "t",
+    DEAD.name: "d",
+    WEIGHT.name: "w",
+}
+
+_FUSED_KERNEL_TEMPLATE = """\
+import triton
+import triton.language as tl
+
+{consts}
+
+@triton.jit
+def fused_forward_prune(tgt_ptr, src_ptr, w_ptr, dead_ptr, x_ptr, {params}acc_ptr,
+                        cnt_ptr, n, n_blocks, COUNT: tl.constexpr, SUB: tl.constexpr):
+    # One program streams SUB free-count blocks of COUNT slots each.
+    BLOCK: tl.constexpr = COUNT * SUB
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    d = tl.load(dead_ptr + offs, mask=m, other=1) != 0
+    t = tl.load(tgt_ptr + offs, mask=m, other=0)
+    s = tl.load(src_ptr + offs, mask=m, other=0)
+    w = tl.load(w_ptr + offs, mask=m, other=0.0)
+    live = m & ~d
+    xv = tl.load(x_ptr + s, mask=live, other=0.0)
+    tl.atomic_add(acc_ptr + t, w * xv, mask=live, sem="relaxed")
+{body}
+    p = {result}
+    nd = d | p
+    # dead_ptr is aliased to the new-mask output: only fresh tombstones move.
+    tl.store(dead_ptr + offs, p, mask=m & p & ~d)
+    per_block = tl.sum(tl.reshape(tl.where(m & nd, 1, 0), [SUB, COUNT]), axis=1)
+    b = pid * SUB + tl.arange(0, SUB)
+    tl.store(cnt_ptr + b, per_block, mask=b < n_blocks)
+"""
+
+
+@functools.cache
+def _compile_fused_kernel(source: str) -> Any:
+    """Load a generated kernel source as a Triton JITFunction (cached)."""
+    import hashlib
+    import linecache
+    import types
+
+    filename = f"<plastax-fused-{hashlib.sha1(source.encode()).hexdigest()[:16]}>"
+    # triton.jit reads the function's source through inspect / linecache.
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    module = types.ModuleType(filename)
+    module.__file__ = filename
+    exec(compile(source, filename, "exec"), module.__dict__)  # noqa: S102
+    return module.fused_forward_prune
+
+
+def free_block_len(cap: int) -> tuple[int, int]:
+    """The free-slot block length `count_free_blocks` uses, and the padding.
+
+    Args:
+        cap: The bucket (or shard slice) capacity.
+
+    Returns:
+        `(block, pad)`: the block length and how many False slots are
+        appended so the blocks tile the bucket.
+    """
+    block = _FREE_BLOCK
+    while block > 1 and cap % block:
+        block //= 2
+    if block < 64:  # an awkward capacity: pad rather than use tiny blocks
+        return _FREE_BLOCK, -cap % _FREE_BLOCK
+    return block, 0
+
+
+def triton_forward_prune(
+    kernel: _TritonPredicate,
+    bucket: Columns,
+    x: Float[Array, " num_units"],
+    pred_units: Columns,
+    globals_: Any,
+) -> tuple[
+    Float[Array, " num_units"], Bool[Array, " cap"], Int32[Array, " blocks"], int
+]:
+    """One bucket of the fused forward + prune as a single Triton kernel.
+
+    Gathers `x` at each live edge's source, adds `weight * x` into the
+    destination with relaxed atomics (B = 1), evaluates the translated prune
+    predicate, writes the new tombstones in place of a copy of the old mask,
+    and counts the tombstones in each free-slot block (`count_free_blocks`'s
+    blocks, before the running sum).
+
+    Args:
+        kernel: The translated predicate for this bucket.
+        bucket: The bucket's columns (the step's old dead mask).
+        x: The forward's linear-input column.
+        pred_units: The unit columns the predicate reads.
+        globals_: The globals pytree.
+
+    Returns:
+        The bucket's accumulator contribution, the new dead mask, the
+        running free count per block, and the block length.
+    """
+    import jax_triton  # ty: ignore[unresolved-import]
+
+    dead = bucket[DEAD.name]
+    cap = dead.shape[0]
+    block, pad = free_block_len(cap)
+    n_blocks = (cap + pad) // block
+    sub = max(1, _FUSED_TILE // block)
+    leaves = jax.tree.leaves(globals_)
+    extra = []
+    for kind, key in kernel.inputs:
+        col = (
+            pred_units[key]
+            if kind == "unit"
+            else bucket[key]
+            if kind == "conn"
+            else jnp.asarray(leaves[key]).reshape(-1)
+        )
+        # Bool buffers go in as-is (jax_triton passes them as *i1, one byte
+        # each): a `view` as int8 would be a full convert pass in XLA.
+        extra.append(col)
+    num_units = x.shape[0]
+    # The aliased output goes last: jax_triton 0.4.1 hands the unaliased
+    # output pointers out by position, so an aliased output ahead of an
+    # unaliased one sends the latter's stores into the aliased buffer.
+    acc, counts, new_dead = jax_triton.triton_call(
+        bucket[TO_ID.name],
+        bucket[FROM_ID.name],
+        bucket[WEIGHT.name],
+        dead,
+        x,
+        *extra,
+        kernel=_compile_fused_kernel(kernel.source),
+        out_shape=(
+            _sds((num_units,), jnp.float32),
+            _sds((n_blocks,), jnp.int32),
+            _sds((cap,), jnp.bool_),
+        ),
+        grid=(-(-n_blocks // sub),),
+        zeroed_outputs=(0,),
+        input_output_aliases={3: 2},
+        num_warps=_FUSED_WARPS,
+        n=cap,
+        n_blocks=n_blocks,
+        COUNT=block,
+        SUB=sub,
+    )
+    return acc, new_dead, jnp.cumsum(counts), block
+
+
+def build_fused_forward_prune_phase[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    plan: PruneFusionPlan,
+    *,
+    dead_sink: list[Any],
+    free_sink: list[Any],
+) -> Phase[GS]:
+    """The forward phase with the prune predicate evaluated in its sweep.
+
+    Runs the ordinary forward walk (topological level walk, or the pipeline
+    flat sweep). Per bucket it also evaluates `prune_conn.predicate` against
+    the unit columns with each forwarded field (see `PruneFusionPlan`)
+    replaced by its post-forward value, and leaves `dead | predicate` in
+    `dead_sink` (and, on the Triton engine, the per-block free counts in
+    `free_sink`) for `build_prune_merge_phase` and add_conn. The state's dead
+    masks are not touched here.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network's trait class.
+        static: The network's static configuration.
+        plan: A fused plan from `plan_prune_fusion`.
+        dead_sink: One slot per bucket, overwritten with the new dead mask.
+        free_sink: One slot per bucket, overwritten with `(running free
+            counts per block, block length)` or None.
+
+    Returns:
+        The fused forward phase.
+    """
+    pc = net.prune_conn
+    assert pc is not None and plan.fused
+    fp = net.forward_pass
+    num_units = static.num_units
+    num_levels = len(static.level_capacities)
+    pipeline = net.propagation is Propagation.PIPELINE
+    accumulate = build_forward_accumulate(
+        fp,
+        num_units=num_units,
+        indices_are_sorted=False,
+        shard_axis=_shard_axis(static),
+    )
+    apply = build_forward_apply(fp, num_units=num_units)
+    not_input = ~unit_id_mask(static.input_ids, num_units)
+    field = linear_input_field(fp)
+    forwarded = plan.forwarded
+
+    def forwarded_units(units: Columns, g: GS) -> Columns:
+        if not forwarded:
+            return units
+        if pipeline:
+            finalized = not_input
+        else:
+            level = units[LEVEL.name]
+            finalized = (level >= 1) & (level <= num_levels) & not_input
+        acc0 = identity_accumulator(fp.combine, num_units)
+        u_view = UnitView(units)
+
+        def one(i: jax.Array, a: Any) -> dict[str, jax.Array]:
+            fields = fp.apply(u_view, UnitIdx(i), g, a).fields
+            return {k: fields[k] for k in forwarded}
+
+        writes = jax.vmap(one)(jnp.arange(num_units), acc0)
+        return {
+            **units,
+            **{k: jnp.where(finalized, writes[k], units[k]) for k in forwarded},
+        }
+
+    def should_die(pred_units: Columns, bucket: Columns, g: GS) -> jax.Array:
+        u_view = UnitView(pred_units)
+        c_view = ConnView(bucket)
+        cids = jnp.arange(bucket[DEAD.name].shape[0], dtype=jnp.int32)
+        result: jax.Array = jax.vmap(
+            lambda cid: pc.predicate(u_view, c_view, ConnIdx(cid), g)
+        )(cids)
+        return result
+
+    def phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        g = state.globals_
+        units = state.units
+        pred_units = forwarded_units(units, g)
+        acc = identity_accumulator(fp.combine, num_units)
+        for level_idx in range(num_levels):
+            bucket = state.conns[level_idx]
+            if plan.engine == "triton":
+                assert field is not None
+                part, new_dead, free_blocks, block = triton_forward_prune(
+                    plan.triton_kernels[level_idx],
+                    bucket,
+                    units[field.name],
+                    pred_units,
+                    g,
+                )
+                acc = monoid.sum_.combine_pairwise(acc, part)
+                free_sink[level_idx] = (free_blocks, block)
+            else:
+                acc = accumulate(units, bucket, acc, g)
+                new_dead = bucket[DEAD.name] | should_die(pred_units, bucket, g)
+                free_sink[level_idx] = None
+            dead_sink[level_idx] = new_dead
+            if pipeline:
+                finalize = not_input
+            else:
+                finalize = (units[LEVEL.name] == level_idx + 1) & not_input
+            units, acc = apply(units, acc, g, finalize)
+        units = {**units, **{k: pred_units[k] for k in forwarded}}
+        return dataclasses.replace(state, units=units), jnp.float32(0.0)
+
+    return phase
+
+
+def build_prune_merge_phase[GS](dead_sink: list[Any]) -> Phase[GS]:
+    """Commit the fused forward's tombstones at the prune_conn slot.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        dead_sink: The fused forward's per-bucket new dead masks.
+
+    Returns:
+        The phase replacing every bucket's dead mask.
+    """
+
+    def merge_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        conns = tuple(
+            {**bucket, DEAD.name: dead_sink[i]} for i, bucket in enumerate(state.conns)
+        )
+        return dataclasses.replace(state, conns=conns), jnp.float32(0.0)
+
+    return merge_phase
+
+
 # jnp.searchsorted's default method ("scan") is a while loop, one tiny kernel
 # launch per halving step on GPU; unrolled, the whole search fuses. At 5.4M
 # edges this took the add phase from 0.34 to 0.07 ms per step.
@@ -1170,13 +2143,9 @@ def count_free_blocks(
         The per-block inclusive counts and the (static) block length. The last
         count is the bucket's total free slots.
     """
-    cap = dead.shape[0]
-    block = _FREE_BLOCK
-    while block > 1 and cap % block:
-        block //= 2
-    if block < 64:  # an awkward capacity: pad rather than use tiny blocks
-        block = _FREE_BLOCK
-        dead = jnp.pad(dead, (0, -cap % block))
+    block, pad = free_block_len(dead.shape[0])
+    if pad:
+        dead = jnp.pad(dead, (0, pad))
     counts = dead.reshape(-1, block).sum(axis=1, dtype=jnp.int32)
     running: Int32[Array, " blocks"] = jnp.cumsum(counts)
     return running, block
@@ -1323,6 +2292,7 @@ def build_add_conn_phase[GS](
     static: NetworkStatic,
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
+    free_sink: list[Any] | None = None,
 ) -> Phase[GS]:
     """Select each bucket's top-k candidates and claim free slots via prefix sum.
 
@@ -1376,6 +2346,9 @@ def build_add_conn_phase[GS](
         static: static network configuration giving the arena shapes.
         overflow_sink: optional length-1 out-parameter overwritten with
             this call's computed overflow flag.
+        free_sink: optional per-bucket `(running free counts, block length)`
+            left by a fused forward (`build_fused_forward_prune_phase`) for
+            this step's dead masks, reused in place of `count_free_blocks`.
 
     Returns:
         The add_conn phase function.
@@ -1657,7 +2630,11 @@ def build_add_conn_phase[GS](
             # outgrows one capacity-sized cumsum, which is then used instead.
             small_claim = k * _FREE_BLOCK <= local_capacity
             if small_claim:
-                free_blocks, block_len = count_free_blocks(dead_b)
+                fused = free_sink[bucket_idx] if free_sink is not None else None
+                if fused is not None:
+                    free_blocks, block_len = fused
+                else:
+                    free_blocks, block_len = count_free_blocks(dead_b)
                 local_free = free_blocks[-1]
             else:
                 free_through = jnp.cumsum(dead_b.astype(jnp.int32))

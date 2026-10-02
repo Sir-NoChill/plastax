@@ -805,6 +805,52 @@ the log below:
   - It can be written and AOT-compiled for v5p/v6e now. Correctness and speed
     need hardware.
 
+### Iteration 12 (2026-10-02): prune fused into the forward sweep
+
+- **Goal.** At 50M edges the churn step's forward scatter (1.33 ms) and its
+  prune fusion (predicate + dead write + free-block reduce, 1.01 ms) each
+  read the edge columns at the DRAM roofline. Read them once.
+- **XLA cannot.** With the predicate made independent of the forward (below),
+  XLA still emits `input_scatter_fusion` and a separate
+  `input_or_reduce_fusion`, both reading `to`, `from`, `dead`: a scatter is
+  never a multi-output fusion root. So the portable fused step ("xla") is no
+  faster, and "auto" fuses only through Triton.
+- **Triton's B = 1 scatter is not 3x slower.** A 1-D jax_triton gather +
+  relaxed atomic scatter-add at 25M edges: 0.81 ms against XLA's 0.71 (the
+  P6.1 3x was the 2-D `(BLOCK, WIDTH = 1)` tile on random targets). ptxas
+  turns the unused-result `atom` into `RED`, as XLA does.
+- **Build.** `plan_prune_fusion` traces the predicate, the forward's `apply`
+  and the loss/backward/update_conn writes to jaxprs. The synth-bench
+  predicate reads `psb/pruned`, which the forward writes -- but from the
+  globals only, so the flag is computed up front ("forwarded"). One kernel
+  per bucket: gather, atomic add, the predicate (generated from its jaxpr),
+  tombstones in place (aliased), the free-slot block counts add_conn reuses.
+  - jax_triton 0.4.1 hands unaliased output pointers out by position: an
+    aliased output listed before an unaliased one sent the counts into the
+    dead mask. The aliased output goes last.
+  - `x.view(jnp.int8)` on a bool array is a convert pass, not a bitcast
+    (two extra passes per bucket); bool buffers go in as `*i1`.
+  - Tile 2048 slots x 8 warps, from a 1024-8192 x 2-8 sweep (within 3 %).
+- **Measured** (synth-bench grid, k = 64, wall ms/step median of 300-400
+  synced steps after 20 warm-up, replay-validated; nsys GPU kernel time):
+
+  | cell | two-pass wall | fused wall | two-pass GPU | fused GPU | kernels |
+  |---|---|---|---|---|---|
+  | E5M_s0.999 | 0.486-0.495 | 0.461-0.497 | 0.318 | 0.321 | 61 -> 60 |
+  | E50M_s0.999 | 2.84-3.28 | 2.03-2.05 | 2.54 | 1.91 | 61 -> 60 |
+
+  - E50M: the two read passes (0.68 + 0.65 scatter, 1.01 prune) become one
+    1.71 ms kernel (about 400 GB/s, the Triton scatter's own speed: the
+    predicate is nearly free).
+  - E5M: no change. A 2.8M-slot bucket is L2-resident (64 MB), so the
+    prune's second read already hits L2.
+- **Limits.** Streaming (B = 1) only; unsharded (Scheme-A keeps two passes
+  under "auto"; "xla" fuses there, tested); NVIDIA + jax_triton only; a
+  linear float32 forward; a predicate inside the translator's exact subset.
+
 ## Deviations
 
-(none yet)
+- step/phases (2026-10-02, iteration 12): the prune slot of a fused streaming
+  step only commits tombstones computed in the forward sweep; the fusion
+  decision is made at first trace (it needs the globals' shapes). See
+  IMPLEMENTATION_PLAN.md Deviations.

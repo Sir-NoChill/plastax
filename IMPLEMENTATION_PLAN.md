@@ -675,6 +675,22 @@ Scale plan P0 (2026-09-30, `phases`; see SCALE_PLAN.md):
   for the untyped triton / jax_triton modules (the strict gate is otherwise
   unchanged). ty: `unresolved-import` ignores on the two lazy `jax_triton`
   imports (the extra is absent from the dev venv).
+- phases/step (2026-10-02): `make_step(..., fuse_prune="auto" | "triton" |
+  "xla" | "off")` (additive) and `phases.plan_prune_fusion` /
+  `PruneFusionPlan` / `PruneFusionRecord`. A streaming step may evaluate the
+  prune predicate inside the forward's edge sweep when a jaxpr trace of the
+  policies proves it sees the same values there; the tombstones are then
+  committed at the prune slot by a merge phase (so phase *order* is
+  unchanged: loss/backward/update_conn see the old dead mask). The decision
+  needs the globals' shapes, so it is made at the step's first trace (still
+  Python-level, before any equation: invariant 1 holds) and exposed as
+  `step.prune_fusion`. The single-pass lowering is a second jax_triton kernel
+  (NVIDIA, unsharded, linear forward), whose predicate is generated from its
+  jaxpr by a translator restricted to ops bit-identical to XLA's; "auto" fuses
+  only there (XLA cannot fuse a scatter with a reduction, so its fused step
+  still reads the edges twice). `build_phases` gains `prune_fusion=`,
+  `build_add_conn_phase` gains `free_sink=` (reuses the kernel's free-slot
+  block counts), `count_free_blocks` factors out `free_block_len`.
 
 ## Handoff conventions
 

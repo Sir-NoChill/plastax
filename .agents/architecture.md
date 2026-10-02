@@ -186,7 +186,8 @@ backward branch on `net.propagation` (single flat sweep for PIPELINE; a
 per-bucket level walk for TOPOLOGICAL). `build_add_conn_phase` (`phases.py:426`)
 is the most complex: candidate grid (full or shortlisted) → level-window filter
 + dedup vs live edges → `score` → per-bucket `top_k` → prefix-sum free-slot
-claim → commit only finite-scored candidates → set `needs_resort` if a
+claim (`xla_claim`, or `triton_claim`'s three jax_triton kernels on NVIDIA,
+picked by `make_step(growth=...)`) → commit only finite-scored candidates → set `needs_resort` if a
 committed edge isn't level-preserving. A `-inf` score is a **hard veto**. Under
 Scheme-A it is device-resident and shards byte-identically: the dedup all-
 reduces (so every shard agrees on the candidate set and `top_k`), and the

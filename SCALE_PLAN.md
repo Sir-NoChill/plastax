@@ -805,6 +805,74 @@ the log below:
   - It can be written and AOT-compiled for v5p/v6e now. Correctness and speed
     need hardware.
 
+### Iteration 12 (2026-10-02): the growth claim as jax_triton kernels
+
+- **Inventory before** (nsys `--cuda-graph-trace=node`, plastix-synth-bench
+  grid cells, k = 64 units churned per update, 2 buckets). The step was 61
+  kernels; growth was about 50 of them:
+  - E5M_s0.999 (P = 6656 proposals, 2.8M slots per bucket, the large-claim
+    path): per bucket a 6-kernel capacity cumsum, a 2-kernel growable
+    cumsum, a 22-level `searchsorted` split into 9 fusions, and 4 column
+    scatters; plus 6 flag reductions. About 85 us.
+  - E50M_s0.999 (P = 20224, 26M slots per bucket, the small-claim path):
+    the block counts fused into the prune sweep, then per bucket the block
+    cumsum, the (k, 1024) in-block gather and cumsum (15-19 us), the block
+    search, and 4 scatters. About 126 us.
+- **XLA (portable) restructure.** The claim is now `xla_claim` over a
+  `GrowthClaim` (growable, violating, per-column values), and the overflow
+  and resort flags are one reduction over every bucket. 61 -> 59 kernels;
+  slot choice and flags are bit-identical (pinned to 7ff7cc6's digests).
+  Merging the per-column scatters is not expressible in JAX (no variadic
+  scatter), so the XLA path keeps them.
+- **Triton (NVIDIA).** `triton_claim`: three launches for all buckets.
+  - `prep`: growable candidates per 32-candidate tile, free slots per coarse
+    window of 1024 block counts.
+  - `claim`: a tile's first free rank is the earlier tiles' growable count;
+    the coarse windows, then a gather-based binary search of 1024 block
+    counts, locate each candidate's 256-slot block; the block's dead mask
+    is read as 64 32-bit words (four 0/1 bytes each) to find the slot; every
+    column but DEAD is written in place (jax.Ref aliasing, no copies).
+  - `clear`: clears DEAD at the placed slots. A separate launch, because a
+    DEAD write inside `claim` would race other programs reading that block.
+  - The per-block free counts are an input: `triton_claim(...,
+    block_counts=...)` takes `free_block_counts(dead, TRITON_CLAIM_BLOCK)`
+    from a fused sweep; otherwise one XLA reduction computes them, behind
+    an optimization barrier (fused into the prune predicate it slowed that
+    sweep from 92 to 140 us at E5M).
+- **Tuning notes.** A first version (candidate tiles scanning the dead mask
+  forward) took 0.7-4.9 ms: clustered free slots made some programs scan
+  hundreds of chunks. Per-candidate search fixed that (37 us at E5M); the
+  first fix was register-bound at E50M (153 registers, 25% occupancy,
+  48-66 us); the gather search and word-packed block read brought it to
+  7 us (E5M) and 18 us (E50M).
+- **Measured.**
+
+  | | kernels / step | kernel span | wall ms/step (median of 500, two runs) |
+  |---|---|---|---|
+  | E5M before | 61 | 319 us | 0.480 / 0.425 |
+  | E5M XLA claim | 59 | 318 us | 0.480 / 0.394 |
+  | E5M Triton claim | 18 | 247 us | 0.376 / 0.339 |
+  | E50M before | 61 | 2595 us | 2.90 / 3.10 |
+  | E50M XLA claim | 59 | 2592 us | 2.93 / 3.27 |
+  | E50M Triton claim | 19 | 2491 us | 2.90 / 3.15 |
+
+  - Growth at E5M: about 85 us in ~50 kernels -> 10 us (prep 1.3, claim
+    7.4, clear 1.5) plus one count reduction. At E50M: about 126 us -> 21
+    us of kernels plus two 51 us count reductions, which re-read the 26 MB
+    dead masks; a sweep that produces the counts removes them.
+  - E50M wall time is within run-to-run noise (about 0.2 ms), and runs 0.4-
+    0.6 ms above the kernel span.
+  - churn_probe (8192-wide, 1M edges, k = 256, propose): churn 0.143 ->
+    0.094 ms/step. Grid growth: 0.498 -> 0.454 (top_k over the grid dominates).
+- **Fallbacks.** XLA under Scheme-A sharding (jax_triton is not validated in
+  shard_map), off NVIDIA, above 32 connection columns, and for a bucket
+  capacity that is not a multiple of 4.
+
 ## Deviations
 
-(none yet)
+- 2026-10-02, phases / step: the add_conn free-slot claim is now an engine
+  choice, `make_step(growth="auto" | "xla" | "triton")`. "auto" uses three
+  jax_triton kernels (`triton_claim`) on an NVIDIA GPU and the portable
+  `xla_claim` elsewhere. Both pick the same slots: the i-th growable
+  candidate takes the i-th free slot. Reason: growth was about 50 kernels
+  per step (iteration 12).

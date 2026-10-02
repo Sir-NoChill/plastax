@@ -264,18 +264,27 @@ def _run_both(
         inputs = px.StepInputs(inputs=x, targets=t)
         ra, rb = fused(a, inputs), plain(b, inputs)
         assert bool(ra.overflow) == bool(rb.overflow)
-        np.testing.assert_array_equal(np.asarray(ra.loss), np.asarray(rb.loss))
+        _assert_same(ra.loss, rb.loss, "loss")
         a, b = ra.state, rb.state
     return a, b, getattr(fused, "prune_fusion").plan  # noqa: B009
+
+
+def _assert_same(la: Any, lb: Any, msg: str = "") -> None:
+    # Bit-identical on CPU. A GPU scatter-add sums in no fixed order, so there
+    # float columns match to rounding; every integer and bool column (ids,
+    # tombstones, counts) must still be exact.
+    la, lb = np.asarray(la), np.asarray(lb)
+    if la.dtype.kind == "f" and jax.default_backend() != "cpu":
+        np.testing.assert_allclose(la, lb, rtol=1e-5, atol=1e-5, err_msg=msg)
+    else:
+        np.testing.assert_array_equal(la, lb, err_msg=msg)
 
 
 def _assert_identical(a: px.NetworkState[G], b: px.NetworkState[G]) -> None:
     leaves_a = jax.tree_util.tree_flatten_with_path(a)[0]
     leaves_b = jax.tree.leaves(b)
     for (path, la), lb in zip(leaves_a, leaves_b, strict=True):
-        np.testing.assert_array_equal(
-            np.asarray(la), np.asarray(lb), err_msg=jax.tree_util.keystr(path)
-        )
+        _assert_same(la, lb, jax.tree_util.keystr(path))
 
 
 @pytest.mark.parametrize(

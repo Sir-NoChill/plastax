@@ -120,12 +120,13 @@ Scheme-A multi-device sharding.
 - *Why:* v1 is "rung 0" — the trace-time metaprogramming rung. Later rungs
   (composites, Pallas, FFI) are deliberately deferred as the *general*
   lowering; premature scope creep breaks the clean lowering ladder (see the
-  design docs). The exceptions are two hand-written Triton kernels via
+  design docs). The exceptions are hand-written Triton kernels via
   jax_triton, NVIDIA GPUs only: `layout="triton"` (the batched linear bucket
-  product, scale plan P6) and the streaming step's fused forward + prune
+  product, scale plan P6), the streaming step's fused forward + prune
   (`make_step(fuse_prune=)`, a linear forward with a prune predicate the
-  framework translates to Triton). Both have XLA counterparts used
-  everywhere else (IMPLEMENTATION_PLAN.md Deviations). No Pallas kernel
+  framework translates to Triton), and add_conn's free-slot claim
+  (`make_step(growth=)`, `phases.triton_claim`). Each has an XLA counterpart
+  used everywhere else (IMPLEMENTATION_PLAN.md Deviations). No Pallas kernel
   ships today.
 - *Enforced by:* code review, the plan docs, and `monoid.UnsupportedMonoidError`
   guards (`monoid.py`).

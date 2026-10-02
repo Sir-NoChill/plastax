@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, cast, no_type_check
 
 import jax
 import jax.numpy as jnp
@@ -81,6 +81,7 @@ def build_phases[GS](
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
     prune_fusion: PruneFusionPlan | None = None,
+    growth: str = "auto",
 ) -> tuple[Phase[GS], ...]:
     """Assemble the phases present for this net; absent slots trace nothing.
 
@@ -101,6 +102,8 @@ def build_phases[GS](
         prune_fusion: a fused `plan_prune_fusion` plan to evaluate the prune
             predicate inside the forward sweep (the prune slot then only
             commits the tombstones), or None for the separate prune sweep.
+        growth: the add_conn free-slot claim engine (see
+            `build_add_conn_phase`).
 
     Returns:
         The tuple of phase functions to run in order, one per present
@@ -138,6 +141,7 @@ def build_phases[GS](
                 static,
                 overflow_sink=overflow_sink,
                 free_sink=free_sink if fused else None,
+                growth=growth,
             )
         )
     if net.reset_global is not None:
@@ -178,6 +182,7 @@ def build_batched_phases[GS](
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
     engine: str | None = None,
+    growth: str = "auto",
 ) -> BatchedPhases[GS]:
     """Assemble a batched step's phases (see `BatchedPhases`).
 
@@ -191,6 +196,7 @@ def build_batched_phases[GS](
         engine: route each linear pass (see `linear_input_field`) through this
             bucket product (`bucket_product`), or None for the per-sample edge
             list; non-linear passes always keep the edge list.
+        growth: as for `build_phases`.
 
     Returns:
         The per-sample, update, and structural phases.
@@ -217,7 +223,9 @@ def build_batched_phases[GS](
         structural.append(build_prune_conn_phase(net, static))
     if net.add_conn is not None:
         structural.append(
-            build_add_conn_phase(net, static, overflow_sink=overflow_sink)
+            build_add_conn_phase(
+                net, static, overflow_sink=overflow_sink, growth=growth
+            )
         )
     if net.reset_global is not None:
         structural.append(_build_reset_global_phase(net))
@@ -1792,15 +1800,11 @@ def free_block_len(cap: int) -> tuple[int, int]:
         cap: The bucket (or shard slice) capacity.
 
     Returns:
-        `(block, pad)`: the block length and how many False slots are
-        appended so the blocks tile the bucket.
+        `(block, pad)`: the block length (`free_block_length(cap)`) and how
+        many False slots are appended so the blocks tile the bucket.
     """
-    block = _FREE_BLOCK
-    while block > 1 and cap % block:
-        block //= 2
-    if block < 64:  # an awkward capacity: pad rather than use tiny blocks
-        return _FREE_BLOCK, -cap % _FREE_BLOCK
-    return block, 0
+    block = free_block_length(cap)
+    return block, -cap % block
 
 
 def triton_forward_prune(
@@ -2127,6 +2131,54 @@ def repeats_earlier(
 _FREE_BLOCK = 1024
 
 
+def free_block_length(capacity: int, max_block: int = _FREE_BLOCK) -> int:
+    """The block length of a bucket's per-block free counts.
+
+    The largest power of two up to `max_block` dividing `capacity`, so the
+    counts are a plain reshape-and-sum; below 64 (an awkward capacity) it is
+    `max_block` and the mask is padded instead. A producer of precomputed
+    block counts (see `free_block_counts`) must use this length.
+
+    Args:
+        capacity: The bucket's (static) capacity.
+        max_block: The largest block length, a power of two of at least 64:
+            1024 for the XLA claim, `TRITON_CLAIM_BLOCK` for the Triton one.
+
+    Returns:
+        The block length.
+    """
+    block = max_block
+    while block > 1 and capacity % block:
+        block //= 2
+    return block if block >= 64 else max_block
+
+
+def free_block_counts(
+    dead: Bool[Array, " cap"], max_block: int = _FREE_BLOCK
+) -> Int32[Array, " blocks"]:
+    """Count the free (dead) slots in each block of the bucket.
+
+    One reduction over the mask, in blocks of `free_block_length(cap,
+    max_block)` (the last block padded with live slots when the length does
+    not divide `cap`).
+
+    Args:
+        dead: The bucket's tombstone mask.
+        max_block: As for `free_block_length`.
+
+    Returns:
+        The per-block free counts (not cumulative).
+    """
+    cap = dead.shape[0]
+    block = free_block_length(cap, max_block)
+    if cap % block:
+        dead = jnp.pad(dead, (0, -cap % block))
+    counts: Int32[Array, " blocks"] = dead.reshape(-1, block).sum(
+        axis=1, dtype=jnp.int32
+    )
+    return counts
+
+
 def count_free_blocks(
     dead: Bool[Array, " cap"],
 ) -> tuple[Int32[Array, " blocks"], int]:
@@ -2143,12 +2195,8 @@ def count_free_blocks(
         The per-block inclusive counts and the (static) block length. The last
         count is the bucket's total free slots.
     """
-    block, pad = free_block_len(dead.shape[0])
-    if pad:
-        dead = jnp.pad(dead, (0, pad))
-    counts = dead.reshape(-1, block).sum(axis=1, dtype=jnp.int32)
-    running: Int32[Array, " blocks"] = jnp.cumsum(counts)
-    return running, block
+    running: Int32[Array, " blocks"] = jnp.cumsum(free_block_counts(dead))
+    return running, free_block_length(dead.shape[0])
 
 
 def nth_free_slot(
@@ -2188,6 +2236,524 @@ def nth_free_slot(
     ).astype(jnp.int32)
     slot: Int32[Array, " k"] = jnp.minimum(b * jnp.int32(block) + offset, cap - 1)
     return slot
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class GrowthClaim:
+    """One bucket's selected growth candidates, ready for the free-slot claim.
+
+    Candidates claim free slots in candidate order: the i-th growable
+    candidate takes the bucket's i-th free (dead) slot, in slot order. A
+    growable candidate left without a slot is overflow.
+
+    Attributes:
+        growable: `(k,)` candidates that may take a slot.
+        violating: `(k,)` candidates whose edge, once committed, breaks the
+            leveling invariant (sets `needs_resort`).
+        values: Each written connection column's `(k,)` values, already in the
+            column's dtype: every connection field but `DEAD`, which a claim
+            always clears.
+    """
+
+    growable: Bool[Array, " k"]
+    violating: Bool[Array, " k"]
+    values: dict[str, jax.Array]
+
+
+def xla_claim(
+    bucket: Columns,
+    claim: GrowthClaim,
+    *,
+    shard_axis: str | None = None,
+    num_shards: int = 1,
+    free_blocks: tuple[Int32[Array, " blocks"], int] | None = None,
+) -> tuple[Columns, Bool[Array, " k"], Bool[Array, " k"]]:
+    """Claim free slots for one bucket's candidates and write them, in plain XLA.
+
+    The portable claim, sharding-aware. Under Scheme-A the dead mask is this
+    shard's capacity slice, so the claim runs over the LOCAL slice and is
+    coordinated across shards: each growable candidate takes a GLOBAL
+    free-slot rank and lands on the one shard that owns it. Because shard g
+    holds arena positions [g*local_capacity, (g+1)*local_capacity), the global
+    free-slot order (shard 0's free slots, then shard 1's, ...) is exactly the
+    single-device position order -- so a candidate lands where the
+    single-device claim would put it.
+
+    Args:
+        bucket: The bucket's (local) columns.
+        claim: The bucket's candidates.
+        shard_axis: The Scheme-A mesh axis, or None when unsharded.
+        num_shards: The Scheme-A shard count (1 when unsharded).
+        free_blocks: Precomputed `count_free_blocks(dead)` of the bucket's
+            current (local) dead mask (for example from a fused prune sweep),
+            or None to compute them here.
+
+    Returns:
+        The updated columns, and per candidate whether it overflowed and
+        whether it was committed with a leveling-breaking edge. Both masks are
+        replicated across shards.
+    """
+    growable = claim.growable
+    k = growable.shape[0]
+    dead_b = bucket[DEAD.name]
+    local_capacity = dead_b.shape[0]
+    # Per-block free counts over this shard's slice: one reduction reading the
+    # dead mask, instead of a capacity-sized cumsum. Two-level search for a
+    # small claim (O(k * block) past one reduction); for a claim large next to
+    # the bucket that gather outgrows one capacity-sized cumsum, which is then
+    # used instead.
+    small_claim = k * _FREE_BLOCK <= local_capacity
+    if small_claim:
+        running, block_len = (
+            count_free_blocks(dead_b) if free_blocks is None else free_blocks
+        )
+        local_free = running[-1]
+    else:
+        free_through = jnp.cumsum(dead_b.astype(jnp.int32))
+        local_free = free_through[-1]
+    # This shard's offset into the global free-slot space, and the total free
+    # count. The offset is an exclusive prefix of the per-shard free counts (an
+    # all-gather -- a prefix is not a plain all-reduce) and feeds only the
+    # per-shard placement below. total_free is a psum, not sum(all_gather): it
+    # flows into `overflow` and `needs_resort`, which shard_map requires be
+    # provably replicated, and psum is the all-reduce it recognizes as
+    # replicating. Both are device-resident collectives.
+    if shard_axis is not None:
+        all_free = jax.lax.all_gather(local_free, shard_axis)
+        my_index = jax.lax.axis_index(shard_axis)
+        offset = jnp.sum(jnp.where(jnp.arange(num_shards) < my_index, all_free, 0))
+        total_free = monoid.sum_.collective(local_free, shard_axis)
+    else:
+        offset = jnp.int32(0)
+        total_free = local_free
+    # growth_rank[i] = candidate i's rank among the growable candidates -- its
+    # global free-slot index. A candidate whose rank exceeds the total free
+    # slots is overflow: dropped, flag raised.
+    growth_rank = jnp.cumsum(growable.astype(jnp.int32)) - 1
+    committed = growable & (growth_rank < total_free)
+    overflowed = growable & (growth_rank >= total_free)
+    # A committed candidate belongs to THIS shard iff its global rank falls in
+    # [offset, offset + local_free); place it at that shard-local free slot,
+    # else scatter to `local_capacity` (out of this slice's range), dropped by
+    # the scatter's drop mode.
+    local_rank = growth_rank - offset
+    mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
+    safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
+    if small_claim:
+        free_slot = nth_free_slot(dead_b, running, block_len, safe_rank)
+    else:
+        free_slot = jnp.searchsorted(
+            free_through, safe_rank + jnp.int32(1), method=_SEARCH
+        ).astype(jnp.int32)
+    target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
+    new_bucket: Columns = dict(bucket)
+    for name, column in bucket.items():
+        value = (
+            jnp.zeros((k,), dtype=column.dtype)
+            if name == DEAD.name
+            else claim.values[name]
+        )
+        new_bucket[name] = column.at[target_slot].set(value, mode="drop")
+    return new_bucket, overflowed, committed & claim.violating
+
+
+# Triton claim tiling: candidates per program (TILE), block counts compared
+# against every candidate per placement step (CHUNK), block counts per coarse
+# window (WIDE), the coarse window counts (and earlier tiles' counts) one
+# program reads per step (COARSE), and
+# warps per claim program.
+_CLAIM_TILE = 32
+_CLAIM_CHUNK = 1024
+_CLAIM_WIDE = 1024
+_CLAIM_COARSE = 256
+_CLAIM_WARPS = 4
+# Written columns per bucket the kernel is specialised for; above it the
+# claim falls back to XLA. Generous: the builtins plus an Adam bundle are 6.
+TRITON_CLAIM_MAX_FIELDS = 32
+# The Triton claim's block length (see `free_block_length`): each candidate
+# reads its block's dead mask, so a short block keeps that read small.
+TRITON_CLAIM_BLOCK = 256
+
+
+# no_type_check also keeps jaxtyping's test-time import hook from wrapping the
+# nested kernels, which would hide their closure (`tl`) from Triton.
+@functools.cache
+@no_type_check
+def _triton_claim_kernels() -> tuple[Any, Any, Any]:
+    """The claim kernels, built on first use so plastax never imports triton.
+
+    `prep` sums the inputs every claim program needs a prefix of: the growable
+    candidates per tile, and the free slots per coarse window of block counts.
+    `claim` places every candidate and writes every column but `DEAD`; `clear`
+    then clears `DEAD` at the placed slots. `clear` is its own launch because
+    `claim`'s programs read the dead mask, which a write in `claim` would
+    race: a candidate's slot is found by a cumsum over its whole block, where
+    another program may be placing its own candidates.
+    """
+    import triton
+    import triton.language as tl
+
+    # Triton kernel arguments are pointers, tuples of pointers and constexprs,
+    # which carry no Python annotations the type checkers understand.
+    @triton.jit
+    def prep(  # noqa: ANN202
+        flags_ptr,  # noqa: ANN001
+        counts,  # noqa: ANN001
+        windows_ptr,  # noqa: ANN001
+        tiles_ptr,  # noqa: ANN001
+        status_ptr,  # noqa: ANN001
+        K: tl.constexpr,
+        NBLKS: tl.constexpr,
+        NB: tl.constexpr,
+        NT: tl.constexpr,
+        TILE: tl.constexpr,
+        WIDE: tl.constexpr,
+        WSTRIDE: tl.constexpr,
+        TILES_PER: tl.constexpr,
+    ):
+        p = tl.program_id(0)
+        b = tl.program_id(1)
+        for i in tl.static_range(NB):
+            if b == i:
+                if p * WIDE < NBLKS[i]:
+                    o = p * WIDE + tl.arange(0, WIDE)
+                    c = tl.load(counts[i] + o, mask=o < NBLKS[i], other=0)
+                    tl.store(windows_ptr + i * WSTRIDE + p, tl.sum(c, axis=0))
+        if p * TILES_PER < NT:
+            t = p * TILES_PER + tl.arange(0, TILES_PER)
+            idx = t[:, None] * TILE + tl.arange(0, TILE)[None, :]
+            f = tl.load(flags_ptr + b * K + idx, mask=idx < K, other=0).to(tl.int32)
+            tl.store(tiles_ptr + b * NT + t, tl.sum(f & 1, axis=1), mask=t < NT)
+        if (p == 0) & (b == 0):
+            tl.store(status_ptr + tl.arange(0, 2), tl.zeros((2,), tl.int32))
+
+    @triton.jit
+    def claim_bucket(  # noqa: ANN202
+        flags_ptr,  # noqa: ANN001
+        tiles_ptr,  # noqa: ANN001
+        windows_ptr,  # noqa: ANN001
+        counts_ptr,  # noqa: ANN001
+        dead_ptr,  # noqa: ANN001
+        vals,  # noqa: ANN001
+        cols,  # noqa: ANN001
+        status_ptr,  # noqa: ANN001
+        slot_ptr,  # noqa: ANN001
+        K: tl.constexpr,
+        CAP: tl.constexpr,
+        NBLK: tl.constexpr,
+        BLK: tl.constexpr,
+        NF: tl.constexpr,
+        TILE: tl.constexpr,
+        CHUNK: tl.constexpr,
+        LOG_CHUNK: tl.constexpr,
+        WIDE: tl.constexpr,
+        NWIN: tl.constexpr,
+        COARSE: tl.constexpr,
+    ):
+        tile = tl.program_id(0)
+        offs = tile * TILE + tl.arange(0, TILE)
+        in_k = offs < K
+        flags = tl.load(flags_ptr + offs, mask=in_k, other=0).to(tl.int32)
+        grow = flags & 1
+        n_grow = tl.sum(grow, axis=0)
+        # This tile's first free rank: the growable candidates of earlier tiles.
+        base = n_grow * 0
+        for s in range(0, tile, COARSE):
+            o = s + tl.arange(0, COARSE)
+            base += tl.sum(tl.load(tiles_ptr + o, mask=o < tile, other=0), axis=0)
+        rank = base + tl.cumsum(grow, axis=0) - 1
+        slot = tl.full((TILE,), -1, tl.int32)
+        if n_grow > 0:
+            # The coarse window of block counts holding free rank `base`, then
+            # the chunk within it.
+            ow = tl.arange(0, COARSE)
+            w = 0
+            per_window = tl.load(windows_ptr + ow, mask=ow < NWIN, other=0)
+            carry = n_grow * 0
+            wsum = tl.sum(per_window, axis=0)
+            while (w + COARSE < NWIN) & (carry + wsum <= base):
+                carry += wsum
+                w += COARSE
+                per_window = tl.load(windows_ptr + w + ow, mask=w + ow < NWIN, other=0)
+                wsum = tl.sum(per_window, axis=0)
+            skipped = (tl.cumsum(per_window, axis=0) + carry) <= base
+            w0 = (w + tl.sum(skipped.to(tl.int32), axis=0)) * WIDE
+            carry += tl.sum(tl.where(skipped, per_window, 0), axis=0)
+            sub = tl.arange(0, WIDE // CHUNK)[:, None] * CHUNK
+            o2 = w0 + sub + tl.arange(0, CHUNK)[None, :]
+            window = tl.load(counts_ptr + o2, mask=o2 < NBLK, other=0)
+            chunk_sums = tl.sum(window, axis=1)
+            skipped = (tl.cumsum(chunk_sums, axis=0) + carry) <= base
+            c0 = w0 + tl.sum(skipped.to(tl.int32), axis=0) * CHUNK
+            carry += tl.sum(tl.where(skipped, chunk_sums, 0), axis=0)
+            # Each candidate's block, and the free slots before that block,
+            # chunk by chunk (the tile's ranks are consecutive, so usually one
+            # chunk): a binary search of the chunk's running counts.
+            block = tl.full((TILE,), -1, tl.int32)
+            before = tl.zeros((TILE,), tl.int32)
+            pending = grow == 1
+            while (tl.max(pending.to(tl.int32), axis=0) > 0) & (c0 < NBLK):
+                o = c0 + tl.arange(0, CHUNK)
+                chunk = tl.load(counts_ptr + o, mask=o < NBLK, other=0)
+                through = tl.cumsum(chunk, axis=0) + carry
+                csum = tl.sum(chunk, axis=0)
+                here = pending & (rank < carry + csum)
+                at = tl.zeros((TILE,), tl.int32)  # blocks of the chunk <= rank
+                for step in tl.static_range(LOG_CHUNK):
+                    half = CHUNK >> (step + 1)
+                    probe = tl.gather(through, at + (half - 1), 0)
+                    at = tl.where(probe <= rank, at + half, at)
+                prior = tl.gather(through, tl.maximum(at - 1, 0), 0)
+                block = tl.where(here, c0 + at, block)
+                before = tl.where(here, tl.where(at > 0, prior, carry), before)
+                pending = pending & ~here
+                carry += csum
+                c0 += CHUNK
+            # Within its block, the candidate's slot is its (rank - before)-th
+            # free slot. The block's dead mask is read as 32-bit words (four
+            # 0/1 bytes each): a running count over the words finds the word,
+            # three compares the byte.
+            lanes = tl.arange(0, BLK // 4)[None, :]
+            wpos = block[:, None] * (BLK // 4) + lanes
+            ok = (block >= 0)[:, None] & (wpos < CAP // 4)
+            words = tl.load(
+                dead_ptr.to(tl.pointer_type(tl.uint32)) + wpos, mask=ok, other=0
+            )
+            per_word = ((words * 0x01010101) >> 24).to(tl.int32)
+            want = rank - before + 1
+            word = tl.sum(
+                (tl.cumsum(per_word, axis=1) < want[:, None]).to(tl.int32), axis=1
+            )
+            picked = tl.sum(tl.where(lanes == word[:, None], words, 0), axis=1)
+            want -= tl.sum(tl.where(lanes < word[:, None], per_word, 0), axis=1)
+            first = (picked & 1).to(tl.int32)
+            second = first + ((picked >> 8) & 1).to(tl.int32)
+            third = second + ((picked >> 16) & 1).to(tl.int32)
+            byte = (
+                (first < want).to(tl.int32)
+                + (second < want).to(tl.int32)
+                + (third < want).to(tl.int32)
+            )
+            slot = tl.where(block >= 0, block * BLK + word * 4 + byte, slot)
+        committed = slot >= 0
+        tl.store(slot_ptr + offs, tl.where(committed, slot, CAP), mask=in_k)
+        for f in tl.static_range(NF):
+            value = tl.load(vals[f] + offs, mask=in_k)
+            tl.store(cols[f] + slot, value, mask=committed)
+        if tl.max(((grow == 1) & ~committed).to(tl.int32), axis=0) > 0:
+            tl.atomic_max(status_ptr, 1, sem="relaxed")
+        if tl.max((committed & ((flags & 2) != 0)).to(tl.int32), axis=0) > 0:
+            tl.atomic_max(status_ptr + 1, 1, sem="relaxed")
+
+    @triton.jit
+    def claim(  # noqa: ANN202
+        flags_ptr,  # noqa: ANN001
+        tiles_ptr,  # noqa: ANN001
+        windows_ptr,  # noqa: ANN001
+        counts,  # noqa: ANN001
+        deads,  # noqa: ANN001
+        vals,  # noqa: ANN001
+        cols,  # noqa: ANN001
+        status_ptr,  # noqa: ANN001
+        slot_ptr,  # noqa: ANN001
+        K: tl.constexpr,
+        CAPS: tl.constexpr,
+        NBLKS: tl.constexpr,
+        BLKS: tl.constexpr,
+        NB: tl.constexpr,
+        NF: tl.constexpr,
+        NT: tl.constexpr,
+        TILE: tl.constexpr,
+        CHUNK: tl.constexpr,
+        LOG_CHUNK: tl.constexpr,
+        WIDE: tl.constexpr,
+        NWINS: tl.constexpr,
+        WSTRIDE: tl.constexpr,
+        COARSE: tl.constexpr,
+    ):
+        b = tl.program_id(1)
+        for i in tl.static_range(NB):
+            if b == i:
+                claim_bucket(
+                    flags_ptr + i * K,
+                    tiles_ptr + i * NT,
+                    windows_ptr + i * WSTRIDE,
+                    counts[i],
+                    deads[i],
+                    vals[i],
+                    cols[i],
+                    status_ptr,
+                    slot_ptr + i * K,
+                    K,
+                    CAPS[i],
+                    NBLKS[i],
+                    BLKS[i],
+                    NF,
+                    TILE,
+                    CHUNK,
+                    LOG_CHUNK,
+                    WIDE,
+                    NWINS[i],
+                    COARSE,
+                )
+
+    @triton.jit
+    def clear(  # noqa: ANN202
+        slot_ptr,  # noqa: ANN001
+        deads,  # noqa: ANN001
+        K: tl.constexpr,
+        CAPS: tl.constexpr,
+        NB: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        b = tl.program_id(1)
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        for i in tl.static_range(NB):
+            if b == i:
+                slot = tl.load(slot_ptr + i * K + offs, mask=offs < K, other=CAPS[i])
+                tl.store(deads[i] + slot, 0, mask=slot < CAPS[i])
+
+    return prep, claim, clear
+
+
+def triton_claim(
+    buckets: list[Columns],
+    claims: list[GrowthClaim],
+    *,
+    block_counts: list[Int32[Array, " _"]] | None = None,
+) -> tuple[list[Columns], Bool[Array, ""], Bool[Array, ""]]:
+    """Claim free slots and write every column for all buckets in three launches.
+
+    The fused counterpart of `xla_claim` on one device (NVIDIA GPUs, through
+    jax_triton): the same slots, the same writes, the same flags. A `prep`
+    launch sums the growable candidates per tile and the free slots per
+    coarse window of block counts. Then one `claim` program takes a tile of
+    candidates: its first free rank is the earlier tiles' growable count; the
+    coarse windows, then the block counts, locate each candidate's block; a
+    cumsum over that block's dead mask locates its slot; and every column but
+    `DEAD` is written in place. A `clear` launch then clears `DEAD` at the
+    placed slots. Every bucket shares the three launches (the grid's second
+    axis is the bucket), so growth costs three kernels whatever the bucket
+    count.
+
+    Args:
+        buckets: Every bucket's columns.
+        claims: Every bucket's candidates, one per bucket, all of one `k`.
+        block_counts: Precomputed `free_block_counts(dead,
+            TRITON_CLAIM_BLOCK)` of each bucket's current dead mask (for
+            example from a fused prune sweep), or None to compute them here.
+
+    Returns:
+        The updated buckets, whether any growable candidate overflowed, and
+        whether any committed edge breaks the leveling invariant.
+
+    Raises:
+        ValueError: If a bucket capacity is not a multiple of 4 (the kernel
+            reads the dead masks as 32-bit words).
+    """
+    import jax_triton  # ty: ignore[unresolved-import]
+
+    prep_kernel, claim_kernel, clear_kernel = _triton_claim_kernels()
+    num_buckets = len(buckets)
+    k = claims[0].growable.shape[0]
+    num_tiles = -(-k // _CLAIM_TILE)
+    names = [name for name in buckets[0] if name != DEAD.name]
+    deads = [bucket[DEAD.name] for bucket in buckets]
+    caps = tuple(int(dead.shape[0]) for dead in deads)
+    if block_counts is None:
+        # The barrier keeps XLA from fusing the counts into the producer of
+        # the dead masks (the prune sweep), where the reduction slowed that
+        # whole elementwise pass: 92 -> 140 us at 5.4M edges. A separate
+        # reduction re-reads the masks (2.8 MB per bucket there).
+        counted = jax.lax.optimization_barrier(deads)  # type: ignore[no-untyped-call]
+        block_counts = [free_block_counts(dead, TRITON_CLAIM_BLOCK) for dead in counted]
+    num_blocks = tuple(int(c.shape[0]) for c in block_counts)
+    if any(cap % 4 for cap in caps):
+        raise ValueError("triton_claim: bucket capacities must be multiples of 4")
+    num_windows = tuple(-(-n // _CLAIM_WIDE) for n in num_blocks)
+    wstride = max(num_windows)
+    flags = jnp.stack(
+        [
+            c.growable.astype(jnp.int8) | (c.violating.astype(jnp.int8) << 1)
+            for c in claims
+        ]
+    ).reshape(-1)
+    tiles_per = 1024 // _CLAIM_TILE
+    windows, tiles, status = jax_triton.triton_call(
+        flags,
+        tuple(block_counts),
+        kernel=prep_kernel,
+        out_type=(
+            jax.ShapeDtypeStruct((num_buckets * wstride,), jnp.int32),  # type: ignore[no-untyped-call]
+            jax.ShapeDtypeStruct((num_buckets * num_tiles,), jnp.int32),  # type: ignore[no-untyped-call]
+            jax.ShapeDtypeStruct((2,), jnp.int32),  # type: ignore[no-untyped-call]
+        ),
+        grid=(
+            max(-(-max(num_blocks) // _CLAIM_WIDE), -(-num_tiles // tiles_per)),
+            num_buckets,
+        ),
+        K=k,
+        NBLKS=num_blocks,
+        NB=num_buckets,
+        NT=num_tiles,
+        TILE=_CLAIM_TILE,
+        WIDE=_CLAIM_WIDE,
+        WSTRIDE=wstride,
+        TILES_PER=tiles_per,
+    )
+    cols = [{name: jax.new_ref(bucket[name]) for name in names} for bucket in buckets]
+    status_ref = jax.new_ref(status)
+    slots = jax_triton.triton_call(
+        flags,
+        tiles,
+        windows,
+        tuple(block_counts),
+        tuple(deads),
+        tuple(tuple(c.values[name] for name in names) for c in claims),
+        tuple(tuple(col[name] for name in names) for col in cols),
+        status_ref,
+        kernel=claim_kernel,
+        out_type=jax.ShapeDtypeStruct((num_buckets * k,), jnp.int32),  # type: ignore[no-untyped-call]
+        grid=(num_tiles, num_buckets),
+        num_warps=_CLAIM_WARPS,
+        K=k,
+        CAPS=caps,
+        NBLKS=num_blocks,
+        BLKS=tuple(free_block_length(cap, TRITON_CLAIM_BLOCK) for cap in caps),
+        NB=num_buckets,
+        NF=len(names),
+        NT=num_tiles,
+        TILE=_CLAIM_TILE,
+        CHUNK=_CLAIM_CHUNK,
+        LOG_CHUNK=_CLAIM_CHUNK.bit_length() - 1,
+        WIDE=_CLAIM_WIDE,
+        NWINS=num_windows,
+        WSTRIDE=wstride,
+        COARSE=_CLAIM_COARSE,
+    )
+    dead_refs = tuple(jax.new_ref(dead) for dead in deads)
+    jax_triton.triton_call(
+        slots,
+        dead_refs,
+        kernel=clear_kernel,
+        out_type=(),
+        grid=(-(-k // 1024), num_buckets),
+        K=k,
+        CAPS=caps,
+        NB=num_buckets,
+        BLOCK=1024,
+    )
+    new_buckets: list[Columns] = []
+    for bucket, col, dead_ref in zip(buckets, cols, dead_refs, strict=True):
+        new_buckets.append(
+            {
+                name: (dead_ref if name == DEAD.name else col[name])[...]
+                for name in bucket
+            }
+        )
+    flags_out = status_ref[...] > 0
+    return new_buckets, flags_out[0], flags_out[1]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2293,6 +2859,7 @@ def build_add_conn_phase[GS](
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
     free_sink: list[Any] | None = None,
+    growth: str = "auto",
 ) -> Phase[GS]:
     """Select each bucket's top-k candidates and claim free slots via prefix sum.
 
@@ -2322,13 +2889,18 @@ def build_add_conn_phase[GS](
     with more free slots than finite-scored candidates leaves the surplus empty
     rather than back-filling with vetoed edges.
 
-    Free slots are claimed by a prefix-sum scan over each bucket's own
-    `dead` mask: the scan turns dead-row rank into a slot assignment, so a
-    committed candidate lands in the position of the rank-th free dead
-    slot. A candidate that is invalid or for which the bucket has no free
-    slot scatters to one past the bucket's valid range, which the
-    scatter's default drop mode discards rather than mis-writing a live
-    slot.
+    Free slots are claimed in candidate order over each bucket's own `dead`
+    mask: the rank-th growable candidate lands in the rank-th free slot, in
+    slot order. `growth` picks the claim engine: "xla" (`xla_claim`, any
+    backend and under Scheme-A sharding: per-block free counts, a search, and
+    one scatter per column, dropping uncommitted candidates out of range);
+    "triton" (`triton_claim`, one jax_triton kernel placing and writing every
+    column of every bucket plus one clearing `DEAD`, on an NVIDIA GPU with the
+    `triton` extra); or "auto", which takes "triton" where it is available
+    and the step is unsharded. Both choose the same slots and raise the same
+    flags; a "triton" request that cannot run (no NVIDIA GPU or jax_triton,
+    Scheme-A sharding, more than `TRITON_CLAIM_MAX_FIELDS` connection
+    columns, a bucket capacity not a multiple of 4) uses "xla".
 
     Overflow is a real (growable, top-k-selected) candidate for which its
     own bucket ran out of dead slots; it is dropped and the flag is
@@ -2348,10 +2920,15 @@ def build_add_conn_phase[GS](
             this call's computed overflow flag.
         free_sink: optional per-bucket `(running free counts, block length)`
             left by a fused forward (`build_fused_forward_prune_phase`) for
-            this step's dead masks, reused in place of `count_free_blocks`.
+            this step's dead masks, reused by the XLA claim in place of
+            `count_free_blocks`.
+        growth: The free-slot claim engine: "auto", "xla", or "triton".
 
     Returns:
         The add_conn phase function.
+
+    Raises:
+        ValueError: If `growth` is not one of the engines.
     """
     ac = net.add_conn
     assert ac is not None  # build_phases only calls this when set
@@ -2390,6 +2967,8 @@ def build_add_conn_phase[GS](
     # shared with the grid path. The live-edge duplicate check defaults on for
     # the grid and off for proposals (parallel edges allowed; see
     # ProposeAddConn).
+    if growth not in ("auto", "xla", "triton"):
+        raise ValueError(f"build_add_conn_phase: unknown growth engine {growth!r}")
     use_propose = isinstance(ac, ProposeAddConn)
     dedupe = bool(getattr(ac, "dedupe", not use_propose))
     num_proposals = ac.num_proposals if isinstance(ac, ProposeAddConn) else 0
@@ -2413,6 +2992,18 @@ def build_add_conn_phase[GS](
     # and a small test network's pool can undercut a generous max_candidates.
     pool = num_proposals if use_propose else pool_side * pool_side
     k = max(0, min(ac.max_candidates, pool))
+    # The fused claim needs jax_triton on an NVIDIA GPU and one device (it is
+    # not validated inside shard_map), is specialised for a bounded column
+    # count, and reads the dead masks as 32-bit words (capacities a multiple
+    # of 4); anything else takes the portable XLA claim.
+    use_triton = (
+        growth != "xla"
+        and k > 0
+        and shard_axis is None
+        and len(static.conn_fields) - 1 <= TRITON_CLAIM_MAX_FIELDS
+        and all(cap % 4 == 0 for cap in static.level_capacities)
+        and nvidia_triton_available()
+    )
 
     # Every candidate grid is built inside the traced phase, never here: this
     # builder runs eagerly (outside jit), where a num_units^2 grid would be a
@@ -2546,12 +3137,9 @@ def build_add_conn_phase[GS](
             nowhere_live: jax.Array = dup_any == jnp.int32(0)
             return nowhere_live
 
-        new_conns: list[Columns] = []
-        overflow = jnp.bool_(False)
-        reassigning = jnp.bool_(False)
+        claims: list[GrowthClaim] = []
         for bucket_idx in range(num_buckets):
             bucket_conns = state.conns[bucket_idx]
-            capacity_b = static.level_capacities[bucket_idx]
             if use_per_level:
                 assert imp is not None  # use_per_level implies importance is set
                 flat_src, flat_dst = per_level_grid(imp, unit_level, bucket_idx)
@@ -2609,108 +3197,68 @@ def build_add_conn_phase[GS](
             # alone would admit them.
             top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
 
-            # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
-            # dead mask is this shard's capacity slice (size capacity_b //
-            # num_shards; a capacity divisible by the shard count keeps it
-            # exact), so the claim runs over the LOCAL slice and is
-            # coordinated across shards: each growable candidate takes a
-            # GLOBAL free-slot rank and lands on the
-            # one shard that owns it. Because shard g holds arena positions
-            # [g*local_capacity, (g+1)*local_capacity), the global free-slot
-            # order (shard 0's free slots, then shard 1's, ...) is exactly the
-            # single-device position order -- so a candidate lands where the
-            # single-device add_conn would. local_capacity == capacity_b and
-            # offset == 0 when unsharded, leaving that path byte-identical.
-            local_capacity = capacity_b // num_shards
-            dead_b = bucket_conns[DEAD.name]
-            # Per-block free counts over this shard's slice: one reduction
-            # reading the dead mask, instead of a capacity-sized cumsum.
-            # Two-level search for a small claim (O(k * block) past one
-            # reduction); for a claim large next to the bucket that gather
-            # outgrows one capacity-sized cumsum, which is then used instead.
-            small_claim = k * _FREE_BLOCK <= local_capacity
-            if small_claim:
-                fused = free_sink[bucket_idx] if free_sink is not None else None
-                if fused is not None:
-                    free_blocks, block_len = fused
-                else:
-                    free_blocks, block_len = count_free_blocks(dead_b)
-                local_free = free_blocks[-1]
-            else:
-                free_through = jnp.cumsum(dead_b.astype(jnp.int32))
-                local_free = free_through[-1]
-            # This shard's offset into the global free-slot space, and the total
-            # free count. The offset is an exclusive prefix of the per-shard
-            # free counts (an all-gather -- a prefix is not a plain all-reduce)
-            # and feeds only the per-shard placement below. total_free is a
-            # psum, not sum(all_gather): it flows into `overflow` and
-            # `needs_resort`, which shard_map requires be provably replicated,
-            # and psum is the all-reduce it recognizes as replicating. Both are
-            # device-resident collectives.
-            if shard_axis is not None:
-                all_free = jax.lax.all_gather(local_free, shard_axis)
-                my_index = jax.lax.axis_index(shard_axis)
-                offset = jnp.sum(
-                    jnp.where(jnp.arange(num_shards) < my_index, all_free, 0)
-                )
-                total_free = monoid.sum_.collective(local_free, shard_axis)
-            else:
-                offset = jnp.int32(0)
-                total_free = local_free
-            # growth_rank[i] = candidate i's rank among the growable top-k --
-            # its global free-slot index. The -inf-scored candidates sort to
-            # the tail of top_k, so top_growable is a contiguous prefix and
-            # growth_rank[i] == i there: identical to the old per-index claim
-            # when unsharded. A candidate whose rank exceeds the total free
-            # slots is overflow -- dropped, flag raised.
-            growth_rank = jnp.cumsum(top_growable.astype(jnp.int32)) - 1
-            committed = top_growable & (growth_rank < total_free)
-            overflow = overflow | jnp.any(top_growable & (growth_rank >= total_free))
-            # A committed candidate belongs to THIS shard iff its global rank
-            # falls in [offset, offset + local_free); place it at that shard-
-            # local free slot, else scatter to `local_capacity` (out of this
-            # slice's range), dropped by the scatter's drop mode.
-            local_rank = growth_rank - offset
-            mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
-            safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-            if small_claim:
-                free_slot = nth_free_slot(dead_b, free_blocks, block_len, safe_rank)
-            else:
-                free_slot = jnp.searchsorted(
-                    free_through, safe_rank + jnp.int32(1), method=_SEARCH
-                ).astype(jnp.int32)
-            target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
-
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it
             # marks the network as needing a topological resort.
             level_preserving = unit_level[top_dst] > unit_level[top_src]
-            reassigning = reassigning | jnp.any(committed & ~level_preserving)
-
             batched_init = jax.vmap(init_one)(top_src, top_dst)
-
-            new_bucket: Columns = dict(bucket_conns)
+            values: dict[str, jax.Array] = {}
             for spec in static.conn_fields:
-                value: jax.Array
                 if spec.name == FROM_ID.name:
-                    value = top_src.astype(spec.dtype)
+                    values[spec.name] = top_src.astype(spec.dtype)
                 elif spec.name == TO_ID.name:
-                    value = top_dst.astype(spec.dtype)
+                    values[spec.name] = top_dst.astype(spec.dtype)
                 elif spec.name == DEAD.name:
-                    value = jnp.zeros((k,), dtype=spec.dtype)
+                    continue  # a claim always clears DEAD
                 elif spec.name in batched_init:
-                    value = batched_init[spec.name].astype(spec.dtype)
+                    values[spec.name] = batched_init[spec.name].astype(spec.dtype)
                 else:
                     # Not touched by ac.init: reset to the FieldSpec
                     # default rather than inheriting whatever a previous
                     # tenant (a conn tombstoned by this same step's
                     # prune_conn pass, or the builder's initial padding)
                     # left behind.
-                    value = jnp.full((k,), np.asarray(spec.default), dtype=spec.dtype)
-                new_bucket[spec.name] = (
-                    bucket_conns[spec.name].at[target_slot].set(value, mode="drop")
+                    values[spec.name] = jnp.full(
+                        (k,), np.asarray(spec.default), dtype=spec.dtype
+                    )
+            claims.append(
+                GrowthClaim(
+                    growable=top_growable,
+                    violating=~level_preserving,
+                    values=values,
                 )
-            new_conns.append(new_bucket)
+            )
+
+        # Claim free slots for every bucket's growable candidates, in
+        # candidate order, and write them. The claim is a prefix in the
+        # free-slot order: the i-th growable candidate takes the i-th free
+        # slot, the rest overflow.
+        new_conns: list[Columns]
+        if use_triton:
+            new_conns, overflow, reassigning = triton_claim(list(state.conns), claims)
+        else:
+            new_conns = []
+            overflowed, resorting = [], []
+            for bucket_idx, (bucket_conns, claim) in enumerate(
+                zip(state.conns, claims, strict=True)
+            ):
+                new_bucket, overflow_b, resort_b = xla_claim(
+                    bucket_conns,
+                    claim,
+                    shard_axis=shard_axis,
+                    num_shards=num_shards,
+                    free_blocks=(
+                        free_sink[bucket_idx] if free_sink is not None else None
+                    ),
+                )
+                new_conns.append(new_bucket)
+                overflowed.append(overflow_b)
+                resorting.append(resort_b)
+            # One reduction for both flags over every bucket.
+            either = jnp.any(
+                jnp.stack([jnp.stack(overflowed), jnp.stack(resorting)]), axis=(1, 2)
+            )
+            overflow, reassigning = either[0], either[1]
 
         if overflow_sink is not None:
             overflow_sink[0] = overflow

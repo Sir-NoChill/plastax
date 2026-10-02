@@ -146,6 +146,17 @@ and update the design doc if the change is semantic. Do not silently drift.
 
 ### Recorded
 
+Growth claim engine (2026-10-02, `perf/growth-kernel`):
+
+- phases / step: `build_add_conn_phase` splits candidate selection from the
+  free-slot claim (`GrowthClaim`, `xla_claim`, `triton_claim`), and
+  `make_step` / `build_phases` gain `growth="auto" | "xla" | "triton"`.
+  The prefix-sum claim semantics are unchanged (the rank-th growable
+  candidate takes the rank-th free slot; overflow when ranks run out), and
+  the XLA claim is pinned bit-identical to 7ff7cc6. Reason: on NVIDIA the
+  claim runs as three jax_triton kernels instead of about 50 XLA kernels
+  (SCALE_PLAN iteration 13).
+
 API / docstrings (2026-08-18, docstring sweep):
 
 - _types (types): `FieldSpec.f32`/`FieldSpec.i32` -> `FieldSpec.float32`/

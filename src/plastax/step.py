@@ -69,6 +69,7 @@ def make_step[GS](
     batch_size: int | None = None,
     layout: Literal["auto", "edge_list", "csr", "triton"] = "auto",
     fuse_prune: Literal["auto", "triton", "xla", "off"] = "auto",
+    growth: Literal["auto", "xla", "triton"] = "auto",
 ) -> StepFn[GS]:
     """Assemble the present phases and jit them with donate_argnums=0.
 
@@ -120,6 +121,15 @@ def make_step[GS](
     returned step carries the decision as `step.prune_fusion` (a
     `phases.PruneFusionRecord`). A batched step never fuses.
 
+    `growth` picks the add_conn free-slot claim (see
+    `phases.build_add_conn_phase`): "triton" claims and writes every growing
+    bucket in one jax_triton kernel (plus one clearing the tombstones) on an
+    NVIDIA GPU with the `plastax[triton]` extra, where "xla" is the portable
+    claim (per-block free counts, a search, and one scatter per column, about
+    20 kernels per bucket). Both pick the same slots. "auto" takes "triton"
+    where it can run; a "triton" request that cannot (another backend, or
+    Scheme-A sharding, where jax_triton is not validated) uses "xla".
+
     In a batched step a non-floating unit column (a flag, a count) is stored
     from sample 0 rather than averaged, and so is a non-floating connection
     column written by an UpdateConn without the exact pair: such columns
@@ -139,6 +149,7 @@ def make_step[GS](
             or "triton".
         fuse_prune: Whether a streaming step fuses the prune predicate into
             the forward sweep: "auto", "triton", "xla", or "off".
+        growth: The add_conn claim engine: "auto", "xla", or "triton".
 
     Returns:
         A jitted step function for the given network and static config.
@@ -146,7 +157,7 @@ def make_step[GS](
     Raises:
         ValueError: If `batch_size` is below 1, or set for a PIPELINE net
             (whose carried unit state is per-sample recurrent state), or if
-            `layout` or `fuse_prune` is not one of its values.
+            `layout`, `fuse_prune` or `growth` is not one of its values.
     """
     if batch_size is not None:
         if batch_size < 1:
@@ -160,6 +171,8 @@ def make_step[GS](
         raise ValueError(f"make_step: unknown layout {layout!r}")
     if fuse_prune not in ("auto", "triton", "xla", "off"):
         raise ValueError(f"make_step: unknown fuse_prune {fuse_prune!r}")
+    if growth not in ("auto", "xla", "triton"):
+        raise ValueError(f"make_step: unknown growth engine {growth!r}")
     engine: str | None = None
     if batch_size is not None:
         triton_ok = nvidia_triton_available()
@@ -188,7 +201,7 @@ def make_step[GS](
     # identity; hence the cast.
     return cast(
         StepFn[GS],
-        _cached_make_step(net, static, batch_size, engine, fuse_prune),  # type: ignore[arg-type]
+        _cached_make_step(net, static, batch_size, engine, fuse_prune, growth),  # type: ignore[arg-type]
     )
 
 
@@ -257,10 +270,11 @@ def _batched_step(
     input_ids: jax.Array,
     batch_size: int,
     engine: str | None,
+    growth: str = "auto",
 ) -> StepFn[Any]:
     """The jitted batched step (see `make_step`'s `batch_size` and `layout`)."""
     phases = build_batched_phases(
-        net, static, overflow_sink=overflow_sink, engine=engine
+        net, static, overflow_sink=overflow_sink, engine=engine, growth=growth
     )
 
     def per_sample(
@@ -406,6 +420,7 @@ def _cached_make_step(
     batch_size: int | None = None,
     engine: str | None = None,
     fuse_prune: str = "auto",
+    growth: str = "auto",
 ) -> StepFn[Any]:
     # overflow_sink (see build_phases): a length-1 out-parameter
     # build_add_conn_phase (when net.add_conn is set) overwrites on every
@@ -416,7 +431,9 @@ def _cached_make_step(
     overflow_sink: list[Bool[Array, ""]] = [jnp.bool_(False)]
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
     if batch_size is not None:
-        return _batched_step(net, static, overflow_sink, input_ids, batch_size, engine)
+        return _batched_step(
+            net, static, overflow_sink, input_ids, batch_size, engine, growth
+        )
     record = PruneFusionRecord()
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
@@ -429,7 +446,11 @@ def _cached_make_step(
             plan = plan_prune_fusion(net, static, state.globals_, engine=fuse_prune)
         record.plan = plan
         phases = build_phases(
-            net, static, overflow_sink=overflow_sink, prune_fusion=plan
+            net,
+            static,
+            overflow_sink=overflow_sink,
+            prune_fusion=plan,
+            growth=growth,
         )
 
         # Step input scatter, before any phase: StepInputs.inputs onto

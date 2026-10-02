@@ -440,3 +440,40 @@ def test_triton_claim_matches_xla_claim(seed: int, precomputed: bool) -> None:
                 np.testing.assert_array_equal(np.asarray(g[name]), np.asarray(w[name]))
         assert bool(got[1]) == bool(want[1])
         assert bool(got[2]) == bool(want[2])
+
+
+@pytest.mark.parametrize("cap", [4096, 1 << 16, 3 << 14, 256 * 1001, 100_000, 72, 64])
+@pytest.mark.parametrize("max_block", [64, 128, 256, 1024])
+def test_finer_free_counts_regroup_exactly(cap: int, max_block: int) -> None:
+    # A fused prune sweep may count free slots in the Triton claim's 256-slot
+    # blocks; the XLA claim regroups them into its own.
+    rng = np.random.default_rng(cap + max_block)
+    dead = jnp.asarray(rng.random(cap) < 0.3)
+    fine = phases.free_block_counts(dead, max_block)
+    block = phases.free_block_length(cap, max_block)
+    np.testing.assert_array_equal(
+        np.asarray(phases.regroup_free_counts(fine, block, cap)),
+        np.asarray(phases.free_block_counts(dead)),
+    )
+
+
+@pytest.mark.parametrize("seed", range(2))
+def test_xla_claim_takes_precomputed_triton_block_counts(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    for caps, k, density in _CLAIM_CASES:
+        buckets, claims = _claim_case(rng, caps, k, density)
+        for bucket, claim in zip(buckets, claims, strict=True):
+            dead = bucket[px.DEAD.name]
+            cap = dead.shape[0]
+            counts = (
+                phases.free_block_counts(dead, phases.TRITON_CLAIM_BLOCK),
+                phases.free_block_length(cap, phases.TRITON_CLAIM_BLOCK),
+            )
+            want = phases.xla_claim(bucket, claim)
+            got = phases.xla_claim(bucket, claim, free_counts=counts)
+            for name in want[0]:
+                np.testing.assert_array_equal(
+                    np.asarray(got[0][name]), np.asarray(want[0][name])
+                )
+            np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
+            np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want[2]))

@@ -446,3 +446,66 @@ class _ScaledPrune(px.PruneConn):
 def test_translator_rejects_inexact_float_arithmetic() -> None:
     with pytest.raises(phases._Untranslatable, match="mul"):
         _translate(_ScaledPrune(), _net(_ScaledPrune()))
+
+
+@pytest.mark.skipif(
+    not phases.nvidia_triton_available(), reason="needs an NVIDIA GPU + jax_triton"
+)
+@pytest.mark.parametrize("align", [256, 1024])
+@pytest.mark.parametrize(
+    ("name", "net"),
+    [
+        ("marked+propose", _net(_MarkedPrune(), add=_Propose())),
+        ("hash+grid", _net(_HashPrune(), add=_Grow())),
+        ("hash+train", _net(_HashPrune(), add=_Grow(), train=True)),
+        (
+            "marked+propose, pipeline",
+            _net(_MarkedPrune(), add=_Propose(), propagation=px.Propagation.PIPELINE),
+        ),
+    ],
+)
+def test_fused_counts_feed_the_triton_claim(
+    name: str, net: type[px.Network[G]], align: int, monkeypatch: Any
+) -> None:
+    # The fused kernel's 256-slot free counts go straight into triton_claim:
+    # no count reduction is traced, and the state matches the two-pass step
+    # with the XLA claim (integer and bool columns exactly; floats to the
+    # forward's summation order).
+    static, state = _build(net, align=align)
+    recounts: list[int] = []
+    counting = phases.free_block_counts
+
+    def spy(dead: jax.Array, max_block: int = 1024) -> jax.Array:
+        recounts.append(max_block)
+        return counting(dead, max_block)
+
+    monkeypatch.setattr(phases, "free_block_counts", spy)
+    wired = px.make_step(net, static, fuse_prune="triton", growth="triton")
+    plain = px.make_step(net, static, fuse_prune="off", growth="xla")
+    rng = np.random.default_rng(7)
+    a, b = _copy(state), _copy(state)
+    for i in range(_STEPS):
+        x = jnp.asarray(rng.standard_normal(_WIDTH).astype(np.float32))
+        t = (
+            jnp.asarray(rng.standard_normal(_WIDTH).astype(np.float32))
+            if net.loss is not None
+            else None
+        )
+        inputs = px.StepInputs(inputs=x, targets=t)
+        ra = wired(a, inputs)
+        if i == 0:
+            assert recounts == [], (name, recounts)  # traced: nothing recounted
+            plan = getattr(wired, "prune_fusion").plan  # noqa: B009
+            assert plan.fused and plan.engine == "triton", (name, plan)
+        rb = plain(b, inputs)
+        assert bool(ra.overflow) == bool(rb.overflow), (name, i)
+        a, b = ra.state, rb.state
+    leaves_a = jax.tree_util.tree_flatten_with_path(a)[0]
+    for (path, la), lb in zip(leaves_a, jax.tree.leaves(b), strict=True):
+        la, lb = np.asarray(la), np.asarray(lb)
+        msg = f"{name}: {jax.tree_util.keystr(path)}"
+        if la.dtype.kind == "f":
+            np.testing.assert_allclose(la, lb, rtol=1e-5, atol=1e-5, err_msg=msg)
+        else:
+            np.testing.assert_array_equal(la, lb, err_msg=msg)
+    assert int(px.state.live_conn_count(a)) > 0, name

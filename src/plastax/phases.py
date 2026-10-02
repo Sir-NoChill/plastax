@@ -115,9 +115,21 @@ def build_phases[GS](
     free_sink: list[Any] = [None] * num_buckets
     if fused:
         assert prune_fusion is not None
+        # The fused kernel counts free slots in the blocks of the claim that
+        # reads them: 256-slot blocks for the Triton claim, 1024 for XLA's.
+        count_block = (
+            TRITON_CLAIM_BLOCK
+            if net.add_conn is not None and triton_claim_applies(static, growth)
+            else _FREE_BLOCK
+        )
         phases: list[Phase[GS]] = [
             build_fused_forward_prune_phase(
-                net, static, prune_fusion, dead_sink=dead_sink, free_sink=free_sink
+                net,
+                static,
+                prune_fusion,
+                dead_sink=dead_sink,
+                free_sink=free_sink,
+                count_block=count_block,
             )
         ]
     else:
@@ -1731,6 +1743,10 @@ def _py_literal(value: Any) -> str:
     return repr(value)
 
 
+# Block length for the two-level free-slot search: the largest power of two up
+# to this that divides the bucket, so the per-block counts are a plain reshape.
+_FREE_BLOCK = 1024
+
 # Slots per fused-kernel program (a whole number of free-count blocks) and its
 # warps: the best of a sweep at 5M and 50M edges (SCALE_PLAN.md iteration 12;
 # 1024-8192 slots x 2-8 warps, within 3 % of each other at 1024-2048 x 8).
@@ -1793,17 +1809,21 @@ def _compile_fused_kernel(source: str) -> Any:
     return module.fused_forward_prune
 
 
-def free_block_len(cap: int) -> tuple[int, int]:
-    """The free-slot block length `count_free_blocks` uses, and the padding.
+def free_block_len(cap: int, max_block: int = _FREE_BLOCK) -> tuple[int, int]:
+    """A free-slot block length (see `free_block_length`), and the padding.
 
     Args:
         cap: The bucket (or shard slice) capacity.
+        max_block: As for `free_block_length`: `_FREE_BLOCK` (1024) gives
+            `count_free_blocks`' blocks, `TRITON_CLAIM_BLOCK` the Triton
+            claim's.
 
     Returns:
-        `(block, pad)`: the block length (`free_block_length(cap)`) and how
-        many False slots are appended so the blocks tile the bucket.
+        `(block, pad)`: the block length (`free_block_length(cap,
+        max_block)`) and how many False slots are appended so the blocks
+        tile the bucket.
     """
-    block = free_block_length(cap)
+    block = free_block_length(cap, max_block)
     return block, -cap % block
 
 
@@ -1813,6 +1833,8 @@ def triton_forward_prune(
     x: Float[Array, " num_units"],
     pred_units: Columns,
     globals_: Any,
+    *,
+    count_block: int = _FREE_BLOCK,
 ) -> tuple[
     Float[Array, " num_units"], Bool[Array, " cap"], Int32[Array, " blocks"], int
 ]:
@@ -1821,8 +1843,9 @@ def triton_forward_prune(
     Gathers `x` at each live edge's source, adds `weight * x` into the
     destination with relaxed atomics (B = 1), evaluates the translated prune
     predicate, writes the new tombstones in place of a copy of the old mask,
-    and counts the tombstones in each free-slot block (`count_free_blocks`'s
-    blocks, before the running sum).
+    and counts the tombstones in each free-slot block of
+    `free_block_len(cap, count_block)` slots (`free_block_counts(new_dead,
+    count_block)`, exactly).
 
     Args:
         kernel: The translated predicate for this bucket.
@@ -1830,16 +1853,18 @@ def triton_forward_prune(
         x: The forward's linear-input column.
         pred_units: The unit columns the predicate reads.
         globals_: The globals pytree.
+        count_block: The largest free-count block length (see
+            `free_block_length`).
 
     Returns:
-        The bucket's accumulator contribution, the new dead mask, the
-        running free count per block, and the block length.
+        The bucket's accumulator contribution, the new dead mask, the free
+        count per block (not cumulative), and the block length.
     """
     import jax_triton  # ty: ignore[unresolved-import]
 
     dead = bucket[DEAD.name]
     cap = dead.shape[0]
-    block, pad = free_block_len(cap)
+    block, pad = free_block_len(cap, count_block)
     n_blocks = (cap + pad) // block
     sub = max(1, _FUSED_TILE // block)
     leaves = jax.tree.leaves(globals_)
@@ -1881,7 +1906,7 @@ def triton_forward_prune(
         COUNT=block,
         SUB=sub,
     )
-    return acc, new_dead, jnp.cumsum(counts), block
+    return acc, new_dead, counts, block
 
 
 def build_fused_forward_prune_phase[GS](
@@ -1891,6 +1916,7 @@ def build_fused_forward_prune_phase[GS](
     *,
     dead_sink: list[Any],
     free_sink: list[Any],
+    count_block: int = _FREE_BLOCK,
 ) -> Phase[GS]:
     """The forward phase with the prune predicate evaluated in its sweep.
 
@@ -1910,8 +1936,12 @@ def build_fused_forward_prune_phase[GS](
         static: The network's static configuration.
         plan: A fused plan from `plan_prune_fusion`.
         dead_sink: One slot per bucket, overwritten with the new dead mask.
-        free_sink: One slot per bucket, overwritten with `(running free
-            counts per block, block length)` or None.
+        free_sink: One slot per bucket, overwritten with `(free counts per
+            block, block length)` (`free_block_counts(new_dead,
+            count_block)`, not cumulative) or None.
+        count_block: The largest free-count block length (see
+            `free_block_length`): `TRITON_CLAIM_BLOCK` when the Triton claim
+            reads the counts, else `_FREE_BLOCK`.
 
     Returns:
         The fused forward phase.
@@ -1981,6 +2011,7 @@ def build_fused_forward_prune_phase[GS](
                     units[field.name],
                     pred_units,
                     g,
+                    count_block=count_block,
                 )
                 acc = monoid.sum_.combine_pairwise(acc, part)
                 free_sink[level_idx] = (free_blocks, block)
@@ -2126,11 +2157,6 @@ def repeats_earlier(
     return repeated
 
 
-# Block length for the two-level free-slot search: the largest power of two up
-# to this that divides the bucket, so the per-block counts are a plain reshape.
-_FREE_BLOCK = 1024
-
-
 def free_block_length(capacity: int, max_block: int = _FREE_BLOCK) -> int:
     """The block length of a bucket's per-block free counts.
 
@@ -2177,6 +2203,35 @@ def free_block_counts(
         axis=1, dtype=jnp.int32
     )
     return counts
+
+
+def regroup_free_counts(
+    counts: Int32[Array, " blocks"], block: int, capacity: int
+) -> Int32[Array, " groups"]:
+    """Per-block free counts in `count_free_blocks`' blocks, from finer ones.
+
+    Exact: `free_block_length(capacity)` is a multiple of
+    `free_block_length(capacity, m)` for every power-of-two `m` of at least 64
+    (it is the same block, or a larger power of two), and the padded tail
+    blocks hold no free slots, so each coarse block is a sum of whole fine
+    ones.
+
+    Args:
+        counts: `free_block_counts(dead, m)` for some `m`.
+        block: That count's block length, `free_block_length(capacity, m)`.
+        capacity: The bucket's (or shard slice's) capacity.
+
+    Returns:
+        `free_block_counts(dead)`, the counts in `free_block_length(capacity)`
+        blocks.
+    """
+    ratio = free_block_length(capacity) // block
+    if ratio == 1:
+        return counts
+    if -counts.shape[0] % ratio:
+        counts = jnp.pad(counts, (0, -counts.shape[0] % ratio))
+    grouped: Int32[Array, " groups"] = counts.reshape(-1, ratio).sum(axis=1)
+    return grouped
 
 
 def count_free_blocks(
@@ -2267,7 +2322,7 @@ def xla_claim(
     *,
     shard_axis: str | None = None,
     num_shards: int = 1,
-    free_blocks: tuple[Int32[Array, " blocks"], int] | None = None,
+    free_counts: tuple[Int32[Array, " blocks"], int] | None = None,
 ) -> tuple[Columns, Bool[Array, " k"], Bool[Array, " k"]]:
     """Claim free slots for one bucket's candidates and write them, in plain XLA.
 
@@ -2285,9 +2340,10 @@ def xla_claim(
         claim: The bucket's candidates.
         shard_axis: The Scheme-A mesh axis, or None when unsharded.
         num_shards: The Scheme-A shard count (1 when unsharded).
-        free_blocks: Precomputed `count_free_blocks(dead)` of the bucket's
-            current (local) dead mask (for example from a fused prune sweep),
-            or None to compute them here.
+        free_counts: Precomputed `(free_block_counts(dead, max_block),
+            free_block_length(cap, max_block))` of the bucket's current
+            (local) dead mask for any `max_block` (for example from a fused
+            prune sweep), or None to compute them here.
 
     Returns:
         The updated columns, and per candidate whether it overflowed and
@@ -2305,9 +2361,11 @@ def xla_claim(
     # used instead.
     small_claim = k * _FREE_BLOCK <= local_capacity
     if small_claim:
-        running, block_len = (
-            count_free_blocks(dead_b) if free_blocks is None else free_blocks
-        )
+        if free_counts is None:
+            running, block_len = count_free_blocks(dead_b)
+        else:
+            running = jnp.cumsum(regroup_free_counts(*free_counts, local_capacity))
+            block_len = free_block_length(local_capacity)
         local_free = running[-1]
     else:
         free_through = jnp.cumsum(dead_b.astype(jnp.int32))
@@ -2617,6 +2675,30 @@ def _triton_claim_kernels() -> tuple[Any, Any, Any]:
     return prep, claim, clear
 
 
+def triton_claim_applies(static: NetworkStatic, growth: str) -> bool:
+    """Whether add_conn claims through `triton_claim` (for a non-empty claim).
+
+    The fused claim needs jax_triton on an NVIDIA GPU and one device (it is not
+    validated inside shard_map), is specialised for a bounded column count,
+    and reads the dead masks as 32-bit words (capacities a multiple of 4);
+    anything else, or `growth="xla"`, takes the portable XLA claim.
+
+    Args:
+        static: The network's static configuration.
+        growth: The requested claim engine: "auto", "xla", or "triton".
+
+    Returns:
+        Whether the Triton claim runs.
+    """
+    return (
+        growth != "xla"
+        and static.sharding is None
+        and len(static.conn_fields) - 1 <= TRITON_CLAIM_MAX_FIELDS
+        and all(cap % 4 == 0 for cap in static.level_capacities)
+        and nvidia_triton_available()
+    )
+
+
 def triton_claim(
     buckets: list[Columns],
     claims: list[GrowthClaim],
@@ -2918,9 +3000,10 @@ def build_add_conn_phase[GS](
         static: static network configuration giving the arena shapes.
         overflow_sink: optional length-1 out-parameter overwritten with
             this call's computed overflow flag.
-        free_sink: optional per-bucket `(running free counts, block length)`
-            left by a fused forward (`build_fused_forward_prune_phase`) for
-            this step's dead masks, reused by the XLA claim in place of
+        free_sink: optional per-bucket `(free counts per block, block
+            length)` left by a fused forward (`build_fused_forward_prune_phase`)
+            for this step's dead masks: `triton_claim`'s `block_counts` when in
+            its 256-slot blocks, and regrouped for the XLA claim in place of
             `count_free_blocks`.
         growth: The free-slot claim engine: "auto", "xla", or "triton".
 
@@ -2992,18 +3075,7 @@ def build_add_conn_phase[GS](
     # and a small test network's pool can undercut a generous max_candidates.
     pool = num_proposals if use_propose else pool_side * pool_side
     k = max(0, min(ac.max_candidates, pool))
-    # The fused claim needs jax_triton on an NVIDIA GPU and one device (it is
-    # not validated inside shard_map), is specialised for a bounded column
-    # count, and reads the dead masks as 32-bit words (capacities a multiple
-    # of 4); anything else takes the portable XLA claim.
-    use_triton = (
-        growth != "xla"
-        and k > 0
-        and shard_axis is None
-        and len(static.conn_fields) - 1 <= TRITON_CLAIM_MAX_FIELDS
-        and all(cap % 4 == 0 for cap in static.level_capacities)
-        and nvidia_triton_available()
-    )
+    use_triton = k > 0 and triton_claim_applies(static, growth)
 
     # Every candidate grid is built inside the traced phase, never here: this
     # builder runs eagerly (outside jit), where a num_units^2 grid would be a
@@ -3235,7 +3307,18 @@ def build_add_conn_phase[GS](
         # slot, the rest overflow.
         new_conns: list[Columns]
         if use_triton:
-            new_conns, overflow, reassigning = triton_claim(list(state.conns), claims)
+            # A fused prune sweep's counts, when it made them in this claim's
+            # blocks (see build_phases); otherwise triton_claim counts.
+            fused_counts = None
+            if free_sink is not None and all(
+                entry is not None
+                and entry[1] == free_block_length(cap, TRITON_CLAIM_BLOCK)
+                for entry, cap in zip(free_sink, static.level_capacities, strict=True)
+            ):
+                fused_counts = [entry[0] for entry in free_sink]
+            new_conns, overflow, reassigning = triton_claim(
+                list(state.conns), claims, block_counts=fused_counts
+            )
         else:
             new_conns = []
             overflowed, resorting = [], []
@@ -3247,7 +3330,7 @@ def build_add_conn_phase[GS](
                     claim,
                     shard_axis=shard_axis,
                     num_shards=num_shards,
-                    free_blocks=(
+                    free_counts=(
                         free_sink[bucket_idx] if free_sink is not None else None
                     ),
                 )

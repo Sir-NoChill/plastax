@@ -157,6 +157,18 @@ Growth claim engine (2026-10-02, `perf/growth-kernel`):
   claim runs as three jax_triton kernels instead of about 50 XLA kernels
   (SCALE_PLAN iteration 13).
 
+Fused prune counts feed the Triton claim (2026-10-02, `perf/integration`):
+
+- phases (semi-internal): a fused forward's `free_sink` entries are now
+  `(per-block free counts, block length)`, not running counts, in the claim's
+  own blocks (`TRITON_CLAIM_BLOCK` = 256 slots when `triton_claim_applies`,
+  else 1024). `triton_claim` takes them as `block_counts`; `xla_claim` takes
+  them as `free_counts=` and regroups finer blocks exactly
+  (`regroup_free_counts`). `triton_forward_prune` and
+  `build_fused_forward_prune_phase` gain `count_block=`, `free_block_len` gains
+  `max_block=`. Slot choice is unchanged. Reason: the Triton claim otherwise
+  re-reads every dead mask to count it (SCALE_PLAN iteration 14).
+
 API / docstrings (2026-08-18, docstring sweep):
 
 - _types (types): `FieldSpec.f32`/`FieldSpec.i32` -> `FieldSpec.float32`/

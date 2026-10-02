@@ -911,6 +911,51 @@ the log below:
   shard_map), off NVIDIA, above 32 connection columns, and for a bucket
   capacity that is not a multiple of 4.
 
+### Iteration 14 (2026-10-02): prune fusion and the growth claim together
+
+- **Merge.** `make_step(fuse_prune=, growth=)` both key the step cache. The
+  streaming step builds its phases per trace with both, and the batched step
+  takes `growth` only. A fused kernel's free counts reach `xla_claim` as
+  `free_counts=`.
+- **Wiring.** The fused kernel counts free slots in the Triton claim's
+  256-slot blocks when `triton_claim_applies`, and `triton_claim` takes them
+  as `block_counts`. That removes its two 50 us recounts at E50M.
+  `xla_claim` regroups finer counts exactly (`regroup_free_counts`), so
+  either claim can read either block size.
+- **Measured** (synth-bench grid, k = 64). Kernels per step and GPU kernel
+  time are from nsys `--cuda-graph-trace=node`. Wall time is the median of
+  800 synced steps per mode, interleaved in one process in rounds of 40, over
+  three processes (wired tree: two-pass+xla is `fuse_prune="off",
+  growth="xla"`, and comb forces the 1024-slot counts). The conn digests
+  match across all five modes and match main 7ff7cc6.
+
+  | E50M_s0.999 | kernels | GPU ms/step | wall ms/step (3 runs) |
+  |---|---|---|---|
+  | main 7ff7cc6 | 61 | 2.543 | 2.89 / 3.12 / 3.26 (two-pass+xla) |
+  | fuse only | 60 | 1.886 | 2.14 / 2.39 / 2.54 |
+  | growth only | 19 | 2.478 | 2.80 / 3.04 / 3.18 |
+  | fuse + growth (merge) | 18 | 1.896 | 2.08 / 2.32 / 2.48 |
+  | wired | 16 | 1.811 | 2.07 / 2.31 / 2.47 |
+
+  | E5M_s0.999 | kernels | GPU ms/step | wall ms/step (3 runs) |
+  |---|---|---|---|
+  | main 7ff7cc6 | 61 | 0.317 | 0.452 / 0.458 / 0.484 (two-pass+xla) |
+  | fuse only | 60 | 0.323 | 0.474 / 0.489 / 0.491 |
+  | growth only | 18 | 0.246 | 0.397 / 0.420 / 0.427 |
+  | fuse + growth (merge) | 17 | 0.251 | 0.393 / 0.402 / 0.416 |
+  | wired | 15 | 0.242 | 0.387 / 0.396 / 0.413 |
+
+  - Absolute wall time drifts by about 0.4 ms between processes at E50M, and
+    separate per-mode processes (7 runs each) spread 0.5-0.9 ms. Only
+    interleaved runs order the modes reliably.
+  - Wiring saves 85 us of GPU time at E50M but only about 10 us of wall
+    time. The synced step runs 0.3-0.6 ms above its kernel time, so the
+    removed reductions mostly shorten an idle gap.
+  - At E5M the fused kernel is slower than the two-pass step (0.220 against
+    0.215 ms of forward + prune, and about 20 us of wall time) because a
+    2.8M-slot bucket is L2-resident (iteration 12). `fuse_prune="auto"`
+    still picks it there.
+
 ## Deviations
 
 - step/phases (2026-10-02, iteration 12): the prune slot of a fused streaming

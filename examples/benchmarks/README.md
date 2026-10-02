@@ -14,5 +14,6 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false                # shared GPU
 |---|---|
 | `churn_probe.py` | Per-phase cost of a churn step (forward, prune, add) on a three-layer synthetic net; `--json` appends a result line. |
 | `layouts_probe.py` | One sparse layer as COO `segment_sum`, BCOO, BCSR (cuSPARSE) and dense: forward at batch 1 and B, plus the CSR rebuild. |
+| `fused_prune_check.py` | The fused forward + prune Triton kernel (`make_step(fuse_prune=)`) against the two-pass step over churn steps, then both timed. |
 | `sort_probe.py` | Which sort formulation XLA lowers to a radix sort. |
 | `plot_step_300M.py` | Regenerates `docs/scale_plan/step_300M.png` for `SCALE_PLAN.md`. |

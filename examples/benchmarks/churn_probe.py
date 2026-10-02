@@ -184,6 +184,12 @@ def main() -> None:
     )
     ap.add_argument("--grow", choices=("grid", "propose"), default="grid")
     ap.add_argument("--dedupe", action="store_true", help="propose: exact dedupe")
+    ap.add_argument(
+        "--growth",
+        choices=("auto", "xla", "triton"),
+        default="auto",
+        help="add_conn claim engine (make_step's `growth`)",
+    )
     ap.add_argument("--json", help="append one JSON line of results here")
     args = ap.parse_args()
 
@@ -212,7 +218,7 @@ def main() -> None:
     state_gb = sum(a.nbytes for a in jax.tree.leaves(state0)) / 1e9
     print(
         f"width={args.width} edges={args.edges} k={args.k} m={args.m} "
-        f"grow={args.grow}{'+dedupe' if args.dedupe else ''} "
+        f"grow={args.grow}{'+dedupe' if args.dedupe else ''} growth={args.growth} "
         f"caps={static.level_capacities} state={state_gb:.2f} GB",
         flush=True,
     )
@@ -220,7 +226,7 @@ def main() -> None:
     inputs = px.StepInputs(inputs=x, targets=None)
 
     def run(net: type[px.Network[Globals]]) -> float:
-        step = px.make_step(net, static)
+        step = px.make_step(net, static, growth=args.growth)
         state = jax.tree.map(lambda a: a.copy(), state0)
         state = step(state, inputs).state  # compile + one warm step
         jax.block_until_ready(state)

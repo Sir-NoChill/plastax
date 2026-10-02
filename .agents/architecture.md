@@ -273,7 +273,9 @@ GPU, each bucket is one Triton kernel (`triton_forward_prune`): gather,
 relaxed atomic scatter-add, the predicate translated from its jaxpr by
 `_PredicateTranslator` (exact integer / compare / select ops only), the
 tombstones written in place, and the free-slot block counts that add_conn's
-claim then reuses (`free_sink`). XLA cannot do this in one pass (a scatter is
+claim then reuses (`free_sink`): in `TRITON_CLAIM_BLOCK` (256-slot) blocks
+straight into `triton_claim(block_counts=)` when the Triton claim runs
+(`triton_claim_applies`), else in 1024-slot blocks for `xla_claim`. XLA cannot do this in one pass (a scatter is
 never a multi-output fusion root), so `fuse_prune="auto"` keeps the two-pass
 step everywhere else; `"xla"` forces the XLA-lowered fused step (the CPU
 correctness reference, also valid under Scheme-A). Batched steps never fuse.

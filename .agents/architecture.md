@@ -237,7 +237,10 @@ the CSR layout addresses that for linear passes:
   same linear passes as one edge-once Triton kernel per bucket, called
   through `jax_triton` (the optional `plastax[triton]` extra; triton is
   imported lazily) -- each edge read once for the whole batch, relaxed
-  atomics into the targets, no sort. NVIDIA GPUs only
+  atomics into the targets, no sort. Dead slots are masked in the kernel
+  (a null target row serialises its atomics on one address), and the
+  backward (targets FROM_ID, in runs in a source-major bucket) sums each run
+  in a tile before one atomic for a padded batch of at most 8. NVIDIA GPUs only
   (`phases.nvidia_triton_available`); anywhere else, and under Scheme-A,
   "triton" runs `phases.xla_bucket_product`, the same edge-once product in
   plain XLA (how the CPU tests exercise the layout). It replaced a Pallas
@@ -245,7 +248,7 @@ the CSR layout addresses that for linear passes:
   backend cannot express a scatter-add into arbitrary rows (a low-level
   `inline_mgpu` prototype ran 1.03-1.6x slower than Triton, scale plan).
   `bucket_product(engine)` is the seam the layouts share with the level walks.
-- **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 32 (when jax_triton is
+- **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 64 (when jax_triton is
   installed) and CSR above; on every other backend (AMD GPU, TPU, CPU) the
   XLA edge-once product for B >= 2 (same speed as the per-sample edge list,
   about 2.6x smaller temporaries compiled for TPU); the edge list at B = 1

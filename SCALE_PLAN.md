@@ -956,6 +956,113 @@ the log below:
     2.8M-slot bucket is L2-resident (iteration 12). `fuse_prune="auto"`
     still picks it there.
 
+### Iteration 15 (2026-10-02): Triton batched-product diagnosis
+
+- **Question.** Why was `triton_bucket_product` about 3× slower than XLA's
+  gather + scatter-add at B = 1, and only just ahead of the per-sample edge
+  list at B = 2?
+- **Root cause: the null row, not the tile shape.**
+  - Dead slots were sent to an extra row `num_units`. Every one of their
+    atomics hits one L2 address and serialises.
+  - At 5.4M edges with 5 % dead slots, the kernel took 0.40 ms. The same
+    kernel with the dead slots masked took 0.15 ms.
+  - ncu showed the same red sector count both ways (5.4M against 5.1M), but
+    2.7× the time, lg_throttle stalls of 53k cycles per warp against 32k,
+    and DRAM at 27 % of peak against 83 %.
+  - The cost scales with the dead fraction: 1.5 ms (12.6×) at 20 % dead,
+    against 0.2 ms with none. Most of the time at 0 % dead is the wrapper's
+    `jnp.where` pass (60 µs) and the output slice copy.
+  - XLA does not pay it: its scatter issues only the live atomics (5.09M red
+    requests).
+  - plastax's default power-of-two capacity leaves up to half of each
+    bucket dead. With it, batched SGD on Triton was **3.69 ms per sample at
+    B = 2**, against 0.36 with `capacity_align=256`.
+- **What was ruled out.**
+  - *2-D tile layout:* a 1-D kernel and the 2-D `[BLOCK, B]` kernel time
+    the same at B = 1 (0.122 against 0.133 ms at 5.4M; 0.631 against 0.642
+    at 25M).
+  - *Coalescing:* with the `(num_units, B)` activation layout the lanes are
+    contiguous. The SASS has `LDG.E.128` for the x slab at B ≥ 8, and the
+    red sectors per edge are optimal, `ceil(4B / 32)`: 1 per edge up to
+    B = 8, 4 at B = 32.
+  - *Vectorised atomics:* not available on sm_89. Triton emits scalar
+    `RED.E.ADD.F32.FTZ.RN.STRONG.GPU`, 16 per thread at every B, and each
+    warp instruction covers `32 / B` edges × B lanes.
+  - *Tile and warps:* 1024-4096 slots and 2-8 warps are within about 7 %
+    of each other at every B.
+- **The second cause: backward runs.**
+  - Buckets are source-major, so the backward's targets (FROM_ID) arrive in
+    runs of one source's fan-out (about 110 edges at 5.4M). Each run
+    serialises the same way.
+  - Before the fix the backward was 0.274 ms against 0.133 for the forward
+    at B = 1.
+- **Fix** (`perf(phases)`).
+  - The kernel loads `DEAD` (bool, as is) and masks. There is no null row,
+    no `where` pass, and no slice when B is a power of two.
+  - For `rows = FROM_ID` and a padded batch of at most 8
+    (`_TRITON_SEGMENT_MAX_WIDTH`), each run in a tile is summed with a
+    segmented `tl.associative_scan`. Only the run's last edge adds, with one
+    atomic.
+  - Above 8 the scan costs more than it saves: 0.80 against 0.65 ms at
+    B = 32.
+  - Results match XLA to 6e-7 relative, and the GPU edge-list step to 6e-8
+    in the weights. The 316 fast tests pass.
+- **Kernel time** (ms, 5 % dead, median of 7 × 50 calls; clocks not locked):
+
+  | E | dir | B = 1 | 2 | 4 | 8 | 16 | 32 |
+  |---|---|---|---|---|---|---|---|
+  | 5.4M | fwd before | 0.448 | 0.498 | 0.472 | 0.465 | 0.661 | 1.058 |
+  | 5.4M | fwd after | 0.134 | 0.174 | 0.167 | 0.166 | 0.258 | 0.458 |
+  | 5.4M | fwd XLA | 0.118 | 0.204 | 0.399 | 0.604 | 0.913 | 1.558 |
+  | 5.4M | bwd before | 0.462 | 0.519 | 0.522 | 0.524 | 0.718 | 1.112 |
+  | 5.4M | bwd after | 0.130 | 0.122 | 0.130 | 0.242 | 0.403 | 0.652 |
+  | 5.4M | bwd XLA | 0.319 | 0.436 | 0.616 | 1.088 | 1.571 | 2.558 |
+  | 25M | fwd before | 2.149 | 2.210 | 2.229 | 2.263 | 3.211 | 5.331 |
+  | 25M | fwd after | 0.652 | 0.760 | 0.767 | 0.801 | 1.195 | 3.157 |
+  | 25M | fwd XLA | 0.634 | 0.965 | 1.822 | 2.781 | 4.223 | 7.307 |
+  | 25M | bwd after | 0.704 | 0.667 | 0.673 | 1.119 | 1.829 | 2.971 |
+  | 25M | bwd XLA | 1.579 | 2.088 | 2.984 | 4.558 | 6.410 | 10.478 |
+
+  The 5.4M rows use 49,152 units; the 25M rows use 316,228.
+- **What bounds it now.**
+  - *B = 1 forward:* DRAM. It moves 13 B per slot (76 MB at 5.4M) at 83 %
+    of peak, against 96 % for XLA. Occupancy is the difference: 88
+    registers × 128 threads gives 39 %, against 93 % for XLA. Triton is
+    0.88× XLA at 5.4M and 0.97× at 25M.
+  - *B = 32:* L2. At 98 % of L2 throughput, 88 % of the L2 sectors are
+    reds (20.5M), and the x gather hits L1 87 % of the time.
+- **Batched SGD** (5.4M, ms per sample, `batched_perf`):
+
+  | layout | capacity | B = 2 | 8 | 32 | 64 | 128 | 256 |
+  |---|---|---|---|---|---|---|---|
+  | triton before | align 256 | 0.359 | 0.139 | 0.090 | | 0.078 | |
+  | triton after | align 256 | 0.257 | 0.117 | 0.085 | 0.081 | 0.077 | 0.078 |
+  | CSR | align 256 | 1.196 | 0.354 | 0.126 | 0.087 | 0.074 | 0.071 |
+  | edge list | align 256 | 0.429 | 0.345 | 0.294 | | 0.256 | |
+  | triton before | pow2 | 3.690 | 0.922 | 0.410 | | 0.241 | |
+  | triton after | pow2 | 0.359 | 0.171 | 0.105 | 0.095 | 0.092 | 0.089 |
+  | CSR | pow2 | 2.878 | 0.752 | 0.235 | 0.156 | 0.112 | 0.095 |
+  | edge list | pow2 | 0.454 | 0.354 | 0.280 | | 0.267 | |
+
+  At 50M (align 256), Triton against CSR: 2.180 / 1.947 / 1.934 / 2.175
+  against 7.629 / 3.169 / 2.445 / 2.162 at B = 8 / 32 / 64 / 128.
+- **"auto" re-tuned** (`perf(step)`): Triton for 2 ≤ B ≤ 64 (previously
+  32), and CSR above. CSR is 4 % ahead at 128 with tight capacity, ties at
+  50M, and is 18 % behind with power-of-two capacity.
+- **B = 1 Triton forward is viable, but not faster.** It runs at 0.88-0.97×
+  XLA, so streaming "auto" stays on XLA.
+  - The B = 1 **backward** is 2.2-2.5× faster than XLA's `segment_sum`
+    (which also serialises on the runs). A Triton streaming backward for a
+    linear backward pass would pay off.
+- **Open.**
+  - CSR has the same null-row problem: `bucket_csr` puts the dead slots in
+    row `num_units`, one cuSPARSE row with up to half the bucket. That is
+    likely why CSR is 2× slower with power-of-two capacity.
+  - The streaming edge list's `segment_sum` backward could pre-reduce the
+    runs too.
+  - At B ≥ 32 the forward is bound by L2 red throughput. Only fewer atomics
+    help: destination-blocked tiles, or `red.v4` on sm_90+.
+
 ## Deviations
 
 - step/phases (2026-10-02, iteration 12): the prune slot of a fused streaming

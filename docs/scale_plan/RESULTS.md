@@ -37,8 +37,8 @@ numbers come from plastix-synth-bench (`REEVAL_RESULTS.md`) and from
   The arithmetic is the same: fp32 weights and int32 ids.
 - **It started 11× behind:** 144 ms at 300M before this branch, against
   13.7 ms now on the light-churn probe.
-- **Batched training:** `layout="auto"` picks a Pallas edge-once kernel for
-  2 ≤ B ≤ 32 and CSR + cuSPARSE above. At 5.4M edges that is up to 3.3× per
+- **Batched training:** `layout="auto"` picks a Triton edge-once kernel for
+  2 ≤ B ≤ 64 and CSR + cuSPARSE above. At 5.4M edges that is up to 3.3× per
   sample over the per-sample edge list.
 - **DEEP R on the real MultiMNIST stream runs at 286M edges** (4.4M hidden
   units) in 7.3 GB, against 29.4 GB for C++. It is 1.7× behind C++ in place
@@ -81,9 +81,10 @@ These are SGD steps (forward, loss, backward, update) on a 3-layer net with
 
 - **Edge list.** The per-sample vmap touches every edge once per sample, so
   batching barely helps: 0.54 → 0.25 ms per sample from B = 1 to 128.
-- **Pallas.** Each edge is read once for the whole batch. It is best for
-  2 ≤ B ≤ 32: 2.4× the edge list at B = 8. Past B = 64 the E·B atomics
-  dominate.
+- **Triton** (Pallas in the figure, since replaced by a jax_triton kernel).
+  Each edge is read once for the whole batch. It is best for 2 ≤ B ≤ 64:
+  2.9× the edge list at B = 8 (0.117 ms per sample). From B = 32 the E·B
+  atomics bound it (L2 at 98 % of peak), and CSR is 4 % ahead at 128.
 - **CSR.** It rebuilds the view on device every step (one radix sort) and
   multiplies with cuSPARSE. It is best above 32: 3.3× at B = 128. At 50M edges
   the per-step sort makes Pallas the better choice even at B = 32 (2.35

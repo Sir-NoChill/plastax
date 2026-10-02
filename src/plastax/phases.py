@@ -477,8 +477,18 @@ def bucket_csr(
 
 # Elements (edges x batch lanes) per Triton program: the edge block shrinks as
 # the batch widens so a program's tile stays this size (a 512-edge block at
-# B = 32 spilled and ran 25x slower).
+# B = 32 spilled and ran 25x slower). 1024-4096 and 2-8 warps time within
+# ~7 % of each other at 5.4M edges (SCALE_PLAN.md "Triton batched-product
+# diagnosis").
 _TRITON_TILE = 2048
+
+# Widest padded batch at which the backward product pre-reduces each run of
+# equal targets inside a tile before its atomic. Buckets are source-major, so
+# the backward's targets (FROM_ID) come in runs of one source's fan-out, and
+# unreduced they serialise on one address: at 5.4M edges the pre-reduction
+# makes the backward 2.2x faster at B = 1 and 2, 1.2x at 8, and 1.3x slower
+# at 32, where the in-tile scan costs more than the contention.
+_TRITON_SEGMENT_MAX_WIDTH = 8
 
 
 @functools.cache
@@ -515,30 +525,58 @@ def _triton_edge_kernel() -> Any:
 
     # Triton kernel arguments are pointers and constexprs, which carry no
     # Python annotations the type checkers understand.
+    @triton.jit
+    def segment_add(f1, v1, f2, v2):  # type: ignore[no-untyped-def]  # noqa: ANN001, ANN202
+        # Segmented sum over (run-head flag, value): associative for any flags.
+        return f1 | f2, tl.where(f2 != 0, v2, v1 + v2)
+
     @triton.jit  # type: ignore[untyped-decorator]
     def edge_product(  # type: ignore[no-untyped-def]  # noqa: ANN202
         tgt_ptr,  # noqa: ANN001
         src_ptr,  # noqa: ANN001
         w_ptr,  # noqa: ANN001
+        dead_ptr,  # noqa: ANN001
         x_ptr,  # noqa: ANN001
         out_ptr,  # noqa: ANN001
         n_edges,  # noqa: ANN001
         WIDTH: tl.constexpr,
         BLOCK: tl.constexpr,
+        SEGMENTED: tl.constexpr,
     ):
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        start = tl.program_id(0) * BLOCK
+        offs = start + tl.arange(0, BLOCK)
         m = offs < n_edges
+        # Dead slots are masked here rather than sent to a null row: every
+        # such atomic hits one address and serialises (3.9x slower at 5 %
+        # dead slots, 13x at 20 %).
+        live = m & (tl.load(dead_ptr + offs, mask=m, other=1) == 0)
         t = tl.load(tgt_ptr + offs, mask=m, other=0)
         s = tl.load(src_ptr + offs, mask=m, other=0)
         w = tl.load(w_ptr + offs, mask=m, other=0.0)
         lanes = tl.arange(0, WIDTH)
         xv = tl.load(
-            x_ptr + s[:, None] * WIDTH + lanes[None, :], mask=m[:, None], other=0.0
+            x_ptr + s[:, None] * WIDTH + lanes[None, :],
+            mask=live[:, None],
+            other=0.0,
         )
+        v = tl.where(live[:, None], w[:, None] * xv, 0.0)
+        if SEGMENTED:
+            # One atomic per run of equal targets in the tile, at its last
+            # edge, carrying the run's sum.
+            nxt = offs + 1
+            t_prev = tl.load(tgt_ptr + offs - 1, mask=m & (offs > start), other=-1)
+            t_next = tl.load(
+                tgt_ptr + nxt, mask=(nxt < n_edges) & (nxt < start + BLOCK), other=-1
+            )
+            head = tl.broadcast_to((t != t_prev).to(tl.int32)[:, None], v.shape)
+            _, v = tl.associative_scan((head, v), 0, segment_add)
+            keep = m & (t != t_next)
+        else:
+            keep = live
         tl.atomic_add(
             out_ptr + t[:, None] * WIDTH + lanes[None, :],
-            w[:, None] * xv,
-            mask=m[:, None],
+            v,
+            mask=keep[:, None],
             sem="relaxed",
         )
 
@@ -556,11 +594,15 @@ def triton_bucket_product(
     """`bucket_csr(...) @ x` as one edge-once Triton kernel (NVIDIA GPUs).
 
     Each program loads a block of edges, gathers its `(block, batch)` slab of
-    x once, and adds `weight * slab` into the target rows with relaxed atomics:
-    no sort, every edge read once for the whole batch. Dead edges target an
-    extra null row that is sliced off; the batch is padded to a power of two
-    (a Triton tile constraint). Called through `jax_triton` -- the Pallas
-    Triton lowering this replaces is deprecated in jax.
+    x once (the batch lanes contiguous, so a lane group is one coalesced
+    access), and adds `weight * slab` into the target rows with relaxed
+    atomics: no sort, every edge read once for the whole batch. Dead edges are
+    masked in the kernel. With `rows` = FROM_ID (the backward; buckets are
+    source-major, so its targets come in runs) and a batch of at most
+    `_TRITON_SEGMENT_MAX_WIDTH`, each run in a tile is summed before one
+    atomic. The batch is padded to a power of two (a Triton tile constraint).
+    Called through `jax_triton` -- the Pallas Triton lowering this replaces is
+    deprecated in jax.
 
     Args:
         bucket: The bucket's columns.
@@ -578,22 +620,25 @@ def triton_bucket_product(
     batch = x.shape[1]
     width = 1 << max(batch - 1, 0).bit_length()
     block = max(16, _TRITON_TILE // width)
-    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
     x_pad = x if width == batch else jnp.pad(x, ((0, 0), (0, width - batch)))
     out = jax_triton.triton_call(
-        target.astype(jnp.int32),
+        bucket[rows.name].astype(jnp.int32),
         bucket[cols.name].astype(jnp.int32),
         bucket[WEIGHT.name].astype(jnp.float32),
+        # A bool buffer goes in as-is (one byte per slot): a cast would be a
+        # separate XLA pass over the bucket.
+        bucket[DEAD.name],
         x_pad.astype(jnp.float32),
         kernel=_triton_edge_kernel(),
-        out_shape=jax.ShapeDtypeStruct((num_units + 1, width), jnp.float32),  # type: ignore[no-untyped-call]
+        out_shape=jax.ShapeDtypeStruct((num_units, width), jnp.float32),  # type: ignore[no-untyped-call]
         grid=(-(-cap // block),),
         zeroed_outputs=(0,),
         n_edges=cap,
         WIDTH=width,
         BLOCK=block,
+        SEGMENTED=(rows.name == FROM_ID.name and width <= _TRITON_SEGMENT_MAX_WIDTH),
     )
-    product: Float[Array, "num_units batch"] = out[:num_units, :batch]
+    product: Float[Array, "num_units batch"] = out if width == batch else out[:, :batch]
     return product
 
 

@@ -4,7 +4,7 @@ Run over the change before the role passes. Each item is a question; a "no" or
 "unsure" is a candidate finding. This is the generic maintainability checklist
 plus the plastax-specific contracts the deterministic hooks cannot check. The
 project's own docs win over any generic default here: `.agents/invariants.md`,
-`.agents/architecture.md`, `AGENTS.md`, `TOOLING.md`.
+`.agents/architecture.md`, `AGENTS.md`, `docs/development/tooling.md`.
 
 ## Invariants (the plastax core — check every `src/plastax/` change)
 
@@ -30,8 +30,8 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
   read, or instance state beyond hyperparameters is a break. Are `UnitWrite`/
   `ConnWrite` still *not* pytree-registered? (invariant #6)
 - **Type discipline:** does the change keep `FieldSpec[DT]` generics intact end
-  to end, and would `mypy --strict` pass? Any new `ty`-ignore recorded in
-  IMPLEMENTATION_PLAN.md Deviations? (invariant #7)
+  to end, and would `mypy --strict` pass? Any new `ty`-ignore explained in
+  a comment? (invariant #7)
 - **v1 scope:** does the change implement (even partially) something out of
   scope — AddUnit/PruneUnit, generic `Monoid(op, identity)` lowering, `jax.Ref`
   arenas, hijax, MLIR, densification? Do the `Monoid` methods still raise
@@ -101,5 +101,5 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
   into a policy or numerics into the driver?
 - Over-engineering: any abstraction/indirection the change doesn't need?
 - Leftover experiment code, dead branches, commented-out blocks?
-- Commit hygiene: does the change fit **one** `SCOPES.md` scope? A multi-scope
+- Commit hygiene: does the change fit **one** `docs/development/scopes.md` scope? A multi-scope
   diff is a signal to split the commit.

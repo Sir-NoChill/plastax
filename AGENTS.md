@@ -5,9 +5,8 @@ first, then load the reference docs and skills it points to **before** you
 write code. Everything here is binding: a rule in this file beats the style of
 the surrounding code.
 
-> This file is agent-agnostic (the `AGENTS.md` convention). Claude Code also
-> reads the user's global `CLAUDE.md`; nothing here overrides the safety rules
-> in the system prompt.
+> This file is agent-agnostic (the `AGENTS.md` convention). Nothing here
+> overrides the safety rules in your agent's system prompt.
 
 ---
 
@@ -22,7 +21,7 @@ fields, and propagation model. At **trace time** the library assembles and
 `jax.jit`-specializes the corresponding step function; the step donates the
 whole state pytree and runs in place.
 
-The central claim (see `SPARSE_PLAN.md`): mask-based dynamic sparse training
+The central claim: mask-based dynamic sparse training
 (SET, RigL) keeps weights, gradients, **and optimizer state** dense at
 `O(N²)`; plastax runs the *same algorithms* on a live-edge arena at `O(E)`.
 Static dense-matmul parity is an explicit **non-goal** — explicit edges are the
@@ -76,7 +75,7 @@ These are design decisions already made. Violating one is a failed change
 ## Module map
 
 `src/plastax/` — each module's commit **scope** is in parentheses (see
-`SCOPES.md`). Detailed per-module contracts: [`.agents/architecture.md`](.agents/architecture.md).
+`docs/development/scopes.md`). Detailed per-module contracts: [`.agents/architecture.md`](.agents/architecture.md).
 
 | Module | Scope | Responsibility |
 |---|---|---|
@@ -92,12 +91,12 @@ These are design decisions already made. Violating one is a failed change
 | `builder.py` | `builder` | Host-side eager construction: `NetworkBuilder` (`add_unit`/`add_conn`/`finalize`/`from_topology`/`from_edges`). `from_edges` is the vectorized whole-array path (no per-edge Python); `from_topology` and `finalize` route through its shared `_assemble` core. |
 | `driver.py` | `driver` | Host control loop: retrace/overflow/resort protocol around one jitted step. |
 | `topology.py` | `topology` | Host-side topology DSL: `dense`, `conv2d` (unrolled per-edge), `input_units`, `sequential`, `Block`/`EdgeSet`/`Topology`. |
-| `shard.py` | `shard`* | Scheme-B band-partition math (`balanced_level_cut`). Pure numpy. (*commit under `topo`/`step` per SCOPES.md — `shard` has no dedicated scope; ask if unsure.) |
+| `shard.py` | `shard`* | Scheme-B band-partition math (`balanced_level_cut`). Pure numpy. (*commit under `topo`/`step` per `docs/development/scopes.md` — `shard` has no dedicated scope; ask if unsure.) |
 | `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = an `UpdateConn` policy + per-connection `state_fields` (`opt/…` columns). |
 
 **Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (40
 names). Breaking any of them is a `type(scope)!:` change with a
-`BREAKING CHANGE:` footer and an IMPLEMENTATION_PLAN.md Deviations entry.
+`BREAKING CHANGE:` footer and a changelog entry (`docs/changelog.md`).
 Names reachable only via submodule import (`plastax.topo.*`, `plastax.shard.*`,
 `plastax.state.live_conn_count`, `plastax.phases.build_phases`) are
 semi-internal but tests reach into them — renaming still has blast radius.
@@ -118,10 +117,10 @@ semi-internal but tests reach into them — renaming still has blast radius.
 4. **Add tests** in `tests/test_<topic>.py` with the right oracle tolerance and
    markers (see [`.agents/architecture.md`](.agents/architecture.md) §Testing).
    If the code broke, the test must fail.
-5. **Update docs** that the change touches (`docs/`, README, the plan docs).
+5. **Update docs** that the change touches (`docs/`, README, `.agents/`).
    Docs-in-sync is a review condition.
 6. **Review** with the **`plastax-review`** skill before committing.
-7. **Commit** under the agent-commit protocol (below). Let the hooks run.
+7. **Commit** under the commit protocol (below). Let the hooks run.
 
 ---
 
@@ -133,36 +132,30 @@ semi-internal but tests reach into them — renaming still has blast radius.
   `Attributes:`; PEP 695 type params in `Type Args:`. `__init__` docstrings are
   intentionally omitted (documented on the class; `D107` ignored, `DOC301`
   enforced). Tests and examples are exempt.
-  > **Direction note:** the maintainer is considering migrating to Doxygen-style
-  > docblocks as a single source of truth for generated docs (`prompt.md`).
-  > Until that migration lands and the hooks change, **write Google-style** — do
-  > not pre-emptively introduce Doxygen `@brief`/`@param` syntax; it will fail
-  > pydoclint today.
 - **Lint/format: ruff** (`E/F/I/UP/B/ANN/D`), autofix + `ruff-format`. `F722`
   is disabled repo-wide — do not add `# noqa: F722` on jaxtyping string
   annotations.
 - **Types: `ty` (fast, pre-commit) + `mypy --strict` (authoritative, CI /
   pre-push).** If `ty` false-positives on a load-bearing jaxtyping annotation,
-  silence it with a rule-scoped ignore and record it in IMPLEMENTATION_PLAN.md
-  Deviations — never weaken the mypy gate.
-- Full toolchain reference: `TOOLING.md`.
+  silence it with a rule-scoped ignore and explain why in a comment —
+  never weaken the mypy gate.
+- Full toolchain reference: `docs/development/tooling.md`.
 
 ---
 
 ## Commit & hook protocol (mandatory)
 
 - **Every commit is `type(scope): subject`** with a **mandatory scope**, one
-  scope per commit. `type` ∈ `TAGS.md`, `scope` ∈ `SCOPES.md`. A diff spanning
+  scope per commit. `type` ∈ `docs/development/tags.md`, `scope` ∈ `docs/development/scopes.md`. A diff spanning
   many scopes is a signal to split the commit.
-- Commit via the global **`git agent-commit`** wrapper (invoke the
-  **`agent-commit`** skill; there is no repo-local commit wrapper). Breaking
-  public-API changes use `type(scope)!:` + `BREAKING CHANGE:` footer + a
-  Deviations entry in the same commit.
+- Commit under your own configured identity (the repo ships no commit
+  wrapper). Breaking public-API changes use `type(scope)!:` +
+  `BREAKING CHANGE:` footer + a changelog entry in the same commit.
 - **The hooks are the gate. Never use `--no-verify`.**
   - **pre-commit:** trailing-whitespace/EOF/toml/merge-conflict, ruff (autofix),
     ruff-format, pydoclint, `ty check`.
   - **commit-msg:** `scripts/check-commit-msg.sh` enforces the type(scope)
-    grammar against TAGS.md/SCOPES.md (single source of truth).
+    grammar against `docs/development/tags.md`/`scopes.md` (single source of truth).
   - **pre-push:** `mypy --strict src`, then `pytest -m "not slow"`.
 - Install (once): `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push`.
 
@@ -170,7 +163,7 @@ semi-internal but tests reach into them — renaming still has blast radius.
 
 ## Environment
 
-All commands from `plastax/`. Interpreter pinned to 3.13 (`.python-version`);
+All commands from the repository root. Interpreter pinned to 3.13 (`.python-version`);
 `requires-python >= 3.12`.
 
 ```bash
@@ -209,8 +202,5 @@ Reference docs (agent-facing, deeper than this file):
   rest of the vocabulary.
 - [`.agents/README.md`](.agents/README.md) — index of the above.
 
-Planning/spec docs (human-facing, authoritative on scope and history):
-`IMPLEMENTATION_PLAN.md` (v1 core), `SPARSE_PLAN.md` (dynamic sparse training),
-`ECOSYSTEM_ROADMAP.md` (optim/heuristics/tools tracks), `DISTRIBUTION_PLAN.md`
-(packaging), `SCALE_PLAN.md` (in-place churn, layouts), `TPU_PLAN.md`,
-`BATCHING_PLAN.md`, `SCALING_PLAN.md` (step-time and memory laws), `TOOLING.md`, `TAGS.md`, `SCOPES.md`.
+Human-facing contributor docs: `docs/development/` (tooling, commit tags and
+scopes, releasing), published with the Read the Docs site.

@@ -1,4 +1,4 @@
-"""Donation contract (M5).
+"""Donation contract.
 
 make_step jits with donate_argnums=0 (step.py), so the returned step
 function claims ownership of the whole state pytree: XLA is free to reuse

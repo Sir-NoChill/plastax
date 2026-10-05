@@ -1,7 +1,7 @@
-"""AddConn (M4a).
+"""AddConn.
 
 K-bounded candidates, top_k selection, prefix-sum slot claim, overflow flag,
-and level-preserving adds do not set needs_resort (rung0 design section 5).
+and level-preserving adds do not set needs_resort.
 
 Shared network: unit 0 (ANCHOR) and unit 1 (SRC) both sit at level 0; units
 2..6 (DST) sit at level 1, each already wired from ANCHOR with a DISTINCT
@@ -200,14 +200,13 @@ def test_level_preserving_add_does_not_set_needs_resort() -> None:
     phase = phases.build_add_conn_phase(_AddConnNet, static)
     new_state, _ = phase(state, _DUMMY_INPUTS)
 
-    # M4b Deviation (IMPLEMENTATION_PLAN.md): the window is no longer
-    # restricted to dst-strictly-ahead-of-src (phases.py's
-    # build_add_conn_phase docstring), so a same-level or behind-src
-    # candidate CAN now be proposed and scored -- but _SRC_BONUS makes
+    # The window is not restricted to dst-strictly-ahead-of-src
+    # (phases.py's build_add_conn_phase docstring), so a same-level or
+    # behind-src candidate CAN be proposed and scored -- but _SRC_BONUS makes
     # every (SRC, dst in _DST) candidate outscore every such candidate here
     # (see the module docstring), so the top-3 actually COMMITTED are still
     # exactly the level-preserving (SRC, 2/3/4) edges and needs_resort
-    # stays False, same outcome as M4a for a different reason.
+    # stays False.
     assert bool(new_state.needs_resort) is False
 
 
@@ -219,7 +218,7 @@ def test_overflow_flag_set_and_excess_candidates_dropped_not_miswritten() -> Non
     # anchor edges, so only the highest-scored of the 3 top-k'd candidates
     # can actually claim a slot -- this needs a hand-truncated (static,
     # state) since NetworkBuilder.finalize's capacity_policy always leaves
-    # >= 64 slots per bucket (M1: min_bucket=64).
+    # >= 64 slots per bucket (min_bucket=64).
     truncated = {name: col[:6] for name, col in state.conns[0].items()}
     small_static = dataclasses.replace(static, level_capacities=(6,))
     small_state = dataclasses.replace(state, conns=(truncated,))
@@ -292,7 +291,7 @@ def test_added_edge_participates_in_the_next_forward_sweep() -> None:
 
 
 def test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort() -> None:
-    """PIPELINE's level_capacities is a 1-tuple (rung0 design section 3):
+    """PIPELINE's level_capacities is a 1-tuple:
     every accepted candidate, regardless of its source unit's level, must
     land in that one flat bucket. The level WINDOW itself is still
     consulted (native's AddConnections has no Pipeline/Topological
@@ -302,11 +301,9 @@ def test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort() -> None
     needs_resort stays False here for the SAME reason as the TOPOLOGICAL
     test above (_SRC_BONUS keeps the actually-committed top-3 confined to
     the level-preserving (SRC, dst) edges), not because PIPELINE mode
-    structurally forbids it (M4b Deviation, IMPLEMENTATION_PLAN.md,
-    phases.py's build_add_conn_phase docstring: design section 5's "in
-    pipeline mode adds never resort at all" described a consequence of
-    M4a's narrower window, not a carve-out in the reassignment formula,
-    which never distinguished propagation mode).
+    structurally forbids it (phases.py's build_add_conn_phase docstring:
+    the level-reassignment formula does not distinguish propagation
+    mode).
     """
     static, state = _build_net(_PipelineAddConnNet)
     assert len(static.level_capacities) == 1

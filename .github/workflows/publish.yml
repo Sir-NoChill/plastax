@@ -1,4 +1,4 @@
-# Tag-driven publishing via PyPI trusted publishing (OIDC); see RELEASING.md.
+# Tag-driven publishing via PyPI trusted publishing (OIDC); see docs/development/releasing.md.
 # The PyPI trusted publisher is registered against THIS filename (publish.yml)
 # and the `pypi` environment -- renaming either breaks authentication.
 name: Publish
@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          fetch-depth: 0 # hatch-vcs derives the version from tag history (P1.2)
+          fetch-depth: 0 # hatch-vcs derives the version from tag history
       - uses: astral-sh/setup-uv@v7
       - run: uv build
       - run: uvx twine check dist/*
@@ -41,7 +41,7 @@ jobs:
         with:
           name: dist
           path: dist
-      # P2.1: install from the wheel alone, smoke-test outside the repo dir
+      # Install from the wheel alone, smoke-test outside the repo dir
       # so accidental reliance on repo files is caught.
       - run: |
           python -m venv "$RUNNER_TEMP/venv"
@@ -67,8 +67,8 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
 
   # rc tags (v0.1.0rc1) go to TestPyPI. Requires a TestPyPI trusted publisher
-  # registered for publish.yml + environment `testpypi` (pending, HUMAN --
-  # DISTRIBUTION_PLAN.md P4.3).
+  # registered for publish.yml + environment `testpypi` (see
+  # docs/development/releasing.md).
   publish-testpypi:
     if: ${{ contains(github.ref_name, 'rc') }}
     needs: verify

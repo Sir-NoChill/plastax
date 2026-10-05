@@ -1,7 +1,7 @@
-"""Builder -> finalize invariants (M1).
+"""Builder -> finalize invariants.
 
 Levels correct; buckets sorted by (dead, from_id, to_id); capacities obey
-capacity_policy. Implemented when M1 lands.
+capacity_policy.
 """
 
 from __future__ import annotations

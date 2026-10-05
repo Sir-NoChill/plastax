@@ -1,4 +1,4 @@
-"""Pipeline forward sweep (M2).
+"""Pipeline forward sweep.
 
 Flat sweep vs numpy reference; one-hop latency semantics
 (dispatch_cpu.hpp:202-223); dead-slot null-scatter.
@@ -144,7 +144,7 @@ def test_forward_pipeline_matches_numpy_reference_and_one_hop_latency() -> None:
 
 def test_forward_pipeline_dead_slot_null_scatter_matches_exactly_live() -> None:
     """A conn bucket with extra dead/headroom slots must give the identical
-    result to one with only the exactly-live slots (rung0 design section 3
+    result to one with only the exactly-live slots (the
     null-slot trick): grow one build's bucket well past what
     capacity_policy gave it by construction, run both, compare."""
     static_a, state_a = _build()

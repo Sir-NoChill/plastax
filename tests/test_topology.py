@@ -1,9 +1,9 @@
-"""Topology generators (M1).
+"""Topology generators.
 
 dense edge count = n_in*n_out; conv2d edge enumeration matches
 lax.conv_general_dilated shape semantics (positions, receptive fields,
 stride); initializer statistics sane; sequential id offsetting; from_topology
-equals the equivalent manual builder calls. Implemented when M1 lands.
+equals the equivalent manual builder calls.
 """
 
 from __future__ import annotations

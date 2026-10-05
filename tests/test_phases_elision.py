@@ -1,4 +1,4 @@
-"""Phase elision (M2).
+"""Phase elision.
 
 Absent phases produce identical jaxprs to a hand-assembled subset (compare
 jax.make_jaxpr output structure). build_phases is a Python-level `if
@@ -197,8 +197,7 @@ def test_loss_phase_runs_end_to_end_through_make_step_with_donation() -> None:
     donation path (they trace build_phases' output directly); the forward
     pipeline tests exercise that path but never with a loss phase present.
     Close the gap: run a loss net through make_step for real and check the
-    reduced scalar this milestone's loss-target Deviation lands in
-    StepResult.loss."""
+    reduced loss scalar lands in StepResult.loss."""
     static, state = _build(_ForwardLossNet)
     step = px.make_step(_ForwardLossNet, static)
     # Phases run forward-then-loss (build_phases order), so loss reads

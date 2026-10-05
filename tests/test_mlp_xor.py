@@ -1,5 +1,5 @@
-"""XOR training acceptance test (M3 milestone, IMPLEMENTATION_PLAN.md: "the
-mlp_xor example trains XOR to convergence"). End to end through
+"""XOR training acceptance test: the mlp_xor example trains XOR to
+convergence. End to end through
 build_phases/make_step -- forward, loss, backward, update_conn all wired
 together via a real gradient-descent training loop, not a hand-fed
 reference. The example is now optimizer-parameterized; the fast tests pin the
@@ -97,11 +97,10 @@ def test_xor_training_is_deterministic_for_a_fixed_seed() -> None:
 
 
 def test_xor_net_uses_topological_propagation_with_two_hidden_levels() -> None:
-    """Sanity check on the topology itself (task: "2 inputs -> hidden -> 1
-    output"): 3 input-slot units (x1, x2, bias) at level 0, hidden at level
-    1, output at level 2 -- 2 buckets, matching the M3 topological
-    level-walk this milestone's acceptance is meant to exercise (not the
-    pipeline degenerate case)."""
+    """Sanity check on the topology itself (2 inputs -> hidden -> 1
+    output): 3 input-slot units (x1, x2, bias) at level 0, hidden at level
+    1, output at level 2 -- 2 buckets, so the test exercises the
+    topological level-walk (not the pipeline degenerate case)."""
     _, static, _ = mlp_xor.build_net(_sgd(), jax.random.PRNGKey(mlp_xor.SEED))
     assert static.propagation is px.Propagation.TOPOLOGICAL
     assert len(static.level_capacities) == 2

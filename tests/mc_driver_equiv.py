@@ -3,7 +3,7 @@
 sharding_driver_equiv.py pins these under single-controller shard_map, where one
 process owns every device. This is the true multi-controller case: N genuinely
 separate processes launched via jax.distributed (gloo on CPU), one device each --
-the local stand-in for a one-process-per-node Narval run.
+the local stand-in for a one-process-per-node multi-node run.
 
 It shows the "multi-controller resort/overflow unhandled" gap is closed. Once
 `distribute_state` makes the state a global jax.Array, the Driver's eager

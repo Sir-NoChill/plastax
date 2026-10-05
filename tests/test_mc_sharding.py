@@ -2,7 +2,7 @@
 
 The real check lives in `mc_sharding_equiv.py`, which launches N separate
 processes via `jax.distributed` (gloo on CPU), one device each -- the local
-stand-in for a one-process-per-node Narval run. It runs here as a subprocess for
+stand-in for a one-process-per-node multi-node run. It runs here as a subprocess for
 two reasons, both matching the other sharding tests: shard_map is incompatible
 with pytest's jaxtyping instrumentation, and the launcher needs each worker to
 own exactly one device (its own JAX backend), which a re-exec gives cleanly.

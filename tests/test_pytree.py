@@ -1,8 +1,7 @@
-"""Pytree contract for NetworkState / NetworkStatic (M1).
+"""Pytree contract for NetworkState / NetworkStatic.
 
 NetworkState flatten/unflatten roundtrip; NetworkStatic meta fields hash/eq;
 changing a meta field changes the PyTreeDef; changing a leaf does not.
-Implemented when M1 lands (see tests/README.md, IMPLEMENTATION_PLAN.md).
 """
 
 from __future__ import annotations
@@ -135,11 +134,11 @@ def test_changing_a_leaf_does_not_change_the_pytreedef() -> None:
 
 
 def test_networkstatic_value_equality_drives_cache_reuse() -> None:
-    """The load-bearing mechanism the design doc cites (rung0 section 1):
+    """The load-bearing step-cache mechanism:
     `_make_step` is a `weakref_lru_cache` keyed on `NetworkStatic`, so two
     value-equal-but-distinct instances must collapse to one cache entry and
     a meta-field change must mint a new one. functools.lru_cache exercises
-    the same hash/eq contract without needing M2's make_step.
+    the same hash/eq contract without needing make_step.
     """
     static, _ = _build_tiny()
     static_value_equal = dataclasses.replace(static)  # equal, not the same object

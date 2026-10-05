@@ -6,7 +6,7 @@ the pair and the step) and grows up to `--k` per bucket, so the live count
 stays near `--edges`. Four net variants share one built state, so the phase
 costs difference out: forward only, + prune, + add, and the full churn step.
 
-Run on a GPU venv (see TOOLING.md), e.g.:
+Run on a GPU venv (see docs/development/tooling.md), e.g.:
 
     XLA_PYTHON_CLIENT_PREALLOCATE=false .venv-gpu/bin/python \\
         examples/benchmarks/churn_probe.py --width 158114 --edges 50000000

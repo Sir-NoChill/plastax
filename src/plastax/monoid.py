@@ -110,8 +110,8 @@ class Monoid[Acc]:
         """
         if self.named is None:
             raise UnsupportedMonoidError(
-                "generic Monoid(op, identity) has no v1 lowering (rung0 design "
-                "section 3); only named monoids (sum/prod/max/min) are supported"
+                "generic Monoid(op, identity) has no v1 lowering; only named "
+                "monoids (sum/prod/max/min) are supported"
             )
         segment_fn = _SEGMENT_REDUCERS[self.named]
         return segment_fn(
@@ -146,8 +146,8 @@ class Monoid[Acc]:
         """
         if self.named is None:
             raise UnsupportedMonoidError(
-                "generic Monoid(op, identity) has no v1 lowering (rung0 design "
-                "section 3); only named monoids (sum/prod/max/min) are supported"
+                "generic Monoid(op, identity) has no v1 lowering; only named "
+                "monoids (sum/prod/max/min) are supported"
             )
         return _NAMED_PAIRWISE[self.named](a, b)
 
@@ -167,8 +167,7 @@ class Monoid[Acc]:
         if self.named is None:
             if self.identity is None:
                 raise UnsupportedMonoidError(
-                    "generic Monoid(op, identity) has no v1 lowering (rung0 "
-                    "design section 3)"
+                    "generic Monoid(op, identity) has no v1 lowering"
                 )
             return jnp.asarray(self.identity, dtype=dtype)
         return jnp.asarray(_NAMED_IDENTITY[self.named], dtype=dtype)

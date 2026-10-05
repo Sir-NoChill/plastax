@@ -1,8 +1,8 @@
 """Dense MLP on MNIST, two ways: plastax optim.sgd vs jax+optax, online SGD.
 
 Both nets share architecture and initial weights, so plain SGD makes them track
-to float32 precision -- the reference-oracle parity demo for plastax.optim.sgd
-(Track A.1, ECOSYSTEM_ROADMAP.md). plastax runs online (one sample per step,
+to float32 precision -- the reference-oracle parity demo for plastax.optim.sgd.
+plastax runs online (one sample per step,
 host-driven) and is much slower than the batched jax reference; the point is
 that the weight updates agree and both learn, not throughput.
 

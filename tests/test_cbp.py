@@ -215,7 +215,7 @@ def test_v1_local_threshold_agrees_with_the_oracle_on_rate() -> None:
     moments, and carrying v0's fractional count the way the authors' code does,
     took the rate to within ~10% and the gate to ~0.80.
 
-    RL_PLAN's bar is 0.9 and is still NOT met. What remains is genuine ranking
+    The target bar is 0.9 and is still NOT met. What remains is genuine ranking
     disagreement on the marginal unit, not rate: at moment_decay 0.5 the two
     fire within 4% of each other and the gate does not move. Asserted as a
     regression floor rather than an equality, since a further improvement should

@@ -1,4 +1,4 @@
-"""Backward sweep (M3).
+"""Backward sweep.
 
 Direction reversal: accumulate into the source unit
 (dispatch_cpu.hpp:232-258). Two tests: sweep.build_backward_sweep in

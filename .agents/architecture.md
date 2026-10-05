@@ -242,14 +242,14 @@ the CSR layout addresses that for linear passes:
   plain XLA (how the CPU tests exercise the layout). It replaced a Pallas
   Triton kernel: that lowering is deprecated in jax, and Pallas' Mosaic GPU
   backend cannot express a scatter-add into arbitrary rows (a low-level
-  `inline_mgpu` prototype ran 1.03-1.6x slower than Triton, scale plan).
+  `inline_mgpu` prototype ran 1.03-1.6x slower than Triton).
   `bucket_product(engine)` is the seam the layouts share with the level walks.
 - **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 32 (when jax_triton is
   installed) and CSR above; on every other backend (AMD GPU, TPU, CPU) the
   XLA edge-once product for B >= 2 (same speed as the per-sample edge list,
   about 2.6x smaller temporaries compiled for TPU); the edge list at B = 1
   and for every non-linear pass. The CSR step keeps jit's `.trace`/`.lower`
-  (`step._CusparseStep`), so every layout AOT-compiles (TOOLING.md, TPU).
+  (`step._CusparseStep`), so every layout AOT-compiles (`docs/development/tooling.md`, TPU).
 
 ### Host loop (`driver.py`)
 
@@ -332,7 +332,7 @@ update_conn`. To add one, follow §6 and the `plastax-algorithm-scaffold` skill.
 
 ## 8. Testing conventions
 
-Full detail lives in `tests/README.md`; the contract:
+The contract:
 
 - **Location/naming:** flat `tests/test_<topic>.py`, one file per
   trait/mechanism. Non-test helper scripts (e.g. subprocess bodies) drop the

@@ -48,8 +48,8 @@ and nothing else.
   per-level state. In a sparse layer it becomes an estimate over an overlapping
   sample.
 
-Deviations, recorded rather than hidden. Two are from the paper, one is a
-disagreement between the paper and the authors' own code:
+Differences from the paper, recorded rather than hidden. Two are departures
+from the paper, one is a disagreement between the paper and the authors' own code:
 
 * **Replacement count: the paper and the code disagree, and we follow the
   code.** Algorithm 1 says `n_l * rho` -- rho of the LAYER. The released
@@ -748,8 +748,8 @@ def jaccard_gate(
 
     Both thresholds are applied to the SAME state at every churn -- the
     trajectory is advanced by v0 so the comparison never drifts into two
-    different networks. Returns one Jaccard similarity per churn; the plan's
-    gate is a mean of at least 0.9.
+    different networks. Returns one Jaccard similarity per churn; the target
+    is a mean of at least 0.9.
 
     Args:
         d: input dimensionality.

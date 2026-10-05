@@ -67,8 +67,8 @@ Produce a short routing decision the user can sanction:
 
 - The module(s) you will touch and why that module owns this.
 - The public-API impact (does it touch `src/plastax/__init__.py`'s `__all__`? —
-  if so it is a `type(scope)!:` change with a Deviations entry).
-- The commit **scope** (from `SCOPES.md`) — one scope per commit; if the change
+  if so it is a `type(scope)!:` change with a changelog entry).
+- The commit **scope** (from `docs/development/scopes.md`) — one scope per commit; if the change
   naturally spans scopes, that is a signal to split it.
 - The invariants in play and how you keep them.
 - The tests and docs the change requires (docs-in-sync is a review condition).

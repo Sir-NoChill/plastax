@@ -28,12 +28,8 @@ under `.claude/`, so they are committed and shared with the repo.
 
 - **`../AGENTS.md`** — the entry point and the binding rules. Everything here
   elaborates it.
-- **Planning/spec docs at the repo root** (`IMPLEMENTATION_PLAN.md`,
-  `SPARSE_PLAN.md`, `ECOSYSTEM_ROADMAP.md`, `DISTRIBUTION_PLAN.md`) — authoritative
-  on scope, milestones, and history. These `.agents/` docs summarize the
-  *stable* architecture; the plan docs own *what's next*.
-- **`TOOLING.md`, `TAGS.md`, `SCOPES.md`** — toolchain and commit-metadata
-  contracts. The commit-msg hook parses TAGS.md/SCOPES.md directly, so they are
+- **`docs/development/tooling.md`, `docs/development/tags.md`, `docs/development/scopes.md`** — toolchain and commit-metadata
+  contracts. The commit-msg hook parses `docs/development/tags.md`/`scopes.md` directly, so they are
   the single source of truth for commit types and scopes.
 
 ## Keeping these current

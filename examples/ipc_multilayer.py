@@ -1,5 +1,5 @@
 """Port of examples/ipc-multilayer/ipc_multilayer.cpp: streaming iPC, the
-flagship PIPELINE example and M4 oracle target.
+flagship PIPELINE example and oracle target.
 
 Streaming incremental Predictive Coding on a 3 -> 16 -> 1 regression net.
 Layers (generative / top-down convention): input = top, output = bottom,

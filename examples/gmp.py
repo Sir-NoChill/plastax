@@ -20,7 +20,7 @@ sparsity, while `AnnealedMagnitudeStats` prunes a fraction of the *currently
 live* edges. Converting is one line and is where an implementation silently
 drifts if it treats `s_t` as the per-step rate.
 
-Deviation to record: the paper prunes globally by magnitude; `SetPrune` compares
+Difference from the paper: the paper prunes globally by magnitude; `SetPrune` compares
 each edge against its destination's own half-normal quantile, so the realized
 sparsity tracks the schedule only to within that quantile's error. Local rules
 are the library's premise, so this is a deliberate substitution rather than an

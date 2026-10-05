@@ -1,4 +1,4 @@
-"""Balanced level-cut DP (M5 Scheme-B host-side sharding)."""
+"""Balanced level-cut DP (Scheme-B host-side sharding)."""
 
 from __future__ import annotations
 

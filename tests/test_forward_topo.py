@@ -1,6 +1,6 @@
-"""Topological forward level-walk (M3).
+"""Topological forward level-walk.
 
-Level walk vs a numpy reference, and the milestone's correctness oracle:
+Level walk vs a numpy reference, and the level walk's correctness oracle:
 one TOPOLOGICAL step on a layered net must equal exactly `num_levels`
 PIPELINE steps on the identical net (dispatch_cpu.hpp:41-67 vs :202-223).
 """
@@ -55,7 +55,7 @@ class _PipelineNet(px.Network[None]):
 # 0->4 SKIP edge (source level 0, destination level 3) runs alongside the
 # 0->2->3->4 chain: this is the case that actually discriminates a correct
 # level walk from a buggy one that resets the accumulator every bucket
-# instead of persisting it across buckets (IMPLEMENTATION_PLAN.md M3's
+# instead of persisting it across buckets (the topological sweep's
 # correctness crux) -- unit 4's accumulator must carry the skip's
 # contribution (written while processing bucket 0) all the way through
 # buckets 1 and 2 before being finalized at the end.
@@ -146,10 +146,10 @@ def test_forward_topo_one_step_matches_numpy_level_walk_reference() -> None:
 
 
 def test_forward_topo_one_step_equals_pipeline_after_num_levels_steps() -> None:
-    """CRITICAL self-validation (IMPLEMENTATION_PLAN.md M3): the identical
+    """CRITICAL self-validation: the identical
     layered net, one TOPOLOGICAL step must equal exactly `num_levels`
     PIPELINE steps fed the SAME inputs each time. This validates the level
-    walk against M2's already-trusted pipeline sweep independently of the
+    walk against the independently tested pipeline sweep independently of the
     hand-computed reference above."""
     topo_static, topo_state = _build(_TopoNet)
     pipe_static, pipe_state = _build(_PipelineNet)

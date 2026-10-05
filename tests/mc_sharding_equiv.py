@@ -4,7 +4,7 @@ Single-controller `shard_map` (sharding_churn_equiv.py) slices a host-built
 state implicitly -- one process owns every device. This is the true
 multi-controller case: N genuinely separate processes launched via
 `jax.distributed` (gloo collectives on CPU), one device each, exactly the
-one-process-per-node model a Narval multi-node run uses. It is the local
+one-process-per-node model a multi-node cluster run uses. It is the local
 stand-in for that run.
 
 Each worker builds the same net deterministically, assembles the state as a

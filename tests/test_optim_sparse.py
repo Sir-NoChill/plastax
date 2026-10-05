@@ -1,4 +1,4 @@
-"""S0 (SPARSE_PLAN.md): a regrown connection's optimizer state is zeroed.
+"""A regrown connection's optimizer state is zeroed.
 
 The add_conn phase resets a grown edge's untouched fields to their FieldSpec
 default, so a stateful optimizer (adam) starts a regrown edge's moments and step

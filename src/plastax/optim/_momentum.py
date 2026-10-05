@@ -24,7 +24,7 @@ from plastax._types import ACTIVATION, WEIGHT, ConnIdx, FieldSpec, UnitIdx
 from plastax.views import ConnView, ConnWrite, UnitView
 
 # Per-connection optimizer state. The "opt/" prefix namespaces optimizer columns
-# away from user fields (ECOSYSTEM_ROADMAP.md A1.1); default 0.0 so a freshly
+# away from user fields; default 0.0 so a freshly
 # built or grown edge starts at rest.
 _VELOCITY: FieldSpec[np.float32] = FieldSpec.float32("opt/v")
 

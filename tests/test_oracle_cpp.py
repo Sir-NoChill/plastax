@@ -1,4 +1,4 @@
-"""C++ oracle parity (M5).
+"""C++ oracle parity.
 
 Golden-file parity against the native C++ Plastix build. The two flagship
 examples (mlp_xor, ipc_multilayer) both initialise weights from a PRNG, and
@@ -21,7 +21,7 @@ below; regenerate with:
     plastix/build/examples/manual-fcc/manual_fcc
 
 (built from plastix/examples/manual-fcc/manual_fcc.cpp). Tolerance is the
-plan's topological rtol=1e-4 -- segment-reduction order differs from the
+topological rtol=1e-4 -- segment-reduction order differs from the
 C++ level sweep -- with a small atol so the exact-zero row is not compared
 by relative error alone.
 """

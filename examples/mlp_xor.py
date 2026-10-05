@@ -23,8 +23,8 @@ GradPreAct = px.FieldSpec.float32("grad_pre_act")
 # fresh (zeroed right after the Apply that consumes it) -- plastax's
 # backward accumulator instead lives as a value local to backward_phase's
 # own trace closure (phases.py's build_phases), with no channel for an
-# earlier, separate phase function to write into it. LossGrad is the
-# Deviation that bridges the gap: written only for output_ids (every step,
+# earlier, separate phase function to write into it. LossGrad bridges
+# the gap: written only for output_ids (every step,
 # always fresh), permanently 0.0 for every other unit since nothing else
 # ever touches it, so -- unlike reusing GradPreAct itself -- it can never
 # carry a stale value from a previous step into a hidden unit's gradient.
@@ -133,8 +133,8 @@ def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[N
     The forward/backward/loss traits are identical across optimizers; only
     `update_conn` and the `extra_conn_fields` it needs differ. `train=False`
     returns a forward-only sibling sharing the same field layout, so it drives
-    the same (static, state) for read-only inference (rung0 design section 2
-    phase elision; mirrors mlp_xor.cpp's Net.DoForwardPass vs Net.DoStep).
+    the same (static, state) for read-only inference (phase elision;
+    mirrors mlp_xor.cpp's Net.DoForwardPass vs Net.DoStep).
 
     Args:
         optimizer: the plastax.optim bundle supplying update_conn/state_fields.

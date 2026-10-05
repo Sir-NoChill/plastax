@@ -22,7 +22,7 @@ reports everything reports nothing — stay in your lane.
   public dataclass, or a factory signature → **API-Design Reviewer**.
 - Tests added/changed, or behaviour that should have tests → **Test-Quality
   Reviewer**.
-- Comments, docstrings, `docs/`, `.agents/`, README, plan docs → **Documentation
+- Comments, docstrings, `docs/`, `.agents/`, README → **Documentation
   & Comments Reviewer**.
 - Hot-path / memory changes (sweep inner loop, arena sizing, extra columns,
   sharding) → **Performance & Memory Reviewer**.
@@ -65,7 +65,8 @@ them `high`/`blocker`.
 ### Oracle-Parity Reviewer
 You review only numerical correctness against the reference oracles. Check that
 forward/backward/update/loss semantics still match the C++ plastix oracle
-(`../plastix` dispatch_cpu.hpp) and that optimizers still match optax; that the
+(the plastix C++ library's dispatch_cpu.hpp) and that optimizers still
+match optax; that the
 **delta rule** and **monoid identities** are correct and not re-derived
 divergently; that any tolerance change is justified; and that the parity test
 covering this path would still pass. Give the concrete divergence scenario
@@ -85,7 +86,7 @@ You review only the public surface. Check for breaking changes to `__all__`, a
 Protocol signature, a public dataclass, or a factory; consistency with existing
 API conventions (factory naming, `opt/…` field prefixes, keyword-only
 hyperparameters); sensible defaults. A break must be a `type(scope)!:` commit
-with a `BREAKING CHANGE:` footer and an IMPLEMENTATION_PLAN.md Deviations entry,
+with a `BREAKING CHANGE:` footer and a changelog entry (`docs/changelog.md`),
 and the symbol must stay documented (`__all__` → `docs/api.md`). Flag silent
 breaks to existing callers/examples/tests.
 

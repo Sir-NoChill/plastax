@@ -1,9 +1,9 @@
-"""Resort + retrace contract (M4b).
+"""Resort + retrace contract.
 
 recompute_levels vs host Kahn (initial_levels); resort produces sorted,
 compacted, correctly-capacitied buckets; the widened AddConn window
 (phases.py's build_add_conn_phase) can genuinely set needs_resort; the
-retrace-count contract (rung0 design section 4): a level-preserving
+retrace-count contract: a level-preserving
 add/prune workload compiles exactly once, one resort recompiles exactly
 once more; a Driver end-to-end run exercises both escalation paths
 (overflow -> grow_bucket, needs_resort -> topo.resort).
@@ -17,8 +17,8 @@ precomputing masks like `unit_id_mask` before the traced `step` closure
 even exists) and `topo.resort`'s eager device work (segment reductions,
 `lax.sort_key_val`, `lax.fori_loop`) both cost a real, nonzero, and
 UNSPECIFIED number of such events -- neither is the thing the retrace
-contract describes (design section 4: "a new NetworkStatic ... is a new
-jit PyTreeDef, so it [the STEP FUNCTION] recompiles"). Every retrace-count
+contract describes (a new NetworkStatic is a new jit PyTreeDef, so the
+STEP FUNCTION recompiles). Every retrace-count
 assertion below therefore keeps `Driver`/`make_step` CONSTRUCTION (and, for
 the resort test, the resort-triggering call itself) outside the counted
 `with` block, so only the jitted step closure's own first-ever invocation
@@ -120,7 +120,7 @@ def test_recompute_levels_matches_host_initial_levels_on_a_dag_with_a_skip_edge(
     expected = topo.initial_levels(num_units, edges)
     static, state = _build_dag_with_skip_edge()
 
-    # Sanity: the builder's OWN construction-time levels (M1's host
+    # Sanity: the builder's OWN construction-time levels (the host
     # initial_levels, the same function) already match -- the real
     # assertion below is the ON-DEVICE recompute agreeing with the SAME
     # reference from a cold start, not merely reproducing a value it
@@ -252,9 +252,8 @@ def test_resort_redistributes_sorts_and_compacts_after_a_pruning_relevel() -> No
 
 class _SidewaysPipelineAddConn(px.AddConn[None]):
     """Only ever proposes the fixed same-source-level pair (1, 2) -- a
-    candidate the M4a window could never even score (module docstring,
-    phases.py's build_add_conn_phase), now reachable under M4b's widened
-    one."""
+    candidate the add window can score (module docstring, phases.py's
+    build_add_conn_phase)."""
 
     max_candidates = 1
 
@@ -279,7 +278,7 @@ class _SidewaysPipelineNet(px.Network[None]):
 
 
 def test_widened_window_lets_a_same_level_add_actually_set_needs_resort() -> None:
-    """Direct (Driver-bypassing) evidence that the M4b window can commit a
+    """Direct (Driver-bypassing) evidence that the add window can commit a
     same-source-level candidate: PIPELINE's single bucket accepts a source
     at any level (phases.py's build_add_conn_phase docstring), so this
     needs no pre-existing per-level bucket structure the way a
@@ -381,8 +380,8 @@ def test_pure_add_prune_level_preserving_workload_compiles_exactly_once() -> Non
 
     # The whole workload -- the step closure's one real trace on its very
     # first call, plus 19 more steps of genuine add/prune churn -- costs
-    # exactly the ONE jit lowering the retrace contract promises (rung0
-    # design section 4): the static never changes, so nothing ever
+    # exactly the ONE jit lowering the retrace contract promises: the
+    # static never changes, so nothing ever
     # recompiles (module docstring: construction's eager prelude is
     # deliberately outside this window).
     with jtu.assert_num_jit_and_pmap_compilations(1):
@@ -422,8 +421,7 @@ def _build_shrinking_chain() -> tuple[px.NetworkStatic, px.NetworkState[None]]:
 
 def test_one_resort_triggers_exactly_one_additional_compile() -> None:
     """Manufactures needs_resort directly rather than through a real
-    AddConn commit (M4a's deviation note's sanctioned fallback, recorded
-    as a Deviation for M4b too): build_add_conn_phase's window only ever
+    AddConn commit: build_add_conn_phase's window only ever
     proposes a candidate sourced at a level that ALREADY has a bucket
     (`src_ok = src_level == bucket_idx`, only true for bucket_idx <
     num_buckets), and Kahn's `level(dst) = max(incoming src levels) + 1`

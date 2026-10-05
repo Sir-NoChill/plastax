@@ -31,19 +31,18 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
   "Typing :: Typed",
 ]
-# requires-python >=3.12: uv's universal resolver has no solution at 3.11
-# (Deviation 2026-08-17). .python-version pins the concrete interpreter (3.13).
+# requires-python >=3.12: uv's universal resolver has no solution at 3.11.
+# .python-version pins the concrete interpreter (3.13).
 requires-python = ">=3.12"
 dependencies = [
   # Floor is 0.10.2: the API plastax uses (register_dataclass, jax.shard_map --
   # stable since 0.8.0 -- sharding.Mesh/PartitionSpec, make_array_from_process_
-  # local_data) is present and validated on 0.10.2 (Alliance/Narval wheelhouse,
-  # full fast suite green) through 0.11.x (local CUDA). See Deviations.
+  # local_data) is present; validated on jax 0.10.2 through 0.11.x.
   "jax>=0.10.2",
   "jaxtyping>=0.2.36",
   # numpy is imported directly across src/plastax (state, builder, step,
   # topo, views, ...); declare it rather than lean on jax's transitive
-  # install (P0.4). Floor matches jax's numpy>=2 requirement.
+  # install. Floor matches jax's numpy>=2 requirement.
   "numpy>=2",
 ]
 
@@ -54,7 +53,7 @@ dependencies = [
 # Validated with jax[cuda12]==0.11.0 on an RTX 3060 Ti (CUDA 12). `cuda13` is
 # the CUDA-13 counterpart (validated with jax[cuda13]==0.11.0 on an RTX 5000
 # Ada, driver 615); the two are mutually exclusive ([tool.uv] conflicts). Set
-# XLA_PYTHON_CLIENT_PREALLOCATE=false on a shared GPU (see TOOLING.md).
+# XLA_PYTHON_CLIENT_PREALLOCATE=false on a shared GPU (see docs/development/tooling.md).
 [project.optional-dependencies]
 cuda12 = ["jax[cuda12]>=0.10.2"]
 cuda13 = ["jax[cuda13]>=0.11.0"]
@@ -89,11 +88,11 @@ dev = [
   # jax.test_util (jax._src.test_util) imports absl.testing.parameterized;
   # jax itself only declares this as an optional test extra, not a runtime
   # dependency, so it must be added explicitly to use
-  # assert_num_jit_and_pmap_compilations (M4b Deviation, IMPLEMENTATION_PLAN.md
-  # -- the retrace-count tests the task requires import jax.test_util).
+  # assert_num_jit_and_pmap_compilations (the retrace-count tests import
+  # jax.test_util).
   "absl-py",
-  # optax: reference oracle for the plastax.optim parity tests (Track A.1). A
-  # test-only dependency, never a runtime dep (ECOSYSTEM_ROADMAP.md).
+  # optax: reference oracle for the plastax.optim parity tests. A
+  # test-only dependency, never a runtime dep.
   "optax",
   # torchvision: CIFAR-10 download + loader for the dynamic-sparse-training
   # example (examples/cifar_dst.py). Dev/example-only -- never a runtime dep;
@@ -112,8 +111,8 @@ docs = [
 ]
 
 # Tag-driven version: hatch-vcs reads the latest `vX.Y.Z` git tag (PEP 440).
-# The repo starts tagless (P0.3), so untagged/dirty local builds fall back to
-# fallback_version; a real `v*` tag push in CI derives the release version.
+# Untagged/dirty local builds fall back to fallback_version; a real `v*` tag
+# push in CI derives the release version.
 [tool.hatch.version]
 source = "vcs"
 
@@ -123,7 +122,7 @@ fallback_version = "0.1.0.dev0"
 [tool.hatch.build.targets.wheel]
 packages = ["src/plastax"]
 
-# Sdist contents are an explicit allowlist (DISTRIBUTION_PLAN.md P1.3): the
+# Sdist contents are an explicit allowlist: the
 # library, its tests and examples, and the metadata files. Without it hatchling
 # packs every un-ignored file in the tree -- including local virtualenvs such
 # as .venv-gpu (several GB), which carry only their own nested .gitignore.
@@ -133,13 +132,12 @@ include = [
   "/tests",
   "/examples",
   "/README.md",
-  "/CHANGELOG.md",
   "/LICENSE",
   "/pyproject.toml",
 ]
 
 # ty is the fast pre-commit checker; mypy --strict is the authoritative
-# CI/pre-push gate (TOOLING.md). jax and jaxtyping ship py.typed, so mypy
+# CI/pre-push gate (docs/development/tooling.md). jax and jaxtyping ship py.typed, so mypy
 # resolves jax.Array to the real class and erases jaxtyping's dtype[array,shape]
 # to `array` (docs.kidger.site/jaxtyping/faq) -- no follow_imports skip needed.
 [tool.mypy]
@@ -160,7 +158,7 @@ line-length = 88
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-# D (pydocstyle): the library ships Google-style docstrings; see TOOLING.md.
+# D (pydocstyle): the library ships Google-style docstrings; see docs/development/tooling.md.
 select = ["E", "F", "I", "UP", "B", "ANN", "D"]
 # F722/F821: jaxtyping shape strings (e.g. `Float[Array, " n"]`) read as broken
 # forward references to the linter; jaxtyping recommends disabling them globally
@@ -186,7 +184,7 @@ testpaths = ["tests"]
 addopts = "--jaxtyping-packages=plastax,beartype.beartype"
 markers = ["slow: excluded from the pre-push fast suite"]
 filterwarnings = [
-  # donation failure must be an error, rung0 design section 6
+  # donation failure must be an error
   "error:.*Some donated buffers were not usable.*",
 ]
 

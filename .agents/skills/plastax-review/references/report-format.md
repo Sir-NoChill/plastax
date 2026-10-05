@@ -9,7 +9,7 @@ oracle parity** — those are not style.
 - `blocker` — a maintainer would refuse to merge. A broken invariant that
   corrupts state or silently loses donation; a per-step retrace regression; an
   oracle-parity break (wrong numerics vs C++/optax); a sparsity/regrow bug that
-  leaks stale state; a public-API break shipped without the `!:`/Deviations
+  leaks stale state; a public-API break shipped without the `!:`/changelog
   protocol; a test that gives false confidence about any of these.
 - `high` — fix before merge. Real duplication/**divergence** of a rule (delta
   rule, monoid identity, slot-claim); a change that reintroduces `O(N²)` state; a
@@ -49,8 +49,8 @@ Use this exact template. Omit a section only if genuinely empty.
 - Fix: <concrete change, or the shape of one>
 
 ## Commit-readiness
-<the type(scope) this change should use (SCOPES.md); whether it touches __all__
- and thus needs `type(scope)!:` + BREAKING CHANGE + a Deviations entry; whether
+<the type(scope) this change should use (`docs/development/scopes.md`); whether it touches __all__
+ and thus needs `type(scope)!:` + BREAKING CHANGE + a changelog entry; whether
  docs (docs/, .agents/) and tests are in sync>
 
 ## Summary counts

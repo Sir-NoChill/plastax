@@ -1,13 +1,10 @@
-"""UpdateConn two-pass ordering (M3b).
+"""UpdateConn two-pass ordering.
 
 dispatch_cpu.hpp:450-469: a full `incoming` sweep over every live conn,
 then a full `outgoing` sweep -- strictly sequenced, so `outgoing` observes
-`incoming`'s writes. PruneConn / derived live counts stay in
-test_update_prune.py, skipped pending M4 (that file also covers UpdateConn
-in the plan's original one-file-per-milestone layout, but its M4 scope --
-PruneConn, live-count derivation alongside UpdateConn -- is broader than
-what M3b implements; this file exercises the UpdateConn phase alone, on
-its own milestone).
+`incoming`'s writes. This file exercises the UpdateConn phase alone;
+PruneConn and derived live counts, alongside UpdateConn, are covered in
+test_update_prune.py.
 """
 
 from __future__ import annotations

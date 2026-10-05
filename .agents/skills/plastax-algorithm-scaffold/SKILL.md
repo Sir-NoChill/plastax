@@ -42,7 +42,7 @@ Pick the row; it decides everything downstream.
 | A new reduction for accumulators | **Named monoid** | `monoid.py` | §D |
 | A phase category beyond the seven | **New phase** (rare, invasive) | `traits.py` → `phases.py` → maybe `sweep.py` | §E |
 
-Confirm the classification and the commit **scope** (`SCOPES.md`) with the user
+Confirm the classification and the commit **scope** (`docs/development/scopes.md`) with the user
 before implementing if there is any ambiguity.
 
 ## The universal contract (applies to every kind)
@@ -272,7 +272,7 @@ Only when the algorithm needs a phase that is not one of the seven. In order:
    one not already there.
 4. `step.py`/`topo.py` need no change (generic over the phase list / static).
 
-This is a design change: write it up (IMPLEMENTATION_PLAN.md) and get the
+This is a design change: write it up (an issue or design note) and get the
 ordering sanctioned before implementing.
 
 ---
@@ -301,10 +301,10 @@ Do not consider the change done until:
    `ruff format` clean; Google-style docstrings pass pydoclint. Keep `FieldSpec`
    generics intact.
 5. **Review**: run the **`plastax-review`** skill.
-6. **Commit** via the `agent-commit` skill: `type(scope): subject` with the
+6. **Commit**: `type(scope): subject` with the
    scope from Step 0. A new optimizer is `feat(optim): …`; a topology generator
    `feat(topology): …`; a public-surface break is `feat(scope)!:` + a
-   `BREAKING CHANGE:` footer + an IMPLEMENTATION_PLAN.md Deviations entry in the
+   `BREAKING CHANGE:` footer + a changelog entry (`docs/changelog.md`) in the
    same commit. Let the hooks run; never `--no-verify`.
 
 ## Guardrails (things that look right but aren't)
@@ -320,4 +320,4 @@ Do not consider the change done until:
 - Putting orchestration (bucket loop, retrace) inside a policy — that lives in
   `phases.py`/`driver.py`, not in your class.
 - Adding to `__all__` without a docs entry, or a public break without a
-  Deviations entry.
+  changelog entry.

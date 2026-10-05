@@ -1,12 +1,10 @@
-"""UpdateConn / PruneConn composition (M4a).
+"""UpdateConn / PruneConn composition.
 
 PruneConn tombstones the predicted conns (dead set, `live_conn_count` drops
-accordingly, derived from the mask rather than stored -- rung0 design
-section 5 / section 1). UpdateConn's OWN incoming/outgoing two-pass ordering
-is already fully exercised by test_update_conn.py (M3b); this file's
-"validate its ordering here too" mandate (tests/README.md's original,
-pre-M3b-split mapping for this module) is met by additionally confirming
-that ordering holds when prune_conn runs AFTERWARD in the SAME step
+accordingly, derived from the mask rather than stored). UpdateConn's OWN
+incoming/outgoing two-pass ordering is already fully exercised by
+test_update_conn.py; this file additionally confirms that ordering holds
+when prune_conn runs AFTERWARD in the SAME step
 (phases.py module docstring's phase order: ... update_conn, prune_conn,
 ...) -- i.e. prune_conn's predicate observes update_conn's FRESH write,
 not a stale pre-step snapshot.

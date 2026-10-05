@@ -53,8 +53,8 @@ means: the module's own docstring (each states its "add here / not here"
 contract), the Protocol in `traits.py` if a policy changed, and the matching
 test file. Load the project's conventions: [`AGENTS.md`](../../../AGENTS.md),
 [`.agents/invariants.md`](../../invariants.md),
-[`.agents/architecture.md`](../../architecture.md), `TOOLING.md`,
-`SCOPES.md`, `TAGS.md`. **These win over generic defaults and over surrounding
+[`.agents/architecture.md`](../../architecture.md), `docs/development/tooling.md`,
+`docs/development/scopes.md`, `docs/development/tags.md`. **These win over generic defaults and over surrounding
 code.**
 
 ## Step 2 — Run the deterministic layer, then the checklist
@@ -126,7 +126,7 @@ Merge into one report using [`references/report-format.md`](references/report-fo
 
 - **Interactive:** present the report, then offer to fix findings at or above a
   severity the user picks. Remember the commit gate: the change also needs the
-  correct `type(scope)` and a Deviations entry if it breaks `__all__`.
+  correct `type(scope)` and a changelog entry if it breaks `__all__`.
 - **Headless:** write the report to the given path and emit the verdict line;
   do not attempt fixes in a hook.
 

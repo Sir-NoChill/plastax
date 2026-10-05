@@ -1,8 +1,7 @@
 # plastax invariants
 
 The design decisions that are already made. **Violating one is a failed change
-even if every test passes** (IMPLEMENTATION_PLAN.md, "Non-negotiable
-invariants"). If a task appears to require breaking one, stop and surface it —
+even if every test passes**. If a task appears to require breaking one, stop and surface it —
 that is almost always a sign the approach is wrong, not that the invariant is.
 
 Each entry: the rule, why it exists, and how it is enforced (so you know what
@@ -101,8 +100,8 @@ end (views return arrays typed by the spec's `DT`).
   weakening it erodes the safety the whole SoA API is built on.
 - *Enforced by:* `.pre-commit-config.yaml` (`ty` on pre-commit, `mypy --strict`
   on pre-push) and CI. If `ty` false-positives on a load-bearing jaxtyping
-  annotation, use a rule-scoped ignore and record it in IMPLEMENTATION_PLAN.md
-  Deviations — **never** weaken the mypy gate.
+  annotation, use a rule-scoped ignore and explain why in a comment —
+  **never** weaken the mypy gate.
 
 ### 8. Scope contract: what is out of v1
 
@@ -117,14 +116,13 @@ AddConn/PruneConn dynamics; named monoids (incl. pytree-of-monoids struct
 accumulators); donation-based in-place state; host driver retrace protocol;
 Scheme-A multi-device sharding.
 
-- *Why:* v1 is "rung 0" — the trace-time metaprogramming rung. Later rungs
-  (composites, Pallas, FFI) are deliberately deferred as the *general*
-  lowering; premature scope creep breaks the clean lowering ladder (see the
-  design docs). The one exception is opt-in: `layout="triton"` runs a single
+- *Why:* v1 lowers everything through trace-time metaprogramming over plain
+  JAX. Custom lowerings (composites, Pallas, FFI) are deliberately deferred
+  as the *general* path; premature scope creep would entangle the design.
+  The one exception is opt-in: `layout="triton"` runs a single
   primitive (the batched linear bucket product) as a hand-written Triton
-  kernel via jax_triton on NVIDIA GPUs (IMPLEMENTATION_PLAN.md Deviations,
-  scale plan P6). No Pallas kernel ships today.
-- *Enforced by:* code review, the plan docs, and `monoid.UnsupportedMonoidError`
+  kernel via jax_triton on NVIDIA GPUs (see the changelog). No Pallas kernel ships today.
+- *Enforced by:* code review and `monoid.UnsupportedMonoidError`
   guards (`monoid.py`).
 
 ---

@@ -1,4 +1,4 @@
-"""plastax.optim optimizers match their optax reference to float32 (Track A.1).
+"""plastax.optim optimizers match their optax reference to float32.
 
 Oracle test: a dense MLP built two ways -- plastax (plastax.optim) and jax+optax
 -- from identical initial weights, fed identical samples online (batch-1), must

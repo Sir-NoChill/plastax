@@ -1,5 +1,5 @@
-"""Streaming-iPC acceptance test (M4/M5 milestone: "the ipc_multilayer
-example is the flagship PIPELINE oracle target"). Runs the real example end
+"""Streaming-iPC acceptance test: the ipc_multilayer example is the
+flagship PIPELINE oracle target. Runs the real example end
 to end -- forward, backward, update_conn plus the host-side value-node
 dynamics -- and asserts it learns, matching the C++ oracle's own PASS
 criterion (final iPC error window below the predict-previous baseline).

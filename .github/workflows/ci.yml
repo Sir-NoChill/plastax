@@ -41,6 +41,12 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check src tests examples
 
+      - name: pydoclint (Google docstring contract)
+        run: >-
+          uv run pydoclint --style=google --arg-type-hints-in-docstring=False
+          --check-return-types=False --check-class-attributes=True
+          --skip-checking-private-functions=True src/plastax
+
       - name: ty (fast type check)
         run: uv run ty check src
 
@@ -49,3 +55,19 @@ jobs:
 
       - name: Pytest
         run: uv run pytest
+
+  docs:
+    name: docs
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # hatch-vcs derives the version from tag history
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build docs (warnings are errors)
+        run: uv run --group docs sphinx-build -W --keep-going -b html docs docs/_build

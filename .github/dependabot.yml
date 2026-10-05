@@ -1,0 +1,15 @@
+# Keeps the pinned GitHub Actions majors current. Python dependencies are not
+# tracked here: uv.lock is gitignored and CI resolves against the declared
+# floors, so there is nothing for Dependabot to bump.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
+      include: scope
+    groups:
+      actions:
+        patterns: ["*"]

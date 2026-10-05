@@ -9,3 +9,6 @@ dist/
 .ruff_cache/
 uv.lock
 docs/_build/
+
+# Local agent / editor settings
+.claude/

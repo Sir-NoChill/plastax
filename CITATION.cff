@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use plastax in your research, please cite it as below."
+title: "plastax: declarative plastic-network traits for JAX"
+type: software
+authors:
+  - family-names: Chilibeck
+    given-names: Ayrton
+    email: git@blobfish.icu
+license: MIT
+repository-code: "https://github.com/Sir-NoChill/plastax"
+url: "https://plastax.readthedocs.io"
+keywords:
+  - jax
+  - plasticity
+  - neural-networks
+  - continual-learning
+  - sparse-networks
+  - dynamic-networks

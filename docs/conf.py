@@ -1,4 +1,4 @@
-"""Sphinx configuration for plastax (scaffold; full docs are Phase 3)."""
+"""Sphinx configuration for plastax."""
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
@@ -24,7 +24,7 @@ extensions = [
 napoleon_google_docstring = True
 napoleon_numpy_docstring = False
 # PEP 695 type parameters are documented under a custom "Type Args:" section
-# (TOOLING.md docstring conventions).
+# (development/tooling.md docstring conventions).
 napoleon_custom_sections = [("Type Args", "params_style")]
 
 # Types render from signatures only; docstrings never duplicate them
@@ -40,4 +40,4 @@ intersphinx_mapping = {
 
 html_theme = "furo"
 
-exclude_patterns = ["_build", "internal", "parallel_mnist_plan.md", "scale_plan"]
+exclude_patterns = ["_build"]

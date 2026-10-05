@@ -33,7 +33,7 @@ device memory up front.
 
 ### Why passthrough extras
 
-An earlier plan (`DISTRIBUTION_PLAN.md` P1.5) kept the GPU story
+An earlier design kept the GPU story
 documentation-only, because JAX's extra names change between releases (the
 move from `cuda12` to `cuda13` is one such change) and a stale extra is worse
 than an install note. The extras were kept anyway, for two reasons:
@@ -46,7 +46,7 @@ than an install note. The extras were kept anyway, for two reasons:
 
 The cost is the churn risk. Each extra above lists the JAX version it was
 validated with. Before every release, re-check that each extra still resolves
-(`uv lock` resolves all of them; see `RELEASING.md`). An extra whose JAX name
+(`uv lock` resolves all of them; see {doc}`development/releasing`). An extra whose JAX name
 disappears is removed, not left stale.
 
 ## From source
@@ -57,4 +57,4 @@ uv sync                                   # dev environment (CPU)
 UV_PROJECT_ENVIRONMENT=.venv-gpu uv sync --extra cuda13 --extra triton
 ```
 
-See `TOOLING.md` for the GPU and TPU development setups.
+See {doc}`development/tooling` for the GPU and TPU development setups.

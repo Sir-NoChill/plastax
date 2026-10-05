@@ -1,6 +1,6 @@
 # Releasing plastax
 
-Companion to `DISTRIBUTION_PLAN.md` Phase 4. Publishing is tag-driven and
+Publishing is tag-driven and
 tokenless; nothing is released from a developer machine.
 
 ## Infrastructure (state as of 2026-08-21)
@@ -8,9 +8,9 @@ tokenless; nothing is released from a developer machine.
 | Piece | Status | Notes |
 |---|---|---|
 | PyPI trusted publisher | CONFIGURED | repo `Sir-NoChill/plastax`, workflow `publish.yml`, environment `pypi`. The workflow filename and environment name are part of the OIDC identity -- renaming either breaks publishing. |
-| TestPyPI trusted publisher | PENDING (HUMAN) | register the same publisher on test.pypi.org with environment `testpypi` to enable the rc flow. |
-| GitHub environment `pypi` | PENDING (HUMAN) | Settings -> Environments -> New: `pypi`; add Drew as required reviewer so publishes pause for approval. Referencing it from the workflow alone creates it without protection rules. |
-| GitHub environment `testpypi` | PENDING (HUMAN) | same, no reviewer needed. |
+| TestPyPI trusted publisher | PENDING | register the same publisher on test.pypi.org with environment `testpypi` to enable the rc flow. |
+| GitHub environment `pypi` | PENDING | Settings -> Environments -> New: `pypi`; add a maintainer as required reviewer so publishes pause for approval. Referencing it from the workflow alone creates it without protection rules. |
+| GitHub environment `testpypi` | PENDING | same, no reviewer needed. |
 | Read the Docs | CONFIGURED | https://app.readthedocs.org/projects/plastax/ ; builds from `.readthedocs.yaml` via the RTD GitHub App webhook. Enable "build pull requests" in RTD settings for PR previews. |
 
 No secrets or environment variables are required anywhere: PyPI auth is
@@ -27,11 +27,11 @@ which forces the smoke test onto the CPU backend of the runners.
    Local `uv build` + `uvx twine check dist/*` pass (the sdist is an
    explicit allowlist in pyproject).
 2. Docs build clean: `uv run sphinx-build -b html docs docs/_build`
-   (add `-W` once P3.4 flips fail_on_warning).
-3. Cut a CHANGELOG section for the version (P1.4).
+   (add `-W` once `.readthedocs.yaml` flips `fail_on_warning`).
+3. Cut a section for the version in `docs/changelog.md`.
 4. Tag: `git tag -s vX.Y.Z -m "plastax X.Y.Z"` -- release tags are signed
-   by Drew, not the agent identity; hatch-vcs derives the version from this
-   tag (P1.2), so the pyproject version is never edited by hand.
+   by a maintainer, not an agent identity; hatch-vcs derives the version from this
+   tag, so the pyproject version is never edited by hand.
 5. `git push origin vX.Y.Z`. The `Publish` workflow builds, twine-checks,
    wheel-smoke-tests on 3.12/3.13, then waits on the `pypi` environment
    approval before uploading.
@@ -42,7 +42,7 @@ which forces the smoke test onto the CPU backend of the runners.
 Release candidates: tag `vX.Y.ZrcN`; the workflow routes any tag containing
 `rc` to TestPyPI instead of PyPI (requires the pending TestPyPI publisher).
 
-First release sequence (P4.4): `v0.1.0rc1` -> TestPyPI -> install check ->
+First release sequence: `v0.1.0rc1` -> TestPyPI -> install check ->
 `v0.1.0` -> PyPI. Status 2026-10-01: iterating on `v0.1.0rc2` (branch
 `release/v0.1.0rc2`) before `v0.1.0`; the PyPI / TestPyPI publishers and
 environments above still need their human setup.

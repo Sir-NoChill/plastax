@@ -6,9 +6,8 @@ per-unit and per-edge SOA fields, and propagation model of a dynamically
 structured network; the library assembles and jit-specializes the
 corresponding step function at trace time.
 
-This site is a scaffold; the full documentation structure (installation,
-quickstart, concepts, examples, per-module API reference) is tracked in
-`DISTRIBUTION_PLAN.md`, Phase 3.
+This site is a scaffold; the full documentation (quickstart, concepts,
+examples, per-module API reference) is in progress.
 
 ## Installation
 
@@ -27,4 +26,15 @@ installation
 optimizers
 api
 changelog
+```
+
+```{toctree}
+:maxdepth: 1
+:caption: Development
+:hidden:
+
+development/tooling
+development/tags
+development/scopes
+development/releasing
 ```

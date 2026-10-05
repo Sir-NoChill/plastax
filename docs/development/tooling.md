@@ -1,6 +1,7 @@
-# plastax tooling: environment, pre-commit, and JAX-interop testing
+# Tooling
 
-Short reference for the toolchain. All commands run from `plastax/`.
+Short reference for the toolchain: environment, pre-commit, and JAX-interop
+testing. All commands run from the repository root.
 
 ## Environment: uv
 
@@ -58,6 +59,25 @@ dynamic-sparse CIFAR example (`examples/cifar_dst.py`) is the main GPU workload;
 validated with `jax[cuda12]==0.11.0` on an RTX 3060 Ti and with
 `jax[cuda13]==0.11.0` on an RTX 5000 Ada.
 
+### GPU benchmark probes
+
+`examples/benchmarks/` holds standalone scripts for measuring plastax on a GPU.
+They are not collected by pytest (`testpaths = ["tests"]`) and need a CUDA
+jaxlib: build a separate venv so the CPU-pinned dev venv stays untouched.
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-gpu uv sync --extra cuda13   # or --extra cuda12
+export XLA_PYTHON_CLIENT_PREALLOCATE=false                # shared GPU
+.venv-gpu/bin/python examples/benchmarks/churn_probe.py --width 158114 --edges 50000000
+```
+
+| Script | Measures |
+|---|---|
+| `churn_probe.py` | Per-phase cost of a churn step (forward, prune, add) on a three-layer synthetic net; `--json` appends a result line. |
+| `layouts_probe.py` | One sparse layer as COO `segment_sum`, BCOO, BCSR (cuSPARSE) and dense: forward at batch 1 and B, plus the CSR rebuild. |
+| `sort_probe.py` | Which sort formulation XLA lowers to a radix sort. |
+| `tpu_aot_check.py` | Ahead-of-time TPU compilation of every step type (see above). |
+
 ## Lint + format: ruff
 
 One tool for both. `ruff check` (rules pinned in pyproject: E/F/I/UP/B/ANN/D)
@@ -99,8 +119,8 @@ Primary checker is `ty` (Astral, experimental). Because it is pre-1.0, the
 contract is: `ty check` runs in pre-commit as the fast checker, and
 `mypy --strict` runs in CI as the authoritative gate. If ty false-positives
 on something load-bearing (jaxtyping annotations are the likely friction),
-silence it locally with a rule-scoped ignore and note it in
-IMPLEMENTATION_PLAN.md Deviations; do not weaken the mypy strict gate.
+silence it locally with a rule-scoped ignore and explain why in a comment;
+do not weaken the mypy strict gate.
 jaxtyping erases to `jax.Array` for static checkers, so neither checker
 needs a plugin.
 
@@ -114,7 +134,7 @@ The JAX-specific test infrastructure, beyond plain pytest:
    contract during tests, at zero cost outside them.
 2. Determinism: tests run on CPU (`JAX_PLATFORMS=cpu` in conftest) so CI
    needs no accelerator and float reductions are reproducible; the oracle
-   tolerances in tests/README.md assume this.
+   tolerances assume this.
 3. Retrace contract: `jax.test_util.assert_num_jit_and_pmap_compilations`
    for the "exactly N compilations" tests; debug misses locally with
    `JAX_EXPLAIN_CACHE_MISSES=1` (config.py:1303).
@@ -123,11 +143,9 @@ The JAX-specific test infrastructure, beyond plain pytest:
 5. NaN hygiene: `JAX_DEBUG_NANS=1` is opt-in for local debugging, not CI
    default (it disables some fusion and would mask performance-shape bugs).
 6. Version floor: the declared runtime floor is `jax>=0.10.2`. plastax is
-   validated on 0.10.2 (the Alliance/Narval wheelhouse's GPU-capable set:
-   jax/jaxlib/jax-cuda12-plugin/jax-cuda12-pjrt all 0.10.2; full fast suite
-   green) through 0.11.x (local CUDA). `uv.lock` is gitignored so CI resolves
+   validated on jax 0.10.2 through 0.11.x. `uv.lock` is gitignored so CI resolves
    the latest jax satisfying the floor; a floor change is a deliberate change
-   with a Deviations entry, not a routine bump.
+   with a changelog entry, not a routine bump.
 
 ## Pre-commit / pre-push
 
@@ -139,8 +157,8 @@ These hooks must run and pass — never commit or push with `--no-verify`.
 
 ## Commit conventions
 
-Commit metadata contracts live at the repo root: TAGS.md (types) and
-SCOPES.md (mandatory scopes). Every commit is `type(scope): subject` with a
+Commit metadata contracts: {doc}`tags` (types) and {doc}`scopes`
+(mandatory scopes). Every commit is `type(scope): subject` with a
 mandatory scope, one scope per commit; the hooks above are the gate (never
 `--no-verify`).
 

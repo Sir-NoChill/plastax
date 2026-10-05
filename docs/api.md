@@ -1,7 +1,6 @@
 # API reference
 
-Placeholder single-page reference over the `plastax` package exports;
-Phase 3 (P3.3) replaces this with per-module pages.
+Single-page reference over the `plastax` package exports.
 
 ```{eval-rst}
 .. automodule:: plastax

@@ -1,9 +1,10 @@
-# Commit scopes (SCOPES.md)
+# Commit scopes
 
 Scope is the second axis of `type(scope): subject` and is REQUIRED.
 Scopes map to the package structure; prefer the most specific one that
 covers the whole diff. A diff spanning many scopes is a signal to split
-the commit.
+the commit. The commit-msg hook (`scripts/check-commit-msg.sh`) parses this
+list directly, so keep the bullet format.
 
 Module scopes (src/plastax/):
 
@@ -29,18 +30,18 @@ Cross-cutting scopes:
 - `tests` — tests/ when the diff is test infrastructure rather than one
   module's tests (a test for sweep.py alone is `test(sweep): ...`)
 - `tooling` — dev-tool config: ruff/mypy/ty/pytest tables in pyproject,
-  TOOLING.md, uv, and the code-quality hooks in .pre-commit-config.yaml
+  docs/development/tooling.md, uv, and the code-quality hooks in .pre-commit-config.yaml
   (ruff, ruff-format, pydoclint, mypy, pytest). Distribution metadata is
   `packaging`; commit-governance hooks are `repo`.
 - `packaging` — distribution + dependency metadata in pyproject: `[project]`,
   `[build-system]`, `[dependency-groups]`, `[tool.hatch.*]` (runtime/dev/docs
   deps, version, classifiers, URLs, wheel/sdist contents)
-- `release` — release automation: .github/workflows/publish.yml, RELEASING.md
+- `release` — release automation: .github/workflows/publish.yml,
+  docs/development/releasing.md
 - `docs-site` — user-facing Sphinx / Read the Docs documentation: docs/ and
   .readthedocs.yaml (its `docs` dependency group lives in pyproject, `packaging`)
-- `plan` — IMPLEMENTATION_PLAN.md, DISTRIBUTION_PLAN.md, SPARSE_PLAN.md,
-  RL_PLAN.md, SCALE_PLAN.md, TPU_PLAN.md, BATCHING_PLAN.md, SCALING_PLAN.md, ECOSYSTEM_ROADMAP.md, SCOPES.md, TAGS.md, README.md,
-  distribution-plan.bib
+- `plan` — project governance and contributor guidance: README.md,
+  AGENTS.md, .agents/, docs/development/scopes.md and tags.md
 - `repo` — git plumbing and commit-governance mechanics: scripts/, the
   commit-msg type/scope gate wiring, .git hooks, agent identity
 

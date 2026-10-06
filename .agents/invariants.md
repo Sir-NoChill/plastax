@@ -119,9 +119,12 @@ Scheme-A multi-device sharding.
 - *Why:* v1 lowers everything through trace-time metaprogramming over plain
   JAX. Custom lowerings (composites, Pallas, FFI) are deliberately deferred
   as the *general* path; premature scope creep would entangle the design.
-  The one exception is opt-in: `layout="triton"` runs a single
-  primitive (the batched linear bucket product) as a hand-written Triton
-  kernel via jax_triton on NVIDIA GPUs (see the changelog). No Pallas kernel ships today.
+  The exceptions are hand-written Triton kernels via jax_triton, NVIDIA GPUs
+  only: `layout="triton"` (the batched linear bucket product), the streaming
+  step's fused forward + prune (`make_step(fuse_prune=)`, a linear forward
+  with a prune predicate the framework translates to Triton), and add_conn's
+  free-slot claim (`make_step(growth=)`, `phases.triton_claim`). Each has an
+  XLA counterpart used everywhere else. No Pallas kernel ships today.
 - *Enforced by:* code review and `monoid.UnsupportedMonoidError`
   guards (`monoid.py`).
 

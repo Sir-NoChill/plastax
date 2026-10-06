@@ -186,7 +186,8 @@ backward branch on `net.propagation` (single flat sweep for PIPELINE; a
 per-bucket level walk for TOPOLOGICAL). `build_add_conn_phase` (`phases.py:426`)
 is the most complex: candidate grid (full or shortlisted) → level-window filter
 + dedup vs live edges → `score` → per-bucket `top_k` → prefix-sum free-slot
-claim → commit only finite-scored candidates → set `needs_resort` if a
+claim (`xla_claim`, or `triton_claim`'s three jax_triton kernels on NVIDIA,
+picked by `make_step(growth=...)`) → commit only finite-scored candidates → set `needs_resort` if a
 committed edge isn't level-preserving. A `-inf` score is a **hard veto**. Under
 Scheme-A it is device-resident and shards byte-identically: the dedup all-
 reduces (so every shard agrees on the candidate set and `top_k`), and the
@@ -236,7 +237,10 @@ the CSR layout addresses that for linear passes:
   same linear passes as one edge-once Triton kernel per bucket, called
   through `jax_triton` (the optional `plastax[triton]` extra; triton is
   imported lazily) -- each edge read once for the whole batch, relaxed
-  atomics into the targets, no sort. NVIDIA GPUs only
+  atomics into the targets, no sort. Dead slots are masked in the kernel
+  (a null target row serialises its atomics on one address), and the
+  backward (targets FROM_ID, in runs in a source-major bucket) sums each run
+  in a tile before one atomic for a padded batch of at most 8. NVIDIA GPUs only
   (`phases.nvidia_triton_available`); anywhere else, and under Scheme-A,
   "triton" runs `phases.xla_bucket_product`, the same edge-once product in
   plain XLA (how the CPU tests exercise the layout). It replaced a Pallas
@@ -244,12 +248,41 @@ the CSR layout addresses that for linear passes:
   backend cannot express a scatter-add into arbitrary rows (a low-level
   `inline_mgpu` prototype ran 1.03-1.6x slower than Triton).
   `bucket_product(engine)` is the seam the layouts share with the level walks.
-- **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 32 (when jax_triton is
+- **"auto"**: on an NVIDIA GPU, Triton for 2 <= B <= 64 (when jax_triton is
   installed) and CSR above; on every other backend (AMD GPU, TPU, CPU) the
   XLA edge-once product for B >= 2 (same speed as the per-sample edge list,
   about 2.6x smaller temporaries compiled for TPU); the edge list at B = 1
   and for every non-linear pass. The CSR step keeps jit's `.trace`/`.lower`
   (`step._CusparseStep`), so every layout AOT-compiles (`docs/development/tooling.md`, TPU).
+
+### Prune fused into the forward (`make_step(fuse_prune=)`)
+
+A streaming step with a forward and a prune_conn would read every bucket's
+edge columns twice. `phases.plan_prune_fusion` decides once, at the step's
+first trace (it needs the globals' shapes), whether the predicate may run
+inside the forward sweep, by tracing the policies to jaxprs:
+
+- the predicate's reads (plus DEAD) must not be written by loss, backward or
+  update_conn;
+- a unit field it reads that the forward's `apply` writes must depend only on
+  the unit id, the globals and columns the forward does not write -- never
+  on the accumulator. Its post-forward value is then computed up front
+  ("forwarded"); any other forward-written read is not fusable.
+
+A fused step runs `build_fused_forward_prune_phase` in place of the forward
+and `build_prune_merge_phase` at the prune slot, so loss/backward/update_conn
+still see the old dead mask. With an unsharded linear forward on an NVIDIA
+GPU, each bucket is one Triton kernel (`triton_forward_prune`): gather,
+relaxed atomic scatter-add, the predicate translated from its jaxpr by
+`_PredicateTranslator` (exact integer / compare / select ops only), the
+tombstones written in place, and the free-slot block counts that add_conn's
+claim then reuses (`free_sink`): in `TRITON_CLAIM_BLOCK` (256-slot) blocks
+straight into `triton_claim(block_counts=)` when the Triton claim runs
+(`triton_claim_applies`), else in 1024-slot blocks for `xla_claim`. XLA cannot do this in one pass (a scatter is
+never a multi-output fusion root), so `fuse_prune="auto"` keeps the two-pass
+step everywhere else; `"xla"` forces the XLA-lowered fused step (the CPU
+correctness reference, also valid under Scheme-A). Batched steps never fuse.
+The decision is `step.prune_fusion.plan`.
 
 ### Host loop (`driver.py`)
 

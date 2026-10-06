@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, cast, no_type_check
 
 import jax
 import jax.numpy as jnp
@@ -80,6 +80,8 @@ def build_phases[GS](
     static: NetworkStatic,
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
+    prune_fusion: PruneFusionPlan | None = None,
+    growth: str = "auto",
 ) -> tuple[Phase[GS], ...]:
     """Assemble the phases present for this net; absent slots trace nothing.
 
@@ -97,12 +99,41 @@ def build_phases[GS](
         overflow_sink: optional length-1 out-parameter that
             build_add_conn_phase overwrites with its computed overflow
             flag on every call.
+        prune_fusion: a fused `plan_prune_fusion` plan to evaluate the prune
+            predicate inside the forward sweep (the prune slot then only
+            commits the tombstones), or None for the separate prune sweep.
+        growth: the add_conn free-slot claim engine (see
+            `build_add_conn_phase`).
 
     Returns:
         The tuple of phase functions to run in order, one per present
         trait slot.
     """
-    phases: list[Phase[GS]] = [_build_forward_phase(net, static)]
+    fused = prune_fusion is not None and prune_fusion.fused
+    num_buckets = len(static.level_capacities)
+    dead_sink: list[Any] = [None] * num_buckets
+    free_sink: list[Any] = [None] * num_buckets
+    if fused:
+        assert prune_fusion is not None
+        # The fused kernel counts free slots in the blocks of the claim that
+        # reads them: 256-slot blocks for the Triton claim, 1024 for XLA's.
+        count_block = (
+            TRITON_CLAIM_BLOCK
+            if net.add_conn is not None and triton_claim_applies(static, growth)
+            else _FREE_BLOCK
+        )
+        phases: list[Phase[GS]] = [
+            build_fused_forward_prune_phase(
+                net,
+                static,
+                prune_fusion,
+                dead_sink=dead_sink,
+                free_sink=free_sink,
+                count_block=count_block,
+            )
+        ]
+    else:
+        phases = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
     if net.backward_pass is not None:
@@ -110,9 +141,21 @@ def build_phases[GS](
     if net.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
     if net.prune_conn is not None:
-        phases.append(build_prune_conn_phase(net, static))
+        phases.append(
+            build_prune_merge_phase(dead_sink)
+            if fused
+            else build_prune_conn_phase(net, static)
+        )
     if net.add_conn is not None:
-        phases.append(build_add_conn_phase(net, static, overflow_sink=overflow_sink))
+        phases.append(
+            build_add_conn_phase(
+                net,
+                static,
+                overflow_sink=overflow_sink,
+                free_sink=free_sink if fused else None,
+                growth=growth,
+            )
+        )
     if net.reset_global is not None:
         phases.append(_build_reset_global_phase(net))
     return tuple(phases)
@@ -151,6 +194,7 @@ def build_batched_phases[GS](
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
     engine: str | None = None,
+    growth: str = "auto",
 ) -> BatchedPhases[GS]:
     """Assemble a batched step's phases (see `BatchedPhases`).
 
@@ -164,6 +208,7 @@ def build_batched_phases[GS](
         engine: route each linear pass (see `linear_input_field`) through this
             bucket product (`bucket_product`), or None for the per-sample edge
             list; non-linear passes always keep the edge list.
+        growth: as for `build_phases`.
 
     Returns:
         The per-sample, update, and structural phases.
@@ -190,7 +235,9 @@ def build_batched_phases[GS](
         structural.append(build_prune_conn_phase(net, static))
     if net.add_conn is not None:
         structural.append(
-            build_add_conn_phase(net, static, overflow_sink=overflow_sink)
+            build_add_conn_phase(
+                net, static, overflow_sink=overflow_sink, growth=growth
+            )
         )
     if net.reset_global is not None:
         structural.append(_build_reset_global_phase(net))
@@ -430,8 +477,17 @@ def bucket_csr(
 
 # Elements (edges x batch lanes) per Triton program: the edge block shrinks as
 # the batch widens so a program's tile stays this size (a 512-edge block at
-# B = 32 spilled and ran 25x slower).
+# B = 32 spilled and ran 25x slower). 1024-4096 and 2-8 warps time within
+# ~7 % of each other at 5.4M edges.
 _TRITON_TILE = 2048
+
+# Widest padded batch at which the backward product pre-reduces each run of
+# equal targets inside a tile before its atomic. Buckets are source-major, so
+# the backward's targets (FROM_ID) come in runs of one source's fan-out, and
+# unreduced they serialise on one address: at 5.4M edges the pre-reduction
+# makes the backward 2.2x faster at B = 1 and 2, 1.2x at 8, and 1.3x slower
+# at 32, where the in-tile scan costs more than the contention.
+_TRITON_SEGMENT_MAX_WIDTH = 8
 
 
 @functools.cache
@@ -460,7 +516,10 @@ def nvidia_triton_available() -> bool:
     return True
 
 
+# no_type_check keeps jaxtyping's test-time import hook from wrapping the nested
+# kernels, which would hide their closure (`tl`) from Triton.
 @functools.cache
+@no_type_check
 def _triton_edge_kernel() -> Any:
     """The Triton kernel, built on first use so plastax never imports triton."""
     import triton
@@ -468,30 +527,58 @@ def _triton_edge_kernel() -> Any:
 
     # Triton kernel arguments are pointers and constexprs, which carry no
     # Python annotations the type checkers understand.
-    @triton.jit  # type: ignore[untyped-decorator]
-    def edge_product(  # type: ignore[no-untyped-def]  # noqa: ANN202
+    @triton.jit
+    def segment_add(f1, v1, f2, v2):  # noqa: ANN001, ANN202
+        # Segmented sum over (run-head flag, value): associative for any flags.
+        return f1 | f2, tl.where(f2 != 0, v2, v1 + v2)
+
+    @triton.jit
+    def edge_product(  # noqa: ANN202
         tgt_ptr,  # noqa: ANN001
         src_ptr,  # noqa: ANN001
         w_ptr,  # noqa: ANN001
+        dead_ptr,  # noqa: ANN001
         x_ptr,  # noqa: ANN001
         out_ptr,  # noqa: ANN001
         n_edges,  # noqa: ANN001
         WIDTH: tl.constexpr,
         BLOCK: tl.constexpr,
+        SEGMENTED: tl.constexpr,
     ):
-        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        start = tl.program_id(0) * BLOCK
+        offs = start + tl.arange(0, BLOCK)
         m = offs < n_edges
+        # Dead slots are masked here rather than sent to a null row: every
+        # such atomic hits one address and serialises (3.9x slower at 5 %
+        # dead slots, 13x at 20 %).
+        live = m & (tl.load(dead_ptr + offs, mask=m, other=1) == 0)
         t = tl.load(tgt_ptr + offs, mask=m, other=0)
         s = tl.load(src_ptr + offs, mask=m, other=0)
         w = tl.load(w_ptr + offs, mask=m, other=0.0)
         lanes = tl.arange(0, WIDTH)
         xv = tl.load(
-            x_ptr + s[:, None] * WIDTH + lanes[None, :], mask=m[:, None], other=0.0
+            x_ptr + s[:, None] * WIDTH + lanes[None, :],
+            mask=live[:, None],
+            other=0.0,
         )
+        v = tl.where(live[:, None], w[:, None] * xv, 0.0)
+        if SEGMENTED:
+            # One atomic per run of equal targets in the tile, at its last
+            # edge, carrying the run's sum.
+            nxt = offs + 1
+            t_prev = tl.load(tgt_ptr + offs - 1, mask=m & (offs > start), other=-1)
+            t_next = tl.load(
+                tgt_ptr + nxt, mask=(nxt < n_edges) & (nxt < start + BLOCK), other=-1
+            )
+            head = tl.broadcast_to((t != t_prev).to(tl.int32)[:, None], v.shape)
+            _, v = tl.associative_scan((head, v), 0, segment_add)
+            keep = m & (t != t_next)
+        else:
+            keep = live
         tl.atomic_add(
             out_ptr + t[:, None] * WIDTH + lanes[None, :],
-            w[:, None] * xv,
-            mask=m[:, None],
+            v,
+            mask=keep[:, None],
             sem="relaxed",
         )
 
@@ -509,11 +596,15 @@ def triton_bucket_product(
     """`bucket_csr(...) @ x` as one edge-once Triton kernel (NVIDIA GPUs).
 
     Each program loads a block of edges, gathers its `(block, batch)` slab of
-    x once, and adds `weight * slab` into the target rows with relaxed atomics:
-    no sort, every edge read once for the whole batch. Dead edges target an
-    extra null row that is sliced off; the batch is padded to a power of two
-    (a Triton tile constraint). Called through `jax_triton` -- the Pallas
-    Triton lowering this replaces is deprecated in jax.
+    x once (the batch lanes contiguous, so a lane group is one coalesced
+    access), and adds `weight * slab` into the target rows with relaxed
+    atomics: no sort, every edge read once for the whole batch. Dead edges are
+    masked in the kernel. With `rows` = FROM_ID (the backward; buckets are
+    source-major, so its targets come in runs) and a batch of at most
+    `_TRITON_SEGMENT_MAX_WIDTH`, each run in a tile is summed before one
+    atomic. The batch is padded to a power of two (a Triton tile constraint).
+    Called through `jax_triton` -- the Pallas Triton lowering this replaces is
+    deprecated in jax.
 
     Args:
         bucket: The bucket's columns.
@@ -531,22 +622,25 @@ def triton_bucket_product(
     batch = x.shape[1]
     width = 1 << max(batch - 1, 0).bit_length()
     block = max(16, _TRITON_TILE // width)
-    target = jnp.where(bucket[DEAD.name], jnp.int32(num_units), bucket[rows.name])
     x_pad = x if width == batch else jnp.pad(x, ((0, 0), (0, width - batch)))
     out = jax_triton.triton_call(
-        target.astype(jnp.int32),
+        bucket[rows.name].astype(jnp.int32),
         bucket[cols.name].astype(jnp.int32),
         bucket[WEIGHT.name].astype(jnp.float32),
+        # A bool buffer goes in as-is (one byte per slot): a cast would be a
+        # separate XLA pass over the bucket.
+        bucket[DEAD.name],
         x_pad.astype(jnp.float32),
         kernel=_triton_edge_kernel(),
-        out_shape=jax.ShapeDtypeStruct((num_units + 1, width), jnp.float32),  # type: ignore[no-untyped-call]
+        out_shape=jax.ShapeDtypeStruct((num_units, width), jnp.float32),  # type: ignore[no-untyped-call]
         grid=(-(-cap // block),),
         zeroed_outputs=(0,),
         n_edges=cap,
         WIDTH=width,
         BLOCK=block,
+        SEGMENTED=(rows.name == FROM_ID.name and width <= _TRITON_SEGMENT_MAX_WIDTH),
     )
-    product: Float[Array, "num_units batch"] = out[:num_units, :batch]
+    product: Float[Array, "num_units batch"] = out if width == batch else out[:, :batch]
     return product
 
 
@@ -1048,6 +1142,967 @@ def build_prune_conn_phase[GS](
     return prune_conn_phase
 
 
+# ---------------------------------------------------------------------------
+# Prune-into-forward fusion (streaming step)
+# ---------------------------------------------------------------------------
+#
+# A streaming step with both a forward and a prune_conn reads every bucket's
+# edge columns twice: once in the forward's gather/scatter, once in the prune
+# predicate's sweep. When the predicate provably sees the same values in both
+# places, `plan_prune_fusion` lets the forward evaluate it during its own edge
+# sweep: on an NVIDIA GPU (jax_triton) one Triton kernel per bucket gathers,
+# scatter-adds, evaluates the predicate, writes the new tombstones and counts
+# each free-slot block for add_conn, reading the edge columns once. Elsewhere
+# the same restructured step runs in plain XLA. The tombstones are only
+# *committed* at the prune_conn slot (`build_prune_merge_phase`), so loss,
+# backward and update_conn still see the step's old dead mask.
+
+
+@dataclasses.dataclass(frozen=True)
+class PruneFusionPlan:
+    """The static decision whether a streaming step fuses prune into forward.
+
+    Attributes:
+        fused: Whether the predicate is evaluated inside the forward sweep.
+        reason: Why (or why not), for tests and debugging.
+        engine: "triton" (one jax_triton kernel per bucket) or "xla" when
+            fused, else None.
+        forwarded: Unit fields the forward writes and the predicate reads.
+            Each was proved to depend only on columns the forward does not
+            write (never on the accumulator), so its post-forward value is
+            computed up front and the predicate reads that.
+        triton_kernels: The translated predicate per bucket (engine "triton"
+            only); excluded from comparison and repr.
+    """
+
+    fused: bool
+    reason: str
+    engine: str | None = None
+    forwarded: tuple[str, ...] = ()
+    # One translated predicate per bucket (engine "triton"); not compared.
+    triton_kernels: tuple[Any, ...] = dataclasses.field(
+        default=(), repr=False, compare=False
+    )
+
+
+@dataclasses.dataclass
+class PruneFusionRecord:
+    """The plan a step chose on its last trace (`make_step`'s `prune_fusion`).
+
+    Attributes:
+        plan: The plan, or None until the step has been traced.
+    """
+
+    plan: PruneFusionPlan | None = None
+
+
+def _sub_jaxpr(eqn: Any) -> Any:
+    """The callee of a call-like equation whose invars/outvars map 1:1."""
+    for key in ("jaxpr", "call_jaxpr", "fun_jaxpr"):
+        sub = eqn.params.get(key)
+        if sub is None:
+            continue
+        inner = getattr(sub, "jaxpr", sub)
+        if len(inner.invars) == len(eqn.invars) and len(inner.outvars) == len(
+            eqn.outvars
+        ):
+            return inner
+    return None
+
+
+def _live_invars(jaxpr: Any, live_out: list[bool]) -> list[bool]:
+    """Which of `jaxpr`'s inputs the selected outputs depend on.
+
+    A backward liveness walk. Call-like equations (pjit, closed_call, custom
+    derivatives) are entered; any other equation with a live output makes all
+    of its inputs live, which over-approximates a read set -- the safe
+    direction for the fusion check.
+    """
+    from jax.extend.core import Literal
+
+    live: set[Any] = {
+        v
+        for v, keep in zip(jaxpr.outvars, live_out, strict=True)
+        if keep and not isinstance(v, Literal)
+    }
+    for eqn in reversed(jaxpr.eqns):
+        outs = [o in live for o in eqn.outvars]
+        if not any(outs):
+            continue
+        sub = _sub_jaxpr(eqn)
+        used = _live_invars(sub, outs) if sub is not None else [True] * len(eqn.invars)
+        for v, keep in zip(eqn.invars, used, strict=True):
+            if keep and not isinstance(v, Literal):
+                live.add(v)
+    return [v in live for v in jaxpr.invars]
+
+
+def _flat_labels(
+    args: tuple[Any, ...], columns: tuple[int, ...] = (0, 1)
+) -> list[tuple[int, Any]]:
+    """`(argument index, key)` for each flattened input of a traced policy.
+
+    The arguments at `columns` are column dicts, keyed by column name; every
+    other argument is keyed by its running leaf index.
+    """
+    labels: list[tuple[int, Any]] = []
+    for pos, arg in enumerate(args):
+        leaves = jax.tree_util.tree_flatten_with_path(arg)[0]
+        for k, (path, _) in enumerate(leaves):
+            key = getattr(path[0], "key", k) if pos in columns else k
+            labels.append((pos, key))
+    return labels
+
+
+def _sds(shape: tuple[int, ...], dtype: Any) -> Any:
+    """A `jax.ShapeDtypeStruct` (untyped in jax's stubs, hence Any)."""
+    return jax.ShapeDtypeStruct(shape, dtype)  # type: ignore[no-untyped-call]
+
+
+def _abstract(tree: Any) -> Any:
+    """ShapeDtypeStructs standing in for every array leaf of `tree`."""
+    return jax.tree.map(lambda x: _sds(jnp.shape(x), jnp.result_type(x)), tree)
+
+
+def _write_keys(fn: Callable[..., Any], *args: Any) -> frozenset[str]:
+    """The field names of the write record `fn` returns (as a dict)."""
+    out = jax.eval_shape(fn, *args)
+    return frozenset(out)
+
+
+def plan_prune_fusion[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    globals_: GS,
+    *,
+    engine: str = "auto",
+) -> PruneFusionPlan:
+    """Decide, statically, whether prune_conn can run inside the forward sweep.
+
+    Fusion is legal when the predicate sees the same values inside the forward
+    sweep as it would at its own slot. The read and write sets come from
+    tracing the policies to jaxprs (a dependency walk, conservative across
+    control flow). The rules:
+
+    - The predicate's reads (plus DEAD, which the prune merges into) must
+      not be written by loss, backward or update_conn, which run in between.
+    - A unit field the predicate reads that the forward's `apply` writes
+      must provably not depend on the accumulator or on any other field the
+      forward writes (only on the unit id, the globals and unwritten unit
+      columns). Its post-forward value is then known before the sweep and is
+      computed up front ("forwarded"); any other forward-written read is
+      illegal.
+    - The forward never writes edge columns (ForwardPass returns only a
+      UnitWrite), so the predicate's edge reads are always current.
+
+    Anything that fails to trace is not fused. The single-pass lowering is
+    the Triton one: on an unsharded NVIDIA GPU with jax_triton, a linear
+    forward (see `linear_input_field`) whose predicate translates to Triton
+    (integer and exact float ops, see `_PredicateTranslator`) runs as one
+    kernel per bucket. XLA cannot fuse a scatter with the predicate's
+    reduction (a scatter is never a multi-output fusion root), so the fused
+    step in plain XLA still reads the edge columns twice: `engine="auto"`
+    therefore fuses only when the Triton kernel applies, `"triton"` falls
+    back to the XLA fused step where it does not, and `"xla"` always takes
+    the XLA fused step (portable; the correctness reference on CPU).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network's trait class.
+        static: The network's static configuration.
+        globals_: The globals pytree (arrays, tracers or ShapeDtypeStructs);
+            only its shapes and dtypes are used.
+        engine: "auto", "triton" or "xla" (see above).
+
+    Returns:
+        The plan: fused or not, why, and how.
+
+    Raises:
+        ValueError: If `engine` is not "auto", "triton" or "xla".
+    """
+    pc = net.prune_conn
+    if pc is None:
+        return PruneFusionPlan(False, "no prune_conn")
+    fp = net.forward_pass
+    n = static.num_units
+    units = {s.name: _sds((n,), np.dtype(s.dtype)) for s in static.unit_fields}
+
+    def conns_at(cap: int) -> dict[str, Any]:
+        return {s.name: _sds((cap,), np.dtype(s.dtype)) for s in static.conn_fields}
+
+    conns0 = conns_at(static.level_capacities[0])
+    g = _abstract(globals_)
+    scalar_i = _sds((), np.dtype(np.int32))
+    acc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), fp.combine)
+
+    def predicate(u: Columns, c: Columns, cid: jax.Array, g_: Any) -> jax.Array:
+        return jnp.asarray(pc.predicate(UnitView(u), ConnView(c), ConnIdx(cid), g_))
+
+    def forward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> dict[str, Any]:
+        return dict(fp.apply(UnitView(u), UnitIdx(i), g_, a).fields)
+
+    try:
+        pred_args = (units, conns0, scalar_i, g)
+        closed = jax.make_jaxpr(predicate)(*pred_args)
+        if closed.out_avals[0].shape != ():
+            return PruneFusionPlan(False, "predicate is not a scalar")
+        live = _live_invars(closed.jaxpr, [True])
+        reads = {
+            ("unit" if pos == 0 else "conn", key)
+            for (pos, key), keep in zip(_flat_labels(pred_args), live, strict=True)
+            if keep and pos in (0, 1)
+        }
+        reads.add(("conn", DEAD.name))
+
+        apply_args = (units, scalar_i, g, acc)
+        fwd_writes = _write_keys(forward_apply, *apply_args)
+        between: set[tuple[str, str]] = set()
+        if net.loss is not None:
+            loss = net.loss
+
+            def loss_write(u: Columns, i: jax.Array, t: jax.Array, g_: Any) -> Any:
+                return dict(loss.per_output(UnitView(u), UnitIdx(i), t, g_)[1].fields)
+
+            target = _sds((), np.dtype(np.float32))
+            between |= {
+                ("unit", k) for k in _write_keys(loss_write, units, scalar_i, target, g)
+            }
+        if net.backward_pass is not None:
+            bp = net.backward_pass
+
+            def backward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> Any:
+                return dict(bp.apply(UnitView(u), UnitIdx(i), g_, a).fields)
+
+            bacc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), bp.combine)
+            between |= {
+                ("unit", k)
+                for k in _write_keys(backward_apply, units, scalar_i, g, bacc)
+            }
+        if net.update_conn is not None:
+            uc = net.update_conn
+            for rule in (uc.incoming, uc.outgoing):
+
+                def conn_write(
+                    u: Columns,
+                    c: Columns,
+                    a: jax.Array,
+                    b: jax.Array,
+                    cid: jax.Array,
+                    g_: Any,
+                    rule: Any = rule,
+                ) -> Any:
+                    return dict(
+                        rule(
+                            UnitView(u),
+                            UnitIdx(a),
+                            UnitIdx(b),
+                            ConnView(c),
+                            ConnIdx(cid),
+                            g_,
+                        ).fields
+                    )
+
+                between |= {
+                    ("conn", k)
+                    for k in _write_keys(
+                        conn_write, units, conns0, scalar_i, scalar_i, scalar_i, g
+                    )
+                }
+        clash = sorted(name for _, name in reads & between)
+        if clash:
+            return PruneFusionPlan(
+                False, f"a phase between forward and prune writes {clash}"
+            )
+
+        forwarded = tuple(
+            sorted(
+                name for kind, name in reads if kind == "unit" and name in fwd_writes
+            )
+        )
+        if forwarded:
+            apply_closed, out_shape = jax.make_jaxpr(forward_apply, return_shape=True)(
+                *apply_args
+            )
+            out_keys = [
+                getattr(path[0], "key", None)
+                for path, _ in jax.tree_util.tree_flatten_with_path(out_shape)[0]
+            ]
+            labels = _flat_labels(apply_args, columns=(0,))
+            for name in forwarded:
+                deps = _live_invars(apply_closed.jaxpr, [k == name for k in out_keys])
+                for (pos, key), keep in zip(labels, deps, strict=True):
+                    if not keep:
+                        continue
+                    if pos == 3:
+                        return PruneFusionPlan(
+                            False,
+                            f"predicate reads {name!r}, which the forward computes "
+                            "from its accumulator",
+                        )
+                    if pos == 0 and key in fwd_writes:
+                        return PruneFusionPlan(
+                            False,
+                            f"predicate reads {name!r}, which the forward computes "
+                            f"from {key!r}, itself written by the forward",
+                        )
+    except Exception as exc:  # noqa: BLE001 - any trace failure: not provably safe
+        return PruneFusionPlan(False, f"could not trace the policies: {exc!r}")
+
+    if engine not in ("auto", "triton", "xla"):
+        raise ValueError(f"plan_prune_fusion: unknown engine {engine!r}")
+
+    def without_triton(why: str) -> PruneFusionPlan:
+        if engine == "auto":
+            return PruneFusionPlan(False, f"legal, but two-pass: {why}")
+        return PruneFusionPlan(True, f"legal; XLA ({why})", "xla", forwarded)
+
+    if engine == "xla":
+        return PruneFusionPlan(True, "legal; XLA (requested)", "xla", forwarded)
+    if static.sharding is not None:
+        return without_triton("jax_triton is not validated inside shard_map")
+    if not nvidia_triton_available():
+        return without_triton("no NVIDIA GPU with jax_triton")
+    field = linear_input_field(fp)
+    if (
+        field is None
+        or np.dtype(field.dtype) != np.float32
+        or np.dtype(WEIGHT.dtype) != np.float32
+    ):
+        return without_triton("the forward is not a float32 linear pass")
+    kernels = []
+    try:
+        for cap in static.level_capacities:
+            args = (units, conns_at(cap), scalar_i, g)
+            kernels.append(
+                _PredicateTranslator(
+                    jax.make_jaxpr(predicate)(*args), _flat_labels(args)
+                ).build()
+            )
+    except _Untranslatable as exc:
+        return without_triton(f"the predicate does not translate to Triton: {exc}")
+    return PruneFusionPlan(True, "legal; Triton", "triton", forwarded, tuple(kernels))
+
+
+class _Untranslatable(Exception):
+    """A predicate jaxpr outside the Triton translator's exact subset."""
+
+
+_TL_DTYPES: dict[np.dtype[Any], str] = {
+    np.dtype(np.bool_): "tl.int1",
+    np.dtype(np.int8): "tl.int8",
+    np.dtype(np.int16): "tl.int16",
+    np.dtype(np.int32): "tl.int32",
+    np.dtype(np.uint8): "tl.uint8",
+    np.dtype(np.uint16): "tl.uint16",
+    np.dtype(np.uint32): "tl.uint32",
+    np.dtype(np.float32): "tl.float32",
+}
+
+# Binary primitives that are exact (bit-identical to XLA) on integers.
+_INT_BINARY = {
+    "add": "({a} + {b})",
+    "sub": "({a} - {b})",
+    "mul": "({a} * {b})",
+    "max": "tl.maximum({a}, {b})",
+    "min": "tl.minimum({a}, {b})",
+}
+_BITWISE = {"and": "({a} & {b})", "or": "({a} | {b})", "xor": "({a} ^ {b})"}
+_COMPARE = {
+    "eq": "({a} == {b})",
+    "ne": "({a} != {b})",
+    "lt": "({a} < {b})",
+    "le": "({a} <= {b})",
+    "gt": "({a} > {b})",
+    "ge": "({a} >= {b})",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class _TritonPredicate:
+    """A predicate translated to Triton: the kernel and its extra inputs.
+
+    Attributes:
+        source: The generated kernel source (the cache key).
+        inputs: `(kind, key)` per extra kernel input, in order: kind is
+            "unit" or "conn" (key a column name) or "g" (key a leaf index).
+    """
+
+    source: str
+    inputs: tuple[tuple[str, Any], ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Val:
+    """One translated jaxpr value: a Triton expression and what it is."""
+
+    expr: str
+    dtype: np.dtype[Any]
+    kind: str  # "tensor", "cid" (the edge index), "const", or "array" (an input)
+    const: Any = None
+    shape: tuple[int, ...] = ()
+
+
+class _PredicateTranslator:
+    """Translate a per-edge predicate jaxpr into a fused Triton kernel body.
+
+    Only primitives whose Triton lowering is bit-identical to XLA's are
+    accepted: integer arithmetic and bit ops (shifts by in-range literals),
+    comparisons, selects, integer/bool conversions, float negation, abs,
+    int-to-float conversion and division by a power-of-two literal. Gathers
+    are scalar `dynamic_slice`s of the unit, edge or globals arrays, clamped
+    exactly as XLA clamps them. Anything else raises `_Untranslatable`, and
+    the fused step stays on XLA.
+    """
+
+    def __init__(self, closed: Any, labels: list[tuple[int, Any]]) -> None:
+        self.closed = closed
+        self.labels = labels
+        self.lines: list[str] = []
+        self.consts: dict[str, Any] = {}
+        self.params: list[tuple[str, Any]] = []
+        self.param_names: dict[tuple[str, Any], str] = {}
+        self.count = 0
+
+    def fresh(self, expr: str) -> str:
+        name = f"v{self.count}"
+        self.count += 1
+        self.lines.append(f"    {name} = {expr}")
+        return name
+
+    def const_name(self, value: Any) -> str:
+        name = f"K{len(self.consts)}"
+        self.consts[name] = value
+        return name
+
+    def tensor(self, v: _Val) -> str:
+        if v.kind == "const":
+            k = self.const_name(v.const)
+            return self.fresh(f"tl.full([BLOCK], {k}, {_TL_DTYPES[v.dtype]})")
+        if v.kind == "cid":
+            return "offs"
+        if v.kind == "array" and v.shape == () and v.const[0] == "g":
+            # A scalar global: one load, broadcast over the block.
+            raw = f"tl.load({self.param(v.const)})"
+            if v.dtype == np.dtype(np.bool_):
+                return self.fresh(f"tl.zeros([BLOCK], tl.int1) | ({raw} != 0)")
+            return self.fresh(f"tl.zeros([BLOCK], {_TL_DTYPES[v.dtype]}) + {raw}")
+        if v.kind != "tensor":
+            raise _Untranslatable("an array used as a value")
+        return v.expr
+
+    def param(self, label: tuple[str, Any]) -> str:
+        if label not in self.param_names:
+            self.param_names[label] = f"p{len(self.params)}"
+            self.params.append(label)
+        return self.param_names[label]
+
+    def literal(self, lit: Any) -> _Val:
+        aval = lit.aval
+        dtype = np.dtype(aval.dtype)
+        if aval.shape != () or dtype not in _TL_DTYPES:
+            raise _Untranslatable(f"literal of {aval}")
+        value = np.asarray(lit.val).astype(dtype).item()
+        return _Val("", dtype, "const", value)
+
+    def build(self) -> _TritonPredicate:
+        jaxpr = self.closed.jaxpr
+        if jaxpr.constvars:
+            raise _Untranslatable("closed-over constants")
+        env: dict[Any, _Val] = {}
+        for var, (pos, key) in zip(jaxpr.invars, self.labels, strict=True):
+            aval = var.aval
+            dtype = np.dtype(aval.dtype)
+            if pos == 2:
+                env[var] = _Val("offs", dtype, "cid")
+            else:
+                kind = {0: "unit", 1: "conn", 3: "g"}[pos]
+                env[var] = _Val("", dtype, "array", (kind, key), tuple(aval.shape))
+        out = self.run(jaxpr, env)
+        if out.dtype != np.dtype(np.bool_):
+            raise _Untranslatable("predicate is not boolean")
+        result = self.tensor(out)
+        header = ", ".join(self.param_names[label] for label in self.params)
+        consts = "".join(
+            f"{k} = tl.constexpr({_py_literal(v)})\n" for k, v in self.consts.items()
+        )
+        body = "\n".join(self.lines)
+        source = _FUSED_KERNEL_TEMPLATE.format(
+            consts=consts,
+            params=(header + ", ") if header else "",
+            body=body,
+            result=result,
+        )
+        return _TritonPredicate(source, tuple(self.params))
+
+    def run(self, jaxpr: Any, env: dict[Any, _Val]) -> _Val:
+        from jax.extend.core import Literal
+
+        def read(v: Any) -> _Val:
+            return self.literal(v) if isinstance(v, Literal) else env[v]
+
+        for eqn in jaxpr.eqns:
+            ins = [read(v) for v in eqn.invars]
+            sub = _sub_jaxpr(eqn)
+            if sub is not None and eqn.primitive.name in ("pjit", "closed_call", "jit"):
+                inner_env = dict(zip(sub.invars, ins, strict=True))
+                if len(sub.outvars) != 1:
+                    raise _Untranslatable("multi-output call")
+                env[eqn.outvars[0]] = self.run_nested(sub, inner_env)
+                continue
+            if len(eqn.outvars) != 1:
+                raise _Untranslatable(f"multi-output {eqn.primitive.name}")
+            out = eqn.outvars[0]
+            env[out] = self.eqn(eqn.primitive.name, eqn.params, ins, out.aval)
+        outs = [read(v) for v in jaxpr.outvars]
+        if len(outs) != 1:
+            raise _Untranslatable("multiple outputs")
+        return outs[0]
+
+    def run_nested(self, jaxpr: Any, env: dict[Any, _Val]) -> _Val:
+        if getattr(jaxpr, "constvars", ()):
+            raise _Untranslatable("closed-over constants")
+        return self.run(jaxpr, env)
+
+    def eqn(self, prim: str, params: Any, ins: list[_Val], aval: Any) -> _Val:
+        dtype = np.dtype(aval.dtype)
+        if dtype not in _TL_DTYPES:
+            raise _Untranslatable(f"dtype {dtype}")
+        if prim == "dynamic_slice":
+            return self.gather(ins[0], ins[1:], params, dtype)
+        if aval.shape not in ((), (1,)):
+            raise _Untranslatable(f"{prim} of shape {aval.shape}")
+        if prim in ("squeeze", "reshape", "copy", "copy_p"):
+            if ins[0].kind == "array":
+                raise _Untranslatable(f"{prim} of an array")
+            return ins[0]
+        is_float = dtype.kind == "f"
+        if prim == "lt" and ins[0].kind == "cid" and ins[1].kind == "const":
+            if ins[1].const <= 0:  # the edge index is never negative
+                return _Val("", dtype, "const", False)
+        if prim == "ge" and ins[0].kind == "cid" and ins[1].kind == "const":
+            if ins[1].const <= 0:
+                return _Val("", dtype, "const", True)
+        if prim == "select_n":
+            pred, *cases = ins
+            if pred.kind == "const":
+                return (
+                    cases[int(bool(pred.const))]
+                    if len(cases) == 2
+                    else cases[int(pred.const)]
+                )
+            if pred.dtype != np.dtype(np.bool_) or len(cases) != 2:
+                raise _Untranslatable("non-boolean select_n")
+            p, a, b = (self.tensor(v) for v in (pred, *cases))
+            return _Val(self.fresh(f"tl.where({p}, {b}, {a})"), dtype, "tensor")
+        if prim in _COMPARE:
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(_COMPARE[prim].format(a=a, b=b)), dtype, "tensor")
+        if prim in _BITWISE and not is_float:
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(_BITWISE[prim].format(a=a, b=b)), dtype, "tensor")
+        if prim in _INT_BINARY and not is_float:
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(_INT_BINARY[prim].format(a=a, b=b)), dtype, "tensor")
+        if prim == "not" and not is_float:
+            return _Val(self.fresh(f"~{self.tensor(ins[0])}"), dtype, "tensor")
+        if prim == "neg":
+            return _Val(self.fresh(f"-{self.tensor(ins[0])}"), dtype, "tensor")
+        if prim == "abs":
+            return _Val(self.fresh(f"tl.abs({self.tensor(ins[0])})"), dtype, "tensor")
+        if prim in ("shift_left", "shift_right_logical", "shift_right_arithmetic"):
+            amount = ins[1]
+            bits = dtype.itemsize * 8
+            if is_float or amount.kind != "const" or not 0 <= amount.const < bits:
+                raise _Untranslatable(f"{prim} by a non-literal or out-of-range amount")
+            signed = dtype.kind == "i"
+            if prim == "shift_right_logical" and signed:
+                raise _Untranslatable("logical shift of a signed integer")
+            if prim == "shift_right_arithmetic" and not signed:
+                raise _Untranslatable("arithmetic shift of an unsigned integer")
+            op = "<<" if prim == "shift_left" else ">>"
+            a, b = (self.tensor(v) for v in ins)
+            return _Val(self.fresh(f"({a} {op} {b})"), dtype, "tensor")
+        if prim == "div" and is_float:
+            d = ins[1]
+            if d.kind == "const" and d.const != 0 and np.frexp(abs(d.const))[0] == 0.5:
+                inv = self.const_name(1.0 / d.const)
+                return _Val(
+                    self.fresh(f"({self.tensor(ins[0])} * {inv})"), dtype, "tensor"
+                )
+            raise _Untranslatable("float division by a non-power-of-two")
+        if prim == "convert_element_type":
+            src = ins[0]
+            if src.kind == "const":
+                return _Val(
+                    "", dtype, "const", np.asarray(src.const).astype(dtype).item()
+                )
+            if src.dtype.kind == "f" and dtype.kind != "f":
+                raise _Untranslatable("float to integer conversion")
+            if dtype == src.dtype:
+                return src
+            a = self.tensor(src)
+            if dtype == np.dtype(np.bool_):
+                return _Val(self.fresh(f"({a} != 0)"), dtype, "tensor")
+            return _Val(self.fresh(f"{a}.to({_TL_DTYPES[dtype]})"), dtype, "tensor")
+        raise _Untranslatable(f"primitive {prim}")
+
+    def gather(
+        self, array: _Val, idx: list[_Val], params: Any, dtype: np.dtype[Any]
+    ) -> _Val:
+        if array.kind != "array" or any(s != 1 for s in params["slice_sizes"]):
+            raise _Untranslatable("dynamic_slice that is not a scalar read")
+        kind, key = array.const
+        shape = array.shape
+        if kind == "conn" and len(shape) == 1 and idx[0].kind == "cid":
+            # This edge's own row: the column the kernel already streams.
+            builtin = _FUSED_REGISTERS.get(key)
+            if builtin is not None:
+                return _Val(builtin, dtype, "tensor")
+            ptr = self.param((kind, key))
+            return self.load(f"{ptr} + offs", dtype)
+        ptr = self.param((kind, key))
+        flat = ""
+        stride = 1
+        for dim, i in reversed(list(zip(shape, idx, strict=True))):
+            if i.kind == "const":
+                term = str(min(max(int(i.const), 0), dim - 1) * stride)
+            else:
+                e = self.tensor(i) if i.kind != "cid" else "offs"
+                clamped = self.fresh(f"tl.minimum(tl.maximum({e}, 0), {dim - 1})")
+                term = f"{clamped} * {stride}" if stride != 1 else clamped
+            flat = f"{term} + {flat}" if flat else term
+            stride *= dim
+        return self.load(f"{ptr} + {flat}", dtype)
+
+    def load(self, address: str, dtype: np.dtype[Any]) -> _Val:
+        if dtype == np.dtype(np.bool_):
+            raw = self.fresh(f"tl.load({address}, mask=m, other=0)")
+            return _Val(self.fresh(f"({raw} != 0)"), dtype, "tensor")
+        return _Val(self.fresh(f"tl.load({address}, mask=m, other=0)"), dtype, "tensor")
+
+
+def _py_literal(value: Any) -> str:
+    """A Python expression reproducing `value` exactly (floats via hex)."""
+    if isinstance(value, float):
+        return f"float.fromhex({value.hex()!r})"
+    return repr(value)
+
+
+# Block length for the two-level free-slot search: the largest power of two up
+# to this that divides the bucket, so the per-block counts are a plain reshape.
+_FREE_BLOCK = 1024
+
+# Slots per fused-kernel program (a whole number of free-count blocks) and its
+# warps: the best of a sweep at 5M and 50M edges (1024-8192 slots x 2-8
+# warps, within 3 % of each other at 1024-2048 x 8).
+_FUSED_TILE = 2048
+_FUSED_WARPS = 8
+
+# The edge columns every fused kernel loads anyway, by register name.
+_FUSED_REGISTERS = {
+    FROM_ID.name: "s",
+    TO_ID.name: "t",
+    DEAD.name: "d",
+    WEIGHT.name: "w",
+}
+
+_FUSED_KERNEL_TEMPLATE = """\
+import triton
+import triton.language as tl
+
+{consts}
+
+@triton.jit
+def fused_forward_prune(tgt_ptr, src_ptr, w_ptr, dead_ptr, x_ptr, {params}acc_ptr,
+                        cnt_ptr, n, n_blocks, COUNT: tl.constexpr, SUB: tl.constexpr):
+    # One program streams SUB free-count blocks of COUNT slots each.
+    BLOCK: tl.constexpr = COUNT * SUB
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n
+    d = tl.load(dead_ptr + offs, mask=m, other=1) != 0
+    t = tl.load(tgt_ptr + offs, mask=m, other=0)
+    s = tl.load(src_ptr + offs, mask=m, other=0)
+    w = tl.load(w_ptr + offs, mask=m, other=0.0)
+    live = m & ~d
+    xv = tl.load(x_ptr + s, mask=live, other=0.0)
+    tl.atomic_add(acc_ptr + t, w * xv, mask=live, sem="relaxed")
+{body}
+    p = {result}
+    nd = d | p
+    # dead_ptr is aliased to the new-mask output: only fresh tombstones move.
+    tl.store(dead_ptr + offs, p, mask=m & p & ~d)
+    per_block = tl.sum(tl.reshape(tl.where(m & nd, 1, 0), [SUB, COUNT]), axis=1)
+    b = pid * SUB + tl.arange(0, SUB)
+    tl.store(cnt_ptr + b, per_block, mask=b < n_blocks)
+"""
+
+
+@functools.cache
+def _compile_fused_kernel(source: str) -> Any:
+    """Load a generated kernel source as a Triton JITFunction (cached)."""
+    import hashlib
+    import linecache
+    import types
+
+    filename = f"<plastax-fused-{hashlib.sha1(source.encode()).hexdigest()[:16]}>"
+    # triton.jit reads the function's source through inspect / linecache.
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    module = types.ModuleType(filename)
+    module.__file__ = filename
+    exec(compile(source, filename, "exec"), module.__dict__)  # noqa: S102
+    return module.fused_forward_prune
+
+
+def free_block_len(cap: int, max_block: int = _FREE_BLOCK) -> tuple[int, int]:
+    """A free-slot block length (see `free_block_length`), and the padding.
+
+    Args:
+        cap: The bucket (or shard slice) capacity.
+        max_block: As for `free_block_length`: `_FREE_BLOCK` (1024) gives
+            `count_free_blocks`' blocks, `TRITON_CLAIM_BLOCK` the Triton
+            claim's.
+
+    Returns:
+        `(block, pad)`: the block length (`free_block_length(cap,
+        max_block)`) and how many False slots are appended so the blocks
+        tile the bucket.
+    """
+    block = free_block_length(cap, max_block)
+    return block, -cap % block
+
+
+def triton_forward_prune(
+    kernel: _TritonPredicate,
+    bucket: Columns,
+    x: Float[Array, " num_units"],
+    pred_units: Columns,
+    globals_: Any,
+    *,
+    count_block: int = _FREE_BLOCK,
+) -> tuple[
+    Float[Array, " num_units"], Bool[Array, " cap"], Int32[Array, " blocks"], int
+]:
+    """One bucket of the fused forward + prune as a single Triton kernel.
+
+    Gathers `x` at each live edge's source, adds `weight * x` into the
+    destination with relaxed atomics (B = 1), evaluates the translated prune
+    predicate, writes the new tombstones in place of a copy of the old mask,
+    and counts the tombstones in each free-slot block of
+    `free_block_len(cap, count_block)` slots (`free_block_counts(new_dead,
+    count_block)`, exactly).
+
+    Args:
+        kernel: The translated predicate for this bucket.
+        bucket: The bucket's columns (the step's old dead mask).
+        x: The forward's linear-input column.
+        pred_units: The unit columns the predicate reads.
+        globals_: The globals pytree.
+        count_block: The largest free-count block length (see
+            `free_block_length`).
+
+    Returns:
+        The bucket's accumulator contribution, the new dead mask, the free
+        count per block (not cumulative), and the block length.
+    """
+    import jax_triton  # ty: ignore[unresolved-import]
+
+    dead = bucket[DEAD.name]
+    cap = dead.shape[0]
+    block, pad = free_block_len(cap, count_block)
+    n_blocks = (cap + pad) // block
+    sub = max(1, _FUSED_TILE // block)
+    leaves = jax.tree.leaves(globals_)
+    extra = []
+    for kind, key in kernel.inputs:
+        col = (
+            pred_units[key]
+            if kind == "unit"
+            else bucket[key]
+            if kind == "conn"
+            else jnp.asarray(leaves[key]).reshape(-1)
+        )
+        # Bool buffers go in as-is (jax_triton passes them as *i1, one byte
+        # each): a `view` as int8 would be a full convert pass in XLA.
+        extra.append(col)
+    num_units = x.shape[0]
+    # The aliased output goes last: jax_triton 0.4.1 hands the unaliased
+    # output pointers out by position, so an aliased output ahead of an
+    # unaliased one sends the latter's stores into the aliased buffer.
+    acc, counts, new_dead = jax_triton.triton_call(
+        bucket[TO_ID.name],
+        bucket[FROM_ID.name],
+        bucket[WEIGHT.name],
+        dead,
+        x,
+        *extra,
+        kernel=_compile_fused_kernel(kernel.source),
+        out_shape=(
+            _sds((num_units,), jnp.float32),
+            _sds((n_blocks,), jnp.int32),
+            _sds((cap,), jnp.bool_),
+        ),
+        grid=(-(-n_blocks // sub),),
+        zeroed_outputs=(0,),
+        input_output_aliases={3: 2},
+        num_warps=_FUSED_WARPS,
+        n=cap,
+        n_blocks=n_blocks,
+        COUNT=block,
+        SUB=sub,
+    )
+    return acc, new_dead, counts, block
+
+
+def build_fused_forward_prune_phase[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    plan: PruneFusionPlan,
+    *,
+    dead_sink: list[Any],
+    free_sink: list[Any],
+    count_block: int = _FREE_BLOCK,
+) -> Phase[GS]:
+    """The forward phase with the prune predicate evaluated in its sweep.
+
+    Runs the ordinary forward walk (topological level walk, or the pipeline
+    flat sweep). Per bucket it also evaluates `prune_conn.predicate` against
+    the unit columns with each forwarded field (see `PruneFusionPlan`)
+    replaced by its post-forward value, and leaves `dead | predicate` in
+    `dead_sink` (and, on the Triton engine, the per-block free counts in
+    `free_sink`) for `build_prune_merge_phase` and add_conn. The state's dead
+    masks are not touched here.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network's trait class.
+        static: The network's static configuration.
+        plan: A fused plan from `plan_prune_fusion`.
+        dead_sink: One slot per bucket, overwritten with the new dead mask.
+        free_sink: One slot per bucket, overwritten with `(free counts per
+            block, block length)` (`free_block_counts(new_dead,
+            count_block)`, not cumulative) or None.
+        count_block: The largest free-count block length (see
+            `free_block_length`): `TRITON_CLAIM_BLOCK` when the Triton claim
+            reads the counts, else `_FREE_BLOCK`.
+
+    Returns:
+        The fused forward phase.
+    """
+    pc = net.prune_conn
+    assert pc is not None and plan.fused
+    fp = net.forward_pass
+    num_units = static.num_units
+    num_levels = len(static.level_capacities)
+    pipeline = net.propagation is Propagation.PIPELINE
+    accumulate = build_forward_accumulate(
+        fp,
+        num_units=num_units,
+        indices_are_sorted=False,
+        shard_axis=_shard_axis(static),
+    )
+    apply = build_forward_apply(fp, num_units=num_units)
+    not_input = ~unit_id_mask(static.input_ids, num_units)
+    field = linear_input_field(fp)
+    forwarded = plan.forwarded
+
+    def forwarded_units(units: Columns, g: GS) -> Columns:
+        if not forwarded:
+            return units
+        if pipeline:
+            finalized = not_input
+        else:
+            level = units[LEVEL.name]
+            finalized = (level >= 1) & (level <= num_levels) & not_input
+        acc0 = identity_accumulator(fp.combine, num_units)
+        u_view = UnitView(units)
+
+        def one(i: jax.Array, a: Any) -> dict[str, jax.Array]:
+            fields = fp.apply(u_view, UnitIdx(i), g, a).fields
+            return {k: fields[k] for k in forwarded}
+
+        writes = jax.vmap(one)(jnp.arange(num_units), acc0)
+        return {
+            **units,
+            **{k: jnp.where(finalized, writes[k], units[k]) for k in forwarded},
+        }
+
+    def should_die(pred_units: Columns, bucket: Columns, g: GS) -> jax.Array:
+        u_view = UnitView(pred_units)
+        c_view = ConnView(bucket)
+        cids = jnp.arange(bucket[DEAD.name].shape[0], dtype=jnp.int32)
+        result: jax.Array = jax.vmap(
+            lambda cid: pc.predicate(u_view, c_view, ConnIdx(cid), g)
+        )(cids)
+        return result
+
+    def phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        g = state.globals_
+        units = state.units
+        pred_units = forwarded_units(units, g)
+        acc = identity_accumulator(fp.combine, num_units)
+        for level_idx in range(num_levels):
+            bucket = state.conns[level_idx]
+            if plan.engine == "triton":
+                assert field is not None
+                part, new_dead, free_blocks, block = triton_forward_prune(
+                    plan.triton_kernels[level_idx],
+                    bucket,
+                    units[field.name],
+                    pred_units,
+                    g,
+                    count_block=count_block,
+                )
+                acc = monoid.sum_.combine_pairwise(acc, part)
+                free_sink[level_idx] = (free_blocks, block)
+            else:
+                acc = accumulate(units, bucket, acc, g)
+                new_dead = bucket[DEAD.name] | should_die(pred_units, bucket, g)
+                free_sink[level_idx] = None
+            dead_sink[level_idx] = new_dead
+            if pipeline:
+                finalize = not_input
+            else:
+                finalize = (units[LEVEL.name] == level_idx + 1) & not_input
+            units, acc = apply(units, acc, g, finalize)
+        units = {**units, **{k: pred_units[k] for k in forwarded}}
+        return dataclasses.replace(state, units=units), jnp.float32(0.0)
+
+    return phase
+
+
+def build_prune_merge_phase[GS](dead_sink: list[Any]) -> Phase[GS]:
+    """Commit the fused forward's tombstones at the prune_conn slot.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        dead_sink: The fused forward's per-bucket new dead masks.
+
+    Returns:
+        The phase replacing every bucket's dead mask.
+    """
+
+    def merge_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        conns = tuple(
+            {**bucket, DEAD.name: dead_sink[i]} for i, bucket in enumerate(state.conns)
+        )
+        return dataclasses.replace(state, conns=conns), jnp.float32(0.0)
+
+    return merge_phase
+
+
 # jnp.searchsorted's default method ("scan") is a while loop, one tiny kernel
 # launch per halving step on GPU; unrolled, the whole search fuses. At 5.4M
 # edges this took the add phase from 0.34 to 0.07 ms per step.
@@ -1149,9 +2204,81 @@ def repeats_earlier(
     return repeated
 
 
-# Block length for the two-level free-slot search: the largest power of two up
-# to this that divides the bucket, so the per-block counts are a plain reshape.
-_FREE_BLOCK = 1024
+def free_block_length(capacity: int, max_block: int = _FREE_BLOCK) -> int:
+    """The block length of a bucket's per-block free counts.
+
+    The largest power of two up to `max_block` dividing `capacity`, so the
+    counts are a plain reshape-and-sum; below 64 (an awkward capacity) it is
+    `max_block` and the mask is padded instead. A producer of precomputed
+    block counts (see `free_block_counts`) must use this length.
+
+    Args:
+        capacity: The bucket's (static) capacity.
+        max_block: The largest block length, a power of two of at least 64:
+            1024 for the XLA claim, `TRITON_CLAIM_BLOCK` for the Triton one.
+
+    Returns:
+        The block length.
+    """
+    block = max_block
+    while block > 1 and capacity % block:
+        block //= 2
+    return block if block >= 64 else max_block
+
+
+def free_block_counts(
+    dead: Bool[Array, " cap"], max_block: int = _FREE_BLOCK
+) -> Int32[Array, " blocks"]:
+    """Count the free (dead) slots in each block of the bucket.
+
+    One reduction over the mask, in blocks of `free_block_length(cap,
+    max_block)` (the last block padded with live slots when the length does
+    not divide `cap`).
+
+    Args:
+        dead: The bucket's tombstone mask.
+        max_block: As for `free_block_length`.
+
+    Returns:
+        The per-block free counts (not cumulative).
+    """
+    cap = dead.shape[0]
+    block = free_block_length(cap, max_block)
+    if cap % block:
+        dead = jnp.pad(dead, (0, -cap % block))
+    counts: Int32[Array, " blocks"] = dead.reshape(-1, block).sum(
+        axis=1, dtype=jnp.int32
+    )
+    return counts
+
+
+def regroup_free_counts(
+    counts: Int32[Array, " blocks"], block: int, capacity: int
+) -> Int32[Array, " groups"]:
+    """Per-block free counts in `count_free_blocks`' blocks, from finer ones.
+
+    Exact: `free_block_length(capacity)` is a multiple of
+    `free_block_length(capacity, m)` for every power-of-two `m` of at least 64
+    (it is the same block, or a larger power of two), and the padded tail
+    blocks hold no free slots, so each coarse block is a sum of whole fine
+    ones.
+
+    Args:
+        counts: `free_block_counts(dead, m)` for some `m`.
+        block: That count's block length, `free_block_length(capacity, m)`.
+        capacity: The bucket's (or shard slice's) capacity.
+
+    Returns:
+        `free_block_counts(dead)`, the counts in `free_block_length(capacity)`
+        blocks.
+    """
+    ratio = free_block_length(capacity) // block
+    if ratio == 1:
+        return counts
+    if -counts.shape[0] % ratio:
+        counts = jnp.pad(counts, (0, -counts.shape[0] % ratio))
+    grouped: Int32[Array, " groups"] = counts.reshape(-1, ratio).sum(axis=1)
+    return grouped
 
 
 def count_free_blocks(
@@ -1170,16 +2297,8 @@ def count_free_blocks(
         The per-block inclusive counts and the (static) block length. The last
         count is the bucket's total free slots.
     """
-    cap = dead.shape[0]
-    block = _FREE_BLOCK
-    while block > 1 and cap % block:
-        block //= 2
-    if block < 64:  # an awkward capacity: pad rather than use tiny blocks
-        block = _FREE_BLOCK
-        dead = jnp.pad(dead, (0, -cap % block))
-    counts = dead.reshape(-1, block).sum(axis=1, dtype=jnp.int32)
-    running: Int32[Array, " blocks"] = jnp.cumsum(counts)
-    return running, block
+    running: Int32[Array, " blocks"] = jnp.cumsum(free_block_counts(dead))
+    return running, free_block_length(dead.shape[0])
 
 
 def nth_free_slot(
@@ -1219,6 +2338,551 @@ def nth_free_slot(
     ).astype(jnp.int32)
     slot: Int32[Array, " k"] = jnp.minimum(b * jnp.int32(block) + offset, cap - 1)
     return slot
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class GrowthClaim:
+    """One bucket's selected growth candidates, ready for the free-slot claim.
+
+    Candidates claim free slots in candidate order: the i-th growable
+    candidate takes the bucket's i-th free (dead) slot, in slot order. A
+    growable candidate left without a slot is overflow.
+
+    Attributes:
+        growable: `(k,)` candidates that may take a slot.
+        violating: `(k,)` candidates whose edge, once committed, breaks the
+            leveling invariant (sets `needs_resort`).
+        values: Each written connection column's `(k,)` values, already in the
+            column's dtype: every connection field but `DEAD`, which a claim
+            always clears.
+    """
+
+    growable: Bool[Array, " k"]
+    violating: Bool[Array, " k"]
+    values: dict[str, jax.Array]
+
+
+def xla_claim(
+    bucket: Columns,
+    claim: GrowthClaim,
+    *,
+    shard_axis: str | None = None,
+    num_shards: int = 1,
+    free_counts: tuple[Int32[Array, " blocks"], int] | None = None,
+) -> tuple[Columns, Bool[Array, " k"], Bool[Array, " k"]]:
+    """Claim free slots for one bucket's candidates and write them, in plain XLA.
+
+    The portable claim, sharding-aware. Under Scheme-A the dead mask is this
+    shard's capacity slice, so the claim runs over the LOCAL slice and is
+    coordinated across shards: each growable candidate takes a GLOBAL
+    free-slot rank and lands on the one shard that owns it. Because shard g
+    holds arena positions [g*local_capacity, (g+1)*local_capacity), the global
+    free-slot order (shard 0's free slots, then shard 1's, ...) is exactly the
+    single-device position order -- so a candidate lands where the
+    single-device claim would put it.
+
+    Args:
+        bucket: The bucket's (local) columns.
+        claim: The bucket's candidates.
+        shard_axis: The Scheme-A mesh axis, or None when unsharded.
+        num_shards: The Scheme-A shard count (1 when unsharded).
+        free_counts: Precomputed `(free_block_counts(dead, max_block),
+            free_block_length(cap, max_block))` of the bucket's current
+            (local) dead mask for any `max_block` (for example from a fused
+            prune sweep), or None to compute them here.
+
+    Returns:
+        The updated columns, and per candidate whether it overflowed and
+        whether it was committed with a leveling-breaking edge. Both masks are
+        replicated across shards.
+    """
+    growable = claim.growable
+    k = growable.shape[0]
+    dead_b = bucket[DEAD.name]
+    local_capacity = dead_b.shape[0]
+    # Per-block free counts over this shard's slice: one reduction reading the
+    # dead mask, instead of a capacity-sized cumsum. Two-level search for a
+    # small claim (O(k * block) past one reduction); for a claim large next to
+    # the bucket that gather outgrows one capacity-sized cumsum, which is then
+    # used instead.
+    small_claim = k * _FREE_BLOCK <= local_capacity
+    if small_claim:
+        if free_counts is None:
+            running, block_len = count_free_blocks(dead_b)
+        else:
+            running = jnp.cumsum(regroup_free_counts(*free_counts, local_capacity))
+            block_len = free_block_length(local_capacity)
+        local_free = running[-1]
+    else:
+        free_through = jnp.cumsum(dead_b.astype(jnp.int32))
+        local_free = free_through[-1]
+    # This shard's offset into the global free-slot space, and the total free
+    # count. The offset is an exclusive prefix of the per-shard free counts (an
+    # all-gather -- a prefix is not a plain all-reduce) and feeds only the
+    # per-shard placement below. total_free is a psum, not sum(all_gather): it
+    # flows into `overflow` and `needs_resort`, which shard_map requires be
+    # provably replicated, and psum is the all-reduce it recognizes as
+    # replicating. Both are device-resident collectives.
+    if shard_axis is not None:
+        all_free = jax.lax.all_gather(local_free, shard_axis)
+        my_index = jax.lax.axis_index(shard_axis)
+        offset = jnp.sum(jnp.where(jnp.arange(num_shards) < my_index, all_free, 0))
+        total_free = monoid.sum_.collective(local_free, shard_axis)
+    else:
+        offset = jnp.int32(0)
+        total_free = local_free
+    # growth_rank[i] = candidate i's rank among the growable candidates -- its
+    # global free-slot index. A candidate whose rank exceeds the total free
+    # slots is overflow: dropped, flag raised.
+    growth_rank = jnp.cumsum(growable.astype(jnp.int32)) - 1
+    committed = growable & (growth_rank < total_free)
+    overflowed = growable & (growth_rank >= total_free)
+    # A committed candidate belongs to THIS shard iff its global rank falls in
+    # [offset, offset + local_free); place it at that shard-local free slot,
+    # else scatter to `local_capacity` (out of this slice's range), dropped by
+    # the scatter's drop mode.
+    local_rank = growth_rank - offset
+    mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
+    safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
+    if small_claim:
+        free_slot = nth_free_slot(dead_b, running, block_len, safe_rank)
+    else:
+        free_slot = jnp.searchsorted(
+            free_through, safe_rank + jnp.int32(1), method=_SEARCH
+        ).astype(jnp.int32)
+    target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
+    new_bucket: Columns = dict(bucket)
+    for name, column in bucket.items():
+        value = (
+            jnp.zeros((k,), dtype=column.dtype)
+            if name == DEAD.name
+            else claim.values[name]
+        )
+        new_bucket[name] = column.at[target_slot].set(value, mode="drop")
+    return new_bucket, overflowed, committed & claim.violating
+
+
+# Triton claim tiling: candidates per program (TILE), block counts compared
+# against every candidate per placement step (CHUNK), block counts per coarse
+# window (WIDE), the coarse window counts (and earlier tiles' counts) one
+# program reads per step (COARSE), and
+# warps per claim program.
+_CLAIM_TILE = 32
+_CLAIM_CHUNK = 1024
+_CLAIM_WIDE = 1024
+_CLAIM_COARSE = 256
+_CLAIM_WARPS = 4
+# Written columns per bucket the kernel is specialised for; above it the
+# claim falls back to XLA. Generous: the builtins plus an Adam bundle are 6.
+TRITON_CLAIM_MAX_FIELDS = 32
+# The Triton claim's block length (see `free_block_length`): each candidate
+# reads its block's dead mask, so a short block keeps that read small.
+TRITON_CLAIM_BLOCK = 256
+
+
+# no_type_check also keeps jaxtyping's test-time import hook from wrapping the
+# nested kernels, which would hide their closure (`tl`) from Triton.
+@functools.cache
+@no_type_check
+def _triton_claim_kernels() -> tuple[Any, Any, Any]:
+    """The claim kernels, built on first use so plastax never imports triton.
+
+    `prep` sums the inputs every claim program needs a prefix of: the growable
+    candidates per tile, and the free slots per coarse window of block counts.
+    `claim` places every candidate and writes every column but `DEAD`; `clear`
+    then clears `DEAD` at the placed slots. `clear` is its own launch because
+    `claim`'s programs read the dead mask, which a write in `claim` would
+    race: a candidate's slot is found by a cumsum over its whole block, where
+    another program may be placing its own candidates.
+    """
+    import triton
+    import triton.language as tl
+
+    # Triton kernel arguments are pointers, tuples of pointers and constexprs,
+    # which carry no Python annotations the type checkers understand.
+    @triton.jit
+    def prep(  # noqa: ANN202
+        flags_ptr,  # noqa: ANN001
+        counts,  # noqa: ANN001
+        windows_ptr,  # noqa: ANN001
+        tiles_ptr,  # noqa: ANN001
+        status_ptr,  # noqa: ANN001
+        K: tl.constexpr,
+        NBLKS: tl.constexpr,
+        NB: tl.constexpr,
+        NT: tl.constexpr,
+        TILE: tl.constexpr,
+        WIDE: tl.constexpr,
+        WSTRIDE: tl.constexpr,
+        TILES_PER: tl.constexpr,
+    ):
+        p = tl.program_id(0)
+        b = tl.program_id(1)
+        for i in tl.static_range(NB):
+            if b == i:
+                if p * WIDE < NBLKS[i]:
+                    o = p * WIDE + tl.arange(0, WIDE)
+                    c = tl.load(counts[i] + o, mask=o < NBLKS[i], other=0)
+                    tl.store(windows_ptr + i * WSTRIDE + p, tl.sum(c, axis=0))
+        if p * TILES_PER < NT:
+            t = p * TILES_PER + tl.arange(0, TILES_PER)
+            idx = t[:, None] * TILE + tl.arange(0, TILE)[None, :]
+            f = tl.load(flags_ptr + b * K + idx, mask=idx < K, other=0).to(tl.int32)
+            tl.store(tiles_ptr + b * NT + t, tl.sum(f & 1, axis=1), mask=t < NT)
+        if (p == 0) & (b == 0):
+            tl.store(status_ptr + tl.arange(0, 2), tl.zeros((2,), tl.int32))
+
+    @triton.jit
+    def claim_bucket(  # noqa: ANN202
+        flags_ptr,  # noqa: ANN001
+        tiles_ptr,  # noqa: ANN001
+        windows_ptr,  # noqa: ANN001
+        counts_ptr,  # noqa: ANN001
+        dead_ptr,  # noqa: ANN001
+        vals,  # noqa: ANN001
+        cols,  # noqa: ANN001
+        status_ptr,  # noqa: ANN001
+        slot_ptr,  # noqa: ANN001
+        K: tl.constexpr,
+        CAP: tl.constexpr,
+        NBLK: tl.constexpr,
+        BLK: tl.constexpr,
+        NF: tl.constexpr,
+        TILE: tl.constexpr,
+        CHUNK: tl.constexpr,
+        LOG_CHUNK: tl.constexpr,
+        WIDE: tl.constexpr,
+        NWIN: tl.constexpr,
+        COARSE: tl.constexpr,
+    ):
+        tile = tl.program_id(0)
+        offs = tile * TILE + tl.arange(0, TILE)
+        in_k = offs < K
+        flags = tl.load(flags_ptr + offs, mask=in_k, other=0).to(tl.int32)
+        grow = flags & 1
+        n_grow = tl.sum(grow, axis=0)
+        # This tile's first free rank: the growable candidates of earlier tiles.
+        base = n_grow * 0
+        for s in range(0, tile, COARSE):
+            o = s + tl.arange(0, COARSE)
+            base += tl.sum(tl.load(tiles_ptr + o, mask=o < tile, other=0), axis=0)
+        rank = base + tl.cumsum(grow, axis=0) - 1
+        slot = tl.full((TILE,), -1, tl.int32)
+        if n_grow > 0:
+            # The coarse window of block counts holding free rank `base`, then
+            # the chunk within it.
+            ow = tl.arange(0, COARSE)
+            w = 0
+            per_window = tl.load(windows_ptr + ow, mask=ow < NWIN, other=0)
+            carry = n_grow * 0
+            wsum = tl.sum(per_window, axis=0)
+            while (w + COARSE < NWIN) & (carry + wsum <= base):
+                carry += wsum
+                w += COARSE
+                per_window = tl.load(windows_ptr + w + ow, mask=w + ow < NWIN, other=0)
+                wsum = tl.sum(per_window, axis=0)
+            skipped = (tl.cumsum(per_window, axis=0) + carry) <= base
+            w0 = (w + tl.sum(skipped.to(tl.int32), axis=0)) * WIDE
+            carry += tl.sum(tl.where(skipped, per_window, 0), axis=0)
+            sub = tl.arange(0, WIDE // CHUNK)[:, None] * CHUNK
+            o2 = w0 + sub + tl.arange(0, CHUNK)[None, :]
+            window = tl.load(counts_ptr + o2, mask=o2 < NBLK, other=0)
+            chunk_sums = tl.sum(window, axis=1)
+            skipped = (tl.cumsum(chunk_sums, axis=0) + carry) <= base
+            c0 = w0 + tl.sum(skipped.to(tl.int32), axis=0) * CHUNK
+            carry += tl.sum(tl.where(skipped, chunk_sums, 0), axis=0)
+            # Each candidate's block, and the free slots before that block,
+            # chunk by chunk (the tile's ranks are consecutive, so usually one
+            # chunk): a binary search of the chunk's running counts.
+            block = tl.full((TILE,), -1, tl.int32)
+            before = tl.zeros((TILE,), tl.int32)
+            pending = grow == 1
+            while (tl.max(pending.to(tl.int32), axis=0) > 0) & (c0 < NBLK):
+                o = c0 + tl.arange(0, CHUNK)
+                chunk = tl.load(counts_ptr + o, mask=o < NBLK, other=0)
+                through = tl.cumsum(chunk, axis=0) + carry
+                csum = tl.sum(chunk, axis=0)
+                here = pending & (rank < carry + csum)
+                at = tl.zeros((TILE,), tl.int32)  # blocks of the chunk <= rank
+                for step in tl.static_range(LOG_CHUNK):
+                    half = CHUNK >> (step + 1)
+                    probe = tl.gather(through, at + (half - 1), 0)
+                    at = tl.where(probe <= rank, at + half, at)
+                prior = tl.gather(through, tl.maximum(at - 1, 0), 0)
+                block = tl.where(here, c0 + at, block)
+                before = tl.where(here, tl.where(at > 0, prior, carry), before)
+                pending = pending & ~here
+                carry += csum
+                c0 += CHUNK
+            # Within its block, the candidate's slot is its (rank - before)-th
+            # free slot. The block's dead mask is read as 32-bit words (four
+            # 0/1 bytes each): a running count over the words finds the word,
+            # three compares the byte.
+            lanes = tl.arange(0, BLK // 4)[None, :]
+            wpos = block[:, None] * (BLK // 4) + lanes
+            ok = (block >= 0)[:, None] & (wpos < CAP // 4)
+            words = tl.load(
+                dead_ptr.to(tl.pointer_type(tl.uint32)) + wpos, mask=ok, other=0
+            )
+            per_word = ((words * 0x01010101) >> 24).to(tl.int32)
+            want = rank - before + 1
+            word = tl.sum(
+                (tl.cumsum(per_word, axis=1) < want[:, None]).to(tl.int32), axis=1
+            )
+            picked = tl.sum(tl.where(lanes == word[:, None], words, 0), axis=1)
+            want -= tl.sum(tl.where(lanes < word[:, None], per_word, 0), axis=1)
+            first = (picked & 1).to(tl.int32)
+            second = first + ((picked >> 8) & 1).to(tl.int32)
+            third = second + ((picked >> 16) & 1).to(tl.int32)
+            byte = (
+                (first < want).to(tl.int32)
+                + (second < want).to(tl.int32)
+                + (third < want).to(tl.int32)
+            )
+            slot = tl.where(block >= 0, block * BLK + word * 4 + byte, slot)
+        committed = slot >= 0
+        tl.store(slot_ptr + offs, tl.where(committed, slot, CAP), mask=in_k)
+        for f in tl.static_range(NF):
+            value = tl.load(vals[f] + offs, mask=in_k)
+            tl.store(cols[f] + slot, value, mask=committed)
+        if tl.max(((grow == 1) & ~committed).to(tl.int32), axis=0) > 0:
+            tl.atomic_max(status_ptr, 1, sem="relaxed")
+        if tl.max((committed & ((flags & 2) != 0)).to(tl.int32), axis=0) > 0:
+            tl.atomic_max(status_ptr + 1, 1, sem="relaxed")
+
+    @triton.jit
+    def claim(  # noqa: ANN202
+        flags_ptr,  # noqa: ANN001
+        tiles_ptr,  # noqa: ANN001
+        windows_ptr,  # noqa: ANN001
+        counts,  # noqa: ANN001
+        deads,  # noqa: ANN001
+        vals,  # noqa: ANN001
+        cols,  # noqa: ANN001
+        status_ptr,  # noqa: ANN001
+        slot_ptr,  # noqa: ANN001
+        K: tl.constexpr,
+        CAPS: tl.constexpr,
+        NBLKS: tl.constexpr,
+        BLKS: tl.constexpr,
+        NB: tl.constexpr,
+        NF: tl.constexpr,
+        NT: tl.constexpr,
+        TILE: tl.constexpr,
+        CHUNK: tl.constexpr,
+        LOG_CHUNK: tl.constexpr,
+        WIDE: tl.constexpr,
+        NWINS: tl.constexpr,
+        WSTRIDE: tl.constexpr,
+        COARSE: tl.constexpr,
+    ):
+        b = tl.program_id(1)
+        for i in tl.static_range(NB):
+            if b == i:
+                claim_bucket(
+                    flags_ptr + i * K,
+                    tiles_ptr + i * NT,
+                    windows_ptr + i * WSTRIDE,
+                    counts[i],
+                    deads[i],
+                    vals[i],
+                    cols[i],
+                    status_ptr,
+                    slot_ptr + i * K,
+                    K,
+                    CAPS[i],
+                    NBLKS[i],
+                    BLKS[i],
+                    NF,
+                    TILE,
+                    CHUNK,
+                    LOG_CHUNK,
+                    WIDE,
+                    NWINS[i],
+                    COARSE,
+                )
+
+    @triton.jit
+    def clear(  # noqa: ANN202
+        slot_ptr,  # noqa: ANN001
+        deads,  # noqa: ANN001
+        K: tl.constexpr,
+        CAPS: tl.constexpr,
+        NB: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        b = tl.program_id(1)
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        for i in tl.static_range(NB):
+            if b == i:
+                slot = tl.load(slot_ptr + i * K + offs, mask=offs < K, other=CAPS[i])
+                tl.store(deads[i] + slot, 0, mask=slot < CAPS[i])
+
+    return prep, claim, clear
+
+
+def triton_claim_applies(static: NetworkStatic, growth: str) -> bool:
+    """Whether add_conn claims through `triton_claim` (for a non-empty claim).
+
+    The fused claim needs jax_triton on an NVIDIA GPU and one device (it is not
+    validated inside shard_map), is specialised for a bounded column count,
+    and reads the dead masks as 32-bit words (capacities a multiple of 4);
+    anything else, or `growth="xla"`, takes the portable XLA claim.
+
+    Args:
+        static: The network's static configuration.
+        growth: The requested claim engine: "auto", "xla", or "triton".
+
+    Returns:
+        Whether the Triton claim runs.
+    """
+    return (
+        growth != "xla"
+        and static.sharding is None
+        and len(static.conn_fields) - 1 <= TRITON_CLAIM_MAX_FIELDS
+        and all(cap % 4 == 0 for cap in static.level_capacities)
+        and nvidia_triton_available()
+    )
+
+
+def triton_claim(
+    buckets: list[Columns],
+    claims: list[GrowthClaim],
+    *,
+    block_counts: list[Int32[Array, " _"]] | None = None,
+) -> tuple[list[Columns], Bool[Array, ""], Bool[Array, ""]]:
+    """Claim free slots and write every column for all buckets in three launches.
+
+    The fused counterpart of `xla_claim` on one device (NVIDIA GPUs, through
+    jax_triton): the same slots, the same writes, the same flags. A `prep`
+    launch sums the growable candidates per tile and the free slots per
+    coarse window of block counts. Then one `claim` program takes a tile of
+    candidates: its first free rank is the earlier tiles' growable count; the
+    coarse windows, then the block counts, locate each candidate's block; a
+    cumsum over that block's dead mask locates its slot; and every column but
+    `DEAD` is written in place. A `clear` launch then clears `DEAD` at the
+    placed slots. Every bucket shares the three launches (the grid's second
+    axis is the bucket), so growth costs three kernels whatever the bucket
+    count.
+
+    Args:
+        buckets: Every bucket's columns.
+        claims: Every bucket's candidates, one per bucket, all of one `k`.
+        block_counts: Precomputed `free_block_counts(dead,
+            TRITON_CLAIM_BLOCK)` of each bucket's current dead mask (for
+            example from a fused prune sweep), or None to compute them here.
+
+    Returns:
+        The updated buckets, whether any growable candidate overflowed, and
+        whether any committed edge breaks the leveling invariant.
+
+    Raises:
+        ValueError: If a bucket capacity is not a multiple of 4 (the kernel
+            reads the dead masks as 32-bit words).
+    """
+    import jax_triton  # ty: ignore[unresolved-import]
+
+    prep_kernel, claim_kernel, clear_kernel = _triton_claim_kernels()
+    num_buckets = len(buckets)
+    k = claims[0].growable.shape[0]
+    num_tiles = -(-k // _CLAIM_TILE)
+    names = [name for name in buckets[0] if name != DEAD.name]
+    deads = [bucket[DEAD.name] for bucket in buckets]
+    caps = tuple(int(dead.shape[0]) for dead in deads)
+    if block_counts is None:
+        # The barrier keeps XLA from fusing the counts into the producer of
+        # the dead masks (the prune sweep), where the reduction slowed that
+        # whole elementwise pass: 92 -> 140 us at 5.4M edges. A separate
+        # reduction re-reads the masks (2.8 MB per bucket there).
+        counted = jax.lax.optimization_barrier(deads)  # type: ignore[no-untyped-call]
+        block_counts = [free_block_counts(dead, TRITON_CLAIM_BLOCK) for dead in counted]
+    num_blocks = tuple(int(c.shape[0]) for c in block_counts)
+    if any(cap % 4 for cap in caps):
+        raise ValueError("triton_claim: bucket capacities must be multiples of 4")
+    num_windows = tuple(-(-n // _CLAIM_WIDE) for n in num_blocks)
+    wstride = max(num_windows)
+    flags = jnp.stack(
+        [
+            c.growable.astype(jnp.int8) | (c.violating.astype(jnp.int8) << 1)
+            for c in claims
+        ]
+    ).reshape(-1)
+    tiles_per = 1024 // _CLAIM_TILE
+    windows, tiles, status = jax_triton.triton_call(
+        flags,
+        tuple(block_counts),
+        kernel=prep_kernel,
+        out_type=(
+            jax.ShapeDtypeStruct((num_buckets * wstride,), jnp.int32),  # type: ignore[no-untyped-call]
+            jax.ShapeDtypeStruct((num_buckets * num_tiles,), jnp.int32),  # type: ignore[no-untyped-call]
+            jax.ShapeDtypeStruct((2,), jnp.int32),  # type: ignore[no-untyped-call]
+        ),
+        grid=(
+            max(-(-max(num_blocks) // _CLAIM_WIDE), -(-num_tiles // tiles_per)),
+            num_buckets,
+        ),
+        K=k,
+        NBLKS=num_blocks,
+        NB=num_buckets,
+        NT=num_tiles,
+        TILE=_CLAIM_TILE,
+        WIDE=_CLAIM_WIDE,
+        WSTRIDE=wstride,
+        TILES_PER=tiles_per,
+    )
+    cols = [{name: jax.new_ref(bucket[name]) for name in names} for bucket in buckets]
+    status_ref = jax.new_ref(status)
+    slots = jax_triton.triton_call(
+        flags,
+        tiles,
+        windows,
+        tuple(block_counts),
+        tuple(deads),
+        tuple(tuple(c.values[name] for name in names) for c in claims),
+        tuple(tuple(col[name] for name in names) for col in cols),
+        status_ref,
+        kernel=claim_kernel,
+        out_type=jax.ShapeDtypeStruct((num_buckets * k,), jnp.int32),  # type: ignore[no-untyped-call]
+        grid=(num_tiles, num_buckets),
+        num_warps=_CLAIM_WARPS,
+        K=k,
+        CAPS=caps,
+        NBLKS=num_blocks,
+        BLKS=tuple(free_block_length(cap, TRITON_CLAIM_BLOCK) for cap in caps),
+        NB=num_buckets,
+        NF=len(names),
+        NT=num_tiles,
+        TILE=_CLAIM_TILE,
+        CHUNK=_CLAIM_CHUNK,
+        LOG_CHUNK=_CLAIM_CHUNK.bit_length() - 1,
+        WIDE=_CLAIM_WIDE,
+        NWINS=num_windows,
+        WSTRIDE=wstride,
+        COARSE=_CLAIM_COARSE,
+    )
+    dead_refs = tuple(jax.new_ref(dead) for dead in deads)
+    jax_triton.triton_call(
+        slots,
+        dead_refs,
+        kernel=clear_kernel,
+        out_type=(),
+        grid=(-(-k // 1024), num_buckets),
+        K=k,
+        CAPS=caps,
+        NB=num_buckets,
+        BLOCK=1024,
+    )
+    new_buckets: list[Columns] = []
+    for bucket, col, dead_ref in zip(buckets, cols, dead_refs, strict=True):
+        new_buckets.append(
+            {
+                name: (dead_ref if name == DEAD.name else col[name])[...]
+                for name in bucket
+            }
+        )
+    flags_out = status_ref[...] > 0
+    return new_buckets, flags_out[0], flags_out[1]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1323,6 +2987,8 @@ def build_add_conn_phase[GS](
     static: NetworkStatic,
     *,
     overflow_sink: list[Bool[Array, ""]] | None = None,
+    free_sink: list[Any] | None = None,
+    growth: str = "auto",
 ) -> Phase[GS]:
     """Select each bucket's top-k candidates and claim free slots via prefix sum.
 
@@ -1352,13 +3018,18 @@ def build_add_conn_phase[GS](
     with more free slots than finite-scored candidates leaves the surplus empty
     rather than back-filling with vetoed edges.
 
-    Free slots are claimed by a prefix-sum scan over each bucket's own
-    `dead` mask: the scan turns dead-row rank into a slot assignment, so a
-    committed candidate lands in the position of the rank-th free dead
-    slot. A candidate that is invalid or for which the bucket has no free
-    slot scatters to one past the bucket's valid range, which the
-    scatter's default drop mode discards rather than mis-writing a live
-    slot.
+    Free slots are claimed in candidate order over each bucket's own `dead`
+    mask: the rank-th growable candidate lands in the rank-th free slot, in
+    slot order. `growth` picks the claim engine: "xla" (`xla_claim`, any
+    backend and under Scheme-A sharding: per-block free counts, a search, and
+    one scatter per column, dropping uncommitted candidates out of range);
+    "triton" (`triton_claim`, one jax_triton kernel placing and writing every
+    column of every bucket plus one clearing `DEAD`, on an NVIDIA GPU with the
+    `triton` extra); or "auto", which takes "triton" where it is available
+    and the step is unsharded. Both choose the same slots and raise the same
+    flags; a "triton" request that cannot run (no NVIDIA GPU or jax_triton,
+    Scheme-A sharding, more than `TRITON_CLAIM_MAX_FIELDS` connection
+    columns, a bucket capacity not a multiple of 4) uses "xla".
 
     Overflow is a real (growable, top-k-selected) candidate for which its
     own bucket ran out of dead slots; it is dropped and the flag is
@@ -1376,9 +3047,18 @@ def build_add_conn_phase[GS](
         static: static network configuration giving the arena shapes.
         overflow_sink: optional length-1 out-parameter overwritten with
             this call's computed overflow flag.
+        free_sink: optional per-bucket `(free counts per block, block
+            length)` left by a fused forward (`build_fused_forward_prune_phase`)
+            for this step's dead masks: `triton_claim`'s `block_counts` when in
+            its 256-slot blocks, and regrouped for the XLA claim in place of
+            `count_free_blocks`.
+        growth: The free-slot claim engine: "auto", "xla", or "triton".
 
     Returns:
         The add_conn phase function.
+
+    Raises:
+        ValueError: If `growth` is not one of the engines.
     """
     ac = net.add_conn
     assert ac is not None  # build_phases only calls this when set
@@ -1417,6 +3097,8 @@ def build_add_conn_phase[GS](
     # shared with the grid path. The live-edge duplicate check defaults on for
     # the grid and off for proposals (parallel edges allowed; see
     # ProposeAddConn).
+    if growth not in ("auto", "xla", "triton"):
+        raise ValueError(f"build_add_conn_phase: unknown growth engine {growth!r}")
     use_propose = isinstance(ac, ProposeAddConn)
     dedupe = bool(getattr(ac, "dedupe", not use_propose))
     num_proposals = ac.num_proposals if isinstance(ac, ProposeAddConn) else 0
@@ -1440,6 +3122,7 @@ def build_add_conn_phase[GS](
     # and a small test network's pool can undercut a generous max_candidates.
     pool = num_proposals if use_propose else pool_side * pool_side
     k = max(0, min(ac.max_candidates, pool))
+    use_triton = k > 0 and triton_claim_applies(static, growth)
 
     # Every candidate grid is built inside the traced phase, never here: this
     # builder runs eagerly (outside jit), where a num_units^2 grid would be a
@@ -1573,12 +3256,9 @@ def build_add_conn_phase[GS](
             nowhere_live: jax.Array = dup_any == jnp.int32(0)
             return nowhere_live
 
-        new_conns: list[Columns] = []
-        overflow = jnp.bool_(False)
-        reassigning = jnp.bool_(False)
+        claims: list[GrowthClaim] = []
         for bucket_idx in range(num_buckets):
             bucket_conns = state.conns[bucket_idx]
-            capacity_b = static.level_capacities[bucket_idx]
             if use_per_level:
                 assert imp is not None  # use_per_level implies importance is set
                 flat_src, flat_dst = per_level_grid(imp, unit_level, bucket_idx)
@@ -1636,104 +3316,79 @@ def build_add_conn_phase[GS](
             # alone would admit them.
             top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
 
-            # Prefix-sum slot claim, sharding-aware. Under Scheme-A the runtime
-            # dead mask is this shard's capacity slice (size capacity_b //
-            # num_shards; a capacity divisible by the shard count keeps it
-            # exact), so the claim runs over the LOCAL slice and is
-            # coordinated across shards: each growable candidate takes a
-            # GLOBAL free-slot rank and lands on the
-            # one shard that owns it. Because shard g holds arena positions
-            # [g*local_capacity, (g+1)*local_capacity), the global free-slot
-            # order (shard 0's free slots, then shard 1's, ...) is exactly the
-            # single-device position order -- so a candidate lands where the
-            # single-device add_conn would. local_capacity == capacity_b and
-            # offset == 0 when unsharded, leaving that path byte-identical.
-            local_capacity = capacity_b // num_shards
-            dead_b = bucket_conns[DEAD.name]
-            # Per-block free counts over this shard's slice: one reduction
-            # reading the dead mask, instead of a capacity-sized cumsum.
-            # Two-level search for a small claim (O(k * block) past one
-            # reduction); for a claim large next to the bucket that gather
-            # outgrows one capacity-sized cumsum, which is then used instead.
-            small_claim = k * _FREE_BLOCK <= local_capacity
-            if small_claim:
-                free_blocks, block_len = count_free_blocks(dead_b)
-                local_free = free_blocks[-1]
-            else:
-                free_through = jnp.cumsum(dead_b.astype(jnp.int32))
-                local_free = free_through[-1]
-            # This shard's offset into the global free-slot space, and the total
-            # free count. The offset is an exclusive prefix of the per-shard
-            # free counts (an all-gather -- a prefix is not a plain all-reduce)
-            # and feeds only the per-shard placement below. total_free is a
-            # psum, not sum(all_gather): it flows into `overflow` and
-            # `needs_resort`, which shard_map requires be provably replicated,
-            # and psum is the all-reduce it recognizes as replicating. Both are
-            # device-resident collectives.
-            if shard_axis is not None:
-                all_free = jax.lax.all_gather(local_free, shard_axis)
-                my_index = jax.lax.axis_index(shard_axis)
-                offset = jnp.sum(
-                    jnp.where(jnp.arange(num_shards) < my_index, all_free, 0)
-                )
-                total_free = monoid.sum_.collective(local_free, shard_axis)
-            else:
-                offset = jnp.int32(0)
-                total_free = local_free
-            # growth_rank[i] = candidate i's rank among the growable top-k --
-            # its global free-slot index. The -inf-scored candidates sort to
-            # the tail of top_k, so top_growable is a contiguous prefix and
-            # growth_rank[i] == i there: identical to the old per-index claim
-            # when unsharded. A candidate whose rank exceeds the total free
-            # slots is overflow -- dropped, flag raised.
-            growth_rank = jnp.cumsum(top_growable.astype(jnp.int32)) - 1
-            committed = top_growable & (growth_rank < total_free)
-            overflow = overflow | jnp.any(top_growable & (growth_rank >= total_free))
-            # A committed candidate belongs to THIS shard iff its global rank
-            # falls in [offset, offset + local_free); place it at that shard-
-            # local free slot, else scatter to `local_capacity` (out of this
-            # slice's range), dropped by the scatter's drop mode.
-            local_rank = growth_rank - offset
-            mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
-            safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-            if small_claim:
-                free_slot = nth_free_slot(dead_b, free_blocks, block_len, safe_rank)
-            else:
-                free_slot = jnp.searchsorted(
-                    free_through, safe_rank + jnp.int32(1), method=_SEARCH
-                ).astype(jnp.int32)
-            target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
-
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it
             # marks the network as needing a topological resort.
             level_preserving = unit_level[top_dst] > unit_level[top_src]
-            reassigning = reassigning | jnp.any(committed & ~level_preserving)
-
             batched_init = jax.vmap(init_one)(top_src, top_dst)
-
-            new_bucket: Columns = dict(bucket_conns)
+            values: dict[str, jax.Array] = {}
             for spec in static.conn_fields:
-                value: jax.Array
                 if spec.name == FROM_ID.name:
-                    value = top_src.astype(spec.dtype)
+                    values[spec.name] = top_src.astype(spec.dtype)
                 elif spec.name == TO_ID.name:
-                    value = top_dst.astype(spec.dtype)
+                    values[spec.name] = top_dst.astype(spec.dtype)
                 elif spec.name == DEAD.name:
-                    value = jnp.zeros((k,), dtype=spec.dtype)
+                    continue  # a claim always clears DEAD
                 elif spec.name in batched_init:
-                    value = batched_init[spec.name].astype(spec.dtype)
+                    values[spec.name] = batched_init[spec.name].astype(spec.dtype)
                 else:
                     # Not touched by ac.init: reset to the FieldSpec
                     # default rather than inheriting whatever a previous
                     # tenant (a conn tombstoned by this same step's
                     # prune_conn pass, or the builder's initial padding)
                     # left behind.
-                    value = jnp.full((k,), np.asarray(spec.default), dtype=spec.dtype)
-                new_bucket[spec.name] = (
-                    bucket_conns[spec.name].at[target_slot].set(value, mode="drop")
+                    values[spec.name] = jnp.full(
+                        (k,), np.asarray(spec.default), dtype=spec.dtype
+                    )
+            claims.append(
+                GrowthClaim(
+                    growable=top_growable,
+                    violating=~level_preserving,
+                    values=values,
                 )
-            new_conns.append(new_bucket)
+            )
+
+        # Claim free slots for every bucket's growable candidates, in
+        # candidate order, and write them. The claim is a prefix in the
+        # free-slot order: the i-th growable candidate takes the i-th free
+        # slot, the rest overflow.
+        new_conns: list[Columns]
+        if use_triton:
+            # A fused prune sweep's counts, when it made them in this claim's
+            # blocks (see build_phases); otherwise triton_claim counts.
+            fused_counts = None
+            if free_sink is not None and all(
+                entry is not None
+                and entry[1] == free_block_length(cap, TRITON_CLAIM_BLOCK)
+                for entry, cap in zip(free_sink, static.level_capacities, strict=True)
+            ):
+                fused_counts = [entry[0] for entry in free_sink]
+            new_conns, overflow, reassigning = triton_claim(
+                list(state.conns), claims, block_counts=fused_counts
+            )
+        else:
+            new_conns = []
+            overflowed, resorting = [], []
+            for bucket_idx, (bucket_conns, claim) in enumerate(
+                zip(state.conns, claims, strict=True)
+            ):
+                new_bucket, overflow_b, resort_b = xla_claim(
+                    bucket_conns,
+                    claim,
+                    shard_axis=shard_axis,
+                    num_shards=num_shards,
+                    free_counts=(
+                        free_sink[bucket_idx] if free_sink is not None else None
+                    ),
+                )
+                new_conns.append(new_bucket)
+                overflowed.append(overflow_b)
+                resorting.append(resort_b)
+            # One reduction for both flags over every bucket.
+            either = jnp.any(
+                jnp.stack([jnp.stack(overflowed), jnp.stack(resorting)]), axis=(1, 2)
+            )
+            overflow, reassigning = either[0], either[1]
 
         if overflow_sink is not None:
             overflow_sink[0] = overflow

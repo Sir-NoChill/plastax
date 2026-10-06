@@ -22,11 +22,14 @@ from plastax._types import ACTIVATION, Propagation
 from plastax.distributed import scheme_a_mesh
 from plastax.phases import (
     Phase,
+    PruneFusionPlan,
+    PruneFusionRecord,
     StepInputs,
     batch_mean_units,
     build_batched_phases,
     build_phases,
     nvidia_triton_available,
+    plan_prune_fusion,
 )
 from plastax.state import NetworkState, NetworkStatic
 from plastax.traits import Network
@@ -65,6 +68,8 @@ def make_step[GS](
     *,
     batch_size: int | None = None,
     layout: Literal["auto", "edge_list", "csr", "triton"] = "auto",
+    fuse_prune: Literal["auto", "triton", "xla", "off"] = "auto",
+    growth: Literal["auto", "xla", "triton"] = "auto",
 ) -> StepFn[GS]:
     """Assemble the present phases and jit them with donate_argnums=0.
 
@@ -91,14 +96,40 @@ def make_step[GS](
     once for the whole batch, relaxed atomics into the targets) on an NVIDIA
     GPU with the `plastax[triton]` extra, and as the same edge-once product in
     plain XLA anywhere else. "auto" picks, on an NVIDIA GPU, "triton" for
-    `2 <= batch_size <= 32` (when jax_triton is installed) and "csr" above
-    it -- in batched training at 5.4M edges Triton is 2.4x the edge list at
-    B = 8 and CSR edges ahead at 128 -- and on every other backend (AMD GPUs,
+    `2 <= batch_size <= 64` (when jax_triton is installed) and "csr" above
+    it -- in batched SGD at 5.4M edges Triton is 1.7x the edge list at B = 2
+    and 2.9x at 8, ahead of CSR through 64, and CSR is 4 % ahead at 128 (a
+    tie at 50M) -- and on every other backend (AMD GPUs,
     TPU, CPU) the XLA edge-once product for `batch_size >= 2` (the speed of
     the per-sample edge list, with far smaller temporaries). Non-linear
     passes, and every streaming step, use the edge list. Under Scheme-A
     sharding, "triton" uses the XLA edge-once product (jax_triton is not
     validated inside shard_map).
+
+    `fuse_prune` lets a streaming step evaluate the prune_conn predicate
+    inside the forward's edge sweep, so each bucket's edge columns are read
+    once rather than twice, when `phases.plan_prune_fusion` proves the
+    predicate sees the same values there (decided once, when the step is
+    first traced). The single-pass lowering is one Triton kernel per bucket
+    (gather, atomic scatter-add, predicate, tombstones and add_conn's
+    free-slot block counts), for an unsharded linear forward on an NVIDIA
+    GPU with jax_triton; "auto" fuses only then, and otherwise keeps the
+    two-pass step. "triton" also fuses where the kernel does not apply, as
+    the same computation in plain XLA (which reads the edge columns twice,
+    XLA being unable to fuse a scatter with a reduction), and "xla" always
+    does; "off" never fuses. The tombstones and free-slot counts match the
+    two-pass step exactly; forward sums may differ in summation order. The
+    returned step carries the decision as `step.prune_fusion` (a
+    `phases.PruneFusionRecord`). A batched step never fuses.
+
+    `growth` picks the add_conn free-slot claim (see
+    `phases.build_add_conn_phase`): "triton" claims and writes every growing
+    bucket in one jax_triton kernel (plus one clearing the tombstones) on an
+    NVIDIA GPU with the `plastax[triton]` extra, where "xla" is the portable
+    claim (per-block free counts, a search, and one scatter per column, about
+    20 kernels per bucket). Both pick the same slots. "auto" takes "triton"
+    where it can run; a "triton" request that cannot (another backend, or
+    Scheme-A sharding, where jax_triton is not validated) uses "xla".
 
     In a batched step a non-floating unit column (a flag, a count) is stored
     from sample 0 rather than averaged, and so is a non-floating connection
@@ -117,13 +148,17 @@ def make_step[GS](
         batch_size: Samples per step, or None for the streaming step.
         layout: The batched linear-pass layout: "auto", "edge_list", "csr",
             or "triton".
+        fuse_prune: Whether a streaming step fuses the prune predicate into
+            the forward sweep: "auto", "triton", "xla", or "off".
+        growth: The add_conn claim engine: "auto", "xla", or "triton".
 
     Returns:
         A jitted step function for the given network and static config.
 
     Raises:
         ValueError: If `batch_size` is below 1, or set for a PIPELINE net
-            (whose carried unit state is per-sample recurrent state).
+            (whose carried unit state is per-sample recurrent state), or if
+            `layout`, `fuse_prune` or `growth` is not one of its values.
     """
     if batch_size is not None:
         if batch_size < 1:
@@ -135,11 +170,15 @@ def make_step[GS](
             )
     if layout not in ("auto", "edge_list", "csr", "triton"):
         raise ValueError(f"make_step: unknown layout {layout!r}")
+    if fuse_prune not in ("auto", "triton", "xla", "off"):
+        raise ValueError(f"make_step: unknown fuse_prune {fuse_prune!r}")
+    if growth not in ("auto", "xla", "triton"):
+        raise ValueError(f"make_step: unknown growth engine {growth!r}")
     engine: str | None = None
     if batch_size is not None:
         triton_ok = nvidia_triton_available()
         if layout == "auto" and _nvidia_gpu():
-            if batch_size > 32:
+            if batch_size > 64:
                 engine = "csr"
             elif batch_size >= 2 and triton_ok:
                 engine = "triton"
@@ -163,7 +202,7 @@ def make_step[GS](
     # identity; hence the cast.
     return cast(
         StepFn[GS],
-        _cached_make_step(net, static, batch_size, engine),  # type: ignore[arg-type]
+        _cached_make_step(net, static, batch_size, engine, fuse_prune, growth),  # type: ignore[arg-type]
     )
 
 
@@ -232,10 +271,11 @@ def _batched_step(
     input_ids: jax.Array,
     batch_size: int,
     engine: str | None,
+    growth: str = "auto",
 ) -> StepFn[Any]:
     """The jitted batched step (see `make_step`'s `batch_size` and `layout`)."""
     phases = build_batched_phases(
-        net, static, overflow_sink=overflow_sink, engine=engine
+        net, static, overflow_sink=overflow_sink, engine=engine, growth=growth
     )
 
     def per_sample(
@@ -380,6 +420,8 @@ def _cached_make_step(
     static: NetworkStatic,
     batch_size: int | None = None,
     engine: str | None = None,
+    fuse_prune: str = "auto",
+    growth: str = "auto",
 ) -> StepFn[Any]:
     # overflow_sink (see build_phases): a length-1 out-parameter
     # build_add_conn_phase (when net.add_conn is set) overwrites on every
@@ -390,10 +432,28 @@ def _cached_make_step(
     overflow_sink: list[Bool[Array, ""]] = [jnp.bool_(False)]
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
     if batch_size is not None:
-        return _batched_step(net, static, overflow_sink, input_ids, batch_size, engine)
-    phases = build_phases(net, static, overflow_sink=overflow_sink)
+        return _batched_step(
+            net, static, overflow_sink, input_ids, batch_size, engine, growth
+        )
+    record = PruneFusionRecord()
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        # The fusion decision needs the globals' shapes (the predicate may
+        # read them), so it is made here, once per trace, in Python: the
+        # phase tuple is still fixed before any equation is emitted.
+        if fuse_prune == "off":
+            plan = PruneFusionPlan(False, "disabled (fuse_prune='off')")
+        else:
+            plan = plan_prune_fusion(net, static, state.globals_, engine=fuse_prune)
+        record.plan = plan
+        phases = build_phases(
+            net,
+            static,
+            overflow_sink=overflow_sink,
+            prune_fusion=plan,
+            growth=growth,
+        )
+
         # Step input scatter, before any phase: StepInputs.inputs onto
         # units[ACTIVATION] at the static input_ids.
         activation = state.units[ACTIVATION.name].at[input_ids].set(inputs.inputs)
@@ -415,4 +475,6 @@ def _cached_make_step(
     # jax.jit's return type is opaque under follow_imports="skip" (pyproject,
     # jax.* -> Any); step's own signature is the true (and already checked)
     # contract, so cast rather than let strict mypy's no-any-return fire.
-    return cast(StepFn[Any], jax.jit(traced, donate_argnums=0))
+    jitted: Any = jax.jit(traced, donate_argnums=0)
+    jitted.prune_fusion = record
+    return cast(StepFn[Any], jitted)

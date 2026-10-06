@@ -5,7 +5,48 @@ All notable changes to plastax are recorded here. The format follows
 [Semantic Versioning](https://semver.org/) -- before 1.0, a minor release may
 change the API. The first release is iterated as `0.1.0rcN` candidates. Versions come from git tags (hatch-vcs); see {doc}`development/releasing`.
 
-## [0.1.0rc2] - Unreleased
+## [0.1.0rc3] - Unreleased
+
+Fused Triton kernels for the streaming churn step, plus release preparation.
+
+### Added
+
+- `make_step(fuse_prune=...)` ("auto", "triton", "xla", "off"): a streaming
+  step can evaluate the prune_conn predicate inside the forward's edge sweep,
+  so each bucket's edge columns are read once instead of twice. On an NVIDIA
+  GPU with `plastax[triton]`, an unsharded linear forward runs as one Triton
+  kernel per bucket. "auto" fuses only then; the decision is recorded on the
+  returned step as `step.prune_fusion`. Tombstones and free-slot counts match
+  the two-pass step exactly.
+- `make_step(growth=...)` ("auto", "xla", "triton"): selects the add_conn
+  free-slot claim. "triton" claims and writes every growing bucket in one
+  jax_triton kernel instead of about 20 XLA kernels per bucket; both engines
+  pick the same slots. "auto" uses Triton where it can run.
+- Conformance-vector scripts (`scripts/parity_vectors.py`,
+  `scripts/emit_parity_goldens.py`) that emit plastax results as goldens for
+  the plastix C++ library, and a bit-exact NumPy port of plastix's
+  `UniformReal` pinned to the C++ golden.
+- Benchmarks: `examples/benchmarks/fused_prune_check.py`;
+  `churn_probe.py --growth`; `triton_check.py` times the backward product
+  and a dead-slot fraction.
+- `CITATION.cff`, contributing guide, CODEOWNERS and Dependabot config; CI
+  now checks docstrings with pydoclint and builds the docs with warnings as
+  errors.
+
+### Changed
+
+- `layout="auto"` keeps the Triton batched product through batch 64.
+- The fused prune feeds its free-slot counts straight to the Triton claim.
+- The CIFAR dynamic-sparse baseline rewires on device.
+- Contributor documentation moved into the docs site (Development section).
+
+### Fixed
+
+- The Triton batched kernel masks dead slots and pre-reduces runs of equal
+  targets in the backward product.
+- jaxtyping's import hook no longer instruments the Triton edge kernel.
+
+## [0.1.0rc2] - 2026-10-01
 
 Scale work: in-place structural churn at a cost that follows the churn, a
 leaner and faster arena, batched steps with CSR / Triton backends, and TPU
@@ -79,5 +120,6 @@ named-monoid combines; donation-based in-place state; the host driver's
 grow / resort retrace protocol; Scheme-A multi-device sharding; optimizer
 bundles (SGD, momentum, Adam, AdamW, RMSprop).
 
-[0.1.0rc2]: https://github.com/Sir-NoChill/plastax/compare/v0.1.0rc1...HEAD
+[0.1.0rc3]: https://github.com/Sir-NoChill/plastax/compare/v0.1.0rc2...HEAD
+[0.1.0rc2]: https://github.com/Sir-NoChill/plastax/compare/v0.1.0rc1...v0.1.0rc2
 [0.1.0rc1]: https://github.com/Sir-NoChill/plastax/releases/tag/v0.1.0rc1

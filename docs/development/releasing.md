@@ -43,6 +43,6 @@ Release candidates: tag `vX.Y.ZrcN`; the workflow routes any tag containing
 `rc` to TestPyPI instead of PyPI (requires the pending TestPyPI publisher).
 
 First release sequence: `v0.1.0rc1` -> TestPyPI -> install check ->
-`v0.1.0` -> PyPI. Status 2026-10-01: iterating on `v0.1.0rc2` (branch
-`release/v0.1.0rc2`) before `v0.1.0`; the PyPI / TestPyPI publishers and
+`v0.1.0` -> PyPI. Status 2026-10-06: `v0.1.0rc3` is prepared on `main`
+before `v0.1.0`; the PyPI / TestPyPI publishers and
 environments above still need their human setup.

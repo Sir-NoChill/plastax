@@ -24,7 +24,7 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   pick the same slots. "auto" uses Triton where it can run.
 - Conformance-vector scripts (`scripts/parity_vectors.py`,
   `scripts/emit_parity_goldens.py`) that emit plastax results as goldens for
-  the plastix C++ library, and a bit-exact NumPy port of plastix's
+  the plastax-cpp C++ library, and a bit-exact NumPy port of plastax-cpp's
   `UniformReal` pinned to the C++ golden.
 - Benchmarks: `examples/benchmarks/fused_prune_check.py`;
   `churn_probe.py --growth`; `triton_check.py` times the backward product
@@ -56,7 +56,7 @@ readiness.
 
 - `ProposeAddConn`: growth from policy-emitted proposals
   (`num_proposals`, `propose(u, j, g) -> (src, dst, score)`) instead of a
-  candidate grid, so growth costs O(k) per step (plastix's sampled
+  candidate grid, so growth costs O(k) per step (plastax-cpp's sampled
   `GrowFanout`). Proposals may grow **parallel edges** unless the policy sets
   `dedupe = True` (an exact per-step check).
 - Batched steps: `make_step(net, static, batch_size=B)` for feed-forward
@@ -104,7 +104,7 @@ readiness.
 ### Performance
 
 - Synthetic churn at 300M edges (k = 64 edges per level): 144 ms -> 13.7 ms
-  per step on an RTX 5000 Ada; state 4.1 GB. On the plastix C++ synthetic
+  per step on an RTX 5000 Ada; state 4.1 GB. On the plastax-cpp synthetic
   benchmark's grid (64 units churned per update) plastax is 3.7-3.9x faster than a
   tuned CSR + CUB rebuild from 50M edges up and 1.3-1.6x behind hand-written
   C++ in place.

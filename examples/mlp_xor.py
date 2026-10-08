@@ -115,7 +115,7 @@ class SigmoidBackward(px.BackwardPass):
 
 class MSELoss(px.Loss):
     """0.5*(pred-target)**2 per output unit (mlp_xor.cpp's
-    plastix::MSELoss); stages dL/dActivation = pred-target into LossGrad
+    plastax::MSELoss); stages dL/dActivation = pred-target into LossGrad
     for SigmoidBackward.apply to pick up at the output level."""
 
     def per_output(

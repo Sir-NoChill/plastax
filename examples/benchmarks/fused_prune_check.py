@@ -2,7 +2,7 @@
 
 Needs an NVIDIA GPU and the `triton` extra. Builds a layered net whose forward
 marks this step's scheduled units and whose prune kills their edges (the
-plastix C++ synthetic benchmark's churn step), or a hashed-edge prune, grows
+plastax-cpp synthetic benchmark's churn step), or a hashed-edge prune, grows
 replacements, and runs `make_step(fuse_prune="auto")` (one Triton kernel per bucket) and
 `fuse_prune="off"` side by side over many churn steps: every tombstone, slot
 claim and integer column must match exactly, floats to summation order. Then

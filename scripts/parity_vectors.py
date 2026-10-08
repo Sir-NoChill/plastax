@@ -1,9 +1,9 @@
-"""Reference networks for the plastix conformance vectors.
+"""Reference networks for the plastax-cpp conformance vectors.
 
 plastax is the oracle: each network here defines what a step *should* produce,
-and `plastix/tests/test_parity_plastax.cpp` checks that the C++ implementation
+and plastax-cpp's `tests/test_parity_plastax.cpp` checks that the C++ implementation
 agrees within tolerance. Every net in this file has a counterpart traits struct
-in `plastix/tests/parity/parity_fixtures.hpp` under the same `traits` name --
+in plastax-cpp's `tests/parity/parity_fixtures.hpp` under the same `traits` name --
 that pairing is the contract, and the two must be edited together.
 
 These are deliberately self-contained rather than imported from `examples/`.
@@ -11,13 +11,13 @@ Example code changes for algorithmic reasons; a conformance vector has to stay
 pinned to the algorithm it was generated for, or a regenerated golden silently
 redefines the thing it was supposed to be testing.
 
-Weight initialisation goes through `tests/_plastix_rng`, which reproduces
-`plastix::UniformReal` bit-for-bit, so both implementations start from
+Weight initialisation goes through `tests/_plastax_cpp_rng`, which reproduces
+`plastax::UniformReal` bit-for-bit, so both implementations start from
 identical weights. That is what makes a multi-step trajectory comparison
 meaningful: any divergence a vector reports was accumulated by the algorithm,
 not inherited from different initial conditions.
 
-See `plastix/notes/parity/00-parity-harness.md`.
+See `notes/parity/00-parity-harness.md` in plastax-cpp.
 """
 
 from __future__ import annotations
@@ -39,13 +39,13 @@ import plastax as px
 # `ty` cannot resolve a runtime sys.path insert; that is expected here and
 # costs nothing, since the type gates (ty, mypy) are scoped to src/ only.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tests"))
-from _plastix_rng import fully_connected_weights  # noqa: E402
+from _plastax_cpp_rng import fully_connected_weights  # noqa: E402
 
 # Per-unit columns. `grad_pre_act` carries dL/dz between backward levels;
-# plastix persists the same quantity in a user field of the same role, because
+# plastax-cpp persists the same quantity in a user field of the same role, because
 # its framework BackwardAcc is cleared right after each per-level Apply.
 GRAD_PRE_ACT = px.FieldSpec.float32("grad_pre_act")
-# dL/dActivation, staged by the loss for output units only. plastix's MSELoss
+# dL/dActivation, staged by the loss for output units only. plastax-cpp's MSELoss
 # stages this into the framework's BackwardAcc column, which its backward pass
 # then accumulates into rather than resetting; plastax's backward accumulator
 # is local to the phase's trace, so the handoff needs an explicit column.
@@ -143,7 +143,7 @@ class SigmoidBackward(px.BackwardPass):
         # `acc` is the backward-accumulated dL/da for hidden units and the
         # identity 0.0 for output units (no edge sources from the deepest
         # level); `loss_grad` is non-zero only for outputs. Their sum is
-        # exactly the single value plastix keeps in BackwardAcc.
+        # exactly the single value plastax-cpp keeps in BackwardAcc.
         grad = (acc + u[LOSS_GRAD, i]) * a * (jnp.float32(1.0) - a)
         return px.UnitWrite.of((GRAD_PRE_ACT, grad))
 
@@ -151,7 +151,7 @@ class SigmoidBackward(px.BackwardPass):
 class MSELoss(px.Loss):
     """L = 0.5*(pred - target)^2 per output; dL/dpred = pred - target.
 
-    Matches plastix::MSELoss, which stages the same gradient into BackwardAcc.
+    Matches plastax::MSELoss, which stages the same gradient into BackwardAcc.
     """
 
     def per_output(
@@ -186,14 +186,14 @@ class ConstantInit:
 
 @dataclasses.dataclass(frozen=True)
 class UniformInit:
-    """`plastix::RandomUniformWeight`, reproduced exactly.
+    """`plastax::RandomUniformWeight`, reproduced exactly.
 
-    The range width must be a power of two. plastix maps its uniform sample
+    The range width must be a power of two. plastax-cpp maps its uniform sample
     into the range as ``min + (max - min) * u``, and nvcc contracts that into a
     single fused multiply-add on device while the host evaluates a multiply
     then an add. When the width is a power of two the product is exact and the
     rounding order cannot matter; otherwise host and device differ by up to
-    1 ULP (see ``plastix/tests/test_parity_rng_cuda.cpp``).
+    1 ULP (see plastax-cpp's ``tests/test_parity_rng_cuda.cpp``).
 
     A vector's ``expect_initial_weights`` is compared *exactly*, since identical
     starting weights are the precondition that makes the whole trajectory
@@ -222,7 +222,7 @@ class UniformInit:
         if not (width > 0.0 and mantissa == 0.5):
             raise ValueError(
                 f"UniformInit range ({self.lo}, {self.hi}) has width {width}, "
-                "which is not a power of two. plastix's host and device range "
+                "which is not a power of two. plastax-cpp's host and device range "
                 "mapping then differ by up to 1 ULP (FMA contraction), so the "
                 "vector's exact initial-weight comparison would pass on CPU and "
                 "fail on GPU. Use a power-of-two width, e.g. (-1, 1) or (0, 1)."
@@ -233,7 +233,7 @@ class UniformInit:
         return {"kind": "uniform", "seed": self.seed, "min": self.lo, "max": self.hi}
 
     def weights(self, n_src: int, n_dst: int, base_conn_id: int) -> np.ndarray:
-        """Return the (n_src, n_dst) weight matrix in plastix's edge order."""
+        """Return the (n_src, n_dst) weight matrix in plastax-cpp's edge order."""
         return fully_connected_weights(
             self.seed, n_src, n_dst, base_conn_id=base_conn_id, lo=self.lo, hi=self.hi
         )
@@ -259,7 +259,7 @@ class Vector:
         input_dim: Number of input units.
         layers: Fully connected layers, in order.
         steps: (inputs, targets) per step; targets is None for forward-only nets.
-        learning_rate: Value plastix reads into GlobalState, or None.
+        learning_rate: Value plastax-cpp reads into GlobalState, or None.
         hyper: Extra optimizer hyperparameters this vector was generated with,
             recorded so the C++ runner can assert its compile-time constants
             still agree (they live in two places and would otherwise drift).
@@ -285,7 +285,7 @@ def layer_plan(
 ) -> list[tuple[int, int, Layer, int]]:
     """Resolve each layer's fan-in and its first global connection id.
 
-    plastix's connection ids keep counting across layers, and
+    plastax-cpp's connection ids keep counting across layers, and
     `RandomUniformWeight` keys on that global id -- so a second layer with its
     own seed still starts at a non-zero counter. Getting the base wrong yields
     perfectly plausible weights on the wrong edges.
@@ -308,7 +308,7 @@ def layer_plan(
 
 
 def build_topology(vector: Vector) -> Callable[[Any], Any]:
-    """Build the topology callable for a vector, with plastix-identical weights.
+    """Build the topology callable for a vector, with plastax-cpp-identical weights.
 
     Args:
         vector: The vector to build.
@@ -322,7 +322,7 @@ def build_topology(vector: Vector) -> Callable[[Any], Any]:
 
         def init(key: Any, shape: tuple[int, ...], _w: np.ndarray = weights) -> Any:
             # topology.dense calls init(key, (n_in, n_out)); the weights are
-            # fully determined by the plastix seed, so the key is unused.
+            # fully determined by the plastax-cpp seed, so the key is unused.
             del key
             assert shape == _w.shape, f"init shape {shape} != {_w.shape}"
             return jnp.asarray(_w)
@@ -367,7 +367,7 @@ class _LinRegNet(px.Network[None]):
     forward_pass = LinearForward()
     loss = MSELoss()
     # No backward pass: with a single layer, dL/dActivation at the output *is*
-    # dL/dz, so the update reads the loss's staged gradient directly. plastix
+    # dL/dz, so the update reads the loss's staged gradient directly. plastax-cpp
     # does the same by reading BackwardAcc, which nothing clears when the
     # backward pass is elided.
     update_conn = px.optim.sgd(0.01, grad_field=LOSS_GRAD).update_conn()
@@ -376,7 +376,7 @@ class _LinRegNet(px.Network[None]):
 
 
 # ---------------------------------------------------------------------------
-# Optimizer vectors (plastix/notes/parity/02-optimizers.md)
+# Optimizer vectors (plastax-cpp notes/parity/02-optimizers.md)
 # ---------------------------------------------------------------------------
 #
 # One net per plastax.optim bundle, all sharing _MlpNet's traits and differing
@@ -385,7 +385,7 @@ class _LinRegNet(px.Network[None]):
 # rather than to anything around it.
 #
 # Because plastax's bundles are themselves validated against optax, pinning
-# plastix to these vectors pins it transitively to optax. That is the point:
+# plastax-cpp to these vectors pins it transitively to optax. That is the point:
 # there is no separate C++ Adam reference to disagree with.
 #
 # Hyperparameters other than the learning rate are the bundles' own defaults on
@@ -550,7 +550,7 @@ VECTORS: tuple[Vector, ...] = (
         description=(
             "Topological forward from seeded weights. End-to-end check that the "
             "NumPy RNG port lands the same weight on the same edge as "
-            "plastix::RandomUniformWeight, including the cross-layer connection-id "
+            "plastax::RandomUniformWeight, including the cross-layer connection-id "
             "offset."
         ),
         net=_FccSigmoidNet,

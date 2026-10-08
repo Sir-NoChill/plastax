@@ -1,11 +1,12 @@
-"""Emit the plastix conformance vectors.
+"""Emit the plastax-cpp conformance vectors.
 
 Runs each network in `parity_vectors.py` and writes what it produced, step by
-step, to `plastix/tests/golden/*.json`. plastix's `test_parity_plastax.cpp`
+step, to `tests/golden/*.json` in the plastax-cpp checkout (located through
+`PLASTAX_CPP_DIR`; see `tests/_plastax_cpp.py`). plastax-cpp's `test_parity_plastax.cpp`
 rebuilds the same networks in C++ and checks it agrees within tolerance.
 
 plastax is the oracle here: these files are the specification, not a record of
-two implementations happening to agree. Regenerating one redefines what plastix
+two implementations happening to agree. Regenerating one redefines what plastax-cpp
 must do, so it is a deliberate act -- never automatic, never part of CI. A
 golden diff in a pull request should be read as an intentional change to the
 contract.
@@ -20,7 +21,7 @@ Usage::
 writing, which is what CI should run if it ever wants to catch a golden that
 drifted from its generator.
 
-See `plastix/notes/parity/00-parity-harness.md`.
+See `notes/parity/00-parity-harness.md` in plastax-cpp.
 """
 
 from __future__ import annotations
@@ -39,11 +40,15 @@ import numpy as np
 
 import plastax as px
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+sys.path.insert(0, str(_HERE.parent / "tests"))
 from parity_vectors import VECTORS, Vector, build_topology  # noqa: E402
 
+from _plastax_cpp import plastax_cpp_dir  # noqa: E402
+
 _REPO = pathlib.Path(__file__).resolve().parents[1]
-_GOLDEN_DIR = _REPO.parent / "plastix" / "tests" / "golden"
+_GOLDEN_DIR = plastax_cpp_dir() / "tests" / "golden"
 
 
 def _plastax_commit() -> str:
@@ -78,7 +83,7 @@ def _live_edges(static: px.NetworkStatic, state: Any) -> list[dict[str, Any]]:
 
     Weights are keyed by unit pair rather than by index on purpose: plastax
     buckets connections by level and sorts within a bucket, so its connection
-    ids do not correspond to plastix's allocation order. The pair is the only
+    ids do not correspond to plastax-cpp's allocation order. The pair is the only
     identifier both implementations agree on.
 
     Args:
@@ -160,7 +165,7 @@ def _run(vector: Vector) -> dict[str, Any]:
         },
         # Compared exactly, not within tolerance: identical initial weights are
         # the precondition that makes every later comparison interpretable, and
-        # the RNG port is bit-exact (tests/test_plastix_rng.py).
+        # the RNG port is bit-exact (tests/test_plastax_cpp_rng.py).
         "expect_initial_weights": _live_edges(static, state),
         "tolerance": {
             "default": {"rtol": vector.rtol, "atol": vector.atol},
@@ -193,7 +198,7 @@ def _run(vector: Vector) -> dict[str, Any]:
                     ],
                     "weights": _live_edges(static, state),
                     "live_edges": int(px.state.live_conn_count(state)),
-                    # Emitted for reference but not yet asserted: plastix's Loss
+                    # Emitted for reference but not yet asserted: plastax-cpp's Loss
                     # returns void and stages only the gradient, so there is no
                     # loss value to compare. notes/parity/05-loss-split.md adds
                     # Network::GetLastLoss(); the C++ runner picks it up then.

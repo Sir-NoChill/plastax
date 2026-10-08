@@ -22,6 +22,7 @@ Module scopes (src/plastax/):
 - `distributed` — distributed.py (multi-controller state placement, Scheme-A mesh)
 - `topology` — topology.py (dense/conv2d/sequential generators)
 - `optim` — optim/ (Optimizer bundles: sgd, momentum, adam; state_fields contract)
+- `rng` — rng.py (counter-based Philox RNG, the cross-library draw contract)
 
 Cross-cutting scopes:
 

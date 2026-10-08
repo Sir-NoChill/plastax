@@ -64,8 +64,8 @@ them `high`/`blocker`.
 
 ### Oracle-Parity Reviewer
 You review only numerical correctness against the reference oracles. Check that
-forward/backward/update/loss semantics still match the C++ plastix oracle
-(the plastix C++ library's dispatch_cpu.hpp) and that optimizers still
+forward/backward/update/loss semantics still match the C++ plastax-cpp oracle
+(plastax-cpp's dispatch_cpu.hpp) and that optimizers still
 match optax; that the
 **delta rule** and **monoid identities** are correct and not re-derived
 divergently; that any tolerance change is justified; and that the parity test

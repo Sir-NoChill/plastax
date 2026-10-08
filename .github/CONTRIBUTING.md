@@ -90,7 +90,7 @@ comment:
 
 | Comparison | Tolerance |
 |---|---|
-| External oracle (optax, the plastix C++ library) | `rtol=1e-4, atol=1e-5` |
+| External oracle (optax, the plastax-cpp library) | `rtol=1e-4, atol=1e-5` |
 | Internal numpy reference, same reduction order | `rtol=1e-6, atol=1e-6` |
 | Cross-mode equivalence (pipeline vs topological) | `rtol=1e-5, atol=1e-5` |
 | Exact invariants (e.g. regrown state is zeroed) | `atol=0.0` |

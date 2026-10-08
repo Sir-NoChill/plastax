@@ -168,7 +168,7 @@ def test_forward_is_exact_on_buckets_scrambled_by_in_place_churn() -> None:
 
 # --- Equivalence under the Driver: in place vs rebuilt from the live edges ---
 #
-# The plastax counterpart of plastix's `--validate-every` check. Proposal growth
+# The plastax counterpart of plastax-cpp's `--validate-every` check. Proposal growth
 # runs through the Driver long enough to overflow buckets (grow_bucket) and to
 # commit same-level edges (needs_resort -> topo.resort); afterwards the forward
 # on the churned arena must equal the forward on a net rebuilt from scratch

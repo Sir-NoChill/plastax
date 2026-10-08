@@ -1,7 +1,8 @@
-"""NumPy port of plastix's counter-based weight initialiser.
+"""NumPy port of plastax-cpp's counter-based weight initialiser.
 
-plastix's `RandomUniformWeight` does not draw from a PRNG *stream*. It calls
-`plastix::UniformReal(seed, counter)` (``plastix/include/plastix/random.hpp``),
+plastax-cpp's `RandomUniformWeight` does not draw from a PRNG *stream*. It calls
+`plastax::UniformReal(seed, counter)` (``include/plastax/random.hpp`` in
+plastax-cpp),
 a pure function of ``(seed, counter)``: a SplitMix64 mix, one minstd step, and
 a ``std::lerp`` into the requested range. A connection at id ``c`` therefore
 always gets the same weight regardless of scheduling, host or device -- and,
@@ -15,12 +16,12 @@ from an identical state, so any drift they report was genuinely accumulated by
 the algorithm rather than inherited from the initial conditions.
 
 This is the one place in the harness where the comparison is bit-exact.
-Everything downstream is tolerance-based, because plastix walks levels while
+Everything downstream is tolerance-based, because plastax-cpp walks levels while
 plastax segment-reduces and the reduction orders differ by construction.
 
-Pinned by ``tests/test_plastix_rng.py`` against
-``plastix/tests/golden/rng_uniform.json``, which plastix's own
-``test_parity_rng.cpp`` also asserts. Neither side can drift alone.
+Pinned by ``tests/test_plastax_cpp_rng.py`` against
+``tests/golden/rng_uniform.json`` in plastax-cpp, whose own
+``test_parity_rng.cpp`` asserts the same file. Neither side can drift alone.
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ _SHIFT_33 = np.uint64(33)
 def mix_seed(seed: Counters, counter: Counters) -> npt.NDArray[np.uint32]:
     """SplitMix64 finalizer over a Weyl-mixed ``(seed, counter)`` pair.
 
-    Mirrors ``plastix::detail::MixSeed``. Arithmetic is unsigned 64-bit with
+    Mirrors ``plastax::detail::MixSeed``. Arithmetic is unsigned 64-bit with
     wraparound, which NumPy gives us natively -- the ``errstate`` block only
     silences the overflow warnings that wraparound legitimately raises.
 
@@ -115,7 +116,7 @@ def uniform_real(
     lo: float = -1.0,
     hi: float = 1.0,
 ) -> npt.NDArray[np.float32]:
-    """Reproduce ``plastix::UniformReal(seed, counter, lo, hi)``.
+    """Reproduce ``plastax::UniformReal(seed, counter, lo, hi)``.
 
     Args:
         seed: The initialiser's seed.
@@ -145,13 +146,13 @@ def fully_connected_weights(
     lo: float = -1.0,
     hi: float = 1.0,
 ) -> npt.NDArray[np.float32]:
-    """Weights for one `plastix::FullyConnected` layer, as a ``(n_src, n_dst)`` matrix.
+    """Weights for one `plastax::FullyConnected` layer, as a ``(n_src, n_dst)`` matrix.
 
     Two details decide whether this lands the right weight on the right edge,
     and both are easy to get silently wrong:
 
     * **Allocation order is destination-major.** `FullyConnected::operator()`
-      (``plastix/include/plastix/layers.hpp``) runs
+      (``include/plastax/layers.hpp``) runs
       ``for dst in new_units: for src in prev_layer:``, so within a layer the
       connection id is ``base + dst_local * n_src + src_local``. plastax's
       `topology.dense` enumerates source-major, which is why this returns a

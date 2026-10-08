@@ -54,7 +54,7 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
 ## Oracle parity (numerics)
 
 - If the change touches forward/backward/update/loss numerics, is it still
-  consistent with the semantics oracle (the C++ plastix repo for core passes,
+  consistent with the semantics oracle (the plastax-cpp repo for core passes,
   optax for optimizers)? Would the parity test still hold, and at the right
   tolerance?
 - Is the **delta rule** (`grad_field[dst] * ACTIVATION[src]`) implemented once and

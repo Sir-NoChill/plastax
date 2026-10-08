@@ -331,7 +331,7 @@ class ProposeAddConn[GS](Protocol):
     The counterpart of `AddConn` whose cost follows the churn, not the arena.
     Instead of scoring a candidate grid, the policy emits `num_proposals`
     candidates itself, one per proposal index `j`: typically a few random
-    partners per unit (plastix's sampled `GrowFanout`), or k uniform draws. The
+    partners per unit (plastax-cpp's sampled `GrowFanout`), or k uniform draws. The
     phase then routes each proposal to its source level's bucket, applies the
     level window, and keeps each bucket's `max_candidates` best finite-scored
     proposals, exactly as on the grid. A score of -inf vetoes a proposal.

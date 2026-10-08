@@ -10,8 +10,8 @@ jax.test_util.assert_num_jit_and_pmap_compilations .
 ## Recommendations for Poor Performance
 
 1. If your algorithm exhibits many overflow events then
-   you should pre-allocate more VRAM. Note that in plastix
-   native this should not be an issue as VRAM is
+   you should pre-allocate more VRAM. Note that in plastax-cpp
+   this should not be an issue as VRAM is
    reallocated on demand
 2. If your algorithm exhibits many retrace events, then you
    may want to consider implementing a pipelined version

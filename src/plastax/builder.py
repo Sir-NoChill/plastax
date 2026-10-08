@@ -582,6 +582,7 @@ class NetworkBuilder[GS]:
         if repl_sharding is None:
             globals_out: GS = self.globals_
             needs_resort = jnp.bool_(False)
+            step = jnp.int32(0)
         else:
             repl = repl_sharding  # narrowed non-None for the placement closures
             globals_out = jax.tree_util.tree_map(
@@ -589,6 +590,7 @@ class NetworkBuilder[GS]:
                 self.globals_,
             )
             needs_resort = _place(np.asarray(False), repl, ())
+            step = _place(np.asarray(0, dtype=np.int32), repl, ())
 
         static = NetworkStatic(
             num_units=num_units,
@@ -602,11 +604,13 @@ class NetworkBuilder[GS]:
             sharding=effective,
             capacity_headroom=capacity_headroom,
             capacity_align=capacity_align,
+            seed=self.net.seed,
         )
         state = NetworkState(
             units=unit_cols,
             conns=tuple(conns),
             globals_=globals_out,
             needs_resort=needs_resort,
+            step=step,
         )
         return static, state

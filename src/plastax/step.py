@@ -255,6 +255,7 @@ def _shard_map_step(
         conns=conns_spec,
         globals_=repl,
         needs_resort=repl,
+        step=repl,
     )
     in_specs: Any = (state_spec, _spec(StepInputs, inputs=repl, targets=repl))
     out_specs: Any = _spec(StepResult, state=state_spec, overflow=repl, loss=repl)
@@ -336,6 +337,8 @@ def _batched_step(
         state = dataclasses.replace(state, units=batch_mean_units(units_b))
         for phase in phases.structural:
             state, _ = phase(state, inputs)
+        # One batched step = one framework step (phases saw the old value).
+        state = dataclasses.replace(state, step=state.step + 1)
         return StepResult(state=state, overflow=overflow_sink[0], loss=losses.mean())
 
     traced = step if static.sharding is None else _shard_map_step(step, static)
@@ -466,6 +469,8 @@ def _cached_make_step(
             state, contribution = phase(state, inputs)
             total_loss = total_loss + contribution
 
+        # Completed-steps counter: phases above saw the pre-increment value.
+        state = dataclasses.replace(state, step=state.step + 1)
         return StepResult(state=state, overflow=overflow_sink[0], loss=total_loss)
 
     # Under Scheme-A sharding, wrap the step in a shard_map (connections

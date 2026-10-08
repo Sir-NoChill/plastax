@@ -12,7 +12,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Bool
+from jaxtyping import Array, Bool, Int32
 
 from plastax._types import FieldSpec, Propagation, ShardSpec
 
@@ -39,6 +39,8 @@ class NetworkStatic:
             (build, grow_bucket, resort) reserves above the live count.
         capacity_align: the capacity rounding for that sizing: None for a
             power of two, an int for a multiple of it (topo.capacity_policy).
+        seed: the network seed keying the framework's counter-based RNG
+            (`plastax.rng`), copied from `Network.seed` at build time.
     """
 
     num_units: int = dataclasses.field(metadata=dict(static=True))
@@ -62,6 +64,7 @@ class NetworkStatic:
     capacity_align: int | None = dataclasses.field(
         default=None, metadata=dict(static=True)
     )
+    seed: int = dataclasses.field(default=0, metadata=dict(static=True))
 
 
 Columns = dict[str, Array]  # keyed by FieldSpec.name; one array per SOA tag
@@ -82,12 +85,17 @@ class NetworkState[GS]:
         globals_: user-defined global state, opaque to the framework.
         needs_resort: scalar flag marking whether a topological resort is
             due; checked host-side by the driver between steps.
+        step: scalar count of completed framework steps. It reads 0 during
+            the first step's phases and is incremented once at the end of
+            every step (a batched step counts as one); rules and the
+            counter-based RNG key on the pre-increment value.
     """
 
     units: Columns
     conns: tuple[Columns, ...]
     globals_: GS
     needs_resort: Bool[Array, ""]
+    step: Int32[Array, ""] = dataclasses.field(default_factory=lambda: jnp.int32(0))
 
 
 def _filled_columns(specs: tuple[FieldSpec[np.generic], ...], capacity: int) -> Columns:
@@ -123,6 +131,7 @@ def make_empty_state[GS](static: NetworkStatic, globals_: GS) -> NetworkState[GS
         conns=conns,
         globals_=globals_,
         needs_resort=jnp.bool_(False),
+        step=jnp.int32(0),
     )
 
 
@@ -214,5 +223,6 @@ def grow_bucket[GS](
         conns=new_conns,
         globals_=state.globals_,
         needs_resort=state.needs_resort,
+        step=state.step,
     )
     return new_static, new_state

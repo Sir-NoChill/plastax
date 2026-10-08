@@ -1,6 +1,6 @@
 """C++ oracle parity.
 
-Golden-file parity against the native C++ Plastix build. The two flagship
+Golden-file parity against the native plastax-cpp build. The two flagship
 examples (mlp_xor, ipc_multilayer) both initialise weights from a PRNG, and
 plastax's jax PRNG cannot reproduce the C++ std::mt19937 stream, so their
 trajectories are only comparable in aggregate (see their acceptance tests).
@@ -18,9 +18,9 @@ unit's activation to the golden values.
 Golden values were generated once by the native binary and are pinned
 below; regenerate with:
 
-    plastix/build/examples/manual-fcc/manual_fcc
+    plastax-cpp/build/examples/manual-fcc/manual_fcc
 
-(built from plastix/examples/manual-fcc/manual_fcc.cpp). Tolerance is the
+(built from plastax-cpp's examples/manual-fcc/manual_fcc.cpp). Tolerance is the
 topological rtol=1e-4 -- segment-reduction order differs from the
 C++ level sweep -- with a small atol so the exact-zero row is not compared
 by relative error alone.

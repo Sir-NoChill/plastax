@@ -1,41 +1,39 @@
-"""Pin the NumPy port of plastix's initialiser to the C++ golden.
+"""Pin the NumPy port of plastax-cpp's initialiser to the C++ golden.
 
-`tests/_plastix_rng.py` reproduces `plastix::UniformReal` so the conformance
+`tests/_plastax_cpp_rng.py` reproduces `plastax::UniformReal` so the conformance
 vectors can start from weights identical to the C++ ones. This test asserts the
 port is *bit* exact, not merely close: initial weights are an input to every
 other vector, so a one-ULP difference here would quietly eat into the tolerance
 budget of everything downstream and make a real divergence look like rounding.
 
-The golden lives in the plastix tree (`tests/golden/rng_uniform.json`, emitted
-by `tests/tools/emit_rng_golden.cpp`) and plastix's own `test_parity_rng.cpp`
-asserts against the same file, so neither implementation can drift alone.
+The golden lives in the plastax-cpp tree (`tests/golden/rng_uniform.json`,
+emitted by `tests/tools/emit_rng_golden.cpp`) and plastax-cpp's own
+`test_parity_rng.cpp` asserts against the same file, so neither implementation
+can drift alone.
 
-Skipped when the plastix checkout is not a sibling of this repo -- the port is
-still importable and usable, it just cannot be verified from here.
+Skipped when the plastax-cpp checkout is absent (see `_plastax_cpp`) -- the
+port is still importable and usable, it just cannot be verified from here.
 """
 
 from __future__ import annotations
 
 import json
-import pathlib
 import struct
 
 import numpy as np
 import pytest
 
-from _plastix_rng import fully_connected_weights, mix_seed, uniform_real
+from _plastax_cpp import plastax_cpp_dir
+from _plastax_cpp_rng import fully_connected_weights, mix_seed, uniform_real
 
-_GOLDEN = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "plastix"
-    / "tests"
-    / "golden"
-    / "rng_uniform.json"
-)
+_GOLDEN = plastax_cpp_dir() / "tests" / "golden" / "rng_uniform.json"
 
 pytestmark = pytest.mark.skipif(
     not _GOLDEN.is_file(),
-    reason=f"no plastix RNG golden at {_GOLDEN}; needs a sibling plastix checkout",
+    reason=(
+        f"no plastax-cpp RNG golden at {_GOLDEN}; point PLASTAX_CPP_DIR at a "
+        "plastax-cpp checkout"
+    ),
 )
 
 
@@ -66,7 +64,7 @@ def test_uniform_real_is_bit_exact() -> None:
                     f"C++ {sample[name]} vs port {got}"
                 )
     assert not mismatches, "\n".join(
-        ["NumPy port diverged from plastix::UniformReal:", *mismatches[:20]]
+        ["NumPy port diverged from plastax::UniformReal:", *mismatches[:20]]
     )
 
 
@@ -102,7 +100,7 @@ def test_mix_seed_is_uint32() -> None:
 def test_fully_connected_weights_uses_destination_major_ids() -> None:
     """w[src, dst] must come from conn id base + dst * n_src + src.
 
-    This is the mapping between plastix's allocation order and plastax's edge
+    This is the mapping between plastax-cpp's allocation order and plastax's edge
     order. Getting it wrong still produces plausible random weights -- just
     permuted onto the wrong edges -- so pin it explicitly rather than trusting
     a conformance vector to notice.

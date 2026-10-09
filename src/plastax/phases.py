@@ -3037,6 +3037,9 @@ def candidates_shortlist(
     Returns:
         `(flat_src, flat_dst)` int32 arrays of length `pool_side**2`.
     """
+    # top_k is the importance ranking: its equal-value tiebreak (lower index
+    # first) is exactly the documented rule -- importance ties break by
+    # ascending unit id -- so no 4-key sort is needed here.
     _, top = jax.lax.top_k(importance, pool_side)
     src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
     dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
@@ -3067,6 +3070,9 @@ def candidates_per_level(
     Returns:
         `(flat_src, flat_dst)` int32 arrays of length `pool_side**2`.
     """
+    # Both top_k calls are importance rankings; their equal-value tiebreak
+    # (lower index first) is the documented rule -- ties break by ascending
+    # unit id (see candidates_shortlist).
     src_imp = jnp.where(unit_level == bucket_idx, importance, -jnp.inf)
     _, src_top = jax.lax.top_k(src_imp, pool_side)
     deeper = (unit_level > bucket_idx) & (unit_level <= bucket_idx + max_level_gap)
@@ -3216,7 +3222,12 @@ def dedupe_step(
     """Veto within-step repeats, keeping each pair's highest-scored copy.
 
     Proposals, unlike grid cells, can repeat within a step. The veto runs
-    BEFORE top_k, so repeats never take a bucket's k slots.
+    BEFORE selection, so repeats never take a bucket's k slots. The survivor
+    is the pair's first copy in the total candidate order: the stable
+    score-descending pass means a higher-scored copy always survives a
+    lower-scored one, and equally-scored copies keep the earliest candidate
+    index -- the same tiebreak `select` applies (src and dst are equal within
+    a pair by definition).
 
     Args:
         flat_scores: candidate scores (vetoes already applied as -inf).
@@ -3235,22 +3246,46 @@ def dedupe_step(
     return jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
 
 
-def select(flat_scores: jax.Array, k: int) -> jax.Array:
+def select(
+    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array, k: int
+) -> jax.Array:
     """Indices of the bucket's k selection winners, in selection order.
+
+    Winners follow the total candidate order: sort key
+    ``(-score, src, dst, candidate_index)`` ascending, where the candidate
+    index is the candidate's flat position (the grid's ``src * n + dst``, a
+    shortlist grid's row-major position, a proposal's draw index). Score ties
+    therefore resolve to the lower source id, then the lower destination id,
+    then the earlier candidate -- deterministically, identically on every
+    backend, and identically in the C++ implementation. A NaN score sorts
+    last, like the -inf veto it becomes at commit time (`isfinite` gates
+    growability), rather than first as a raw descending float sort would
+    place it.
 
     Args:
         flat_scores: the bucket's candidate scores.
+        flat_src: candidate source ids, parallel to `flat_scores`.
+        flat_dst: candidate destination ids, parallel to `flat_scores`.
         k: the static per-bucket budget.
 
     Returns:
         Indices of the k selected candidates. When every candidate fits the
-        budget, selection is moot: the (full-sort) top_k is skipped, since
-        order only decides which free slot a candidate takes and the claim
-        tolerates vetoed (-inf) candidates anywhere.
+        budget, selection is moot and the full sort is skipped: the same set
+        commits, in candidate order. (Under overflow this order -- not the
+        total order -- decides which candidates land; revisited when
+        `selection = all` becomes a declared policy knob.)
     """
     if k == flat_scores.shape[0]:
         return jnp.arange(k, dtype=jnp.int32)
-    _, top_idx = jax.lax.top_k(flat_scores, k)
+    neg_score = jnp.where(
+        jnp.isnan(flat_scores), jnp.float32(jnp.inf), -flat_scores
+    ).astype(jnp.float32)
+    cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
+    *_, perm = jax.lax.sort(
+        (neg_score, flat_src.astype(jnp.int32), flat_dst.astype(jnp.int32), cand_idx),
+        num_keys=4,
+    )
+    top_idx: jax.Array = perm[:k]
     return top_idx
 
 
@@ -3474,7 +3509,7 @@ def build_add_conn_phase[GS](
                     flat_scores = dedupe_step(flat_scores, flat_src, flat_dst)
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
-            top_idx = select(flat_scores, k)
+            top_idx = select(flat_scores, flat_src, flat_dst, k)
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]

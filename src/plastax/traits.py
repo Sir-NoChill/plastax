@@ -389,10 +389,13 @@ class ProposeAddConn[GS](Protocol):
       the proposing unit. Candidate order index is ``i * P + j``.
     - ``"per_connection"``: every live connection proposes;
       `propose(u, c, cid, j, g, rng)` with `cid` the proposing connection's
-      arena slot. Candidate order index is ``r * P + j`` with ``r`` the
+      arena slot (under Scheme-A sharding, its slot within the shard's band
+      of `c`). Candidate order index is ``r * P + j`` with ``r`` the
       connection's rank in ascending ``(src, dst, occurrence)`` order over the
       live connections (occurrence counts parallel edges in ascending slot
-      order). A unit with no live connections proposes nothing.
+      order). Rank and occurrence are global across shards, so a sharded
+      step proposes and commits exactly what a single-device step does. A
+      unit with no live connections proposes nothing.
     - ``"global"``: one proposer; `propose(u, j, g, rng)`. Order index ``j``.
 
     Each proposal site receives its own counter-based `Rng`

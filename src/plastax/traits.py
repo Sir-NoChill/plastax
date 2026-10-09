@@ -373,6 +373,38 @@ class PruneConn[GS](Protocol):
 
 
 @runtime_checkable
+class PruneUnit[GS](Protocol):
+    """Unit pruning policy: permanently remove units by predicate.
+
+    The predicate is evaluated, on the state as it stands before the phase,
+    for every live unit except the input and output units, which are never
+    pruned. Each unit it selects is marked `PRUNED` for good: its columns
+    reset to their declared defaults except `LEVEL`, which it keeps, and every
+    connection incident to it is tombstoned in the same phase. A slot holding
+    no live unit is skipped by every later phase. The phase runs every step,
+    after the connection update and before connection pruning, and under a
+    batched step it runs once on the batch-mean unit state. It requires
+    `Network.unit_capacity`.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
+
+    def predicate(self, u: UnitView, i: UnitIdx, g: GS) -> Bool[Array, ""]:
+        """Decide whether to prune one unit.
+
+        Args:
+            u: the unit view.
+            i: index of the unit.
+            g: the global state.
+
+        Returns:
+            A scalar bool; True to prune the unit.
+        """
+        ...
+
+
+@runtime_checkable
 class ScoreAddConn[GS](Protocol):
     """Connection growth policy: scored candidates through the shared pipeline.
 
@@ -615,6 +647,8 @@ class Network[GS]:
         loss: the loss policy, or None to elide it.
         update_unit: the unit update policy, or None to elide it.
         update_conn: the connection update policy, or None to elide it.
+        prune_unit: the unit pruning policy, or None to elide it. Requires
+            `unit_capacity`.
         prune_conn: the connection pruning policy, or None to elide it.
         add_conn: the connection growth policy, or None to elide it.
         reset_global: the global-state reset policy, or None to elide it.
@@ -629,7 +663,8 @@ class Network[GS]:
             and growth) only every this many steps -- ``step % n == 0`` fires
             them. Default 1 (every step, the historical behavior). The
             growth rule's own ``trigger`` composes on top: both gates must
-            pass for growth to run.
+            pass for growth to run. Unit pruning is not gated: it runs every
+            step, as in plastax-cpp.
         unit_capacity: the number of unit slots, or None (the default) for
             exactly the built unit count. A capacity sizes every unit column
             to that many slots and adds the built-in `PRUNED` column: the
@@ -648,6 +683,7 @@ class Network[GS]:
     loss: Loss[GS] | None = None
     update_unit: UpdateUnit[GS] | None = None
     update_conn: UpdateConn[GS] | None = None
+    prune_unit: PruneUnit[GS] | None = None
     prune_conn: PruneConn[GS] | None = None
     add_conn: ScoreAddConn[GS] | ProposeAddConn[GS] | None = None
     reset_global: ResetGlobal[GS] | None = None
@@ -842,6 +878,12 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             f"got {cls.update_conn!r}"
         )
 
+    if cls.prune_unit is not None and not isinstance(cls.prune_unit, PruneUnit):
+        raise TypeError(
+            f"{cls.__name__}.prune_unit must satisfy PruneUnit (predicate); "
+            f"got {cls.prune_unit!r}"
+        )
+
     if cls.prune_conn is not None and not isinstance(cls.prune_conn, PruneConn):
         raise TypeError(
             f"{cls.__name__}.prune_conn must satisfy PruneConn; got {cls.prune_conn!r}"
@@ -880,14 +922,15 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
 
 
 def _validate_unit_slots(cls: type[Network[Any]]) -> None:
-    """Check `unit_capacity` and `max_levels` at class definition.
+    """Check `unit_capacity`, `max_levels` and unit pruning at class definition.
 
     Args:
         cls: the Network subclass being validated (for error messages).
 
     Raises:
-        TypeError: if `unit_capacity` is neither None nor an int >= 1, or
-            `max_levels` is not an int >= 2.
+        TypeError: if `unit_capacity` is neither None nor an int >= 1,
+            `max_levels` is not an int >= 2, or `prune_unit` is declared
+            without a `unit_capacity`.
     """
     capacity: object = getattr(cls, "unit_capacity", None)
     if capacity is not None and (
@@ -897,6 +940,12 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.unit_capacity must be None or an int >= 1; "
             f"got {capacity!r}"
         )
+    if cls.prune_unit is not None and capacity is None:
+        raise TypeError(
+            f"{cls.__name__}.prune_unit requires a unit_capacity: the `PRUNED` "
+            "column that marks pruned units exists only with one"
+        )
+    reject_sharded_unit_pruning(cls, cls.sharding)
     max_levels: object = getattr(cls, "max_levels", 1024)
     if (
         not isinstance(max_levels, int)
@@ -905,6 +954,28 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
     ):
         raise TypeError(
             f"{cls.__name__}.max_levels must be an int >= 2; got {max_levels!r}"
+        )
+
+
+def reject_sharded_unit_pruning(
+    net: type[Network[Any]], sharding: ShardSpec | None
+) -> None:
+    """Refuse a network that prunes units under Scheme-A sharding.
+
+    Units are replicated, but pruning one tombstones its connections in the
+    sharded connection arenas, and that path is not designed yet.
+
+    Args:
+        net: the Network subclass (for the check and error messages).
+        sharding: the sharding the network is defined or built with.
+
+    Raises:
+        NotImplementedError: if `net` declares `prune_unit` and `sharding` is
+            set.
+    """
+    if sharding is not None and net.prune_unit is not None:
+        raise NotImplementedError(
+            f"{net.__name__}: unit pruning under sharding is not supported yet"
         )
 
 

@@ -2938,7 +2938,7 @@ def shortlist_coverage[GS](
     if add_conn is None or max_candidate_units is None:
         return ()
     levels = np.asarray(state.units[LEVEL.name])
-    max_level_gap = net.neighbourhood
+    max_level_gap = int(getattr(add_conn, "max_level_gap", 1))
     out: list[ShortlistCoverage] = []
     for bucket in range(len(static.level_capacities)):
         sources = int(np.sum(levels == bucket))
@@ -3269,7 +3269,8 @@ def build_add_conn_phase[GS](
     `importance(u, i, g)` method, the M x M grid of that step's top-M most
     important units (an O(num_units + M^2) shortlist replacing the O(num_units^2)
     sweep) -- filtered to a level-gap window:
-    `abs(level[dst] - level[src]) <= max_level_gap` (`net.neighbourhood`),
+    `abs(level[dst] - level[src]) <= max_level_gap` (the growth rule's own
+    attribute, read structurally, default 1),
     self-loops excluded (see
     per-ordered-pair derivation in `apply_validity`). In TOPOLOGICAL mode a bucket only
     sources candidates from units at its own level (matching
@@ -3336,7 +3337,7 @@ def build_add_conn_phase[GS](
     assert ac is not None  # build_phases only calls this when set
     num_units = static.num_units
     num_buckets = len(static.level_capacities)
-    max_level_gap = net.neighbourhood
+    max_level_gap = int(getattr(ac, "max_level_gap", 1))
     is_pipeline = net.propagation is Propagation.PIPELINE
 
     # Scheme-A sharding: the conn arena is split across `num_shards` devices on

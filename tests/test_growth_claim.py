@@ -199,7 +199,7 @@ _CONFIGS: dict[str, dict[str, Any]] = {
         dedupe=False,
         headroom=0.0,
         align=7,
-        neighbourhood=2,
+        max_level_gap=2,
     ),
     # Grid growth (dedupe default on), top_k over the full grid.
     "grid": dict(
@@ -236,6 +236,8 @@ def _build(cfg: dict[str, Any]) -> tuple[type[px.Network[Any]], Any, Any]:
     else:
         policy = _HashGrid(cfg["k"])
     prune = _HashPrune(cfg["rate"])
+    # the growth window is the rule's attribute, not the Network's
+    policy.max_level_gap = cfg.get("max_level_gap", 1)
 
     class Net(px.Network[Any]):
         forward_pass = _Forward()
@@ -243,7 +245,6 @@ def _build(cfg: dict[str, Any]) -> tuple[type[px.Network[Any]], Any, Any]:
         add_conn = policy
         reset_global = _Tick()
         extra_conn_fields = (_AGE, _TRACE)
-        neighbourhood = cfg.get("neighbourhood", 1)
         propagation = px.Propagation.TOPOLOGICAL
 
     static, state = px.NetworkBuilder.from_edges(

@@ -35,6 +35,15 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** the growth window moved off the network onto the growth rule.
+  `Network.neighbourhood` is removed; set `max_level_gap` (int, default 1, read
+  structurally) on the `AddConn`/`ProposeAddConn` policy instead. A subclass
+  that still sets `neighbourhood` fails validation with a pointer to the new
+  name. Window semantics are unchanged.
+- The add_conn phase is assembled from named, individually testable stage
+  functions (`candidates_grid`/`candidates_shortlist`/`candidates_per_level`/
+  `candidates_propose`, `apply_validity`, `dedupe_live`, `dedupe_step`,
+  `select`); the computation is unchanged.
 - `layout="auto"` keeps the Triton batched product through batch 64.
 - The fused prune feeds its free-slot counts straight to the Triton claim.
 - The CIFAR dynamic-sparse baseline rewires on device.

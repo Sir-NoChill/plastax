@@ -285,6 +285,10 @@ class AddConn[GS](Protocol):
     edge. For growth whose cost follows the churn rather than the arena, see
     `ProposeAddConn`.
 
+    The growth window is the rule's own `max_level_gap` (int, read
+    structurally, default 1): a candidate is in-window when
+    `abs(level[dst] - level[src]) <= max_level_gap` and `src != dst`.
+
     Type Args:
         GS: the global state type threaded through the network.
 
@@ -333,8 +337,10 @@ class ProposeAddConn[GS](Protocol):
     candidates itself, one per proposal index `j`: typically a few random
     partners per unit (plastax-cpp's sampled `GrowFanout`), or k uniform draws. The
     phase then routes each proposal to its source level's bucket, applies the
-    level window, and keeps each bucket's `max_candidates` best finite-scored
-    proposals, exactly as on the grid. A score of -inf vetoes a proposal.
+    level window (the rule's own `max_level_gap`, read structurally, default 1:
+    `abs(level[dst] - level[src]) <= max_level_gap`, no self-loops), and keeps
+    each bucket's `max_candidates` best finite-scored proposals, exactly as on
+    the grid. A score of -inf vetoes a proposal.
 
     **Duplicates.** By default nothing checks a proposal against the live
     edges, so a proposal that repeats a live pair grows a *parallel edge* (the
@@ -438,7 +444,6 @@ class Network[GS]:
         extra_conn_fields: extra per-connection fields beyond the builtin ones.
         propagation: the propagation strategy used to schedule updates.
         kahn_max_depth: max depth for Kahn-order propagation, or None if unbounded.
-        neighbourhood: the neighbourhood radius used by the propagation strategy.
         sharding: Scheme-A sharding config, or None for a single device.
         seed: the network seed keying the framework's counter-based RNG
             (`plastax.rng`); identical seeds give identical draw streams.
@@ -456,7 +461,6 @@ class Network[GS]:
     extra_conn_fields: tuple[FieldSpec[np.generic], ...] = ()
     propagation: Propagation = Propagation.TOPOLOGICAL
     kahn_max_depth: int | None = None
-    neighbourhood: int = 1
     sharding: ShardSpec | None = None
     seed: int = 0
 
@@ -555,6 +559,12 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         ValueError: if a delegated check fails -- a malformed combine
             MonoidTree, or a field-name collision or duplicate.
     """
+    if "neighbourhood" in vars(cls):
+        raise TypeError(
+            f"{cls.__name__}.neighbourhood is no longer a Network attribute: "
+            "the growth window moved onto the growth rule. Set "
+            "`max_level_gap` (int, default 1) on the add_conn policy instead."
+        )
     forward_pass = getattr(cls, "forward_pass", None)
     if forward_pass is None:
         raise TypeError(f"{cls.__name__}.forward_pass is required and was not set")

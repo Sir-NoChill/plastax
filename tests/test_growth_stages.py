@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import plastax as px
 from plastax._types import DEAD, FROM_ID, TO_ID
 from plastax.phases import (
     apply_validity,
@@ -102,3 +103,30 @@ def test_dedupe_live_masks_live_edges_but_not_dead_ones() -> None:
     ok = np.asarray(dedupe_live(bucket, src, dst, 4, None))
     # (0,1) live -> masked; (1,2) only exists dead -> allowed; (2,3) live -> masked
     assert ok.tolist() == [False, True, False]
+
+
+def test_network_level_neighbourhood_is_rejected_with_guidance() -> None:
+    class _Fwd(px.ForwardPass):
+        combine = px.monoid.sum_
+
+        def map(
+            self,
+            u: px.UnitView,
+            dst: px.UnitIdx,
+            src: px.UnitIdx,
+            c: px.ConnView,
+            cid: px.ConnIdx,
+            g: None,
+        ) -> jnp.ndarray:
+            return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
+
+        def apply(
+            self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray
+        ) -> px.UnitWrite:
+            return px.UnitWrite.of((px.ACTIVATION, acc))
+
+    with pytest.raises(TypeError, match="max_level_gap"):
+
+        class _Net(px.Network[None]):
+            forward_pass = _Fwd()
+            neighbourhood = 1

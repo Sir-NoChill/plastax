@@ -126,7 +126,7 @@ def test_proposals_route_to_their_source_level_and_respect_the_window() -> None:
     table = [
         (1, 4, 1.0),  # level 0 -> 1: bucket 0
         (5, 8, 1.0),  # level 1 -> 2: bucket 1
-        (2, 10, 1.0),  # level 0 -> 2: outside neighbourhood 1, dropped
+        (2, 10, 1.0),  # level 0 -> 2: outside max_level_gap 1, dropped
         (6, 6, 1.0),  # self-loop, dropped
         (3, 5, -jnp.inf),  # vetoed
         (99, 5, 1.0),  # out-of-range id, vetoed

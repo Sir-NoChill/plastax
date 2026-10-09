@@ -57,6 +57,7 @@ class _GrowAhead(px.AddConn[None]):
     resets them to their FieldSpec default."""
 
     max_candidates = 3
+    max_level_gap = 2  # let input->output skip edges be growable
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: object
@@ -92,7 +93,6 @@ class _ChurnNet(px.Network[None]):
     extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
     extra_conn_fields = _ADAM.state_fields
     propagation = px.Propagation.TOPOLOGICAL
-    neighbourhood = 2  # let input->output skip edges be growable
 
 
 def _snapshot(state: px.NetworkState[None]) -> list[dict[str, np.ndarray]]:

@@ -195,7 +195,7 @@ _CONFIGS: dict[str, dict[str, Any]] = {
         headroom=0.05,
         align=256,
     ),
-    # Neighbourhood 2 (skip edges, same-level proposals -> needs_resort),
+    # max_level_gap 2 (skip edges, same-level proposals -> needs_resort),
     # capacities not a multiple of 64 (the padded block count).
     "propose_window2": dict(
         widths=(10, 9, 11, 7),

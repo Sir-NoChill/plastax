@@ -570,7 +570,11 @@ for _field in Proposal._fields:
 class ProposeAddConn[GS](Protocol):
     """Connection growth policy: bounded growth from sampled proposals.
 
-    The counterpart of `AddConn` whose cost follows the churn, not the arena.
+    The counterpart of `ScoreAddConn` whose cost follows the churn, not the
+    arena, and the default growth for networks with unit addition: a
+    per-unit proposer lets every live unit, one spawned this step included,
+    propose its own edges, num_units x P candidates instead of a
+    num_units^2 grid.
     Instead of scoring a candidate grid, the policy emits proposals through
     `propose`, called `proposals_per_proposer` times (index `j`) for each
     proposing site. Who proposes is the rule's `proposer` (read structurally,

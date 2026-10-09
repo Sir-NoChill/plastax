@@ -103,15 +103,18 @@ class ProposeGrow(px.ProposeAddConn):
     """Uniform proposals: 4k per bucket, a random (src, dst) between layers."""
 
     def __init__(self, k: int, width: int, *, dedupe: bool) -> None:
+        self.proposer = "global"
         self.max_candidates = k
-        self.num_proposals = 2 * 4 * k  # two buckets, 4x oversampled
+        self.proposals_per_proposer = 2 * 4 * k  # two buckets, 4x oversampled
         self.width = width
-        self.dedupe = dedupe
+        # The old single flag covered both dedupe stages.
+        self.dedupe_live = dedupe
+        self.dedupe_step = dedupe
 
     def propose(
-        self, u: px.UnitView, j: jax.Array, g: Globals
+        self, u: px.UnitView, j: jax.Array, g: Globals, rng: px.rng.Rng
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del u
+        del u, rng
         layer = j % 2
         w = jnp.float32(self.width)
         src = layer * self.width + (hash01(j, g["step"], jnp.int32(1)) * w).astype(

@@ -103,6 +103,8 @@ group, ordered roughly by how fundamental they are.
   Inputs are level 0.
 - **`initial_levels` / `recompute_levels`** — host-side Kahn/longest-path at
   build time; on-device bounded Bellman-Ford relaxation after structural change.
+  Both keep inputs at level 0; topological builds and resorts reject a cycle,
+  including one through an input.
 - **Resort** — rebucket all edges by (recomputed) source level after a
   non-level-preserving change; produces a new `NetworkStatic` → retrace.
 - **`needs_resort`** — a device flag set only by the add_conn phase when it

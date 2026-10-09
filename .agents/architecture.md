@@ -354,8 +354,11 @@ no retry of an overflowing step (buckets short of `max_new_per_level` free slots
 grow at the check) and a resort deferred to the check. Opt-in, for launch-
 bound small nets; N = 1 is the exact protocol above.
 
-`topo.resort` (`topo.py:149`) recomputes levels (`recompute_levels`,
-Bellman-Ford relaxation bounded by `kahn_max_depth`), redistributes edges into
+`topo.resort` first rejects, in topological mode, a cycle in the live edges
+(`has_cycle`; edges into inputs count, so a cycle through an input is
+rejected), then recomputes levels (`recompute_levels`, Bellman-Ford
+relaxation bounded by `kahn_max_depth`; inputs stay at level 0 whatever feeds
+them, as in the builder's `initial_levels`), redistributes edges into
 new per-level buckets (prefix-sum compacting scatter + stable sort on
 `dead*num_units + from_id` to restore the builder's source-major order -- live
 edges first, grouped by source, for scatter-add performance; in-place churn

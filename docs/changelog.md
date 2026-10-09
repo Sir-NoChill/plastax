@@ -177,6 +177,13 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 - The Triton batched kernel masks dead slots and pre-reduces runs of equal
   targets in the backward product.
 - jaxtyping's import hook no longer instruments the Triton edge kernel.
+- A topological `topo.resort` raises `ValueError` when the live connections
+  contain a cycle (growth can commit one, through an input or between
+  same-level units), as plastax-cpp's level recompute does; it used to
+  level the cycle units at the relaxation bound. The new `topo.has_cycle`
+  makes the check. `topo.initial_levels` takes `input_ids` and keeps them at
+  level 0 when an acyclic edge feeds them, as `recompute_levels` does; a
+  cycle through an input still raises.
 
 ## [0.1.0rc2] - 2026-10-01
 

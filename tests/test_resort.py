@@ -33,6 +33,7 @@ import dataclasses
 
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax._src import test_util as jtu
 
 import plastax as px
@@ -150,6 +151,146 @@ def test_recompute_levels_ignores_a_stale_level_column_and_recomputes_from_conns
     )
     got = topo.recompute_levels(static, corrupted)
     np.testing.assert_array_equal(np.asarray(got), expected)
+
+
+# ---------------------------------------------------------------------------
+# Level rules shared by initial_levels, recompute_levels and resort: inputs
+# sit at level 0 whatever feeds them, and a topological resort rejects a
+# cycle in the live edges, a cycle through an input included.
+# ---------------------------------------------------------------------------
+
+
+class _CycleNet(px.Network[None]):
+    forward_pass = _SumForward()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+class _CyclePipelineNet(px.Network[None]):
+    forward_pass = _SumForward()
+    propagation = px.Propagation.PIPELINE
+
+
+def _with_extra_edge(
+    net: type[px.Network[None]],
+    num_units: int,
+    edges: list[tuple[int, int]],
+    extra: tuple[int, int],
+) -> tuple[px.NetworkStatic, px.NetworkState[None]]:
+    """Build 0, 1 (inputs) plus `edges`, then write `extra` into bucket 0's
+    first free slot, as a growth commit would."""
+    builder = px.NetworkBuilder(net, None)
+    for _ in range(num_units):
+        builder.add_unit()
+    builder.mark_input(0)
+    builder.mark_input(1)
+    for src, dst in edges:
+        builder.add_conn(src, dst, weight=1.0)
+    static, state = builder.finalize()
+    bucket = dict(state.conns[0])
+    dead = np.asarray(bucket[px.DEAD.name]).copy()
+    slot = int(np.flatnonzero(dead)[0])
+    for name, value in (
+        (px.DEAD.name, False),
+        (px.FROM_ID.name, extra[0]),
+        (px.TO_ID.name, extra[1]),
+    ):
+        col = np.asarray(bucket[name]).copy()
+        col[slot] = value
+        bucket[name] = jnp.asarray(col)
+    state = dataclasses.replace(
+        state, conns=(bucket, *state.conns[1:]), needs_resort=jnp.bool_(True)
+    )
+    return static, state
+
+
+def test_resort_rejects_a_cycle_through_an_input() -> None:
+    """0 -> 2 and 1 -> 2, then 2 -> 0 closes the cycle 0 -> 2 -> 0."""
+    static, state = _with_extra_edge(_CycleNet, 3, [(0, 2), (1, 2)], (2, 0))
+    assert bool(topo.has_cycle(static, state))
+    with pytest.raises(ValueError, match="acyclic"):
+        topo.resort(static, state)
+
+
+def test_resort_rejects_a_cycle_among_non_inputs() -> None:
+    """0 -> 2 -> 3, then 3 -> 2 closes the cycle 2 -> 3 -> 2."""
+    static, state = _with_extra_edge(_CycleNet, 4, [(0, 2), (1, 2), (2, 3)], (3, 2))
+    with pytest.raises(ValueError, match="acyclic"):
+        topo.resort(static, state)
+
+
+def test_pipeline_resort_accepts_a_cycle() -> None:
+    static, state = _with_extra_edge(
+        _CyclePipelineNet, 4, [(0, 2), (1, 2), (2, 3)], (3, 2)
+    )
+    new_static, new_state = topo.resort(static, state)
+    assert (3, 2) in _live_edges(new_state)
+    assert len(new_static.level_capacities) == 1
+
+
+def test_resort_pins_an_input_fed_by_an_acyclic_edge() -> None:
+    """1 -> 2 -> 0 -> 3 is acyclic: input 0 stays at level 0, as in the
+    builder's initial_levels, and the resort goes through."""
+    static, state = _with_extra_edge(_CycleNet, 4, [(1, 2), (0, 3)], (2, 0))
+    assert not bool(topo.has_cycle(static, state))
+    _, new_state = topo.resort(static, state)
+    edges = np.array(sorted(_live_edges(new_state)), dtype=np.int32)
+    expected = topo.initial_levels(4, edges, input_ids=(0, 1))
+    assert expected.tolist() == [0, 0, 1, 1]
+    np.testing.assert_array_equal(np.asarray(new_state.units[px.LEVEL.name]), expected)
+
+    # The builder levels the same graph the same way.
+    builder = px.NetworkBuilder(_CycleNet, None)
+    for _ in range(4):
+        builder.add_unit()
+    builder.mark_input(0)
+    builder.mark_input(1)
+    for src, dst in ((1, 2), (2, 0), (0, 3)):
+        builder.add_conn(src, dst, weight=1.0)
+    _, built = builder.finalize()
+    np.testing.assert_array_equal(np.asarray(built.units[px.LEVEL.name]), expected)
+
+
+class _GrowBackEdge(px.ProposeAddConn[None]):
+    """Propose 2 -> 0: from the level-1 unit back into input 0."""
+
+    proposer = "global"
+    proposals_per_proposer = 1
+    max_new_per_level = 1
+
+    def propose(
+        self, u: px.UnitView, j: jnp.ndarray, g: None, rng: px.rng.Rng
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        del u, j, g, rng
+        return jnp.int32(2), jnp.int32(0), jnp.float32(1.0)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(1.0)))
+
+
+class _BackEdgeNet(px.Network[None]):
+    forward_pass = _SumForward()
+    add_conn = _GrowBackEdge()
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+def test_a_growth_cycle_is_rejected_at_resort() -> None:
+    """Growth commits 2 -> 0 on top of 0 -> 2 -> 3; the Driver's resort
+    rejects the cycle instead of leveling it."""
+    builder = px.NetworkBuilder(_BackEdgeNet, None)
+    for _ in range(4):
+        builder.add_unit()
+    builder.mark_input(0)
+    builder.mark_input(1)
+    for src, dst in ((0, 2), (1, 2), (2, 3)):
+        builder.add_conn(src, dst, weight=1.0)
+    static, state = builder.finalize()
+    driver = px.Driver(_BackEdgeNet, static, state)
+    inputs = px.StepInputs(inputs=jnp.ones((2,), dtype=jnp.float32), targets=None)
+    with pytest.raises(ValueError, match="acyclic"):
+        driver.step(inputs)
 
 
 # ---------------------------------------------------------------------------

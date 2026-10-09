@@ -115,7 +115,9 @@ def _worker(pid: int, port: int) -> None:
     ) -> px.Driver[None]:
         # grow-heavy but bounded: a couple of grow_bucket rounds exercise the
         # retrace path without many recompiles (mirrors sharding_driver_equiv).
-        churn = make_net(opt, method="set", mode="churn", zeta=0.1, max_candidates=256)
+        churn = make_net(
+            opt, method="set", mode="churn", zeta=0.1, max_new_per_level=256
+        )
         drv = px.Driver(churn, st, state)
         sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
         for _ in range(3):

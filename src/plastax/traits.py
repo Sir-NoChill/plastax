@@ -7,8 +7,10 @@ Python analogue of the C++ policy concepts; static checking via ty / mypy
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
+import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Float, Int32
 
@@ -270,36 +272,57 @@ class PruneConn[GS](Protocol):
 
 
 @runtime_checkable
-class AddConn[GS](Protocol):
-    """Connection growth policy: K-bounded growth by scored candidates.
+class ScoreAddConn[GS](Protocol):
+    """Connection growth policy: scored candidates through the shared pipeline.
 
-    An implementation may optionally declare two extra members to shortlist
-    growth candidates instead of scoring the full num_units^2 grid: an integer
-    attribute `max_candidate_units` (M) and a method
-    `importance(u, i, g) -> Float[Array, ""]`. When both are present (and
-    0 < M < num_units), the add-conn phase draws candidates only from the M x M
-    grid of that step's top-M most important units -- O(num_units + M^2) instead
-    of O(num_units^2). They are read structurally (getattr), so omitting them
-    keeps the exhaustive grid; they are not part of the required protocol.
+    The rule scores candidate pairs; the framework selects and commits them
+    through the deterministic growth pipeline (validity window, optional
+    dedupe stages, the total candidate order, per-source-level selection, and
+    the in-order slot claim). Candidate production is the rule's
+    ``candidates`` attribute (read structurally):
 
-    A candidate that is already a live edge is excluded (`dedupe`, read
-    structurally, defaults to True here), so this path never grows a parallel
-    edge. For growth whose cost follows the churn rather than the arena, see
-    `ProposeAddConn`.
+    - ``"exhaustive"`` (default): every ordered unit pair.
+    - ``"shortlist"``: the M x M grid over the step's top-M most important
+      units (one global importance ranking), M = ``shortlist_size``; requires
+      an ``importance(u, i, g) -> Float[Array, ""]`` method. Importance ties
+      break by ascending unit id. O(num_units + M^2) instead of
+      O(num_units^2).
+    - ``"shortlist_per_level"``: each source level draws its own M x M grid --
+      top-M sources at that level x top-M destinations inside that level's
+      gap window, both by importance. Topological mode only.
 
-    The growth window is the rule's own `max_level_gap` (int, read
-    structurally, default 1): a candidate is in-window when
-    `abs(level[dst] - level[src]) <= max_level_gap` and `src != dst`.
+    Selection is the rule's ``selection`` (read structurally):
+
+    - ``"top_k"`` (default): each source level's first ``max_new_per_level``
+      finite candidates in the total order.
+    - ``"threshold"``: those with score >= ``threshold(g)`` (a method, read
+      per step), at most ``max_new_per_level``.
+    - ``"all"``: every finite candidate.
+
+    ``max_new_per_step`` (int, default None) then caps the step's total
+    across levels, level-ascending. The validity window is the rule's
+    ``max_level_gap`` (default 1), ``direction`` (``"any"`` default,
+    ``"deeper"``, ``"same_or_deeper"``) and ``allow_self_loops`` (default
+    False). A score of -inf (or NaN, or any non-finite) vetoes a candidate.
+
+    **Duplicates.** Nothing is deduplicated by default: a candidate equal to
+    a live edge grows a *parallel edge*, and two equal candidates in one step
+    grow two edges. Set ``dedupe_live = True`` to veto candidates equal to a
+    live edge (costs a sort of the live keys every growth step) and/or
+    ``dedupe_step = True`` to keep only the first copy, in the total
+    candidate order, of equal candidates within the step.
+
+    ``trigger`` gates the phase: ``"every_step"`` (default), ``("every", n)``
+    (fires when ``step % n == 0``), ``"on_units_added"`` (fires when this
+    step added units), or ``"when"`` (fires when the rule's ``when(g)``
+    returns True). ``on_overflow`` is ``"flag"`` (default: dropped commits
+    raise the state's ``overflow`` flag) or ``"error"`` (additionally raise
+    at runtime). For growth whose cost follows the churn rather than the
+    arena, see `ProposeAddConn`.
 
     Type Args:
         GS: the global state type threaded through the network.
-
-    Attributes:
-        max_candidates: the maximum number of candidate connections
-            considered per growth step.
     """
-
-    max_candidates: int
 
     def score(self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS) -> Float[Array, ""]:
         """Score a candidate connection for growth.
@@ -311,7 +334,7 @@ class AddConn[GS](Protocol):
             g: the global state.
 
         Returns:
-            The candidate score.
+            The candidate score; -inf vetoes the candidate.
         """
         ...
 
@@ -381,7 +404,7 @@ class ProposeAddConn[GS](Protocol):
     Downstream, every proposal passes the shared pipeline: the level-gap
     window (the rule's own `max_level_gap`, read structurally, default 1:
     `abs(level[dst] - level[src]) <= max_level_gap`, no self-loops), the
-    opt-in dedupe stages, and each bucket's `max_candidates`-bounded
+    opt-in dedupe stages, and each source level's `max_new_per_level`-bounded
     selection in the deterministic total candidate order. A score of -inf
     vetoes a proposal, as do ids outside [0, num_units).
 
@@ -399,14 +422,16 @@ class ProposeAddConn[GS](Protocol):
     Type Args:
         GS: the global state type threaded through the network.
 
+    Selection, the validity window (``max_level_gap``, ``direction``,
+    ``allow_self_loops``), ``max_new_per_level`` / ``max_new_per_step``,
+    ``trigger`` and ``on_overflow`` are the same rule attributes
+    `ScoreAddConn` documents; proposals feed the same pipeline.
+
     Attributes:
-        max_candidates: the maximum number of connections grown per bucket
-            per step.
         proposals_per_proposer: how many proposals each proposing site emits
-            per step, a static int >= 1.
+            per step, a static int >= 1 (required).
     """
 
-    max_candidates: int
     proposals_per_proposer: int
 
     def propose(
@@ -495,6 +520,11 @@ class Network[GS]:
         sharding: Scheme-A sharding config, or None for a single device.
         seed: the network seed keying the framework's counter-based RNG
             (`plastax.rng`); identical seeds give identical draw streams.
+        structural_interval: run the structural phases (connection pruning
+            and growth) only every this many steps -- ``step % n == 0`` fires
+            them. Default 1 (every step, the historical behavior). The
+            growth rule's own ``trigger`` composes on top: both gates must
+            pass for growth to run.
     """
 
     forward_pass: ForwardPass[object, GS]
@@ -502,7 +532,7 @@ class Network[GS]:
     loss: Loss[GS] | None = None
     update_conn: UpdateConn[GS] | None = None
     prune_conn: PruneConn[GS] | None = None
-    add_conn: AddConn[GS] | ProposeAddConn[GS] | None = None
+    add_conn: ScoreAddConn[GS] | ProposeAddConn[GS] | None = None
     reset_global: ResetGlobal[GS] | None = None
 
     extra_unit_fields: tuple[FieldSpec[np.generic], ...] = ()
@@ -511,6 +541,7 @@ class Network[GS]:
     kahn_max_depth: int | None = None
     sharding: ShardSpec | None = None
     seed: int = 0
+    structural_interval: int = 1
 
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""
@@ -645,16 +676,26 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.prune_conn must satisfy PruneConn; got {cls.prune_conn!r}"
         )
 
+    interval: object = getattr(cls, "structural_interval", 1)
+    if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
+        raise TypeError(
+            f"{cls.__name__}.structural_interval must be an int >= 1; got {interval!r}"
+        )
+
     if cls.add_conn is not None:
-        grid = isinstance(cls.add_conn, AddConn)
+        grid = isinstance(cls.add_conn, ScoreAddConn)
         proposed = isinstance(cls.add_conn, ProposeAddConn)
         if grid == proposed:
             raise TypeError(
-                f"{cls.__name__}.add_conn must satisfy exactly one of AddConn "
-                f"(score) or ProposeAddConn (propose); got {cls.add_conn!r}"
+                f"{cls.__name__}.add_conn must satisfy exactly one of "
+                f"ScoreAddConn (score) or ProposeAddConn (propose); "
+                f"got {cls.add_conn!r}"
             )
-        if isinstance(cls.add_conn, ProposeAddConn) and not grid:
+        if isinstance(cls.add_conn, ProposeAddConn):
             _validate_propose_rule(cls, cls.add_conn)
+        else:
+            _validate_score_rule(cls, cls.add_conn)
+        _validate_growth_knobs(cls, cls.add_conn)
 
     if cls.reset_global is not None and not isinstance(cls.reset_global, ResetGlobal):
         raise TypeError(
@@ -690,12 +731,6 @@ def _validate_propose_rule(cls: type[Network[Any]], ac: ProposeAddConn[Any]) -> 
             f"{cls.__name__}.add_conn.num_proposals was renamed: declare "
             "`proposals_per_proposer` (int >= 1) on the propose rule instead."
         )
-    if hasattr(ac, "dedupe"):
-        raise TypeError(
-            f"{cls.__name__}.add_conn.dedupe does not apply to propose rules: "
-            "set `dedupe_live` and/or `dedupe_step` (bool, default False) "
-            "on the rule instead."
-        )
     n: object = getattr(ac, "proposals_per_proposer", None)
     if not isinstance(n, int) or isinstance(n, bool) or n < 1:
         raise TypeError(
@@ -725,3 +760,177 @@ def _validate_propose_rule(cls: type[Network[Any]], ac: ProposeAddConn[Any]) -> 
             f"{cls.__name__}.add_conn: a {proposer!r} proposer's propose "
             f"takes {want} arguments after self -- expected `{shape}`, got {got}."
         )
+
+
+_SELECTIONS = ("top_k", "threshold", "all")
+_DIRECTIONS = ("any", "deeper", "same_or_deeper")
+_CANDIDATES = ("exhaustive", "shortlist", "shortlist_per_level")
+
+
+def _validate_growth_knobs(cls: type[Network[Any]], ac: object) -> None:
+    """Check the growth-rule knobs shared by both strategies.
+
+    Args:
+        cls: the Network subclass being validated (for error messages).
+        ac: the declared growth rule.
+
+    Raises:
+        TypeError: on a removed attribute name, an unknown knob value, a
+            missing required companion (`max_new_per_level`, `threshold`,
+            `when`), or a mis-typed knob.
+    """
+    for removed, repl in (
+        ("dedupe", "set `dedupe_live` and/or `dedupe_step` (bool, default False)"),
+        ("max_candidates", "declare `max_new_per_level` (int >= 1)"),
+        (
+            "max_candidate_units",
+            'declare `candidates = "shortlist"` and `shortlist_size` (int >= 1)',
+        ),
+        ("shortlist_per_level", 'declare `candidates = "shortlist_per_level"`'),
+    ):
+        if hasattr(ac, removed):
+            raise TypeError(
+                f"{cls.__name__}.add_conn.{removed} was removed: {repl} "
+                "on the growth rule instead."
+            )
+    selection = getattr(ac, "selection", "top_k")
+    if selection not in _SELECTIONS:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.selection must be one of "
+            f"{_SELECTIONS}; got {selection!r}"
+        )
+    mnpl: object = getattr(ac, "max_new_per_level", None)
+    if selection != "all" or mnpl is not None:
+        if not isinstance(mnpl, int) or isinstance(mnpl, bool) or mnpl < 1:
+            raise TypeError(
+                f"{cls.__name__}.add_conn.max_new_per_level must be an "
+                f'int >= 1 (required unless selection = "all"); got {mnpl!r}'
+            )
+    if selection == "threshold" and not callable(getattr(ac, "threshold", None)):
+        raise TypeError(
+            f'{cls.__name__}.add_conn: selection = "threshold" requires a '
+            "`threshold(g)` method on the rule."
+        )
+    mnps: object = getattr(ac, "max_new_per_step", None)
+    if mnps is not None and (
+        not isinstance(mnps, int) or isinstance(mnps, bool) or mnps < 1
+    ):
+        raise TypeError(
+            f"{cls.__name__}.add_conn.max_new_per_step must be an int >= 1 "
+            f"or None; got {mnps!r}"
+        )
+    direction = getattr(ac, "direction", "any")
+    if direction not in _DIRECTIONS:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.direction must be one of "
+            f"{_DIRECTIONS}; got {direction!r}"
+        )
+    trigger: object = getattr(ac, "trigger", "every_step")
+    ok = trigger in ("every_step", "on_units_added", "when") or (
+        isinstance(trigger, tuple)
+        and len(trigger) == 2
+        and trigger[0] == "every"
+        and isinstance(trigger[1], int)
+        and not isinstance(trigger[1], bool)
+        and trigger[1] >= 1
+    )
+    if not ok:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.trigger must be 'every_step', "
+            f"('every', n >= 1), 'on_units_added' or 'when'; got {trigger!r}"
+        )
+    if trigger == "when" and not callable(getattr(ac, "when", None)):
+        raise TypeError(
+            f"{cls.__name__}.add_conn: trigger = 'when' requires a "
+            "`when(g)` method on the rule."
+        )
+    on_overflow = getattr(ac, "on_overflow", "flag")
+    if on_overflow not in ("flag", "error"):
+        raise TypeError(
+            f"{cls.__name__}.add_conn.on_overflow must be 'flag' or "
+            f"'error'; got {on_overflow!r}"
+        )
+    for flag in ("dedupe_live", "dedupe_step", "allow_self_loops"):
+        v = getattr(ac, flag, False)
+        if not isinstance(v, bool):
+            raise TypeError(f"{cls.__name__}.add_conn.{flag} must be a bool; got {v!r}")
+
+
+def _validate_score_rule(cls: type[Network[Any]], ac: ScoreAddConn[Any]) -> None:
+    """Check a ScoreAddConn's candidate-production knobs at class definition.
+
+    Args:
+        cls: the Network subclass being validated (for error messages).
+        ac: the declared score rule.
+
+    Raises:
+        TypeError: on an unknown `candidates`, a shortlist without
+            `shortlist_size` / `importance`, or a shortlist size that is not
+            a positive int.
+    """
+    candidates = getattr(ac, "candidates", "exhaustive")
+    if candidates not in _CANDIDATES:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.candidates must be one of "
+            f"{_CANDIDATES}; got {candidates!r}"
+        )
+    if candidates != "exhaustive":
+        size: object = getattr(ac, "shortlist_size", None)
+        if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            raise TypeError(
+                f"{cls.__name__}.add_conn.shortlist_size must be an int >= 1 "
+                f"for candidates = {candidates!r}; got {size!r}"
+            )
+        if not callable(getattr(ac, "importance", None)):
+            raise TypeError(
+                f"{cls.__name__}.add_conn: candidates = {candidates!r} "
+                "requires an `importance(u, i, g)` method on the rule."
+            )
+
+
+def predicate_add_conn[GS](
+    should_add: Callable[[UnitView, UnitIdx, UnitIdx, GS], Bool[Array, ""]],
+    init: Callable[[UnitView, UnitIdx, UnitIdx, GS], ConnWrite],
+    **params: Any,
+) -> ScoreAddConn[GS]:
+    """Adapt a boolean predicate to a `ScoreAddConn`.
+
+    The predicate becomes a score of 0.0 (grow) or -inf (veto), with
+    ``selection = "all"`` and ``dedupe_step = True`` -- every distinct pair
+    the predicate admits is committed once per step, capacity allowing, which
+    is the natural reading of a boolean growth rule. Both defaults (and any
+    other growth-rule knob) can be overridden through ``params``.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Args:
+        should_add: the predicate over (u, src, dst, g).
+        init: the new-edge initializer, as `ScoreAddConn.init`.
+        **params: growth-rule attributes set on the adapted rule
+            (e.g. ``max_level_gap=2``, ``dedupe_live=True``).
+
+    Returns:
+        A rule satisfying `ScoreAddConn`.
+    """
+
+    class _PredicateRule:
+        selection = "all"
+        dedupe_step = True
+
+        def score(
+            self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS
+        ) -> Float[Array, ""]:
+            grow = should_add(u, src, dst, g)
+            out: Float[Array, ""] = jnp.where(
+                grow, jnp.float32(0.0), jnp.float32(-jnp.inf)
+            )
+            return out
+
+        def init(self, u: UnitView, src: UnitIdx, dst: UnitIdx, g: GS) -> ConnWrite:
+            return init(u, src, dst, g)
+
+    for key, value in params.items():
+        setattr(_PredicateRule, key, value)
+    _PredicateRule.__name__ = "PredicateAddConn"
+    return _PredicateRule()

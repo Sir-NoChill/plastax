@@ -73,14 +73,16 @@ class HashPrune(px.PruneConn):
         return h < jnp.float32(self.kill_p)
 
 
-class HashGrow(px.AddConn):
+class HashGrow(px.ScoreAddConn):
     """Grid growth over a per-level top-M shortlist with a random score."""
 
-    shortlist_per_level = True
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+
+    candidates = "shortlist_per_level"
 
     def __init__(self, k: int, m: int) -> None:
-        self.max_candidates = k
-        self.max_candidate_units = m
+        self.max_new_per_level = k
+        self.shortlist_size = m
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> jax.Array:
         del u
@@ -104,7 +106,7 @@ class ProposeGrow(px.ProposeAddConn):
 
     def __init__(self, k: int, width: int, *, dedupe: bool) -> None:
         self.proposer = "global"
-        self.max_candidates = k
+        self.max_new_per_level = k
         self.proposals_per_proposer = 2 * 4 * k  # two buckets, 4x oversampled
         self.width = width
         # The old single flag covered both dedupe stages.
@@ -138,7 +140,7 @@ class Tick(px.ResetGlobal):
 
 
 def make_net(
-    *, prune: px.PruneConn | None, add: px.AddConn | px.ProposeAddConn | None
+    *, prune: px.PruneConn | None, add: px.ScoreAddConn | px.ProposeAddConn | None
 ) -> type[px.Network[Globals]]:
     """A churn-net variant; every variant shares the same field layout."""
 
@@ -199,7 +201,7 @@ def main() -> None:
     rng = np.random.default_rng(0)
     frm, to = random_layers(args.width, args.edges, rng)
     prune = HashPrune(args.k / (args.edges / 2))
-    grow: px.AddConn | px.ProposeAddConn = (
+    grow: px.ScoreAddConn | px.ProposeAddConn = (
         HashGrow(args.k, args.m)
         if args.grow == "grid"
         else ProposeGrow(args.k, args.width, dedupe=args.dedupe)

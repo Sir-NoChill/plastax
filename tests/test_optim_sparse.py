@@ -51,12 +51,14 @@ class _PruneFromUnit0(px.PruneConn):
         return c[px.FROM_ID, cid] == jnp.int32(0)
 
 
-class _GrowAhead(px.AddConn[None]):
+class _GrowAhead(px.ScoreAddConn[None]):
     """Grow level-ahead edges (dst deeper than src, so no resort), each marked
     with a distinctive weight. Optimizer columns are untouched, so the phase
     resets them to their FieldSpec default."""
 
-    max_candidates = 3
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+
+    max_new_per_level = 3
     max_level_gap = 2  # let input->output skip edges be growable
 
     def score(

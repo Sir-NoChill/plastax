@@ -44,7 +44,7 @@ from plastax.sweep import (
     identity_accumulator,
     unit_id_mask,
 )
-from plastax.traits import AddConn, Network, ProposeAddConn
+from plastax.traits import Network, ProposeAddConn, ScoreAddConn
 from plastax.views import ConnView, UnitView
 
 # PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
@@ -74,6 +74,41 @@ class StepInputs:
 
     inputs: Float[Array, "*batch num_inputs"]
     targets: Float[Array, "*batch num_outputs"] | None
+
+
+def _step_gated[GS](phase: Phase[GS], interval: int) -> Phase[GS]:
+    """Run `phase` only on steps where ``step % interval == 0``.
+
+    The skip branch returns the state unchanged, so a gated structural phase
+    simply does not happen on off-steps (`Network.structural_interval`).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        phase: the phase to gate.
+        interval: the structural cadence, a static int >= 2.
+
+    Returns:
+        The gated phase.
+    """
+
+    def gated(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        fire = (state.step % jnp.int32(interval)) == jnp.int32(0)
+
+        def skip(
+            st: NetworkState[GS], _: StepInputs
+        ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+            return st, jnp.float32(0.0)
+
+        out: tuple[NetworkState[GS], Float[Array, ""]] = jax.lax.cond(
+            fire, phase, skip, state, inputs
+        )
+        return out
+
+    return gated
 
 
 def build_phases[GS](
@@ -141,13 +176,18 @@ def build_phases[GS](
         phases.append(_build_backward_phase(net, static))
     if net.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
+    interval = int(getattr(net, "structural_interval", 1))
     if net.prune_conn is not None:
-        phases.append(
+        prune_phase = (
             build_prune_merge_phase(dead_sink)
             if fused
             else build_prune_conn_phase(net, static)
         )
+        if interval > 1:
+            prune_phase = _step_gated(prune_phase, interval)
+        phases.append(prune_phase)
     if net.add_conn is not None:
+        # build_add_conn_phase folds the interval into its own trigger gate.
         phases.append(
             build_add_conn_phase(
                 net,
@@ -231,9 +271,13 @@ def build_batched_phases[GS](
         and linear_input_field(net.backward_pass) is not None
         else None
     )
+    interval = int(getattr(net, "structural_interval", 1))
     structural: list[Phase[GS]] = []
     if net.prune_conn is not None:
-        structural.append(build_prune_conn_phase(net, static))
+        prune_phase = build_prune_conn_phase(net, static)
+        if interval > 1:
+            prune_phase = _step_gated(prune_phase, interval)
+        structural.append(prune_phase)
     if net.add_conn is not None:
         structural.append(
             build_add_conn_phase(
@@ -2341,6 +2385,23 @@ def nth_free_slot(
     return slot
 
 
+def _live_conn_count(conns: tuple[Columns, ...]) -> jax.Array:
+    """Total live (non-DEAD) connections across the buckets, int32 scalar."""
+    return sum(
+        (jnp.sum(~bucket[DEAD.name]).astype(jnp.int32) for bucket in conns),
+        start=jnp.int32(0),
+    )
+
+
+def _raise_on_overflow(flag: Any) -> None:
+    """Raise when a growth commit overflowed (`on_overflow = "error"`)."""
+    if bool(flag):
+        raise RuntimeError(
+            "add_conn overflow: selected candidates exceeded the free "
+            'connection capacity (the rule declares on_overflow = "error").'
+        )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GrowthClaim:
@@ -2892,7 +2953,7 @@ class ShortlistCoverage:
 
     Attributes:
         bucket: the source-level bucket index.
-        candidate_units: the shortlist size M the AddConn declares.
+        candidate_units: the shortlist size M the rule declares.
         source_units: units sitting at this bucket's source level.
         destination_units: units this bucket may grow INTO, i.e. those within
             the level-gap window and strictly deeper.
@@ -2935,7 +2996,10 @@ def shortlist_coverage[GS](
         shortlist (the exhaustive grid always covers everything).
     """
     add_conn = net.add_conn
-    max_candidate_units: int | None = getattr(add_conn, "max_candidate_units", None)
+    kind = str(getattr(add_conn, "candidates", "exhaustive"))
+    max_candidate_units: int | None = (
+        getattr(add_conn, "shortlist_size", None) if kind != "exhaustive" else None
+    )
     if add_conn is None or max_candidate_units is None:
         return ()
     levels = np.asarray(state.units[LEVEL.name])
@@ -2995,7 +3059,7 @@ def importance_scores[GS](
         GS: the user's global-state pytree, opaque to the framework.
 
     Args:
-        importance_fn: the AddConn's `importance(u, i, g)` method.
+        importance_fn: the rule's `importance(u, i, g)` method.
         u_view: the unit view.
         g: the global state.
         num_units: the number of unit slots.
@@ -3053,13 +3117,17 @@ def candidates_per_level(
     bucket_idx: int,
     pool_side: int,
     max_level_gap: int,
+    direction: str = "any",
 ) -> tuple[jax.Array, jax.Array]:
-    """One bucket's shortlist grid: top-M sources at its level x top-M deeper dests.
+    """One bucket's shortlist grid: top-M sources at its level x top-M windowed dests.
 
     A source top_k that pulls in a wrong-level unit (fewer than M sit at the
     level) is harmless -- the bucket's own `src_ok` filter drops it. The
-    destination side is strictly deeper within the window, matching how this
-    shortlist flavour has always drawn its candidates.
+    destination pool is every unit inside this level's validity window: the
+    gap window (`abs(level - bucket) <= max_level_gap`) intersected with the
+    rule's `direction`, so a deeper-only shortlist is `direction = "deeper"`
+    and its destination pool never wastes slots on units the direction would
+    veto anyway.
 
     Args:
         importance: per-unit importance scores, `(num_units,)`.
@@ -3067,6 +3135,7 @@ def candidates_per_level(
         bucket_idx: the source-level bucket this grid serves.
         pool_side: M, the shortlist size.
         max_level_gap: the growth rule's level-gap window.
+        direction: the rule's level-direction constraint.
 
     Returns:
         `(flat_src, flat_dst)` int32 arrays of length `pool_side**2`.
@@ -3076,8 +3145,12 @@ def candidates_per_level(
     # unit id (see candidates_shortlist).
     src_imp = jnp.where(unit_level == bucket_idx, importance, -jnp.inf)
     _, src_top = jax.lax.top_k(src_imp, pool_side)
-    deeper = (unit_level > bucket_idx) & (unit_level <= bucket_idx + max_level_gap)
-    _, dst_top = jax.lax.top_k(jnp.where(deeper, importance, -jnp.inf), pool_side)
+    in_window = jnp.abs(unit_level - bucket_idx) <= max_level_gap
+    if direction == "deeper":
+        in_window = in_window & (unit_level > bucket_idx)
+    elif direction == "same_or_deeper":
+        in_window = in_window & (unit_level >= bucket_idx)
+    _, dst_top = jax.lax.top_k(jnp.where(in_window, importance, -jnp.inf), pool_side)
     src = jnp.broadcast_to(src_top[:, None], (pool_side, pool_side)).reshape(-1)
     dst = jnp.broadcast_to(dst_top[None, :], (pool_side, pool_side)).reshape(-1)
     return src, dst
@@ -3312,14 +3385,18 @@ def apply_validity(
     bucket_idx: int,
     max_level_gap: int,
     is_pipeline: bool,
+    direction: str = "any",
+    allow_self_loops: bool = False,
 ) -> jax.Array:
     """The framework validity mask for one bucket's candidates.
 
     A candidate is valid when it sits in the level-gap window
-    (`abs(level[dst] - level[src]) <= max_level_gap`, self-loops excluded --
-    the window admits same-level and toward-shallower pairs, which a growth
-    policy's score vetoes if unwanted) and, in TOPOLOGICAL mode, sources from
-    this bucket's own level. PIPELINE's single bucket accepts any source level.
+    (`abs(level[dst] - level[src]) <= max_level_gap`), respects the rule's
+    `direction` (`"any"` admits same-level and toward-shallower pairs;
+    `"deeper"` requires `level[dst] > level[src]`; `"same_or_deeper"`
+    requires `>=`), is not a self-loop unless `allow_self_loops`, and, in
+    TOPOLOGICAL mode, sources from this bucket's own level. PIPELINE's
+    single bucket accepts any source level.
 
     Args:
         flat_src: candidate source ids.
@@ -3328,14 +3405,21 @@ def apply_validity(
         bucket_idx: the destination bucket index.
         max_level_gap: the growth rule's level-gap window.
         is_pipeline: whether the net propagates in PIPELINE mode.
+        direction: the rule's level-direction constraint.
+        allow_self_loops: whether src == dst candidates are admitted.
 
     Returns:
         A boolean mask over the candidates.
     """
     src_level = unit_level[flat_src]
-    window_ok = (jnp.abs(unit_level[flat_dst] - src_level) <= max_level_gap) & (
-        flat_src != flat_dst
-    )
+    dst_level = unit_level[flat_dst]
+    window_ok = jnp.abs(dst_level - src_level) <= max_level_gap
+    if not allow_self_loops:
+        window_ok = window_ok & (flat_src != flat_dst)
+    if direction == "deeper":
+        window_ok = window_ok & (dst_level > src_level)
+    elif direction == "same_or_deeper":
+        window_ok = window_ok & (dst_level >= src_level)
     src_ok = (
         jnp.ones_like(src_level, dtype=jnp.bool_)
         if is_pipeline
@@ -3442,14 +3526,11 @@ def select(
         k: the static per-bucket budget.
 
     Returns:
-        Indices of the k selected candidates. When every candidate fits the
-        budget, selection is moot and the full sort is skipped: the same set
-        commits, in candidate order. (Under overflow this order -- not the
-        total order -- decides which candidates land; revisited when
-        `selection = all` becomes a declared policy knob.)
+        Indices of the k selected candidates, in the total order -- also
+        when k equals the pool size: under overflow the claim consumes
+        winners in this order, so an unsorted full pool would commit in
+        candidate order instead.
     """
-    if k == flat_scores.shape[0]:
-        return jnp.arange(k, dtype=jnp.int32)
     neg_score = jnp.where(
         jnp.isnan(flat_scores), jnp.float32(jnp.inf), -flat_scores
     ).astype(jnp.float32)
@@ -3473,10 +3554,10 @@ def build_add_conn_phase[GS](
     """Select each bucket's top-k candidates and claim free slots via prefix sum.
 
     Candidates come from the (src, dst) unit-id grid -- the full num_units^2
-    grid, or, when the AddConn declares `max_candidate_units` (M) and an
-    `importance(u, i, g)` method, the M x M grid of that step's top-M most
-    important units (an O(num_units + M^2) shortlist replacing the O(num_units^2)
-    sweep) -- filtered to a level-gap window:
+    grid, or, when the rule declares `candidates = "shortlist"` (M =
+    `shortlist_size`, with an `importance(u, i, g)` method), the M x M grid of
+    that step's top-M most important units (an O(num_units + M^2) shortlist
+    replacing the O(num_units^2) sweep) -- filtered to a level-gap window:
     `abs(level[dst] - level[src]) <= max_level_gap` (the growth rule's own
     attribute, read structurally, default 1),
     self-loops excluded (see
@@ -3558,22 +3639,18 @@ def build_add_conn_phase[GS](
     shard_axis = _shard_axis(static)
     num_shards = static.sharding.num_shards if static.sharding is not None else 1
 
-    # Optional candidate reduction: an AddConn may declare `max_candidate_units`
-    # (M) and an `importance(u, i, g)` method to shortlist the M most important
-    # units each step and draw candidates only from that M x M grid, cutting
-    # the per-step cost from O(num_units^2) to O(num_units + M^2). Absent (or M
-    # >= num_units), the full grid is used -- the historical behavior, so
-    # existing AddConn policies are unaffected.
+    # Optional candidate reduction: `candidates = "shortlist"` (M =
+    # `shortlist_size`, with an `importance(u, i, g)` method) shortlists the M
+    # most important units each step and draws candidates only from that M x M
+    # grid, cutting the per-step cost from O(num_units^2) to
+    # O(num_units + M^2).
     #
-    # The shortlist is global (top-M over all units) by default; a policy may
-    # also set `shortlist_per_level = True` to instead draw each bucket its own
-    # M x M grid -- top-M sources at that bucket's source level x top-M deeper
-    # destinations within the window -- so every transition of a layered net is
-    # served. A global top-M can concentrate on one level and starve a bucket,
-    # letting sparsity drift down; per-level is the fix. It is levels-based,
-    # hence topological only (pipeline keeps the global shortlist), and forward
-    # only (its destinations are strictly deeper), matching how growth policies
-    # veto non-deeper edges anyway.
+    # `candidates = "shortlist_per_level"` instead draws each bucket its own
+    # M x M grid -- top-M sources at that bucket's source level x top-M
+    # destinations inside its gap window -- so every transition of a layered
+    # net is served. A global top-M can concentrate on one level and starve a
+    # bucket, letting sparsity drift down; per-level is the fix. It is
+    # levels-based, hence topological only.
     # Proposal growth (ProposeAddConn) replaces the grid as the candidate
     # source: the policy emits `num_proposals` (src, dst, score) triples and
     # everything downstream -- routing, window, top_k, slot claim, init -- is
@@ -3583,12 +3660,19 @@ def build_add_conn_phase[GS](
     if growth not in ("auto", "xla", "triton"):
         raise ValueError(f"build_add_conn_phase: unknown growth engine {growth!r}")
     use_propose = isinstance(ac, ProposeAddConn)
-    # The grid's duplicate check stays on by default; a propose rule opts into
-    # its two dedupe stages separately (both default False: parallel edges and
-    # within-step repeats are allowed by design).
-    dedupe = bool(getattr(ac, "dedupe", True)) and not use_propose
-    ded_live = use_propose and bool(getattr(ac, "dedupe_live", False))
-    ded_step = use_propose and bool(getattr(ac, "dedupe_step", False))
+    # Both strategies share the two opt-in dedupe stages (default False:
+    # parallel edges and within-step repeats are allowed by design).
+    ded_live = bool(getattr(ac, "dedupe_live", False))
+    ded_step = bool(getattr(ac, "dedupe_step", False))
+    selection = str(getattr(ac, "selection", "top_k"))
+    max_new_per_level = getattr(ac, "max_new_per_level", None)
+    max_new_per_step = getattr(ac, "max_new_per_step", None)
+    threshold_fn = getattr(ac, "threshold", None)
+    direction = str(getattr(ac, "direction", "any"))
+    allow_self_loops = bool(getattr(ac, "allow_self_loops", False))
+    trigger = getattr(ac, "trigger", "every_step")
+    when_fn = getattr(ac, "when", None)
+    on_overflow = str(getattr(ac, "on_overflow", "flag"))
     proposer = str(getattr(ac, "proposer", "per_unit")) if use_propose else ""
     num_proposals = ac.proposals_per_proposer if isinstance(ac, ProposeAddConn) else 0
     total_conn_slots = sum(static.level_capacities)
@@ -3600,23 +3684,31 @@ def build_add_conn_phase[GS](
             "per_unit or global proposer, or run unsharded."
         )
 
-    max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
+    candidates_kind = (
+        str(getattr(ac, "candidates", "exhaustive")) if not use_propose else ""
+    )
     importance_fn = getattr(ac, "importance", None)
+    shortlist_size = getattr(ac, "shortlist_size", None)
     use_shortlist = (
         not use_propose
-        and max_candidate_units is not None
-        and importance_fn is not None
-        and 0 < max_candidate_units < num_units
+        and candidates_kind in ("shortlist", "shortlist_per_level")
+        and shortlist_size is not None
+        and 0 < shortlist_size < num_units
     )
-    use_per_level = (
-        use_shortlist
-        and bool(getattr(ac, "shortlist_per_level", False))
-        and not is_pipeline
+    use_per_level = use_shortlist and candidates_kind == "shortlist_per_level"
+    if candidates_kind == "shortlist_per_level" and is_pipeline:
+        raise ValueError(
+            'candidates = "shortlist_per_level" is levels-based and so '
+            "topological-only; PIPELINE networks use the global shortlist."
+        )
+    pool_side = (
+        int(shortlist_size)
+        if use_shortlist and shortlist_size is not None
+        else num_units
     )
-    pool_side = max_candidate_units if use_shortlist else num_units
-    assert pool_side is not None  # use_shortlist implies max_candidate_units set
-    # Static (Python-int) candidate-pool bound: top_k requires k <= pool size,
-    # and a small test network's pool can undercut a generous max_candidates.
+    # Static (Python-int) candidate-pool bound: selection requires
+    # k <= pool size, and a small test network's pool can undercut a
+    # generous max_new_per_level.
     if use_propose:
         pool = {
             "per_unit": num_units * num_proposals,
@@ -3625,7 +3717,11 @@ def build_add_conn_phase[GS](
         }[proposer]
     else:
         pool = pool_side * pool_side
-    k = max(0, min(ac.max_candidates, pool))
+    if selection == "all":
+        k = pool
+    else:
+        assert max_new_per_level is not None  # _validate_growth_knobs
+        k = max(0, min(int(max_new_per_level), pool))
     use_triton = k > 0 and triton_claim_applies(static, growth)
 
     # Every candidate grid is built inside the traced phase, never here: this
@@ -3699,7 +3795,7 @@ def build_add_conn_phase[GS](
             global_src, global_dst = candidates_grid(num_units)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
-            assert isinstance(ac, AddConn)  # the grid path only
+            assert isinstance(ac, ScoreAddConn)  # the score path only
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
             return jnp.where(ok, raw.astype(jnp.float32), jnp.float32(-jnp.inf))
 
@@ -3716,25 +3812,32 @@ def build_add_conn_phase[GS](
             if use_per_level:
                 assert imp is not None  # use_per_level implies importance is set
                 flat_src, flat_dst = candidates_per_level(
-                    imp, unit_level, bucket_idx, pool_side, max_level_gap
+                    imp, unit_level, bucket_idx, pool_side, max_level_gap, direction
                 )
             else:
                 flat_src, flat_dst = global_src, global_dst
             valid = apply_validity(
-                flat_src, flat_dst, unit_level, bucket_idx, max_level_gap, is_pipeline
+                flat_src,
+                flat_dst,
+                unit_level,
+                bucket_idx,
+                max_level_gap,
+                is_pipeline,
+                direction,
+                allow_self_loops,
             )
             if use_propose:
                 valid = valid & in_range
-            if dedupe or ded_live:
+            if ded_live:
                 valid = valid & dedupe_live(
                     bucket_conns, flat_src, flat_dst, num_units, shard_axis
                 )
             if use_propose:
                 flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
-                if ded_step:
-                    flat_scores = dedupe_step(flat_scores, flat_src, flat_dst)
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
+            if ded_step:
+                flat_scores = dedupe_step(flat_scores, flat_src, flat_dst)
             top_idx = select(flat_scores, flat_src, flat_dst, k)
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
@@ -3750,6 +3853,10 @@ def build_add_conn_phase[GS](
             # vetoed edges, since top_k still surfaces them and `has_room`
             # alone would admit them.
             top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
+            if selection == "threshold":
+                assert threshold_fn is not None  # _validate_growth_knobs
+                thresh = jnp.asarray(threshold_fn(g), jnp.float32)
+                top_growable = top_growable & (flat_scores[top_idx] >= thresh)
 
             # A committed candidate whose destination is not strictly
             # deeper than its source breaks the leveling invariant, so it
@@ -3782,6 +3889,25 @@ def build_add_conn_phase[GS](
                     values=values,
                 )
             )
+
+        # The per-step cap applies across levels, level-ascending and in
+        # selection order within a level: a growable candidate whose global
+        # growable rank reaches the cap is dropped (it does not overflow --
+        # the cap, not capacity, excluded it).
+        if max_new_per_step is not None:
+            cap = jnp.int32(max_new_per_step)
+            prior = jnp.int32(0)
+            capped: list[GrowthClaim] = []
+            for claim in claims:
+                grow32 = claim.growable.astype(jnp.int32)
+                rank = jnp.cumsum(grow32) - 1 + prior
+                capped.append(
+                    dataclasses.replace(claim, growable=claim.growable & (rank < cap))
+                )
+                prior = prior + grow32.sum()
+            claims = capped
+
+        live_before = _live_conn_count(state.conns)
 
         # Claim free slots for every bucket's growable candidates, in
         # candidate order, and write them. The claim is a prefix in the
@@ -3825,13 +3951,69 @@ def build_add_conn_phase[GS](
             )
             overflow, reassigning = either[0], either[1]
 
-        if overflow_sink is not None:
-            overflow_sink[0] = overflow
+        grown_count = _live_conn_count(tuple(new_conns)) - live_before
+        if shard_axis is not None:
+            # Each shard counts its own slice of the arena; the step's total
+            # is their sum, replicated like every other scalar on the state.
+            grown_count = monoid.sum_.collective(grown_count, shard_axis)
+        if on_overflow == "error":
+            # Raises inline when the phase runs eagerly; under jit the
+            # callback raises on the host when the step is consumed
+            # (best-effort asynchronous, like any runtime error in XLA).
+            jax.debug.callback(_raise_on_overflow, overflow)
         new_state = dataclasses.replace(
             state,
             conns=tuple(new_conns),
             needs_resort=state.needs_resort | reassigning,
+            grown=grown_count.astype(jnp.int32),
+            overflow=overflow,
         )
         return new_state, jnp.float32(0.0)
 
-    return add_conn_phase
+    interval = int(getattr(net, "structural_interval", 1))
+    if trigger == "every_step" and interval == 1:
+        gated = add_conn_phase
+    else:
+
+        def gated(
+            state: NetworkState[GS], inputs: StepInputs
+        ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+            fire = jnp.bool_(True)
+            if interval > 1:
+                fire = fire & ((state.step % jnp.int32(interval)) == jnp.int32(0))
+            if trigger == "on_units_added":
+                fire = fire & (state.units_added > jnp.int32(0))
+            elif trigger == "when":
+                assert when_fn is not None  # _validate_growth_knobs
+                fire = fire & jnp.asarray(when_fn(state.globals_), jnp.bool_)
+            elif isinstance(trigger, tuple):  # ("every", n): step % n == 0
+                fire = fire & ((state.step % jnp.int32(trigger[1])) == jnp.int32(0))
+
+            def skip(
+                st: NetworkState[GS], _: StepInputs
+            ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+                return (
+                    dataclasses.replace(
+                        st, grown=jnp.int32(0), overflow=jnp.bool_(False)
+                    ),
+                    jnp.float32(0.0),
+                )
+
+            out: tuple[NetworkState[GS], Float[Array, ""]] = jax.lax.cond(
+                fire, add_conn_phase, skip, state, inputs
+            )
+            return out
+
+    if overflow_sink is None:
+        return gated
+
+    def sinked(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        # Written OUTSIDE any trigger/interval cond: a sink write inside a
+        # traced branch would leak the branch-local tracer.
+        new_state, aux = gated(state, inputs)
+        overflow_sink[0] = new_state.overflow
+        return new_state, aux
+
+    return sinked

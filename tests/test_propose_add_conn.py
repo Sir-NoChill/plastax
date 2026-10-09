@@ -54,7 +54,7 @@ class _TableProposals(px.ProposeAddConn[None]):
     def __init__(
         self,
         table: list[tuple[int, int, float]],
-        max_candidates: int,
+        max_new_per_level: int,
         dedupe: bool | None = None,
     ) -> None:
         self.proposer = "global"
@@ -62,7 +62,7 @@ class _TableProposals(px.ProposeAddConn[None]):
         self.dst = jnp.asarray([r[1] for r in table], dtype=jnp.int32)
         self.scores = jnp.asarray([r[2] for r in table], dtype=jnp.float32)
         self.proposals_per_proposer = len(table)
-        self.max_candidates = max_candidates
+        self.max_new_per_level = max_new_per_level
         if dedupe is not None:
             # The old single flag covered both stages; keep that meaning.
             self.dedupe_live = dedupe
@@ -91,10 +91,12 @@ def _net(policy: px.ProposeAddConn[None]) -> type[px.Network[None]]:
 
 
 def _grow(
-    table: list[tuple[int, int, float]], max_candidates: int, dedupe: bool | None = None
+    table: list[tuple[int, int, float]],
+    max_new_per_level: int,
+    dedupe: bool | None = None,
 ) -> list[list[tuple[int, int]]]:
     """Build the 4-4-4 net, run one add phase, return each bucket's grown pairs."""
-    net = _net(_TableProposals(table, max_candidates, dedupe))
+    net = _net(_TableProposals(table, max_new_per_level, dedupe))
     static, state = px.NetworkBuilder.from_edges(
         net,
         12,
@@ -134,7 +136,7 @@ def test_proposals_route_to_their_source_level_and_respect_the_window() -> None:
         (3, 5, -jnp.inf),  # vetoed
         (99, 5, 1.0),  # out-of-range id, vetoed
     ]
-    bucket0, bucket1, bucket2 = _grow(table, max_candidates=4)
+    bucket0, bucket1, bucket2 = _grow(table, max_new_per_level=4)
     assert bucket0 == [(1, 4)]
     assert bucket1 == [(5, 8)]
     assert bucket2 == []  # the deepest level proposed nothing
@@ -142,7 +144,7 @@ def test_proposals_route_to_their_source_level_and_respect_the_window() -> None:
 
 def test_each_bucket_keeps_its_own_top_k_by_score() -> None:
     table = [(1, 4, 1.0), (2, 4, 3.0), (3, 4, 2.0), (5, 8, 0.5)]
-    bucket0, bucket1, bucket2 = _grow(table, max_candidates=2)
+    bucket0, bucket1, bucket2 = _grow(table, max_new_per_level=2)
     assert bucket0 == [(2, 4), (3, 4)]  # the top 2 of 3 in bucket 0
     assert bucket1 == [(5, 8)]  # bucket 1's lone proposal
     assert bucket2 == []  # the deepest level proposed nothing
@@ -150,14 +152,14 @@ def test_each_bucket_keeps_its_own_top_k_by_score() -> None:
 
 def test_default_allows_parallel_edges() -> None:
     table = [(0, 4, 2.0), (1, 4, 1.0), (1, 4, 1.0)]
-    (bucket0, *_) = _grow(table, max_candidates=3)
+    (bucket0, *_) = _grow(table, max_new_per_level=3)
     # A repeat of the live (0, 4) and a within-step repeat both grow.
     assert bucket0 == [(0, 4), (1, 4), (1, 4)]
 
 
 def test_dedupe_excludes_live_and_within_step_duplicates() -> None:
     table = [(0, 4, 2.0), (1, 4, 1.0), (1, 4, 1.0), (2, 4, 0.5)]
-    (bucket0, *_) = _grow(table, max_candidates=4, dedupe=True)
+    (bucket0, *_) = _grow(table, max_new_per_level=4, dedupe=True)
     assert bucket0 == [(1, 4), (2, 4)]
 
 
@@ -178,7 +180,7 @@ def test_within_step_repeats_do_not_consume_top_k_slots_under_dedupe() -> None:
     # Two copies of (1, 4) outscore (2, 4); with k = 2 the repeat must be
     # vetoed before top_k so (2, 4) still grows.
     table = [(1, 4, 1.0), (1, 4, 1.0), (2, 4, 0.5)]
-    (bucket0, *_) = _grow(table, max_candidates=2, dedupe=True)
+    (bucket0, *_) = _grow(table, max_new_per_level=2, dedupe=True)
     assert bucket0 == [(1, 4), (2, 4)]
 
 
@@ -206,7 +208,7 @@ def test_removed_dedupe_flag_names_the_split_flags() -> None:
 def test_wrong_propose_arity_for_declared_proposer_is_rejected() -> None:
     class _PerUnitShapeMismatch(px.ProposeAddConn[None]):
         proposer = "per_unit"
-        max_candidates = 1
+        max_new_per_level = 1
         proposals_per_proposer = 1
 
         def propose(  # type: ignore[override]
@@ -227,7 +229,7 @@ def test_wrong_propose_arity_for_declared_proposer_is_rejected() -> None:
 
 class _WideProposals(px.ProposeAddConn[None]):
     proposer = "global"
-    max_candidates = 4
+    max_new_per_level = 4
     proposals_per_proposer = 8
 
     def propose(

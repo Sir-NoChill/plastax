@@ -47,7 +47,7 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
   order (forward → loss → backward → update_conn → prune_conn → add_conn →
   reset_global) actually guarantees? (e.g. an update reading a grad the backward
   pass writes.)
-- **AddConn veto:** is `-inf` still treated as a hard veto (never grown), distinct
+- **Growth veto:** is `-inf` still treated as a hard veto (never grown), distinct
   from a low finite score?
 - **Reserved names:** do new `extra_*_fields` avoid the reserved column names?
 

@@ -120,8 +120,9 @@ class _TracePrune(px.PruneConn):
         return u[TRACE, c[px.TO_ID, cid]] > 10.0
 
 
-class _Grow(px.AddConn):
-    max_candidates = 48
+class _Grow(px.ScoreAddConn):
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+    max_new_per_level = 48
 
     def score(self, u: Any, src: Any, dst: Any, g: G) -> jax.Array:
         deeper = u[px.LEVEL, dst] == u[px.LEVEL, src] + 1
@@ -136,7 +137,7 @@ class _Propose(px.ProposeAddConn):
     """Re-grow random deeper edges (the C++ synthetic benchmark's growth, hashed)."""
 
     proposer = "global"
-    max_candidates = 64
+    max_new_per_level = 64
     proposals_per_proposer = 2 * _NUM_UNITS
 
     def propose(
@@ -318,7 +319,7 @@ def test_fused_step_reuses_free_counts_on_the_two_level_claim() -> None:
     # Capacities that are multiples of the free-slot block, with a small claim
     # (k * block <= capacity), so add_conn takes the two-level search.
     class _Small(_Grow):
-        max_candidates = 1
+        max_new_per_level = 1
 
     net = _net(_MarkedPrune(), add=_Small())
     a, b, plan = _run_both(net, align=1024)

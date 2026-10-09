@@ -135,7 +135,7 @@ def _worker(pid: int, port: int) -> None:
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
     for method in ("set", "rigl"):
         churn_net = make_net(
-            opt, method=method, mode="churn", zeta=0.3, max_candidates=max(_BUDGETS)
+            opt, method=method, mode="churn", zeta=0.3, max_new_per_level=max(_BUDGETS)
         )
         single = px.make_step(churn_net, static)(_copy(warmed), sp).state
         sharded = px.make_step(churn_net, static_s)(

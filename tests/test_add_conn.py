@@ -1,4 +1,4 @@
-"""AddConn.
+"""ScoreAddConn.
 
 K-bounded candidates, top_k selection, prefix-sum slot claim, overflow flag,
 and level-preserving adds do not set needs_resort.
@@ -63,7 +63,7 @@ class _SumForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _WindowAddConn(px.AddConn[None]):
+class _WindowAddConn(px.ScoreAddConn[None]):
     """score favors any (SRC, *) candidate by a large, fixed bonus over
     dst's own activation, so top_k's selection among (SRC, dst) pairs is
     exactly "highest anchor weight first" (dst 2, then 3, then 4) and never
@@ -73,7 +73,7 @@ class _WindowAddConn(px.AddConn[None]):
     pre-existing ANCHOR edges (5.0..1.0) and from a dead slot's
     FieldSpec-default weight (0.0)."""
 
-    max_candidates = 3
+    max_new_per_level = 3
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -155,7 +155,7 @@ def test_k_bounded_candidate_count_and_top_k_selects_highest_scored() -> None:
     anchor_edges = {(_ANCHOR, dst) for dst in _DST}
     new_edges = live - anchor_edges
 
-    # K-bounded: exactly max_candidates (3) new edges land, even though 5
+    # K-bounded: exactly max_new_per_level (3) new edges land, even though 5
     # distinct (SRC, dst) candidates all pass the level window and would
     # all score above every (ANCHOR, dst) duplicate.
     assert len(new_edges) == 3
@@ -330,14 +330,16 @@ def test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort() -> None
     assert bool(new_state.needs_resort) is False
 
 
-class _NoBonusAddConn(px.AddConn[None]):
+class _NoBonusAddConn(px.ScoreAddConn[None]):
     """score is dst's activation alone, with NO SRC bonus, so the highest-
     scored candidates are the already-live (ANCHOR, dst) pairs (dst 2/3/4,
-    activations 5/4/3). Without dedup those would be selected and grown as
-    duplicate parallel edges; the occupancy mask must exclude them, leaving
-    growth to the fresh (SRC, dst) pairs of equal dst score."""
+    activations 5/4/3). Without `dedupe_live` those would be selected and
+    grown as duplicate parallel edges; the live-dedupe mask must exclude
+    them, leaving growth to the fresh (SRC, dst) pairs of equal dst score."""
 
-    max_candidates = 3
+    dedupe_live = True  # the test asserts no duplicate of a live edge
+
+    max_new_per_level = 3
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -385,13 +387,14 @@ def test_add_conn_never_grows_a_duplicate_of_a_live_edge() -> None:
     assert new_edges == {(_SRC, 2), (_SRC, 3), (_SRC, 4)}
 
 
-class _ShortlistAddConn(px.AddConn[None]):
-    """max_candidate_units shortlists growth candidates to the top-M units by
+class _ShortlistAddConn(px.ScoreAddConn[None]):
+    """`candidates = "shortlist"` shortlists growth candidates to the top-M units by
     `importance`. Here importance favors SRC and DST id 6, so the only
     level-increasing candidate the M=2 shortlist can form is (SRC, 6)."""
 
-    max_candidates = 3
-    max_candidate_units = 2
+    max_new_per_level = 3
+    candidates = "shortlist"
+    shortlist_size = 2
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
         del u, g
@@ -439,15 +442,15 @@ def test_add_conn_candidate_shortlist_restricts_growth_to_top_m_units() -> None:
     assert len(live) == len(set(live))
 
 
-class _DeeperOnlyAddConn(px.AddConn[None]):
+class _DeeperOnlyAddConn(px.ScoreAddConn[None]):
     """Scores deeper candidates finite and vetoes every non-deeper candidate
-    with -inf. max_candidates (10) exceeds the number of deeper candidates
+    with -inf. max_new_per_level (10) exceeds the number of deeper candidates
     (5: SRC -> each DST), and the bucket has many free dead slots, so the veto
     is the only thing keeping growth to deeper edges: without it, top_k would
     back-fill the surplus slots with the -inf-scored same-level candidates it
     surfaces once the finite ones run out (setting needs_resort)."""
 
-    max_candidates = 10
+    max_new_per_level = 10
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -487,7 +490,7 @@ def test_veto_score_is_never_committed_even_with_free_slots() -> None:
 
     # Only the deeper (SRC, dst) edges grow; the vetoed (-inf) non-deeper
     # candidates are never committed, even though free dead slots remain and
-    # max_candidates leaves room for them.
+    # max_new_per_level leaves room for them.
     assert new_edges == {(_SRC, dst) for dst in _DST}
     # No non-deeper edge was back-filled, so leveling is preserved.
     assert bool(new_state.needs_resort) is False
@@ -515,14 +518,16 @@ def _build_3level(
     return builder.finalize()
 
 
-class _DeepestImportanceGrow(px.AddConn[None]):
+class _DeepestImportanceGrow(px.ScoreAddConn[None]):
     """Importance favours the deepest level, so a GLOBAL top-M (M=2) shortlist
     fills with the two output units -- among which no deeper edge exists -- and
     the shallow input->hidden transition grows nothing. score grows any deeper
-    candidate; init tags it. Subclasses only toggle `shortlist_per_level`."""
+    candidate; init tags it. Subclasses only toggle the shortlist flavour."""
 
-    max_candidates = 4
-    max_candidate_units = 2
+    max_new_per_level = 4
+    candidates = "shortlist"
+    shortlist_size = 2
+    direction = "deeper"  # the historical per-level shortlist was deeper-only
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
         del g
@@ -551,7 +556,7 @@ class _GlobalShortlistNet(px.Network[None]):
 
 
 class _PerLevelGrow(_DeepestImportanceGrow):
-    shortlist_per_level = True
+    candidates = "shortlist_per_level"
 
 
 class _PerLevelShortlistNet(px.Network[None]):

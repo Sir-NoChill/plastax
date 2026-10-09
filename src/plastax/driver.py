@@ -49,7 +49,7 @@ class Driver[GS]:
 
     - An overflowing step is not retried: the candidates it could not place
       are simply not grown. At the next check, every bucket with fewer free
-      slots than the growth policy's `max_candidates` is grown.
+      slots than the growth policy's `max_new_per_level` is grown.
     - A resort runs at the next check rather than before the next step. Until
       then, a committed edge that breaks the leveling invariant (a same-level
       or backward edge) may be skipped by the topological forward for up to
@@ -140,7 +140,7 @@ class Driver[GS]:
         if bool(self._overflowed):
             self._overflowed = jnp.bool_(False)
             ac = self._net.add_conn
-            want = ac.max_candidates if ac is not None else 1
+            want = getattr(ac, "max_new_per_level", None) or 1 if ac is not None else 1
             state = self._state
             for level in range(len(self._static.level_capacities)):
                 capacity = self._static.level_capacities[level]

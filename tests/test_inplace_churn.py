@@ -63,8 +63,9 @@ class _HashPrune(px.PruneConn):
         return _hash01(c[px.FROM_ID, cid], c[px.TO_ID, cid], g["step"]) < _KILL_P
 
 
-class _HashGrow(px.AddConn):
-    max_candidates = 32
+class _HashGrow(px.ScoreAddConn):
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+    max_new_per_level = 32
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: dict[str, jax.Array]
@@ -181,7 +182,7 @@ class _FanoutGrow(px.ProposeAddConn[dict[str, jax.Array]]):
     """Each unit proposes _FANOUT random partners; only src < dst (a DAG)."""
 
     proposer = "global"
-    max_candidates = 24
+    max_new_per_level = 24
     proposals_per_proposer = _NUM_UNITS * _FANOUT
 
     def propose(

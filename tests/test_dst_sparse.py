@@ -52,7 +52,7 @@ def _train_and_probe(method: str) -> dict[str, object]:
     optimizer = px.optim.adam(0.05, GradPreAct)
     train_net = dst.make_net(optimizer, method=method, mode="train")
     churn_net = dst.make_net(
-        optimizer, method=method, mode="churn", zeta=0.3, max_candidates=max(budgets)
+        optimizer, method=method, mode="churn", zeta=0.3, max_new_per_level=max(budgets)
     )
     eval_net = dst.make_net(optimizer, method=method, mode="eval")
     static, state = dst.build_sparse_mlp(train_net, layers, budgets, 0)

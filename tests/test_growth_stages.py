@@ -47,7 +47,7 @@ def test_candidates_per_level_sources_at_level_dests_strictly_deeper() -> None:
     #           unit:    0  1  2  3  4
     levels = jnp.asarray([0, 1, 1, 2, 3], dtype=jnp.int32)
     importance = jnp.asarray([9.0, 8.0, 7.0, 6.0, 5.0], dtype=jnp.float32)
-    src, dst = candidates_per_level(importance, levels, 1, 2, 1)
+    src, dst = candidates_per_level(importance, levels, 1, 2, 1, "deeper")
     # sources: the top-2 among units AT level 1 -> {1, 2}
     assert set(np.asarray(src).tolist()) == {1, 2}
     # destinations: strictly deeper within gap 1 -> level 2 only -> unit 3.
@@ -57,6 +57,18 @@ def test_candidates_per_level_sources_at_level_dests_strictly_deeper() -> None:
     dst_ids = set(np.asarray(dst).tolist())
     assert 3 in dst_ids
     assert dst_ids.isdisjoint({1, 2, 4})
+
+
+def test_candidates_per_level_any_direction_pools_the_whole_gap_window() -> None:
+    #           unit:    0  1  2  3  4
+    levels = jnp.asarray([0, 1, 1, 2, 3], dtype=jnp.int32)
+    importance = jnp.asarray([9.0, 8.0, 7.0, 6.0, 5.0], dtype=jnp.float32)
+    _, dst = candidates_per_level(importance, levels, 1, 3, 1)
+    # window |level - 1| <= 1 admits units 0..3; top-3 by importance is
+    # {0, 1, 2} -- the shallower unit 0 included, the deeper-only pool's 3 not.
+    assert set(np.asarray(dst).tolist()) == {0, 1, 2}
+    _, dst_same = candidates_per_level(importance, levels, 1, 3, 1, "same_or_deeper")
+    assert set(np.asarray(dst_same).tolist()) == {1, 2, 3}
 
 
 @pytest.mark.parametrize("is_pipeline", [False, True])
@@ -88,11 +100,13 @@ def test_dedupe_step_keeps_each_pairs_highest_scored_copy() -> None:
     assert out[0] == -np.inf and out[3] == -np.inf
 
 
-def test_select_skips_the_sort_when_everything_fits() -> None:
+def test_select_full_pool_still_commits_in_total_order() -> None:
     scores = jnp.asarray([5.0, -jnp.inf, 7.0], dtype=jnp.float32)
     src = jnp.asarray([0, 1, 2], dtype=jnp.int32)
     dst = jnp.asarray([1, 2, 3], dtype=jnp.int32)
-    assert np.asarray(select(scores, src, dst, 3)).tolist() == [0, 1, 2]
+    # k == n: no shortcut -- the claim consumes winners in this order under
+    # overflow, so it must be the total order, not candidate order.
+    assert np.asarray(select(scores, src, dst, 3)).tolist() == [2, 0, 1]
     # k < n: genuine selection, descending by score
     assert np.asarray(select(scores, src, dst, 2)).tolist() == [2, 0]
 
@@ -103,7 +117,7 @@ def test_select_breaks_score_ties_by_src_then_dst_then_candidate_index() -> None
     dst = jnp.asarray([3, 9, 6, 6, 0], dtype=jnp.int32)
     # total order among the 4.0 ties: src 2 before src 7; within src 2,
     # dst 6 before dst 9; within (2, 6), candidate 2 before candidate 3.
-    assert np.asarray(select(scores, src, dst, 5)).tolist() == [0, 1, 2, 3, 4]
+    assert np.asarray(select(scores, src, dst, 5)).tolist() == [4, 2, 3, 1, 0]
     assert np.asarray(select(scores, src, dst, 4)).tolist() == [4, 2, 3, 1]
 
 
@@ -341,7 +355,7 @@ def test_per_connection_proposer_is_rejected_under_sharding() -> None:
 
     class _PerConn(px.ProposeAddConn[None]):
         proposer = "per_connection"
-        max_candidates = 1
+        max_new_per_level = 1
         proposals_per_proposer = 1
 
         def propose(  # noqa: D102 -- test rule

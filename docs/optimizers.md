@@ -54,7 +54,7 @@ a runtime dependency.
 
 Optimizer state lives per connection, so it does the right thing under dynamic
 sparse training (growing and pruning connections while training). When an
-`AddConn` policy grows a new edge, the framework resets that edge's untouched
+growth policy grows a new edge, the framework resets that edge's untouched
 fields to each `FieldSpec`'s default, so a stateful optimizer's moments start at
 zero on a regrown edge -- exactly the "zero the moments for regrown weights"
 that RigL and SET rely on, with no work from the growth policy. A growth policy

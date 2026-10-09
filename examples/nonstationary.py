@@ -145,7 +145,7 @@ def make_net(
     mode: str,
     method: str = "set",
     zeta: float = 0.1,
-    max_candidates: int = 256,
+    max_new_per_level: int = 256,
     grow_scale: float = 0.0,
     shortlist: int | None = None,
     ema_decay: float = 0.05,
@@ -157,7 +157,7 @@ def make_net(
         mode: ``"train"``, ``"churn"`` or ``"eval"``.
         method: ``"set"`` or ``"rigl"`` (churn only).
         zeta: per-unit prune fraction (churn).
-        max_candidates: per-bucket growth bound (churn).
+        max_new_per_level: per-bucket growth bound (churn).
         grow_scale: regrown-edge init weight (churn).
         shortlist: M for the M x M candidate grid, or None (churn).
         ema_decay: activation-EMA rate for the dormancy metric.
@@ -194,7 +194,7 @@ def make_net(
     if mode == "churn":
         if method not in _GROWTH:
             raise ValueError(f"make_net: unknown method {method!r} (set|rigl)")
-        grow = _GROWTH[method](max_candidates, grow_scale, shortlist)
+        grow = _GROWTH[method](max_new_per_level, grow_scale, shortlist)
 
         class _Churn(px.Network[None]):
             forward_pass = MagnitudeStats(zeta)
@@ -550,7 +550,7 @@ def run(
                 mode="churn",
                 method=method,
                 zeta=zeta,
-                max_candidates=max(max(budgets), m**2 if m else max(budgets)),
+                max_new_per_level=max(max(budgets), m**2 if m else max(budgets)),
                 shortlist=m,
             )
 

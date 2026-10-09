@@ -14,7 +14,7 @@ pip install plastax              # CPU
 pip install "plastax[cuda13]"    # NVIDIA GPU (or [cuda12]); [tpu] for TPU
 ```
 
-v1 scope: pipeline and topological propagation, AddConn/PruneConn dynamics
+v1 scope: pipeline and topological propagation, growth/pruning (ScoreAddConn, ProposeAddConn, PruneConn) dynamics
 (grid or proposal growth, in place, at a cost that follows the churn),
 named-monoid combines, Scheme-A multi-device connection sharding,
 donation-based in-place state.

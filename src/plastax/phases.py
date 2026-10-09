@@ -1046,16 +1046,10 @@ def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phas
         # StepInputs.targets is None only when net.loss is None (phases.py
         # docstring); build_phases only reaches here when net.loss is set.
         assert inputs.targets is not None
-        u_view = UnitView(state.units)
         value, seed = loss.calculate_loss(
-            u_view, output_ids, inputs.targets, state.globals_
+            UnitView(state.units), output_ids, inputs.targets, state.globals_
         )
         units = dict(state.units)
-        live = u_view.live(output_ids)
-        if live is not None:
-            # An output slot holding no live unit gets no seed write; the
-            # policy leaves it out of the loss (see `Loss`).
-            seed = jnp.where(live, seed, units[seed_name][output_ids])
         units[seed_name] = units[seed_name].at[output_ids].set(seed)
         return dataclasses.replace(state, units=units), value
 

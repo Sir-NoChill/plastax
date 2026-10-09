@@ -37,6 +37,7 @@ from plastax.traits import (
     ResetGlobal,
     ScoreAddConn,
     UpdateConn,
+    UpdateUnit,
     predicate_add_conn,
 )
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
@@ -75,6 +76,7 @@ __all__ = [
     "UnitView",
     "UnitWrite",
     "UpdateConn",
+    "UpdateUnit",
     "WEIGHT",
     "distribute_state",
     "make_empty_state",

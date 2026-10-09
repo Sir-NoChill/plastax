@@ -518,14 +518,19 @@ class NetworkBuilder[GS]:
             # source level.
             bucket_of_conn = np.zeros_like(src_arr)
             num_buckets = 1
+            deepest_grows = False
         else:
             # Every edge goes strictly from a lower to a higher level
             # (level(v) = max over incoming edges of level(u) + 1), so the
             # highest level ever used as a SOURCE is max(levels) - 1, i.e.
             # exactly max(levels) buckets (0-indexed); max(., 1) covers the
-            # no-edges degenerate case.
+            # no-edges degenerate case. A growth rule may source an edge at
+            # the deepest level too (committed backward, then resorted), so
+            # with add_conn declared the deepest level gets its own bucket.
             bucket_of_conn = levels[src_arr]
-            num_buckets = max(int(levels.max()) if levels.size else 0, 1)
+            max_level = int(levels.max()) if levels.size else 0
+            deepest_grows = self.net.add_conn is not None
+            num_buckets = max(max_level + (1 if deepest_grows else 0), 1)
 
         conns: list[Columns] = []
         level_capacities: list[int] = []
@@ -605,6 +610,7 @@ class NetworkBuilder[GS]:
             capacity_headroom=capacity_headroom,
             capacity_align=capacity_align,
             seed=self.net.seed,
+            deepest_grows=deepest_grows,
         )
         state = NetworkState(
             units=unit_cols,

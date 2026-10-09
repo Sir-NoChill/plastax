@@ -235,14 +235,17 @@ Each phase is appended **iff its trait slot is not `None`** (forward is
 unconditional). This is **phase elision** (invariant #1): an absent phase means
 no equations in the jaxpr, verified by `test_phases_elision.py`. Forward and
 backward branch on `net.propagation` (single flat sweep for PIPELINE; a
-per-bucket level walk for TOPOLOGICAL). `build_add_conn_phase` (`phases.py:426`)
-is the most complex: candidate grid (full or shortlisted) → level-window filter
-+ dedup vs live edges → `score` → per-bucket `top_k` → prefix-sum free-slot
+per-bucket level walk for TOPOLOGICAL). `build_add_conn_phase` is the most
+complex: trigger → candidates (a `ProposeAddConn`'s proposals, or a
+`ScoreAddConn`'s scored pairs from the exhaustive or shortlisted grid) →
+validity window → the opt-in dedupe stages (`dedupe_live`, `dedupe_step`) →
+per-source-level selection in the total candidate order → prefix-sum free-slot
 claim (`xla_claim`, or `triton_claim`'s three jax_triton kernels on NVIDIA,
-picked by `make_step(growth=...)`) → commit only finite-scored candidates → set `needs_resort` if a
-committed edge isn't level-preserving. A `-inf` score is a **hard veto**. Under
-Scheme-A it is device-resident and shards byte-identically: the dedup all-
-reduces (so every shard agrees on the candidate set and `top_k`), and the
+picked by `make_step(growth=...)`) → commit → set `needs_resort` if a committed
+edge isn't level-preserving (§10 has the full pipeline). A non-finite score
+(`-inf`) is a **hard veto**. Under Scheme-A it is device-resident and shards
+byte-identically: the live dedupe all-reduces (so every shard agrees on the
+candidate set and the selection), and the
 free-slot claim runs over each shard's capacity slice with an all-gathered
 global free-slot rank sending each new edge to the one shard that owns its slot
 (`total_free` a `psum`, keeping `overflow`/`needs_resort` replicated).
@@ -378,7 +381,7 @@ Use this table first. The overwhelmingly common case is the top row.
 | A **new optimizer** | `optim/_<name>.py` + register in `optim/__init__.py` | `traits.py`, `phases.py`, `step.py` | Implement the `Optimizer` bundle: `state_fields` (`opt/…` columns, default 0), `needs_step_counter`, `update_conn()`. Delta-rule gradient. See §7. |
 | A **new topology generator** | `topology.py` | `builder.py`, `state.py` | Return a `Block` (`num_units` + `edges(key, offset_in, offset_out)→EdgeSet`). Host-side numpy only; sets *initial* weights only. |
 | A **new named monoid** | `monoid.py` (`_Named`, the four reducer/identity/pairwise/collective tables) | anything arena-aware | Keep it pure algebra. Do not un-guard the generic `(op, identity)` path without real lowering. |
-| A **new phase category** (beyond the seven) | `traits.py` (Protocol + slot) **then** `phases.py` (`_build_<name>_phase` + wire into `build_phases`, deciding order) **then** likely `sweep.py` helpers | `step.py`, `topo.py` | Rare. `step.py`/`topo.py` are generic over the phase list. |
+| A **new phase category** (beyond the ten slots) | `traits.py` (Protocol + slot) **then** `phases.py` (`_build_<name>_phase` + wire into `build_phases`, deciding order) **then** likely `sweep.py` helpers | `step.py`, `topo.py` | Rare. `step.py`/`topo.py` are generic over the phase list. |
 | A **new propagation/scheduling strategy** (neither pipeline-flat nor topological-level-walk) | `phases.py` forward/backward branch, `_types.Propagation`, `topo.py` bucket-count derivation | — | Rare and invasive. |
 | **Arena layout** change (a new built-in column, bucket shape) | `state.py` (+ `_types.py` for a shared column) | `sweep.py` algorithm logic | A `NetworkStatic` field change is a retrace/cache-key change. |
 | A **new accessor space** | `views.py` | — | Keep views pure and dict-backed; do not pytree-register write records. |
@@ -463,17 +466,20 @@ reference the C++ oracle file when porting.
 
 ## 10. Growth: the target model (design record)
 
-The growth rework lands in stages; this section is the normative design the
-stages implement; as of G5 the code implements all of it except the unit
-lifecycle that `on_units_added` reads (`NetworkState.units_added` stays 0
-until it lands). Where code disagrees with this section, the code loses.
+This section is the normative growth design, and the code implements all of
+it (single device and Scheme-A; the unit lifecycle that `on_units_added`
+reads is single-device). Where code disagrees with this section, the code
+loses.
 
 Two strategies, one deterministic selection pipeline:
 
 - **Propose** (default): a proposer emits `proposals_per_proposer` candidates
   `(src, dst, score)` per step. Proposers: `per_unit` (default, every live
   unit), `per_connection` (every live connection), `global` (one). Neither
-  endpoint need be the proposer.
+  endpoint need be the proposer. Per-unit proposal growth is the default for
+  networks with unit addition: a spawned unit proposes from its first step,
+  and the candidate count is num_units x P, not num_units². Algorithms that
+  add no units (DeepR, say) pick `per_connection`.
 - **Score**: `score(u, src, dst, g)` over candidate pairs from `exhaustive`
   (every windowed pair), `shortlist_per_level`, or `shortlist` (both rank
   units by a user `importance`, M = `shortlist_size`). A boolean predicate
@@ -494,7 +500,7 @@ Pipeline, in order: trigger (`every_step` default, `every(n)`,
 `on_units_added`, `when(g)`); candidates from live proposers; validity (each
 failure scores -inf): live in-range endpoints, `src != dst` unless
 `allow_self_loops`, `|level(dst) - level(src)| <= max_level_gap` (a growth-rule
-attribute — the network-level `neighbourhood` is removed), `direction`
+attribute), `direction`
 (`any`/`deeper`/`same_or_deeper`); non-finite scores veto; `dedupe_live`
 (default **False**) vetoes candidates equal to a live edge; `dedupe_step`
 (default **False**) keeps the first of equal keys; per-source-level selection
@@ -518,5 +524,5 @@ contract in `plastax.rng`'s module docstring, pinned bit-exactly by the
 `rng_philox32.json` golden shared with plastax-cpp.
 
 The golden files under `tests/golden/` tagged `growth_v2` encode this
-pipeline's expected outputs case by case and flip from skipped to enforced as
-the stages land.
+pipeline's expected outputs case by case; `test_parity_goldens.py` enforces
+every one, and plastax-cpp consumes the same files.

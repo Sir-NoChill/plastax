@@ -84,7 +84,7 @@ These are design decisions already made. Violating one is a failed change
 | `monoid.py` | `monoid` | `Monoid[Acc]` + `MonoidTree`; named `sum/prod/max/min` lowered to `segment_*`, `combine_pairwise`, `collective` (all-reduce). Arena-agnostic pure algebra. |
 | `state.py` | `state` | Two-tier state: `NetworkStatic` (hashable jit cache key) + `NetworkState[GS]` (mutable SoA pytree). `make_empty_state`, `live_conn_count`, `grow_bucket`. |
 | `views.py` | `views` | `UnitView`/`ConnView` (read, indexed by `(FieldSpec, Idx)`) and `UnitWrite`/`ConnWrite` (write records). Deliberately **not** pytree-registered. |
-| `traits.py` | `traits` | `Network` base class + policy `Protocol`s (`ForwardPass`, `BackwardPass`, `Loss`, `UpdateUnit`, `UpdateConn`, `PruneUnit`, `PruneConn`, `AddUnit`, `AddConn`, `ProposeAddConn`, `ResetGlobal`); `__init_subclass__` validation. The **declarative surface**. |
+| `traits.py` | `traits` | `Network` base class + policy `Protocol`s (`ForwardPass`, `BackwardPass`, `Loss`, `UpdateUnit`, `UpdateConn`, `PruneUnit`, `PruneConn`, `AddUnit`, `ScoreAddConn`, `ProposeAddConn`, `ResetGlobal`) + `predicate_add_conn`; `__init_subclass__` validation. The **declarative surface**. |
 | `sweep.py` | `sweep` | Primitive gather → vmapped map → `segment_reduce` → masked apply, one bucket at a time; conn-update sweeps. The low-level engine. |
 | `phases.py` | `phases` | `build_phases`: compiles declared traits into the ordered phase tuple (forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_unit → add_conn → reset_global), eliding absent slots. `StepInputs`. |
 | `topo.py` | `topo` | Level assignment (`initial_levels`, `recompute_levels`), `resort` (rebucket after structural change), `capacity_policy`. |
@@ -95,7 +95,7 @@ These are design decisions already made. Violating one is a failed change
 | `shard.py` | `shard`* | Scheme-B band-partition math (`balanced_level_cut`). Pure numpy. (*commit under `topo`/`step` per `docs/development/scopes.md` — `shard` has no dedicated scope; ask if unsure.) |
 | `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = an `UpdateConn` policy + per-connection `state_fields` (`opt/…` columns). |
 
-**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (40
+**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (48
 names). Breaking any of them is a `type(scope)!:` change with a
 `BREAKING CHANGE:` footer and a changelog entry (`docs/changelog.md`).
 Names reachable only via submodule import (`plastax.topo.*`, `plastax.shard.*`,

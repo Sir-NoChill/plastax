@@ -55,7 +55,8 @@ class Optimizer(Protocol):
             extra_conn_fields. Each FieldSpec's ``default`` is also the value a
             regrown connection's state initializes to: the add_conn phase resets
             a new edge's untouched fields to their default, so a stateful
-            optimizer wired with an AddConn growth policy zeroes its moments on
+            optimizer wired with a growth policy (ScoreAddConn or
+            ProposeAddConn) zeroes its moments on
             regrow automatically (RigL behaviour). Growth policies write WEIGHT
             and their own fields only, never optimizer columns.
         needs_step_counter: Whether the rule needs a step counter in the

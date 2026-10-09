@@ -3863,34 +3863,42 @@ def build_add_conn_phase[GS](
     free_sink: list[Any] | None = None,
     growth: str = "auto",
 ) -> Phase[GS]:
-    """Select each bucket's top-k candidates and claim free slots via prefix sum.
+    """Select each source level's growth candidates and claim free slots.
 
-    Candidates come from the (src, dst) unit-id grid -- the full num_units^2
-    grid, or, when the rule declares `candidates = "shortlist"` (M =
-    `shortlist_size`, with an `importance(u, i, g)` method), the M x M grid of
-    that step's top-M most important units (an O(num_units + M^2) shortlist
-    replacing the O(num_units^2) sweep) -- filtered to a level-gap window:
-    `abs(level[dst] - level[src]) <= max_level_gap` (the growth rule's own
-    attribute, read structurally, default 1),
-    self-loops excluded (see
-    per-ordered-pair derivation in `apply_validity`). In TOPOLOGICAL mode a bucket only
-    sources candidates from units at its own level (matching
-    NetworkBuilder.finalize's bucket-of-conn convention); PIPELINE's
-    single bucket accepts a source at any level, since every live conn
-    lives in one flat arena regardless of source level -- the level
-    window itself is still consulted in both modes, only the destination
-    bucket differs. With `dedupe` (the default for grid growth, opt-in for
-    ProposeAddConn) candidates already present as a live edge in the bucket
-    are masked out (each candidate's pair id binary-searched against the
-    sorted live pair ids -- no num_units**2 occupancy grid), and repeated
-    proposals within the step keep only their highest-scored copy, so growth
-    never regrows an existing pair as a duplicate. Each bucket runs an independent
-    top_k (static k) over its own scored, windowed candidates, with no
-    cross-bucket sequencing. A candidate scored -inf is never committed -- the
-    framework scores every invalid candidate -inf, and a growth policy returns
-    -inf to veto one it must never grow (e.g. a non-deeper edge) -- so a bucket
-    with more free slots than finite-scored candidates leaves the surplus empty
-    rather than back-filling with vetoed edges. With a unit capacity
+    Candidates come from the rule. A `ProposeAddConn` emits
+    `proposals_per_proposer` proposals per proposing site (`proposer`:
+    "per_unit", the default, "per_connection" or "global"), each with its
+    own keyed `Rng`. A `ScoreAddConn` scores the (src, dst) unit-id grid --
+    the full num_units^2 grid, or, when the rule declares
+    `candidates = "shortlist"` / `"shortlist_per_level"` (M =
+    `shortlist_size`, with an `importance(u, i, g)` method), the M x M grid
+    of that step's top-M most important units, globally or per source level
+    (an O(num_units + M^2) shortlist replacing the O(num_units^2) sweep).
+    Every candidate then passes the validity window (see `apply_validity`):
+    `abs(level[dst] - level[src]) <= max_level_gap` (default 1), the rule's
+    `direction`, and no self-loops unless `allow_self_loops`. In TOPOLOGICAL
+    mode a bucket only sources candidates from units at its own level
+    (matching NetworkBuilder.finalize's bucket-of-conn convention);
+    PIPELINE's single bucket accepts a source at any level, since every live
+    conn lives in one flat arena regardless of source level -- the window
+    itself is still consulted in both modes, only the destination bucket
+    differs.
+
+    Nothing is deduplicated by default, for either rule kind: a candidate
+    equal to a live edge grows a parallel edge. With `dedupe_live`,
+    candidates already present as a live edge are vetoed (each candidate's
+    pair id binary-searched against the sorted live pair ids -- no
+    num_units**2 occupancy grid); with `dedupe_step`, equal candidates
+    within the step keep only their first copy in the total order. Each
+    bucket then selects independently (`selection`: top_k of
+    `max_new_per_level`, threshold or all) in the total candidate order
+    `(-score, src, dst, candidate index)`, and `max_new_per_step` caps the
+    step across levels, level-ascending. A candidate with a non-finite score
+    is never committed -- the framework scores every invalid candidate
+    -inf, and a growth policy returns -inf to veto one it must never grow
+    (e.g. a non-deeper edge) -- so a bucket with more free slots than
+    finite-scored candidates leaves the surplus empty rather than
+    back-filling with vetoed edges. With a unit capacity
     (`Network.unit_capacity`), both endpoints must be live units: a slot
     holding none is never a candidate, a proposer, or shortlisted.
 
@@ -3964,11 +3972,9 @@ def build_add_conn_phase[GS](
     # bucket, letting sparsity drift down; per-level is the fix. It is
     # levels-based, hence topological only.
     # Proposal growth (ProposeAddConn) replaces the grid as the candidate
-    # source: the policy emits `num_proposals` (src, dst, score) triples and
-    # everything downstream -- routing, window, top_k, slot claim, init -- is
-    # shared with the grid path. The live-edge duplicate check defaults on for
-    # the grid and off for proposals (parallel edges allowed; see
-    # ProposeAddConn).
+    # source: each proposing site emits `proposals_per_proposer` (src, dst,
+    # score) triples and everything downstream -- routing, window, selection,
+    # slot claim, init -- is shared with the grid path.
     if growth not in ("auto", "xla", "triton"):
         raise ValueError(f"build_add_conn_phase: unknown growth engine {growth!r}")
     use_propose = isinstance(ac, ProposeAddConn)

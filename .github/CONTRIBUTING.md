@@ -43,16 +43,21 @@ A few facts that are easy to get wrong:
   `UnitView`/`ConnView` and return `UnitWrite`/`ConnWrite` records. They never
   index raw columns, read another element's state, or keep state beyond
   hyperparameters.
-- The phase order is fixed: forward → loss → backward → update_conn →
-  prune_conn → add_conn → reset_global. An `UpdateConn` can read what the
-  backward pass wrote; `prune_conn` sees `update_conn`'s fresh weights.
+- The phase order is fixed: forward → loss → backward → update_unit →
+  update_conn → prune_unit → prune_conn → add_unit → add_conn → reset_global.
+  An `UpdateConn` can read what the backward pass wrote; `prune_conn` sees
+  `update_conn`'s fresh weights; growth sees the units `add_unit` spawned.
 - Forward `map` accumulates into the destination unit, backward `map` into the
   source unit.
-- An `AddConn` score of `-inf` is a hard veto, distinct from a low score.
+- A growth score of `-inf` (any non-finite score, from a `ScoreAddConn` or a
+  `ProposeAddConn` proposal) is a hard veto, distinct from a low score.
+- Growth deduplicates nothing by default: a rule that must never grow a
+  parallel edge sets `dedupe_live = True` (and `dedupe_step = True` against
+  repeats within a step).
 - Extra per-unit / per-connection fields are declared with
   `extra_unit_fields` / `extra_conn_fields` and must not collide with the
   reserved columns (`from_id`, `to_id`, `dead`, `weight`, `activation`,
-  `level`). A regrown edge's fields start at their `FieldSpec` default, so
+  `level`, `pruned`). A regrown edge's fields start at their `FieldSpec` default, so
   optimizer state should default to 0.0 rather than special-casing regrowth.
 - Optimizers form the gradient with the delta rule
   `grad_field[dst] * ACTIVATION[src]`, and never read the network globals.
@@ -75,8 +80,9 @@ to discuss the approach first.
 6. **Policies are pure, vmapped and per-element** (see above).
 7. **Type discipline:** `mypy --strict` must pass, with `FieldSpec` generics
    intact end to end.
-8. **Out of scope for now:** adding/pruning units, generic
-   `Monoid(op, identity)` lowering (it must keep raising
+8. **Out of scope for now:** adding/pruning units under Scheme-A sharding
+   (both run on a single device and raise `NotImplementedError` when
+   sharded), generic `Monoid(op, identity)` lowering (it must keep raising
    `UnsupportedMonoidError`), `jax.Ref` arenas, and MLIR emission.
 
 ## Tests

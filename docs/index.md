@@ -1,9 +1,10 @@
 # plastax
 
 Declarative plastic-network traits for JAX. A `plastax.Network` subclass
-declares, in one place, the forward/backward passes, connection-update rule,
-per-unit and per-edge SOA fields, and propagation model of a dynamically
-structured network; the library assembles and jit-specializes the
+declares, in one place, the forward/backward passes, unit- and
+connection-update rules, structural rules (connection growth and pruning, unit
+addition and pruning), per-unit and per-edge SOA fields, and propagation model
+of a dynamically structured network; the library assembles and jit-specializes the
 corresponding step function at trace time.
 
 This site is a scaffold; the full documentation (quickstart, concepts,

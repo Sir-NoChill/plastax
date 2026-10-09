@@ -40,7 +40,7 @@ Pick the row; it decides everything downstream.
 | An optimizer (sgd/adam-like weight update) | **Optimizer bundle** | `optim/_<name>.py` + `optim/__init__.py` | §B |
 | A layer / connectivity generator | **Topology generator** | `topology.py` | §C |
 | A new reduction for accumulators | **Named monoid** | `monoid.py` | §D |
-| A phase category beyond the seven | **New phase** (rare, invasive) | `traits.py` → `phases.py` → maybe `sweep.py` | §E |
+| A phase category beyond the ten slots | **New phase** (rare, invasive) | `traits.py` → `phases.py` → maybe `sweep.py` | §E |
 
 Confirm the classification and the commit **scope** (`docs/development/scopes.md`) with the user
 before implementing if there is any ambiguity.
@@ -60,7 +60,7 @@ before implementing if there is any ambiguity.
 4. **Extra fields** your policy needs are declared on the `Network` via
    `extra_unit_fields` / `extra_conn_fields` (tuples of `FieldSpec`); they must
    not collide with reserved names (`from_id`, `to_id`, `dead`, `weight`,
-   `activation`, `level`). A per-connection field defaults to its
+   `activation`, `level`, `pruned`). A per-connection field defaults to its
    `FieldSpec.default` on a regrown edge — rely on that for zero-init.
 5. **Copy the idiom from working code**, don't invent it. The canonical trait
    implementations live in `examples/mlp_xor.py` (forward/backward/loss/update),
@@ -94,6 +94,10 @@ class MyLoss:
     # read outputs with u.gather(px.ACTIVATION, outputs); return (loss, seed)
     # built-in: px.SoftmaxCrossEntropyLoss(seed_field)
 
+# UpdateUnit[GS]: per-unit state update (every live unit, after backward)
+class MyUnitUpdate:
+    def update(self, u, i, g) -> UnitWrite: ...
+
 # UpdateConn[GS]: two-pass connection state update
 class MyUpdate:
     def incoming(self, u, dst, src, c, cid, g) -> ConnWrite: ...   # all incoming writes land first
@@ -102,6 +106,19 @@ class MyUpdate:
 # PruneConn[GS]: tombstone by predicate
 class MyPrune:
     def predicate(self, u, c, cid, g) -> Bool[Array, ""]: ...      # True ⇒ prune this edge
+
+# PruneUnit[GS]: permanent unit pruning (needs Network.unit_capacity)
+class MyUnitPrune:
+    def predicate(self, u, i, g) -> Bool[Array, ""]: ...  # True ⇒ prune unit i (I/O exempt)
+    # the unit is marked PRUNED and its incident edges are tombstoned
+
+# AddUnit[GS]: spawn children into free unit slots (needs Network.unit_capacity)
+class MySpawn:
+    def spawn(self, u, parent, g) -> tuple[Bool[Array, ""], Int32[Array, ""]]: ...
+    #   (fires?, child level offset from the parent); the k-th parent by id takes
+    #   the k-th lowest free slot; none left ⇒ dropped, state.unit_overflow set
+    def init(self, u, child, parent, g) -> UnitWrite: ...  # the child's fields
+    # the child has no edges until growth adds them (trigger="on_units_added")
 
 # ScoreAddConn[GS]: growth from scored candidate pairs
 class MyGrow:
@@ -117,9 +134,14 @@ class MyGrow:
 class MyProposeGrow:
     max_new_per_level: int = ...     # grown per source level per step, at most
     proposals_per_proposer: int = ...
-    proposer = "per_unit"            # | "per_connection" | "global"
+    proposer = "per_unit"            # the default | "per_connection" | "global"
     def propose(self, u, i, j, g, rng) -> Proposal: ...  # (src, dst, score)
+    # per_connection: propose(u, c, cid, j, g, rng); global: propose(u, j, g, rng)
+    # rng: this site's keyed draw stream (rng.uniform(), rng.normal(), ...)
     def init(self, u, src, dst, g) -> ConnWrite: ...
+# Per-unit proposals are the default growth for networks with unit addition
+# (candidates scale as num_units x P, and a new unit proposes at once);
+# pick per_connection for algorithms that add no units (DeepR).
 
 # Knobs shared by both (all optional, structural):
 #   selection = "top_k" | "threshold" (def threshold(self, g)) | "all"
@@ -163,13 +185,15 @@ required method or a reserved-name collision fails immediately.
 Direction & ordering facts to get right:
 - Forward `map` accumulates into `dst`; backward `map` accumulates into `src`.
   Both `map` signatures are `(u, dst, src, c, cid, g)`.
-- Phase order is fixed: forward → loss → backward → update_conn → prune_conn →
-  add_conn → reset_global. So an `UpdateConn` can read what `backward` wrote
-  (e.g. `grad_pre_act`), and `prune_conn` sees `update_conn`'s fresh weights.
+- Phase order is fixed: forward → loss → backward → update_unit → update_conn →
+  prune_unit → prune_conn → add_unit → add_conn → reset_global. So an
+  `UpdateConn` can read what `backward` wrote (e.g. `grad_pre_act`),
+  `prune_conn` sees `update_conn`'s fresh weights, and growth sees the units
+  `add_unit` spawned in the same step.
 - `UpdateConn` runs *all* incoming writes across every bucket before *any*
   outgoing pass, so the two sub-passes never race.
-- A `-inf` `ScoreAddConn.score` (or proposal score) is a hard veto, distinct
-  from a low finite score.
+- A `-inf` (any non-finite) `ScoreAddConn.score` or proposal score is a hard
+  veto, distinct from a low finite score.
 - Neither rule kind deduplicates by default: set `dedupe_live = True` to never
   regrow a live edge (and `dedupe_step = True` against within-step repeats).
   Prefer candidates that are distinct by construction.
@@ -276,11 +300,11 @@ named monoid.
 
 ## §E — A new phase category (rare, invasive)
 
-Only when the algorithm needs a phase that is not one of the seven. In order:
+Only when the algorithm needs a phase that is not one of the ten. In order:
 1. `traits.py`: add a `@runtime_checkable` Protocol + an optional `Network`
    class attribute; extend `_validate_traits`.
 2. `phases.py`: add `_build_<name>_phase` and wire it into `build_phases`'s
-   ordered list — **decide its position** relative to the existing seven and
+   ordered list — **decide its position** relative to the existing ten and
    justify it (it changes what later phases can read).
 3. `sweep.py`: add the low-level gather/reduce/apply helper if the phase needs
    one not already there.

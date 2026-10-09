@@ -150,7 +150,7 @@ The policy Protocols:
 |---|---|---|
 | `ForwardPass[Acc,GS]` | `map(u,dst,src,c,cid,g)→Acc`, `apply(u,i,g,acc)→UnitWrite`; attr `combine:MonoidTree` | destination unit |
 | `BackwardPass[Acc,GS]` | same shape | source unit |
-| `Loss[GS]` | `per_output(u,i,target,g)→(scalar, UnitWrite)` | output units |
+| `Loss[GS]` | `calculate_loss(u,outputs,targets,g)→(scalar, seed)`; attr `seed_field:FieldSpec` | the seed field, at the output units |
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
 | `ScoreAddConn[GS]` | `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite`; optional `importance(u,i,g)→Float` (shortlists) | grows edges (scored pairs) |
@@ -167,6 +167,30 @@ in `_validate_traits`): `selection` / `max_new_per_level` / `max_new_per_step`
 two Protocols; `predicate_add_conn` adapts a boolean predicate to a
 `ScoreAddConn`. Growth reports `grown` and `overflow` on the state, and
 `Network.structural_interval` gates the structural phases to every n-th step.
+
+### The loss contract
+
+The loss is **whole-output**: `calculate_loss(u, outputs, targets, g)` runs
+once per step (per sample when batched) over every output unit -- `outputs`
+are the output ids in builder order, aligned with `targets`, read through
+`UnitView.gather` -- and returns the scalar loss plus the `(num_outputs,)`
+gradient seed dL/d(output). The framework writes the seed into the policy's
+declared `seed_field` (a float unit column of the network) at the output ids
+and nothing else; the scalar becomes the phase's contribution to
+`StepResult.loss` (the batch mean when batched). Because one call sees every
+output, losses that couple the outputs are expressible; `SoftmaxCrossEntropyLoss`
+ships in `traits.py` (max-subtracted log-sum-exp, operation-for-operation the
+same float32 arithmetic as plastax-cpp's, pinned by the `loss_v1` goldens).
+
+The backward accumulator is **read-only** to every policy: it exists only as
+the value the backward walk carries, and reaches a rule as
+`BackwardPass.apply`'s `acc` argument. The loss cannot write it; a backward
+pass picks the seed up from the seed field instead (the output level's own
+`acc` is the identity, since no edge sources from the deepest level). In
+plastax-cpp the same contract holds: `CalculateLoss` returns the scalar
+(`GetLastLoss()`), writes its declared `SeedField`, and `GetBackwardAcc` is a
+const accessor; its built-in losses declare the accumulator itself as their
+seed field, which is how that library hands the seed to the backward pass.
 
 ### Assembly (`phases.py`)
 
@@ -419,9 +443,20 @@ Two strategies, one deterministic selection pipeline:
   unit), `per_connection` (every live connection), `global` (one). Neither
   endpoint need be the proposer.
 - **Score**: `score(u, src, dst, g)` over candidate pairs from `exhaustive`
-  (every windowed pair), or `shortlist` (top-M units by a user `importance`,
-  score the M x M grid). A boolean predicate adapts via `predicate_add_conn`
-  (True -> 0.0, False -> -inf).
+  (every windowed pair), `shortlist_per_level`, or `shortlist` (both rank
+  units by a user `importance`, M = `shortlist_size`). A boolean predicate
+  adapts via `predicate_add_conn` (True -> 0.0, False -> -inf).
+
+Shortlists. `shortlist_per_level` is the canonical shortlist: for each source
+level, ascending, the sources are the top-M live units of that level by
+importance and the destinations the top-M live units inside that level's
+validity window (the `max_level_gap` window intersected with `direction`), by
+importance; each level's M x M grid is scored. Every source level gets its own
+grid, so no level can take the whole budget and starve the others; it is
+levels-based and so topological only. Plain `shortlist` is the degenerate
+single global grid (the top-M units of the whole network, crossed), kept for
+pipeline mode. Importance ties break by ascending unit id; fewer than M
+eligible units give a smaller grid.
 
 Pipeline, in order: trigger (`every_step` default, `every(n)`,
 `on_units_added`, `when(g)`); candidates from live proposers; validity (each
@@ -441,7 +476,9 @@ Total order: sort key `(-score, src, dst, candidate_index)` ascending.
 Candidate index: per_unit `unit_id * P + j`; per_connection `rank * P + j`
 (rank = ascending `(src, dst, occurrence)` among live connections); global
 `j`; exhaustive `src * capacity + dst`; shortlist row-major over the
-importance-ranked grid (importance ties break by ascending unit id).
+importance-ranked grid (importance ties break by ascending unit id);
+shortlist_per_level `level_rank * M * M` plus the row-major position in that
+level's grid (level_rank counts the levels holding live units, ascending).
 
 Randomness: proposal rules receive an `Rng` keyed by
 `(Network.seed, state.step, stream=1, proposer_key, j)` per the normative

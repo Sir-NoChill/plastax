@@ -87,9 +87,12 @@ class MyBackward:
     def map(self, u, dst, src, c, cid, g) -> Acc: ...
     def apply(self, u, i, g, acc) -> UnitWrite: ...
 
-# Loss[GS]
+# Loss[GS]: whole-output; the framework writes `seed` into seed_field at the outputs
 class MyLoss:
-    def per_output(self, u, i, target, g) -> tuple[Float[Array, ""], UnitWrite]: ...
+    seed_field = LossGrad  # a float unit column declared in extra_unit_fields
+    def calculate_loss(self, u, outputs, targets, g) -> tuple[Float[Array, ""], Float[Array, " n"]]: ...
+    # read outputs with u.gather(px.ACTIVATION, outputs); return (loss, seed)
+    # built-in: px.SoftmaxCrossEntropyLoss(seed_field)
 
 # UpdateConn[GS]: two-pass connection state update
 class MyUpdate:

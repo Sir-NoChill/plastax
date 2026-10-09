@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from typing import TypeVar
 
 import numpy as np
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Int32, Shaped
 
 from plastax._types import ConnIdx, FieldSpec, UnitIdx
 from plastax.state import Columns
@@ -38,6 +38,23 @@ class UnitView:
         """
         spec, idx = key
         return self._cols[spec.name][idx]
+
+    def gather(
+        self, spec: FieldSpec[DT], ids: Int32[Array, " n"]
+    ) -> Shaped[Array, " n"]:
+        """Return a field's values at several units, in the order of `ids`.
+
+        Whole-output rules (`Loss.calculate_loss`) read every output at once
+        through this.
+
+        Args:
+            spec: Field spec to read.
+            ids: Unit indices to read, any order.
+
+        Returns:
+            The field's values at `ids`.
+        """
+        return self._cols[spec.name][ids]
 
 
 @dataclasses.dataclass(frozen=True)

@@ -65,8 +65,9 @@ These are design decisions already made. Violating one is a failed change
 7. **Type discipline.** `mypy --strict` must pass (it is the authoritative CI
    gate; `ty` is the fast pre-commit pass). Keep `FieldSpec` generic typing
    intact end to end.
-8. **Out of v1 scope — do not implement, even partially:** AddUnit/PruneUnit,
-   generic `Monoid(op, identity)` lowering (raise `UnsupportedMonoidError`),
+8. **Out of v1 scope — do not implement, even partially:** the Scheme-A
+   sharded path of unit pruning and addition (both raise
+   `NotImplementedError` under sharding), generic `Monoid(op, identity)` lowering (raise `UnsupportedMonoidError`),
    `jax.Ref` arenas, hijax, MLIR emission. (Multi-device *Scheme-A* sharding
    *is* implemented; `shard.py` Scheme-B is host-side partitioning math only.)
 
@@ -83,9 +84,9 @@ These are design decisions already made. Violating one is a failed change
 | `monoid.py` | `monoid` | `Monoid[Acc]` + `MonoidTree`; named `sum/prod/max/min` lowered to `segment_*`, `combine_pairwise`, `collective` (all-reduce). Arena-agnostic pure algebra. |
 | `state.py` | `state` | Two-tier state: `NetworkStatic` (hashable jit cache key) + `NetworkState[GS]` (mutable SoA pytree). `make_empty_state`, `live_conn_count`, `grow_bucket`. |
 | `views.py` | `views` | `UnitView`/`ConnView` (read, indexed by `(FieldSpec, Idx)`) and `UnitWrite`/`ConnWrite` (write records). Deliberately **not** pytree-registered. |
-| `traits.py` | `traits` | `Network` base class + policy `Protocol`s (`ForwardPass`, `BackwardPass`, `Loss`, `UpdateUnit`, `UpdateConn`, `PruneUnit`, `PruneConn`, `AddConn`, `ProposeAddConn`, `ResetGlobal`); `__init_subclass__` validation. The **declarative surface**. |
+| `traits.py` | `traits` | `Network` base class + policy `Protocol`s (`ForwardPass`, `BackwardPass`, `Loss`, `UpdateUnit`, `UpdateConn`, `PruneUnit`, `PruneConn`, `AddUnit`, `AddConn`, `ProposeAddConn`, `ResetGlobal`); `__init_subclass__` validation. The **declarative surface**. |
 | `sweep.py` | `sweep` | Primitive gather → vmapped map → `segment_reduce` → masked apply, one bucket at a time; conn-update sweeps. The low-level engine. |
-| `phases.py` | `phases` | `build_phases`: compiles declared traits into the ordered phase tuple (forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_conn → reset_global), eliding absent slots. `StepInputs`. |
+| `phases.py` | `phases` | `build_phases`: compiles declared traits into the ordered phase tuple (forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_unit → add_conn → reset_global), eliding absent slots. `StepInputs`. |
 | `topo.py` | `topo` | Level assignment (`initial_levels`, `recompute_levels`), `resort` (rebucket after structural change), `capacity_policy`. |
 | `step.py` | `step` | `make_step`: cached assembly, input scatter, jit, donation, Scheme-A `shard_map` wrap. `StepResult`. |
 | `builder.py` | `builder` | Host-side eager construction: `NetworkBuilder` (`add_unit`/`add_conn`/`finalize`/`from_topology`/`from_edges`). `from_edges` is the vectorized whole-array path (no per-edge Python); `from_topology` and `finalize` route through its shared `_assemble` core. |

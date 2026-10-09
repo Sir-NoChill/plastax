@@ -155,6 +155,7 @@ The policy Protocols:
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
 | `PruneUnit[GS]` | `predicate(u,i,g)→Bool` | permanently prunes live non-I/O units; kills their edges |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
+| `AddUnit[GS]` | `spawn(u,parent,g)→(Bool, Int32 offset)`, `init(u,child,parent,g)→UnitWrite` | places children in the lowest free unit slots |
 | `ScoreAddConn[GS]` | `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite`; optional `importance(u,i,g)→Float` (shortlists) | grows edges (scored pairs) |
 | `ProposeAddConn[GS]` | attr `proposals_per_proposer:int`; `propose(...)→(src,dst,score)` per `proposer`, `init(...)→ConnWrite` | grows edges (proposals) |
 | `ResetGlobal[GS]` | `reset(g)→GS` | globals, between episodes |
@@ -182,8 +183,18 @@ their incident edges are tombstoned in the same phase. It does not set
 `recompute_levels` puts every unit without a live input edge at level 0. It is
 not gated by `structural_interval`, it disables prune fusion, and it is
 refused under Scheme-A sharding (`NotImplementedError`).
-`Network.max_levels` (default 1024) bounds the unit levels unit addition may
-assign.
+`Network.add_unit` (requires the capacity) runs after `prune_conn`, gated by
+`structural_interval`: every unit live at the phase start whose `spawn` fires
+is a parent, and the k-th parent by ascending id takes the k-th lowest
+`PRUNED` slot (ids pruned earlier in the step included); a parent past the
+last free slot is dropped and sets `state.unit_overflow`. The child slot is
+reset to its defaults, marked live, given the level
+`clamp(level(parent) + offset, 1, max_levels - 1)` (`Network.max_levels`,
+default 1024), then `init` writes it. Children are not parents in their own
+step. The phase sets `state.units_added` (which the `"on_units_added"` growth
+trigger reads in the same step) and leaves `needs_resort` alone; the child's
+level is provisional until the next resort. It is refused under Scheme-A
+sharding (`NotImplementedError`).
 
 ### The loss contract
 
@@ -216,7 +227,7 @@ tuple of pure `state → (state, loss_contribution)` phase functions in the
 **fixed order**:
 
 ```
-forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_conn → reset_global
+forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_unit → add_conn → reset_global
 ```
 
 Each phase is appended **iff its trait slot is not `None`** (forward is
@@ -258,7 +269,7 @@ with conns/globals broadcast; the **update** reduced over the batch
 (`build_batched_update_conn`: the exact `per_sample` + `incoming_batched` pair
 if the UpdateConn declares it -- every `optim/` bundle does -- else the mean of
 the per-sample writes; both accumulate in a `fori_loop`, O(capacity) memory);
-and **structural** (prune_unit, prune_conn, add, reset) run once on `batch_mean_units`. Unit
+and **structural** (prune_unit, prune_conn, add_unit, add_conn, reset) run once on `batch_mean_units`. Unit
 columns in the state stay `(num_units,)` and hold the batch mean. PIPELINE nets
 are rejected. Measured on GPU the per-sample cost falls only ~2x from B = 1 to
 128 on the edge-list layout (each pass touches every edge once per sample);

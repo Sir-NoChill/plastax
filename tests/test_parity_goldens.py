@@ -12,10 +12,10 @@ files. Each golden names the feature set it `requires`:
   (exhaustive/shortlist/per-level shortlist/predicate scoring, every
   selection mode, the validity window, the triggers, and growth on the
   batch-mean state).
-- ``unit_lifecycle_v1``: the unit-update cases (those whose only rule is
-  ``update_unit``) are enforced. Unit pruning and addition are not implemented
-  yet; their goldens are skipped loudly below, one visible skip per file,
-  until the features land.
+- ``unit_lifecycle_v1``: the unit-update and unit-prune cases (those whose
+  only rule is ``update_unit`` or ``prune_unit``) are enforced. Unit addition
+  is not implemented yet; its goldens are skipped loudly below, one visible
+  skip per file, until the feature lands.
 
 The reference's Philox core is additionally pinned, bit for bit, to the same
 `rng_philox32.json` golden the shipped `plastax.rng` is pinned to, so the
@@ -44,7 +44,7 @@ from _plastax_cpp import plastax_cpp_dir  # noqa: E402
 _GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "golden"
 _IMPLEMENTED = {"passes_v1", "loss_v1"}
 _SPEC_ONLY = {
-    "unit_lifecycle_v1": "unit pruning and addition are not implemented",
+    "unit_lifecycle_v1": "unit addition is not implemented",
     "growth_v2": "no consumer covers this growth_v2 case",
 }
 # growth_v2 propose cases (enforced by test_grow_propose_golden).
@@ -62,13 +62,14 @@ _ENFORCED_SCORE = {
     and "score" in json.loads(path.read_text())["rules"]
 }
 
-# unit_lifecycle_v1 update cases (enforced by test_unit_update_golden): every
-# one whose only rule is update_unit, discovered like the score cases.
+# unit_lifecycle_v1 update and prune cases (enforced by
+# test_unit_lifecycle_golden): every one whose only rule is update_unit or
+# prune_unit, discovered like the score cases.
 _ENFORCED_UNIT = {
     path.stem
     for path in sorted(_GOLDEN_DIR.glob("unit_*.json"))
     if json.loads(path.read_text()).get("requires") == "unit_lifecycle_v1"
-    and set(json.loads(path.read_text())["rules"]) == {"update_unit"}
+    and set(json.loads(path.read_text())["rules"]) in ({"update_unit"}, {"prune_unit"})
 }
 
 
@@ -354,7 +355,7 @@ def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) ->
         return
     assert requires in _SPEC_ONLY, f"unknown requires tag {requires!r} in {path.name}"
     if doc["name"] in _ENFORCED_GROWTH | _ENFORCED_SCORE | _ENFORCED_UNIT:
-        return  # consumed by the test_grow_* / test_unit_update_golden tests
+        return  # consumed by the test_grow_* / test_unit_lifecycle_golden tests
     pytest.skip(f"{doc['name']}: {_SPEC_ONLY[requires]} ({requires})")
 
 
@@ -774,7 +775,7 @@ def test_grow_score_golden(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# unit_lifecycle_v1, update cases: the real update_unit phase, exactly.
+# unit_lifecycle_v1, update and prune cases: the real unit phase, exactly.
 # ---------------------------------------------------------------------------
 
 
@@ -787,30 +788,40 @@ class _UnitUpdateV1(px.UpdateUnit[None]):
         return px.UnitWrite.of((px.ACTIVATION, u[px.ACTIVATION, i] + 0.125))
 
 
-@pytest.mark.parametrize("name", sorted(_ENFORCED_UNIT))
-def test_unit_update_golden(name: str) -> None:
-    """The update_unit phase reproduces the reference unit state exactly."""
-    import dataclasses
+class _UnitPruneV1(px.PruneUnit[None]):
+    """unit_prune_v1: prune iff activation < -1/2."""
 
-    from plastax.phases import build_update_unit_phase
+    def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
+        """Select a unit whose activation is below -1/2."""
+        del g
+        return u[px.ACTIVATION, i] < jnp.float32(-0.5)
 
-    doc = _load(f"{name}.json")
-    assert doc["rules"] == {"update_unit": "unit_update_v1"}
-    assert doc["field_defaults"] == {px.ACTIVATION.name: 0.0}
-    units = doc["initial_units"]
-    n = len(units)
+
+def _unit_golden_net(doc: dict[str, Any]) -> type[px.Network[None]]:
+    rules = doc["rules"]
 
     class _Net(px.Network[None]):
         forward_pass = ReluForward()
-        update_unit = _UnitUpdateV1()
+        update_unit = _UnitUpdateV1() if "update_unit" in rules else None
+        prune_unit = _UnitPruneV1() if "prune_unit" in rules else None
         unit_capacity = int(doc["capacity"])
         max_levels = int(doc["max_levels"])
         propagation = px.Propagation.TOPOLOGICAL
 
+    return _Net
+
+
+def _unit_golden_state(
+    net: type[px.Network[None]], doc: dict[str, Any]
+) -> tuple[px.NetworkStatic, Any]:
+    """Build the golden's initial network, units' fields and flags included."""
+    import dataclasses
+
+    units = doc["initial_units"]
     edges = doc["initial_edges"]
     static, state = px.NetworkBuilder.from_edges(
-        _Net,
-        n,
+        net,
+        len(units),
         np.asarray([e["src"] for e in edges], dtype=np.int32),
         np.asarray([e["dst"] for e in edges], dtype=np.int32),
         weights=np.asarray([e["fields"]["weight"] for e in edges], dtype=np.float32),
@@ -819,8 +830,8 @@ def test_unit_update_golden(name: str) -> None:
         globals_=None,
     )
     assert static.num_units == doc["capacity"]
-    # The golden's allocated slots carry their own field values and pruned
-    # flags (the builder cannot mark an allocated unit pruned).
+    # The golden's allocated slots carry their own field values, levels and
+    # pruned flags (the builder cannot mark an allocated unit pruned).
     ids = jnp.asarray([u["id"] for u in units], jnp.int32)
     cols = dict(state.units)
     cols[px.ACTIVATION.name] = (
@@ -836,24 +847,53 @@ def test_unit_update_golden(name: str) -> None:
         .at[ids]
         .set(jnp.asarray([u["level"] for u in units], jnp.int32))
     )
-    state = dataclasses.replace(state, units=cols)
-    before = np.asarray(state.units[px.ACTIVATION.name]).copy()
+    return static, dataclasses.replace(state, units=cols)
 
-    phase = build_update_unit_phase(_Net, static)
-    new_state, _ = phase(state, px.StepInputs(inputs=jnp.zeros((0,)), targets=None))
+
+@pytest.mark.parametrize("name", sorted(_ENFORCED_UNIT))
+def test_unit_lifecycle_golden(name: str) -> None:
+    """The unit phase reproduces the reference units and edges exactly."""
+    from plastax.phases import build_prune_unit_phase, build_update_unit_phase
+
+    doc = _load(f"{name}.json")
+    assert doc["rules"] in (
+        {"update_unit": "unit_update_v1"},
+        {"prune_unit": "unit_prune_v1"},
+    )
+    assert doc["field_defaults"] == {px.ACTIVATION.name: 0.0}
+    n = len(doc["initial_units"])
+    net = _unit_golden_net(doc)
+    static, state = _unit_golden_state(net, doc)
+    before = {k: np.asarray(v).copy() for k, v in state.units.items()}
+
+    build = (
+        build_update_unit_phase
+        if "update_unit" in doc["rules"]
+        else build_prune_unit_phase
+    )
+    new_state, _ = build(net, static)(
+        state, px.StepInputs(inputs=jnp.zeros((0,)), targets=None)
+    )
 
     act = np.asarray(new_state.units[px.ACTIVATION.name])
     pruned = np.asarray(new_state.units[px.PRUNED.name])
+    level = np.asarray(new_state.units[px.LEVEL.name])
     for want in doc["expect"]["units"]:
         uid = want["id"]
         assert act[uid] == want["fields"]["activation"], f"unit {uid} activation"
         assert bool(pruned[uid]) == want["pruned"], f"unit {uid} pruned"
+        assert level[uid] == want["level"], f"unit {uid} level"
+    newly = np.flatnonzero(pruned & ~before[px.PRUNED.name]).tolist()
+    assert newly == doc["expect"]["pruned"]
     # The never-allocated slots are free and untouched.
     assert pruned[n:].all()
-    np.testing.assert_array_equal(act[n:], before[n:])
-    assert doc["expect"]["pruned"] == []
+    for col, old in before.items():
+        np.testing.assert_array_equal(
+            np.asarray(new_state.units[col])[n:], old[n:], err_msg=col
+        )
     want_edges = sorted(
         (int(e["src"]), int(e["dst"]), float(e["fields"]["weight"]))
         for e in doc["expect"]["edges"]
     )
     assert _live_pairs(new_state) == want_edges
+    assert not bool(new_state.needs_resort)

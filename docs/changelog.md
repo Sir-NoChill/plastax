@@ -33,8 +33,48 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   now checks docstrings with pydoclint and builds the docs with warnings as
   errors.
 
+- Growth-rule knobs shared by `ScoreAddConn` and `ProposeAddConn`:
+  `selection` ("top_k" default, "threshold" with a per-step `threshold(g)`,
+  "all"), `max_new_per_step` (a cap across source levels, level-ascending),
+  `direction` ("any" default, "deeper", "same_or_deeper"),
+  `allow_self_loops` (default off), `trigger` ("every_step" default,
+  `("every", n)`, "on_units_added", or "when" with a `when(g)` method) and
+  `on_overflow` ("flag" default, or "error" to raise). Combinations are
+  validated when the `Network` subclass is defined.
+- `ScoreAddConn.candidates`: "exhaustive" (default), "shortlist" (the M x M
+  grid of the top-`shortlist_size` units by `importance`) or
+  "shortlist_per_level" (per source level: its top-M sources x the top-M
+  destinations its validity window admits; topological only).
+- `predicate_add_conn(should_add, init, **knobs)` adapts a boolean predicate
+  to a `ScoreAddConn` (True grows, False vetoes; `selection = "all"`,
+  `dedupe_step = True`).
+- `NetworkState.grown` (connections the step's growth committed),
+  `NetworkState.overflow` (whether it dropped any for lack of capacity) and
+  `NetworkState.units_added` (0 until the unit lifecycle lands).
+- `Network.structural_interval` (default 1) runs the structural phases
+  (pruning and growth) only on every n-th step.
+- All growth_v2 conformance goldens are enforced: scoring, selection, the
+  validity window, triggers and growth on the batch-mean state.
+
 ### Changed
 
+- **Breaking:** `AddConn` is renamed `ScoreAddConn`, and growth rules
+  declare `max_new_per_level` instead of `max_candidates` (including the
+  examples' `make_net(max_new_per_level=...)`). The shortlist attributes are
+  now `candidates = "shortlist"` / `"shortlist_per_level"` with
+  `shortlist_size`, replacing `max_candidate_units` and
+  `shortlist_per_level = True`. Setting a removed name raises a `TypeError`
+  naming its replacement.
+- **Breaking:** score rules no longer deduplicate by default. The single
+  `dedupe` flag (default on) is replaced by `dedupe_live` and `dedupe_step`,
+  both defaulting off as on the propose path, so a score rule regrows live
+  edges as parallel edges unless it sets `dedupe_live = True`.
+- **Breaking:** the per-level shortlist's destination pool is the rule's
+  validity window (gap and `direction`) rather than strictly deeper units; a
+  rule that relied on the old pool declares `direction = "deeper"`.
+- Growth selection commits in the total order even when the budget equals
+  the candidate pool. Previously such a step committed in candidate order,
+  which decided which candidates an overflowing bucket dropped.
 - **Breaking:** `ProposeAddConn` declares who proposes. Rules carry a
   `proposer` ("per_unit" — the default — "per_connection", or "global"), and
   `propose` takes the proposer-specific signature with a counter-based `rng`
@@ -119,7 +159,7 @@ readiness.
   destination-sorted; scatter-adds no longer serialise on one destination
   (GPU forward up to 3.3x faster). Results change only in float summation
   order.
-- `Network.add_conn` is typed `AddConn | ProposeAddConn | None`.
+- `Network.add_conn` is typed `AddConn | ProposeAddConn | None` (since renamed `ScoreAddConn`).
 - `topo.resort` keeps the build's headroom and never shrinks a carried-over
   bucket.
 - No sweep passes a sorted-segment hint any more (`indices_are_sorted`).

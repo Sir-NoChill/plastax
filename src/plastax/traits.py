@@ -405,6 +405,64 @@ class PruneUnit[GS](Protocol):
 
 
 @runtime_checkable
+class AddUnit[GS](Protocol):
+    """Unit addition policy: live units spawn children into free slots.
+
+    `spawn` is evaluated, on the state as it stands before the phase, for
+    every unit live at the start of the phase, inputs and outputs included.
+    Each parent spawns at most one child per step, and the parents that spawn
+    are served in ascending id order: the i-th one receives the i-th lowest
+    free slot id. The free slots are every slot holding no live unit, so the
+    ids pruned earlier in the same step are reused before the never-allocated
+    ones above them. A spawn with no free slot left is dropped and raises
+    `NetworkState.unit_overflow`. Children are not parents in the step that
+    creates them.
+
+    A child slot starts at its declared column defaults, live, at level
+    ``clamp(level(parent) + offset, 1, max_levels - 1)``; `init` then writes
+    its fields. The child has no connections until growth adds them, and its
+    level is provisional until the next resort recomputes the levels from the
+    live edges. The phase runs after connection pruning and before growth,
+    gated by `Network.structural_interval`, and under a batched step it runs
+    once on the batch-mean unit state. It requires `Network.unit_capacity`.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
+
+    def spawn(
+        self, u: UnitView, parent: UnitIdx, g: GS
+    ) -> tuple[Bool[Array, ""], Int32[Array, ""]]:
+        """Decide whether one live unit spawns a child.
+
+        Args:
+            u: the unit view, before the phase.
+            parent: index of the candidate parent.
+            g: the global state.
+
+        Returns:
+            A scalar bool, True to spawn, and the child's level offset from
+            the parent's level.
+        """
+        ...
+
+    def init(self, u: UnitView, child: UnitIdx, parent: UnitIdx, g: GS) -> UnitWrite:
+        """Write a new child's fields.
+
+        Args:
+            u: the unit view, with the child's slot at its column defaults
+                and its assigned level.
+            child: index of the child's slot.
+            parent: index of the parent.
+            g: the global state.
+
+        Returns:
+            The child's fields; unwritten fields keep their defaults.
+        """
+        ...
+
+
+@runtime_checkable
 class ScoreAddConn[GS](Protocol):
     """Connection growth policy: scored candidates through the shared pipeline.
 
@@ -650,6 +708,8 @@ class Network[GS]:
         prune_unit: the unit pruning policy, or None to elide it. Requires
             `unit_capacity`.
         prune_conn: the connection pruning policy, or None to elide it.
+        add_unit: the unit addition policy, or None to elide it. Requires
+            `unit_capacity`.
         add_conn: the connection growth policy, or None to elide it.
         reset_global: the global-state reset policy, or None to elide it.
         extra_unit_fields: extra per-unit fields beyond the builtin ones.
@@ -659,12 +719,12 @@ class Network[GS]:
         sharding: Scheme-A sharding config, or None for a single device.
         seed: the network seed keying the framework's counter-based RNG
             (`plastax.rng`); identical seeds give identical draw streams.
-        structural_interval: run the structural phases (connection pruning
-            and growth) only every this many steps -- ``step % n == 0`` fires
-            them. Default 1 (every step, the historical behavior). The
-            growth rule's own ``trigger`` composes on top: both gates must
-            pass for growth to run. Unit pruning is not gated: it runs every
-            step, as in plastax-cpp.
+        structural_interval: run the structural phases (connection pruning,
+            unit addition and growth) only every this many steps --
+            ``step % n == 0`` fires them. Default 1 (every step, the
+            historical behavior). The growth rule's own ``trigger``
+            composes on top: both gates must pass for growth to run. Unit
+            pruning is not gated: it runs every step, as in plastax-cpp.
         unit_capacity: the number of unit slots, or None (the default) for
             exactly the built unit count. A capacity sizes every unit column
             to that many slots and adds the built-in `PRUNED` column: the
@@ -673,9 +733,8 @@ class Network[GS]:
             apply and by connection growth, and keeps its field defaults.
             Input and output units are always built units and are never
             pruned.
-        max_levels: the unit-level bound: ``max_levels - 1`` is the deepest
-            level unit addition may assign. Default 1024, the C++ library's
-            bound.
+        max_levels: the unit-level bound: a child unit's level is clamped to
+            ``[1, max_levels - 1]``. Default 1024, the C++ library's bound.
     """
 
     forward_pass: ForwardPass[object, GS]
@@ -685,6 +744,7 @@ class Network[GS]:
     update_conn: UpdateConn[GS] | None = None
     prune_unit: PruneUnit[GS] | None = None
     prune_conn: PruneConn[GS] | None = None
+    add_unit: AddUnit[GS] | None = None
     add_conn: ScoreAddConn[GS] | ProposeAddConn[GS] | None = None
     reset_global: ResetGlobal[GS] | None = None
 
@@ -889,6 +949,12 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.prune_conn must satisfy PruneConn; got {cls.prune_conn!r}"
         )
 
+    if cls.add_unit is not None and not isinstance(cls.add_unit, AddUnit):
+        raise TypeError(
+            f"{cls.__name__}.add_unit must satisfy AddUnit (spawn, init); "
+            f"got {cls.add_unit!r}"
+        )
+
     interval: object = getattr(cls, "structural_interval", 1)
     if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
         raise TypeError(
@@ -922,15 +988,15 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
 
 
 def _validate_unit_slots(cls: type[Network[Any]]) -> None:
-    """Check `unit_capacity`, `max_levels` and unit pruning at class definition.
+    """Check `unit_capacity`, `max_levels` and the unit lifecycle slots.
 
     Args:
         cls: the Network subclass being validated (for error messages).
 
     Raises:
         TypeError: if `unit_capacity` is neither None nor an int >= 1,
-            `max_levels` is not an int >= 2, or `prune_unit` is declared
-            without a `unit_capacity`.
+            `max_levels` is not an int >= 2, or `prune_unit` or `add_unit` is
+            declared without a `unit_capacity`.
     """
     capacity: object = getattr(cls, "unit_capacity", None)
     if capacity is not None and (
@@ -945,7 +1011,12 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.prune_unit requires a unit_capacity: the `PRUNED` "
             "column that marks pruned units exists only with one"
         )
-    reject_sharded_unit_pruning(cls, cls.sharding)
+    if cls.add_unit is not None and capacity is None:
+        raise TypeError(
+            f"{cls.__name__}.add_unit requires a unit_capacity: children are "
+            "placed in the free unit slots, which exist only with one"
+        )
+    reject_sharded_unit_lifecycle(cls, cls.sharding)
     max_levels: object = getattr(cls, "max_levels", 1024)
     if (
         not isinstance(max_levels, int)
@@ -957,25 +1028,33 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
         )
 
 
-def reject_sharded_unit_pruning(
+def reject_sharded_unit_lifecycle(
     net: type[Network[Any]], sharding: ShardSpec | None
 ) -> None:
-    """Refuse a network that prunes units under Scheme-A sharding.
+    """Refuse a network that prunes or adds units under Scheme-A sharding.
 
     Units are replicated, but pruning one tombstones its connections in the
-    sharded connection arenas, and that path is not designed yet.
+    sharded connection arenas, and placing a child in a free slot raises the
+    same question of how the shards stay balanced; neither path is designed
+    yet.
 
     Args:
         net: the Network subclass (for the check and error messages).
         sharding: the sharding the network is defined or built with.
 
     Raises:
-        NotImplementedError: if `net` declares `prune_unit` and `sharding` is
-            set.
+        NotImplementedError: if `net` declares `prune_unit` or `add_unit` and
+            `sharding` is set.
     """
-    if sharding is not None and net.prune_unit is not None:
+    if sharding is None:
+        return
+    if net.prune_unit is not None:
         raise NotImplementedError(
             f"{net.__name__}: unit pruning under sharding is not supported yet"
+        )
+    if net.add_unit is not None:
+        raise NotImplementedError(
+            f"{net.__name__}: unit addition under sharding is not supported yet"
         )
 
 

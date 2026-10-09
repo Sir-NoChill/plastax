@@ -27,6 +27,7 @@ from plastax.phases import (
 from plastax.state import NetworkState, NetworkStatic, make_empty_state
 from plastax.step import StepResult, make_step
 from plastax.traits import (
+    AddUnit,
     BackwardPass,
     ForwardPass,
     Loss,
@@ -46,6 +47,7 @@ from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 __all__ = [
     "ACTIVATION",
+    "AddUnit",
     "ScoreAddConn",
     "BackwardPass",
     "ConnIdx",

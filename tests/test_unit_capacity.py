@@ -89,11 +89,7 @@ class OffsetBackward(px.BackwardPass):
 
 
 class HalfSquaredLoss(px.Loss):
-    """sum(0.5 * (activation - target)^2) over the live outputs.
-
-    The seed is the difference at every output, masked or not, so it is the
-    framework that must keep a masked output's seed column untouched.
-    """
+    """sum(0.5 * (activation - target)^2), seeding the difference."""
 
     seed_field = LOSS_GRAD
 
@@ -102,11 +98,7 @@ class HalfSquaredLoss(px.Loss):
     ) -> tuple[jax.Array, jax.Array]:
         del g
         diff = u.gather(px.ACTIVATION, outputs) - targets
-        terms = jnp.float32(0.5) * diff * diff
-        live = u.live(outputs)
-        if live is not None:
-            terms = jnp.where(live, terms, jnp.zeros_like(terms))
-        return jnp.sum(terms), diff
+        return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
 class DeltaRule(px.UpdateConn):
@@ -298,6 +290,17 @@ def test_capacity_equal_to_the_unit_count_has_no_free_slot() -> None:
     assert not np.asarray(state.units[px.PRUNED.name]).any()
 
 
+@pytest.mark.parametrize("io", ["input", "output"])
+def test_inputs_and_outputs_must_be_built_units(io: str) -> None:
+    """A free slot (id >= the built count) can be neither input nor output."""
+    ids = {"input_ids": _INPUTS, "output_ids": _OUTPUTS}
+    ids[f"{io}_ids"] = (*ids[f"{io}_ids"], _N)  # the first free slot
+    with pytest.raises(ValueError, match="unit id 6 out of range"):
+        px.NetworkBuilder.from_edges(
+            _net(capacity=8), _N, _SRC, _DST, weights=_W, globals_=None, **ids
+        )
+
+
 def test_capacity_below_the_unit_count_is_rejected() -> None:
     with pytest.raises(ValueError, match="unit_capacity 5 is below the 6 built"):
         _build(_net(capacity=5))
@@ -400,72 +403,6 @@ def test_masked_units_take_no_part_in_forward_and_backward(
     # The isolated-but-live unit 3 of the reference is applied.
     assert float(plain.units[APPLIED.name][3]) == 1.0
     assert float(plain.units[GRAD.name][3]) != 0.0
-
-
-def test_a_masked_output_adds_no_loss() -> None:
-    """An output slot holding no live unit contributes no loss term."""
-    net = _net(capacity=8)
-    static, state = _build(net)
-    state = _kill_unit(state, 5, prune=True)
-    result = px.make_step(net, static)(state, _inputs())
-    act = np.asarray(result.state.units[px.ACTIVATION.name])
-    loss_grad = np.asarray(result.state.units[LOSS_GRAD.name])
-    want = np.float32(0.5) * np.float32(act[4] - np.float32(0.25)) ** 2
-    assert float(result.loss) == float(want)
-    assert loss_grad[5] == 0.0
-    assert loss_grad[4] == act[4] - np.float32(0.25)
-
-
-class _SoftmaxNet(px.Network[None]):
-    forward_pass = OffsetForward()
-    loss = px.SoftmaxCrossEntropyLoss(seed_field=LOSS_GRAD)
-    extra_unit_fields = (LOSS_GRAD, APPLIED)
-    unit_capacity = 6
-
-
-def test_softmax_cross_entropy_leaves_a_masked_output_out() -> None:
-    """A masked output is out of the normalisation, the loss and the seed.
-
-    Inputs 0, 1 feed outputs 2, 3, 4; output 4 is masked. The loss and seed
-    must be the softmax cross-entropy over outputs 2 and 3 alone.
-    """
-    src = np.asarray([0, 1, 0, 1, 0, 1], np.int32)
-    dst = np.asarray([2, 2, 3, 3, 4, 4], np.int32)
-    w = np.asarray([0.5, -0.25, 1.5, 0.75, 2.0, 1.0], np.float32)
-    static, state = px.NetworkBuilder.from_edges(
-        _SoftmaxNet,
-        5,
-        src,
-        dst,
-        weights=w,
-        input_ids=(0, 1),
-        output_ids=(2, 3, 4),
-        globals_=None,
-    )
-    state = _kill_unit(state, 4, prune=True)
-    targets = np.asarray([0.25, 0.75, 0.5], np.float32)
-    result = px.make_step(_SoftmaxNet, static)(
-        state,
-        px.StepInputs(
-            inputs=jnp.asarray([0.5, -1.0], jnp.float32), targets=jnp.asarray(targets)
-        ),
-    )
-    act = np.asarray(result.state.units[px.ACTIVATION.name])
-    seed = np.asarray(result.state.units[LOSS_GRAD.name])
-    assert act[4] == 0.0  # masked: never applied
-    logits = act[[2, 3]].astype(np.float64)
-    z = logits - logits.max()
-    total = np.exp(z).sum()
-    t = targets[:2].astype(np.float64)
-    want_loss = float(np.sum(t * (np.log(total) - z)))
-    np.testing.assert_allclose(float(result.loss), want_loss, rtol=1e-6)
-    np.testing.assert_allclose(seed[[2, 3]], np.exp(z) / total - t, rtol=1e-6)
-    assert seed[4] == 0.0
-    # Not vacuous: output 4's logit (0, its default) and target would change
-    # both numbers if it took part.
-    z3 = np.asarray([*logits, 0.0]) - max(*logits, 0.0)
-    with_masked = float(np.sum(targets * (np.log(np.exp(z3).sum()) - z3)))
-    assert abs(with_masked - want_loss) > 1e-3
 
 
 # ---------------------------------------------------------------------------

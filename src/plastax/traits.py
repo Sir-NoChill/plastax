@@ -166,11 +166,6 @@ class Loss[GS](Protocol):
     picks the seed up from `seed_field` (the output level's own `acc` is the
     identity, since no edge sources from the deepest level).
 
-    With a unit capacity (`Network.unit_capacity`) an output slot may hold no
-    live unit. The framework never writes such an output's seed, and the
-    policy must leave it out of the loss: `u.live(outputs)` gives the live
-    flags, or None when every slot is live.
-
     Type Args:
         GS: the global state type threaded through the network.
 
@@ -220,10 +215,6 @@ class SoftmaxCrossEntropyLoss:
     float32 (max, then the shifted exponentials and their sum, then the
     per-output quotient and the target-weighted log-sum-exp).
 
-    An output slot holding no live unit (`UnitView.live`) takes no part: it is
-    left out of the max and the normalising sum, its target is ignored, and
-    its seed is 0. The softmax is then over the live outputs alone.
-
     Attributes:
         seed_field: the unit column the gradient seed is written to.
     """
@@ -250,23 +241,11 @@ class SoftmaxCrossEntropyLoss:
         """
         del g
         logits = u.gather(ACTIVATION, outputs)
-        live = u.live(outputs)
-        if live is None:
-            z = logits - jnp.max(logits)
-            shifted = jnp.exp(z)
-            total = jnp.sum(shifted)
-            seed = shifted / total - targets
-            loss = jnp.sum(targets * (jnp.log(total) - z))
-            return loss, seed
-        zero = jnp.zeros_like(logits)
-        z = jnp.where(live, logits - jnp.max(jnp.where(live, logits, -jnp.inf)), zero)
-        shifted = jnp.where(live, jnp.exp(z), zero)
-        # >= 1 whenever an output is live (its max term is exp(0)); the floor
-        # only keeps an all-masked output set finite.
-        total = jnp.maximum(jnp.sum(shifted), jnp.float32(1.0))
-        t = jnp.where(live, targets, zero)
-        seed = jnp.where(live, shifted / total - t, zero)
-        loss = jnp.sum(t * (jnp.log(total) - z))
+        z = logits - jnp.max(logits)
+        shifted = jnp.exp(z)
+        total = jnp.sum(shifted)
+        seed = shifted / total - targets
+        loss = jnp.sum(targets * (jnp.log(total) - z))
         return loss, seed
 
 
@@ -656,8 +635,9 @@ class Network[GS]:
             to that many slots and adds the built-in `PRUNED` column: the
             built units are live and the slots above them are free (marked
             pruned). A slot that holds no live unit is skipped by every pass's
-            apply, by the loss and by connection growth, and keeps its field
-            defaults.
+            apply and by connection growth, and keeps its field defaults.
+            Input and output units are always built units and are never
+            pruned.
         max_levels: the unit-level bound: ``max_levels - 1`` is the deepest
             level unit addition may assign. Default 1024, the C++ library's
             bound.

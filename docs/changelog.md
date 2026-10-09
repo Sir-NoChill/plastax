@@ -56,10 +56,9 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 - `Network.unit_capacity` (default None): the number of unit slots. The built
   units are live and the slots above them are free, marked in the new
   built-in `PRUNED` unit column. A slot holding no live unit is skipped by
-  every pass's apply, gets no loss seed and takes no part in growth;
-  `UnitView.live` lets a loss leave it out (`SoftmaxCrossEntropyLoss` drops it
-  from the normalisation). A net without
-  a capacity has no `PRUNED` column and steps exactly as before.
+  every pass's apply and takes no part in growth. Input and output units are
+  always built units and are never pruned, so the loss is unchanged. A net
+  without a capacity has no `PRUNED` column and steps exactly as before.
   `Network.max_levels` (default 1024) bounds unit levels.
 - `UpdateUnit` and the `Network.update_unit` slot: `update(u, i, g)` writes
   every live unit, inputs and outputs included, after the backward pass and

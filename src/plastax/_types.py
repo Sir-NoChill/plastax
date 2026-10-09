@@ -127,7 +127,8 @@ ACTIVATION: FieldSpec[np.float32] = FieldSpec.float32("activation")
 LEVEL: FieldSpec[np.int32] = FieldSpec.int32("level")
 # Unit-slot liveness: True for a slot that holds no live unit (never
 # allocated, or pruned). Materialized only when the network declares a unit
-# capacity; every apply, the loss and growth skip a slot it marks.
+# capacity; every apply and growth skip a slot it marks. Input and output
+# units are never pruned, so the loss always sees live outputs.
 PRUNED: FieldSpec[np.bool_] = FieldSpec.boolean("pruned", default=True)
 
 DeadMask = Bool[Array, " capacity"]

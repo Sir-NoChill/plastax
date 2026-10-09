@@ -20,6 +20,7 @@ from plastax._types import (
     DEAD,
     FROM_ID,
     LEVEL,
+    PRUNED,
     TO_ID,
     WEIGHT,
     ConnIdx,
@@ -600,6 +601,17 @@ class Network[GS]:
             them. Default 1 (every step, the historical behavior). The
             growth rule's own ``trigger`` composes on top: both gates must
             pass for growth to run.
+        unit_capacity: the number of unit slots, or None (the default) for
+            exactly the built unit count. A capacity sizes every unit column
+            to that many slots and adds the built-in `PRUNED` column: the
+            built units are live and the slots above them are free (marked
+            pruned). A slot that holds no live unit is skipped by every pass's
+            apply and by connection growth, and keeps its field defaults.
+            Input and output units are always built units and are never
+            pruned.
+        max_levels: the unit-level bound: ``max_levels - 1`` is the deepest
+            level unit addition may assign. Default 1024, the C++ library's
+            bound.
     """
 
     forward_pass: ForwardPass[object, GS]
@@ -617,6 +629,8 @@ class Network[GS]:
     sharding: ShardSpec | None = None
     seed: int = 0
     structural_interval: int = 1
+    unit_capacity: int | None = None
+    max_levels: int = 1024
 
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""
@@ -624,7 +638,15 @@ class Network[GS]:
 
 
 _RESERVED_FIELD_NAMES = frozenset(
-    {FROM_ID.name, TO_ID.name, DEAD.name, WEIGHT.name, ACTIVATION.name, LEVEL.name}
+    {
+        FROM_ID.name,
+        TO_ID.name,
+        DEAD.name,
+        WEIGHT.name,
+        ACTIVATION.name,
+        LEVEL.name,
+        PRUNED.name,
+    }
 )
 
 
@@ -795,6 +817,8 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.structural_interval must be an int >= 1; got {interval!r}"
         )
 
+    _validate_unit_slots(cls)
+
     if cls.add_conn is not None:
         grid = isinstance(cls.add_conn, ScoreAddConn)
         proposed = isinstance(cls.add_conn, ProposeAddConn)
@@ -817,6 +841,35 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         )
 
     _validate_field_names(cls)
+
+
+def _validate_unit_slots(cls: type[Network[Any]]) -> None:
+    """Check `unit_capacity` and `max_levels` at class definition.
+
+    Args:
+        cls: the Network subclass being validated (for error messages).
+
+    Raises:
+        TypeError: if `unit_capacity` is neither None nor an int >= 1, or
+            `max_levels` is not an int >= 2.
+    """
+    capacity: object = getattr(cls, "unit_capacity", None)
+    if capacity is not None and (
+        not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1
+    ):
+        raise TypeError(
+            f"{cls.__name__}.unit_capacity must be None or an int >= 1; "
+            f"got {capacity!r}"
+        )
+    max_levels: object = getattr(cls, "max_levels", 1024)
+    if (
+        not isinstance(max_levels, int)
+        or isinstance(max_levels, bool)
+        or max_levels < 2
+    ):
+        raise TypeError(
+            f"{cls.__name__}.max_levels must be an int >= 2; got {max_levels!r}"
+        )
 
 
 _PROPOSE_ARITY = {

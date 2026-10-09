@@ -20,6 +20,7 @@ from plastax._types import (
     DEAD,
     FROM_ID,
     LEVEL,
+    PRUNED,
     TO_ID,
     WEIGHT,
     FieldSpec,
@@ -89,9 +90,12 @@ class NetworkBuilder[GS]:
     def __init__(self, net: type[Network[GS]], globals_: GS) -> None:
         self.net = net
         self.globals_ = globals_
+        # PRUNED (unit-slot liveness) exists only when the net declares a
+        # unit capacity, so a net without one keeps its exact column layout.
         self._unit_fields: tuple[FieldSpec[np.generic], ...] = (
             ACTIVATION,
             LEVEL,
+            *((PRUNED,) if net.unit_capacity is not None else ()),
             *net.extra_unit_fields,
         )
         self._conn_fields: tuple[FieldSpec[np.generic], ...] = (
@@ -101,11 +105,14 @@ class NetworkBuilder[GS]:
             WEIGHT,
             *net.extra_conn_fields,
         )
-        # level is derived at finalize() time (topo.initial_levels), never
-        # user-settable; from_id/to_id/dead are add_conn's positional args
-        # and derived tombstone state, not settable via **field_values.
+        # level is derived at finalize() time (topo.initial_levels) and
+        # pruned from the unit capacity, never user-settable; from_id/to_id/
+        # dead are add_conn's positional args and derived tombstone state, not
+        # settable via **field_values.
         self._settable_unit_fields: dict[str, FieldSpec[np.generic]] = {
-            spec.name: spec for spec in self._unit_fields if spec.name != LEVEL.name
+            spec.name: spec
+            for spec in self._unit_fields
+            if spec.name not in (LEVEL.name, PRUNED.name)
         }
         self._settable_conn_fields: dict[str, FieldSpec[np.generic]] = {
             spec.name: spec
@@ -200,7 +207,9 @@ class NetworkBuilder[GS]:
 
         Args:
             net: The network type to build.
-            num_units: Total unit count; ids must fall in ``[0, num_units)``.
+            num_units: The built unit count; ids must fall in
+                ``[0, num_units)``. A net declaring `Network.unit_capacity`
+                gets that many slots, the ones above `num_units` free.
             from_ids: ``(E,)`` source unit ids.
             to_ids: ``(E,)`` destination unit ids (parallel to ``from_ids``).
             weights: ``(E,)`` initial edge weights, or None for the ``WEIGHT``
@@ -235,8 +244,8 @@ class NetworkBuilder[GS]:
         Raises:
             ValueError: On mismatched array lengths, an out-of-range unit id,
                 an unknown/non-settable ``extra_conn_columns`` key, a negative
-                ``capacity_headroom``, or a bucket capacity not divisible by the
-                shard count.
+                ``capacity_headroom``, a bucket capacity not divisible by the
+                shard count, or a unit capacity below ``num_units``.
         """
         builder = cls(net, globals_)
         src_arr = np.asarray(from_ids, dtype=np.int32)
@@ -435,7 +444,8 @@ class NetworkBuilder[GS]:
         arena. `sharding` overrides ``net.sharding`` when given.
 
         Args:
-            num_units: Total unit count.
+            num_units: The built unit count (unit slots above it, up to
+                ``net.unit_capacity``, are free).
             src_arr: (E,) int32 source ids in insertion order.
             dst_arr: (E,) int32 destination ids (parallel to src_arr).
             conn_columns: Settable conn field name -> (E,) values.
@@ -455,8 +465,16 @@ class NetworkBuilder[GS]:
 
         Raises:
             ValueError: A referenced unit id or edge endpoint is out of range,
-                or a bucket capacity is not divisible by the shard count.
+                a bucket capacity is not divisible by the shard count, or the
+                unit capacity is below the built unit count.
         """
+        capacity = self.net.unit_capacity
+        num_slots = num_units if capacity is None else capacity
+        if num_slots < num_units:
+            raise ValueError(
+                f"finalize: {self.net.__name__}.unit_capacity {capacity} is below "
+                f"the {num_units} built units"
+            )
         for unit_id in (*input_ids, *output_ids):
             if not 0 <= unit_id < num_units:
                 raise ValueError(
@@ -505,12 +523,21 @@ class NetworkBuilder[GS]:
 
         unit_cols: Columns = {}
         for spec in self._unit_fields:
-            src_vals = levels if spec.name == LEVEL.name else unit_columns[spec.name]
-            host = np.asarray(src_vals, dtype=spec.dtype)
+            if spec.name == PRUNED.name:
+                host = np.arange(num_slots) >= num_units
+            else:
+                src_vals = (
+                    levels if spec.name == LEVEL.name else unit_columns[spec.name]
+                )
+                host = np.asarray(src_vals, dtype=spec.dtype)
+                if num_slots > num_units:
+                    # Free slots hold the field defaults (level 0).
+                    free = np.full((num_slots - num_units,), spec.default, spec.dtype)
+                    host = np.concatenate([host, free])
             unit_cols[spec.name] = (
                 jnp.asarray(host)
                 if repl_sharding is None
-                else _place(host, repl_sharding, (num_units,))
+                else _place(host, repl_sharding, (num_slots,))
             )
 
         if self.net.propagation is Propagation.PIPELINE:
@@ -598,7 +625,7 @@ class NetworkBuilder[GS]:
             step = _place(np.asarray(0, dtype=np.int32), repl, ())
 
         static = NetworkStatic(
-            num_units=num_units,
+            num_units=num_slots,
             propagation=self.net.propagation,
             unit_fields=self._unit_fields,
             conn_fields=self._conn_fields,

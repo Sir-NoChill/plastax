@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Int32
 
-from plastax._types import FieldSpec, Propagation, ShardSpec
+from plastax._types import PRUNED, FieldSpec, Propagation, ShardSpec
 
 
 @jax.tree_util.register_dataclass
@@ -23,7 +23,8 @@ class NetworkStatic:
     """Static network configuration.
 
     Attributes:
-        num_units: total number of units in the network.
+        num_units: number of unit slots: the unit count, or the network's
+            unit capacity when it declares one (`Network.unit_capacity`).
         propagation: propagation mode used to advance the network.
         unit_fields: field specs defining the unit column layout.
         conn_fields: field specs defining the connection column layout.
@@ -178,6 +179,43 @@ def live_conn_count[GS](state: NetworkState[GS], level: int | None = None) -> Ar
     for columns in state.conns:
         total = total + jnp.sum(~columns["dead"])
     return total
+
+
+def live_unit_mask(units: Columns) -> Bool[Array, " num_units"] | None:
+    """The unit slots that hold a live unit, or None when every slot does.
+
+    A network that declares a unit capacity carries the `PRUNED` column, and a
+    slot is live when it is not marked there. Without that column every slot
+    is a live unit, and callers skip the mask entirely, so a network without a
+    unit capacity traces no masking equations.
+
+    Args:
+        units: the unit columns (batched or not; the mask has their shape).
+
+    Returns:
+        The boolean live mask, or None when the network has no `PRUNED`
+        column.
+    """
+    pruned = units.get(PRUNED.name)
+    return None if pruned is None else ~pruned
+
+
+def live_unit_count[GS](state: NetworkState[GS]) -> Array:
+    """Count live units: every slot, minus those `PRUNED` marks.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        state: network state to count units in.
+
+    Returns:
+        Scalar int32 array with the live unit count.
+    """
+    live = live_unit_mask(state.units)
+    if live is None:
+        return jnp.asarray(next(iter(state.units.values())).shape[0], jnp.int32)
+    return jnp.sum(live, dtype=jnp.int32)
 
 
 def grow_bucket[GS](

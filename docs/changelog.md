@@ -54,6 +54,13 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   `NetworkState.units_added` (0 until the unit lifecycle lands).
 - `Network.structural_interval` (default 1) runs the structural phases
   (pruning and growth) only on every n-th step.
+- `Network.unit_capacity` (default None): the number of unit slots. The built
+  units are live and the slots above them are free, marked in the new
+  built-in `PRUNED` unit column. A slot holding no live unit is skipped by
+  every pass's apply and takes no part in growth. Input and output units are
+  always built units and are never pruned, so the loss is unchanged. A net
+  without a capacity has no `PRUNED` column and steps exactly as before.
+  `Network.max_levels` (default 1024) bounds unit levels.
 - All growth_v2 conformance goldens are enforced: scoring, selection, the
   validity window, triggers and growth on the batch-mean state, including
   the per-level shortlist.

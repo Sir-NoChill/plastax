@@ -31,7 +31,7 @@ from plastax._types import (
     Propagation,
     UnitIdx,
 )
-from plastax.state import Columns, NetworkState, NetworkStatic
+from plastax.state import Columns, NetworkState, NetworkStatic, live_unit_mask
 from plastax.sweep import (
     build_backward_accumulate,
     build_backward_apply,
@@ -2045,6 +2045,9 @@ def build_fused_forward_prune_phase[GS](
         else:
             level = units[LEVEL.name]
             finalized = (level >= 1) & (level <= num_levels) & not_input
+        live = live_unit_mask(units)
+        if live is not None:
+            finalized = finalized & live
         acc0 = identity_accumulator(fp.combine, num_units)
         u_view = UnitView(units)
 
@@ -3214,9 +3217,9 @@ def candidates_propose_per_unit[GS](
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Per-unit proposals: units x P candidates, order index = i * P + j.
 
-    Every unit slot proposes (there is no unit pruning yet, so every slot is
-    live); the flat candidate position `i * P + j` is the deterministic total
-    order's candidate index.
+    Every unit slot proposes (the growth phase vetoes the proposals of a slot
+    holding no live unit); the flat candidate position `i * P + j` is the
+    deterministic total order's candidate index.
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -3650,7 +3653,9 @@ def build_add_conn_phase[GS](
     framework scores every invalid candidate -inf, and a growth policy returns
     -inf to veto one it must never grow (e.g. a non-deeper edge) -- so a bucket
     with more free slots than finite-scored candidates leaves the surplus empty
-    rather than back-filling with vetoed edges.
+    rather than back-filling with vetoed edges. With a unit capacity
+    (`Network.unit_capacity`), both endpoints must be live units: a slot
+    holding none is never a candidate, a proposer, or shortlisted.
 
     Free slots are claimed in candidate order over each bucket's own `dead`
     mask: the rank-th growable candidate lands in the rank-th free slot, in
@@ -3801,6 +3806,17 @@ def build_add_conn_phase[GS](
         g = state.globals_
         u_view = UnitView(units)
         unit_level = units[LEVEL.name]
+        # Growth connects live units only: a slot holding none never ranks in
+        # a shortlist, never proposes, and is never a candidate endpoint.
+        live = live_unit_mask(units)
+
+        def ranked_importance() -> jax.Array:
+            assert importance_fn is not None  # only called when shortlisting
+            imp = importance_scores(importance_fn, u_view, g, num_units)
+            if live is None:
+                return imp
+            return jnp.where(live, imp, -jnp.inf)
+
         # Per-level shortlisting draws each bucket its own grid in the loop
         # below; every other mode reuses this one global grid. Its per-bucket
         # window (`apply_validity`) is also computed in the loop, cheap on the
@@ -3808,11 +3824,7 @@ def build_add_conn_phase[GS](
         # two branches both bind flat_src/flat_dst; when per-level it is the
         # (small) top-M grid and goes unused, dead-code-eliminated -- never the
         # num_units^2 full grid.
-        if use_per_level:
-            assert importance_fn is not None  # use_per_level implies it is set
-            imp = importance_scores(importance_fn, u_view, g, num_units)
-        else:
-            imp = None
+        imp = ranked_importance() if use_per_level else None
         if isinstance(ac, ProposeAddConn):
             # The proposals are this step's global candidate list: computed
             # once, filtered per bucket in the loop. The flat layout is the
@@ -3828,6 +3840,10 @@ def build_add_conn_phase[GS](
                     seed=static.seed,
                     step=state.step,
                 )
+                if live is not None:
+                    in_range = in_range & jnp.repeat(
+                        live, num_proposals, total_repeat_length=in_range.shape[0]
+                    )
             elif proposer == "per_connection":
                 global_src, global_dst, p_score, in_range = candidates_propose_per_conn(
                     ac.propose,
@@ -3852,9 +3868,8 @@ def build_add_conn_phase[GS](
                     step=state.step,
                 )
         elif use_shortlist:
-            assert importance_fn is not None  # use_shortlist implies it is set
             global_src, global_dst = candidates_shortlist(
-                importance_scores(importance_fn, u_view, g, num_units), pool_side
+                ranked_importance(), pool_side
             )
         else:
             global_src, global_dst = candidates_grid(num_units)
@@ -3893,6 +3908,8 @@ def build_add_conn_phase[GS](
             )
             if use_propose:
                 valid = valid & in_range
+            if live is not None:
+                valid = valid & live[flat_src] & live[flat_dst]
             if ded_live:
                 valid = valid & dedupe_live(
                     bucket_conns, flat_src, flat_dst, num_units, shard_axis

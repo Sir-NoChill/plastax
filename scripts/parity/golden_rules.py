@@ -7,7 +7,11 @@ change its semantics in place -- a semantic change is a new version, new
 goldens, and a deliberate commit.
 
 All scores, weights and field values are integers or dyadic fractions, so
-float32 arithmetic on them is exact and goldens compare with ``==``.
+float32 arithmetic on them is exact and goldens compare with ``==``. The
+softmax cross-entropy goldens keep that property by construction: every
+shifted logit is 0 or far enough below the maximum that its exponential
+underflows to exactly 0, and every loss is insensitive to the last bits of
+the logarithm (emit.py checks both).
 """
 
 from __future__ import annotations
@@ -31,6 +35,20 @@ def dyadic_weight_v1(src: int, dst: int) -> float:
 # combine = sum, apply: grad_pre_act = (acc + loss_grad) * [act > 0].
 
 RELU_MLP_V1 = "relu_mlp_v1"
+
+
+# --- loss --------------------------------------------------------------------
+# linear_v1: forward map = w * act_src, combine = sum, apply = identity.
+# softmax_ce_v1: whole-output softmax cross-entropy in the max-subtracted
+# log-sum-exp form (reference.softmax_ce_loss_grad), seed staged to loss_grad.
+
+LINEAR_V1 = "linear_v1"
+SOFTMAX_CE_V1 = "softmax_ce_v1"
+
+
+def identity_weight_v1(src: int, dst: int, n_in: int) -> float:
+    """w(src, dst) = 1 if dst == src + n_in else 0: output k copies input k."""
+    return 1.0 if dst == src + n_in else 0.0
 
 
 # --- growth scores ---------------------------------------------------------

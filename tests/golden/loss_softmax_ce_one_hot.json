@@ -1,0 +1,221 @@
+{
+ "_comment": "One-hot targets, on and off the argmax: the seed is softmax - target on every output and the loss is the target's log-sum-exp margin. Compare exactly: the seed is the loss's gradient seed on each output (in output order), the loss the scalar it returns. Forward is linear_v1 over identity_weight_v1, so each output's activation is its input logit.",
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 3
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 3
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 3
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 3
+  }
+ ],
+ "name": "loss_softmax_ce_one_hot",
+ "network": {
+  "input_dim": 4,
+  "layers": [
+   4
+  ]
+ },
+ "requires": "loss_v1",
+ "rules": {
+  "forward": "linear_v1",
+  "loss": "softmax_ce_v1",
+  "weights": "identity_weight_v1"
+ },
+ "schema": "registry_v1",
+ "steps": [
+  {
+   "expect": {
+    "activations": [
+     3.0,
+     -125.0,
+     -130.0,
+     -141.0
+    ],
+    "loss": 133.0,
+    "seed": [
+     1.0,
+     0.0,
+     -1.0,
+     0.0
+    ]
+   },
+   "inputs": [
+    3.0,
+    -125.0,
+    -130.0,
+    -141.0
+   ],
+   "targets": [
+    0.0,
+    0.0,
+    1.0,
+    0.0
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     -128.0,
+     0.0,
+     -136.0,
+     -200.0
+    ],
+    "loss": 0.0,
+    "seed": [
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "inputs": [
+    -128.0,
+    0.0,
+    -136.0,
+    -200.0
+   ],
+   "targets": [
+    0.0,
+    1.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     -110.0,
+     -250.0,
+     4.0,
+     -112.0
+    ],
+    "loss": 114.0,
+    "seed": [
+     -1.0,
+     0.0,
+     1.0,
+     0.0
+    ]
+   },
+   "inputs": [
+    -110.0,
+    -250.0,
+    4.0,
+    -112.0
+   ],
+   "targets": [
+    1.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  }
+ ]
+}

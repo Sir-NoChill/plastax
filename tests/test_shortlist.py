@@ -51,7 +51,7 @@ def _nets(shortlist: int | None) -> tuple[type, type]:
         method="set",
         mode="churn",
         zeta=0.3,
-        max_candidates=grow,
+        max_new_per_level=grow,
         shortlist=shortlist,
     )
     return train, churn

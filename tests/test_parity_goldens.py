@@ -6,9 +6,12 @@ files. Each golden names the feature set it `requires`:
 
 - ``passes_v1`` runs here today, with exact float equality (every value in
   those goldens is a dyadic fraction, so float32 arithmetic on them is exact).
-- ``unit_lifecycle_v1`` and ``growth_v2`` are the specification of phases this
-  library does not implement yet; their goldens are skipped loudly below, one
-  visible skip per file, until the features land.
+- ``growth_v2`` is enforced in full: the propose cases and the score cases
+  (exhaustive/shortlist/predicate scoring, every selection mode, the
+  validity window, the triggers, and growth on the batch-mean state).
+- ``unit_lifecycle_v1`` is the specification of phases this library does not
+  implement yet; its goldens are skipped loudly below, one visible skip per
+  file, until the features land.
 
 The reference's Philox core is additionally pinned, bit for bit, to the same
 `rng_philox32.json` golden the shipped `plastax.rng` is pinned to, so the
@@ -38,18 +41,22 @@ _GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "golden"
 _IMPLEMENTED = {"passes_v1"}
 _SPEC_ONLY = {
     "unit_lifecycle_v1": "the unit lifecycle (update/prune/add) is not implemented",
-    "growth_v2": (
-        "this growth_v2 case needs selection/score/trigger semantics the "
-        "pipeline does not implement yet"
-    ),
+    "growth_v2": "no consumer covers this growth_v2 case",
 }
-# growth_v2 cases the propose pipeline implements today (enforced below);
-# the score/selection/window/trigger/batched cases stay spec-only.
+# growth_v2 propose cases (enforced by test_grow_propose_golden).
 _ENFORCED_GROWTH = {
     f"grow_propose_{kind}_{var}"
     for kind in ("per_unit", "per_conn", "global")
     for var in ("plain", "dedupe_live", "dedupe_step", "dedupe_both")
 } | {"grow_per_conn_isolated_unit_no_growth"}
+# growth_v2 score cases (enforced by test_grow_score_golden): every one whose
+# rules name a `score`, discovered so a newly emitted case cannot slip past.
+_ENFORCED_SCORE = {
+    path.stem
+    for path in sorted(_GOLDEN_DIR.glob("grow_*.json"))
+    if json.loads(path.read_text()).get("requires") == "growth_v2"
+    and "score" in json.loads(path.read_text())["rules"]
+}
 
 
 def _registry_goldens() -> list[pathlib.Path]:
@@ -256,8 +263,8 @@ def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) ->
         }, f"{doc['name']} claims {requires} but no consumer covers it"
         return
     assert requires in _SPEC_ONLY, f"unknown requires tag {requires!r} in {path.name}"
-    if doc["name"] in _ENFORCED_GROWTH:
-        return  # consumed by test_grow_propose_golden below
+    if doc["name"] in _ENFORCED_GROWTH | _ENFORCED_SCORE:
+        return  # consumed by test_grow_propose_golden / test_grow_score_golden
     pytest.skip(f"{doc['name']}: {_SPEC_ONLY[requires]} ({requires})")
 
 
@@ -290,7 +297,7 @@ def _make_propose_rule(doc: dict[str, Any], n_units: int) -> px.ProposeAddConn[N
     class _Rule(px.ProposeAddConn[None]):
         proposer = kind
         proposals_per_proposer = int(params["proposals_per_proposer"])
-        max_candidates = int(params["max_new_per_level"])
+        max_new_per_level = int(params["max_new_per_level"])
         max_level_gap = int(params["max_level_gap"])
         dedupe_live = bool(params.get("dedupe_live", False))
         dedupe_step = bool(params.get("dedupe_step", False))
@@ -397,3 +404,280 @@ def test_grow_propose_golden(name: str) -> None:
     assert grown == want, f"{name}: committed edges diverge from the reference"
     assert len(grown) == doc["expect"]["grown"]
     assert bool(new_state.needs_resort) == doc["expect"]["needs_resort"]
+
+
+# ---------------------------------------------------------------------------
+# growth_v2, score cases: the real pipeline against the reference, exactly.
+#
+# Claim domains. The reference claims into ONE domain of `free_slots` slots
+# (cx's single connection arena): the selection -- level-ascending, then the
+# total order -- is committed as a prefix, and anything beyond raises the
+# overflow flag. px claims per source-level bucket instead, so the harness
+# maps the single domain onto px's own semantics rather than onto the
+# expected answer:
+#
+# - run A (ample bucket capacity) yields px's full selection S;
+# - run B caps the step at `free_slots` through `max_new_per_step`, which is
+#   precisely the level-ascending, total-order prefix -- its commits must
+#   equal the reference's exactly, and the reference's overflow flag must
+#   equal |S| > free_slots;
+# - run C runs px's real per-bucket claim with the single domain's slots
+#   distributed the way its prefix spends them -- level L gets
+#   clamp(free_slots - |S below L|, 0, |S at L|), derived from px's own
+#   selection S, never from the expected commits -- and checks the claim's
+#   own commits and overflow flag against the reference.
+# ---------------------------------------------------------------------------
+
+
+def _grid_score_v1(src: jax.Array, dst: jax.Array) -> jax.Array:
+    """grid_score_v1: (((3*src + 5*dst) mod 17) - 8) / 8."""
+    return (((3 * src + 5 * dst) % 17) - 8).astype(jnp.float32) / jnp.float32(8.0)
+
+
+def _importance_v1(i: jax.Array) -> jax.Array:
+    """importance_v1: ((7*i) mod 13) / 4."""
+    return ((7 * i) % 13).astype(jnp.float32) / jnp.float32(4.0)
+
+
+def _make_score_rule(
+    doc: dict[str, Any], *, step_cap: int | None
+) -> px.ScoreAddConn[dict[str, jax.Array]]:
+    """The golden's registry score rule, every knob from its params."""
+    params = doc["params"]
+    rules = doc["rules"]
+    assert rules["init"] == "grow_init_v1"
+    score_rule = rules["score"]
+    assert score_rule in {"grid_score_v1", "predicate_score_v1", "score_act_v1"}
+
+    def init(
+        u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: dict[str, jax.Array]
+    ) -> px.ConnWrite:
+        del u, g
+        return px.ConnWrite.of((px.WEIGHT, _dyadic_weight_arr(src, dst)))
+
+    knobs: dict[str, Any] = {
+        "max_level_gap": int(params["max_level_gap"]),
+        "selection": params["selection"],
+        "direction": params.get("direction", "any"),
+        "allow_self_loops": bool(params.get("allow_self_loops", False)),
+        "dedupe_live": bool(params.get("dedupe_live", False)),
+        "dedupe_step": bool(params.get("dedupe_step", False)),
+    }
+    if "max_new_per_level" in params:
+        knobs["max_new_per_level"] = int(params["max_new_per_level"])
+    caps = [c for c in (params.get("max_new_per_step"), step_cap) if c is not None]
+    if caps:
+        knobs["max_new_per_step"] = int(min(caps))
+    trigger = doc.get("trigger")
+    if trigger is not None:
+        knobs["trigger"] = (
+            ("every", int(trigger["n"]))
+            if trigger["kind"] == "every"
+            else trigger["kind"]
+        )
+
+    if score_rule == "predicate_score_v1":
+        # The adapter itself is under test: True -> 0.0, False -> -inf,
+        # selection = "all", dedupe_step = True -- the golden's params must
+        # agree with the adapter's defaults rather than override them.
+        assert knobs.pop("selection") == "all"
+        assert knobs.pop("dedupe_step") is True
+
+        def should_add(
+            u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: dict[str, jax.Array]
+        ) -> jax.Array:
+            del u, g
+            return (src + dst) % 2 == 0
+
+        return px.predicate_add_conn(should_add, init, **knobs)
+
+    class _Rule:
+        if params["candidates"] == "shortlist":
+            candidates = "shortlist"
+            shortlist_size = int(params["shortlist_size"])
+
+        def score(
+            self,
+            u: px.UnitView,
+            src: px.UnitIdx,
+            dst: px.UnitIdx,
+            g: dict[str, jax.Array],
+        ) -> jax.Array:
+            del g
+            if score_rule == "score_act_v1":
+                return u[px.ACTIVATION, src] + u[px.ACTIVATION, dst]
+            return _grid_score_v1(src, dst)
+
+        def importance(
+            self, u: px.UnitView, i: px.UnitIdx, g: dict[str, jax.Array]
+        ) -> jax.Array:
+            del u, g
+            return _importance_v1(i)
+
+        def threshold(self, g: dict[str, jax.Array]) -> jax.Array:
+            return g["threshold"]
+
+        def when(self, g: dict[str, jax.Array]) -> jax.Array:
+            return g["when"]
+
+        def init(
+            self,
+            u: px.UnitView,
+            src: px.UnitIdx,
+            dst: px.UnitIdx,
+            g: dict[str, jax.Array],
+        ) -> px.ConnWrite:
+            return init(u, src, dst, g)
+
+    for key, value in knobs.items():
+        setattr(_Rule, key, value)
+    return _Rule()
+
+
+def _score_net(
+    doc: dict[str, Any], *, step_cap: int | None, free_at: dict[int, int]
+) -> tuple[Any, Any, Any]:
+    """Build the golden's network; `free_at` pins exact free-slot counts.
+
+    Every bucket is built with ample capacity. For each `free_at[L] = f`,
+    bucket L's surplus dead slots (all but the first f) are plugged with a
+    live, zero-weight self-loop on a level-L unit, leaving exactly f free
+    slots. The plug is inert to these goldens (none sets `dedupe_live`, and
+    scores read only ids and activations) and is diffed out of the commits.
+    """
+    import dataclasses
+
+    params = doc["params"]
+    units = doc["initial_units"]
+    n_units = len(units)
+    rule = _make_score_rule(doc, step_cap=step_cap)
+
+    class _Net(px.Network[dict[str, jax.Array]]):
+        forward_pass = ReluForward()
+        add_conn = rule
+        seed = int(params["network_seed"])
+        propagation = px.Propagation.TOPOLOGICAL
+
+    edges = doc["initial_edges"]
+    trigger = doc.get("trigger") or {}
+    globals_ = {
+        "threshold": jnp.float32(params.get("threshold", 0.0)),
+        "when": jnp.bool_(trigger.get("value", True)),
+    }
+    static, state = px.NetworkBuilder.from_edges(
+        _Net,
+        n_units,
+        np.asarray([e["src"] for e in edges], dtype=np.int32),
+        np.asarray([e["dst"] for e in edges], dtype=np.int32),
+        weights=np.asarray([e["fields"]["weight"] for e in edges], dtype=np.float32),
+        input_ids=[u["id"] for u in units if u["is_input"]],
+        output_ids=[u["id"] for u in units if u["is_output"]],
+        globals_=globals_,
+        capacity_headroom=4.0,
+    )
+    got_levels = np.asarray(state.units[px.LEVEL.name]).tolist()
+    for u in units:
+        assert got_levels[u["id"]] == u["level"], f"unit {u['id']} level"
+    if free_at:
+        conns = list(state.conns)
+        for lvl, free in free_at.items():
+            bucket = dict(conns[lvl])
+            dead = np.flatnonzero(np.asarray(bucket[px.DEAD.name]))
+            assert dead.size >= free, "bucket built too small to pin"
+            surplus = dead[free:]
+            plug = next(u["id"] for u in units if u["level"] == lvl)
+            plug_value = {
+                px.DEAD.name: False,
+                px.FROM_ID.name: plug,
+                px.TO_ID.name: plug,
+                px.WEIGHT.name: 0.0,
+            }
+            for name, value in plug_value.items():
+                col = np.asarray(bucket[name]).copy()
+                col[surplus] = value
+                bucket[name] = jnp.asarray(col)
+            conns[lvl] = bucket
+        state = dataclasses.replace(state, conns=tuple(conns))
+    # Growth reads the batch-mean state under batching: reduce the recorded
+    # per-sample activations with px's own batch reduction.
+    if "batch_activations" in doc:
+        from plastax.phases import batch_mean_units
+
+        per_sample = jnp.asarray(doc["batch_activations"], jnp.float32)
+        batched = {
+            name: jnp.broadcast_to(col, (per_sample.shape[0], *col.shape))
+            for name, col in state.units.items()
+        }
+        batched[px.ACTIVATION.name] = per_sample
+        state = dataclasses.replace(state, units=batch_mean_units(batched))
+    else:
+        act = jnp.asarray([u["fields"]["activation"] for u in units], dtype=jnp.float32)
+        state = dataclasses.replace(
+            state, units={**state.units, px.ACTIVATION.name: act}
+        )
+    step = int(trigger.get("step", params["step"]))
+    state = dataclasses.replace(
+        state,
+        step=jnp.int32(step),
+        units_added=jnp.int32(trigger.get("units_added_this_step", 0)),
+    )
+    return _Net, static, state
+
+
+def _grow_once(
+    doc: dict[str, Any], *, step_cap: int | None, free_at: dict[int, int]
+) -> tuple[list[tuple[int, int, float]], Any]:
+    from plastax.phases import build_add_conn_phase
+
+    net, static, state = _score_net(doc, step_cap=step_cap, free_at=free_at)
+    before = _live_pairs(state)
+    phase = build_add_conn_phase(net, static)
+    new_state, _ = phase(state, px.StepInputs(inputs=jnp.zeros((0,)), targets=None))
+    grown = sorted(_live_pairs(new_state))
+    for pair in before:
+        grown.remove(pair)
+    assert int(new_state.grown) == len(grown), "state.grown miscounts the commits"
+    return grown, new_state
+
+
+@pytest.mark.parametrize("name", sorted(_ENFORCED_SCORE))
+def test_grow_score_golden(name: str) -> None:
+    """The score pipeline reproduces the reference commit set and flags exactly."""
+    doc = _load(f"{name}.json")
+    free_slots = int(doc["params"]["free_slots"])
+    expect = doc["expect"]
+    want = sorted(
+        (
+            int(c["src"]),
+            int(c["dst"]),
+            float(np.float32((((3 * c["src"] + 5 * c["dst"]) % 16) - 8) / 8.0)),
+        )
+        for c in expect["committed"]
+    )
+    level = {u["id"]: u["level"] for u in doc["initial_units"]}
+
+    # Run A: px's whole selection, nothing capacity-bound.
+    selected, state_a = _grow_once(doc, step_cap=None, free_at={})
+    assert not bool(state_a.overflow), "ample capacity must not overflow"
+    assert (len(selected) > free_slots) == expect["conn_overflow"], (
+        f"{name}: px selected {len(selected)} for {free_slots} free slots"
+    )
+
+    # Run B: the reference's single claim domain as a step cap.
+    grown, state_b = _grow_once(doc, step_cap=free_slots, free_at={})
+    assert grown == want, f"{name}: committed edges diverge from the reference"
+    assert len(grown) == expect["grown"]
+    assert bool(state_b.needs_resort) == expect["needs_resort"]
+
+    # Run C: px's real per-bucket claim, slots spent as the prefix spends them.
+    per_level: dict[int, int] = {}
+    for s_id, _, _ in selected:
+        per_level[level[s_id]] = per_level.get(level[s_id], 0) + 1
+    free_at, left = {}, free_slots
+    for lvl in sorted(per_level):
+        free_at[lvl] = min(left, per_level[lvl])
+        left -= free_at[lvl]
+    grown_c, state_c = _grow_once(doc, step_cap=None, free_at=free_at)
+    assert grown_c == want, f"{name}: the real claim diverges"
+    assert bool(state_c.overflow) == expect["conn_overflow"]
+    assert bool(state_c.needs_resort) == expect["needs_resort"]

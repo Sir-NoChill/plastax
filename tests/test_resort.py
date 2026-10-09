@@ -1,7 +1,7 @@
 """Resort + retrace contract.
 
 recompute_levels vs host Kahn (initial_levels); resort produces sorted,
-compacted, correctly-capacitied buckets; the widened AddConn window
+compacted, correctly-capacitied buckets; the widened ScoreAddConn window
 (phases.py's build_add_conn_phase) can genuinely set needs_resort; the
 retrace-count contract: a level-preserving
 add/prune workload compiles exactly once, one resort recompiles exactly
@@ -246,16 +246,18 @@ def test_resort_redistributes_sorts_and_compacts_after_a_pruning_relevel() -> No
 
 
 # ---------------------------------------------------------------------------
-# The widened AddConn window can genuinely set needs_resort
+# The widened ScoreAddConn window can genuinely set needs_resort
 # ---------------------------------------------------------------------------
 
 
-class _SidewaysPipelineAddConn(px.AddConn[None]):
+class _SidewaysPipelineAddConn(px.ScoreAddConn[None]):
     """Only ever proposes the fixed same-source-level pair (1, 2) -- a
     candidate the add window can score (module docstring, phases.py's
     build_add_conn_phase)."""
 
-    max_candidates = 1
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+
+    max_new_per_level = 1
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -314,13 +316,15 @@ _R_ANCHOR_W = (5.0, 4.0, 3.0)
 _R_MARK = 999.0
 
 
-class _SafeAddConn(px.AddConn[None]):
+class _SafeAddConn(px.ScoreAddConn[None]):
     """Only ever proposes (SRC, dst) pairs where dst is genuinely ahead of
     src, read via the view rather than hardcoded: level-preserving by this
     POLICY's own choice, not because the (now-widened) window forbids
     anything else -- a real user policy is free to stay this conservative."""
 
-    max_candidates = 2
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+
+    max_new_per_level = 2
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -424,7 +428,7 @@ def _build_shrinking_chain() -> tuple[px.NetworkStatic, px.NetworkState[None]]:
 
 def test_one_resort_triggers_exactly_one_additional_compile() -> None:
     """Manufactures needs_resort directly rather than through a real
-    AddConn commit: build_add_conn_phase's window only ever
+    ScoreAddConn commit: build_add_conn_phase's window only ever
     proposes a candidate sourced at a level that ALREADY has a bucket
     (`src_ok = src_level == bucket_idx`, only true for bucket_idx <
     num_buckets), and Kahn's `level(dst) = max(incoming src levels) + 1`
@@ -489,12 +493,14 @@ _E_DST_B = 2
 _E_SINK = 3
 
 
-class _E2EAddConn(px.AddConn[None]):
+class _E2EAddConn(px.ScoreAddConn[None]):
     """Only ever proposes the fixed same-source-level pair (DST_A, DST_B)
     -- deliberately the one candidate this small graph's single truncated
     bucket has no room for on the first attempt."""
 
-    max_candidates = 1
+    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
+
+    max_new_per_level = 1
     # 0 (not the default of 1): restricts the window to STRICTLY
     # same-level pairs, so bucket 0 (ANCHOR, the only level-0 unit, with no
     # other level-0 unit to pair against) has NO valid candidates at all --

@@ -95,12 +95,12 @@ class _HashProposals(px.ProposeAddConn):
     """Hashed proposals; a slice is vetoed, scores are coarse (many ties)."""
 
     def __init__(
-        self, num_units: int, num_proposals: int, max_candidates: int, dedupe: bool
+        self, num_units: int, num_proposals: int, max_new_per_level: int, dedupe: bool
     ) -> None:
         self.num_units = num_units
         self.proposer = "global"
         self.proposals_per_proposer = num_proposals
-        self.max_candidates = max_candidates
+        self.max_new_per_level = max_new_per_level
         # The pinned digests predate the split flags; the old single flag
         # meant both stages at once.
         self.dedupe_live = dedupe
@@ -125,11 +125,15 @@ class _HashProposals(px.ProposeAddConn):
         return _init(src, dst, g)
 
 
-class _HashGrid(px.AddConn):
-    """Grid growth scored by a hash, a slice vetoed; dedupe on (the default)."""
+class _HashGrid(px.ScoreAddConn):
+    """Grid growth scored by a hash, a slice vetoed; live-edge dedupe on."""
 
-    def __init__(self, max_candidates: int) -> None:
-        self.max_candidates = max_candidates
+    # Pins the pre-L4 grid behaviour (the grid deduplicated live edges by
+    # default): with the flag the "grid" digest is unchanged by the flip.
+    dedupe_live = True
+
+    def __init__(self, max_new_per_level: int) -> None:
+        self.max_new_per_level = max_new_per_level
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Any
@@ -205,7 +209,7 @@ _CONFIGS: dict[str, dict[str, Any]] = {
         align=7,
         max_level_gap=2,
     ),
-    # Grid growth (dedupe default on), top_k over the full grid.
+    # Grid growth (live-edge dedupe opted in), top_k over the full grid.
     "grid": dict(
         widths=(8, 12, 6),
         density=0.4,
@@ -303,12 +307,17 @@ def _run(
 # candidates sourced at the deepest level, previously dropped for lack of a
 # bucket, now commit (verified: the grid config churns 64 live edges into the
 # new bucket), and the arena hash covers the extra bucket itself.
+# propose_overflow and propose_window2 were re-pinned when selection stopped
+# short-circuiting a budget equal to the pool (k == pool): their global
+# proposers emit exactly k proposals, so winners used to commit in candidate
+# order and now commit in the total order, which decides who lands under
+# overflow (verified: restoring the shortcut reproduces both old digests).
 _GOLDEN: dict[str, str] = {
     "grid": "4e8864fe12526877",
     "propose_dedupe": "e9b8e9998f5449b8",
-    "propose_overflow": "052b11bb31cb9ce7",
+    "propose_overflow": "7b3e8de90e4863c4",
     "propose_small_claim": "84b5c49d0d202d72",
-    "propose_window2": "fecc2e9c83061b02",
+    "propose_window2": "54a96de099f5a4b1",
 }
 
 

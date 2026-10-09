@@ -138,7 +138,7 @@ def _check_churn_step_shards(
     single-device position order -- so the rewired arena is byte-identical.
     """
     churn_net = make_net(
-        _OPT, method="set", mode="churn", zeta=0.3, max_candidates=max(_BUDGETS)
+        _OPT, method="set", mode="churn", zeta=0.3, max_new_per_level=max(_BUDGETS)
     )
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
     single = px.make_step(churn_net, static)(_copy(state), sp).state
@@ -157,7 +157,7 @@ class _HashPropose(px.ProposeAddConn[None]):
         self.num_units = num_units
         self.proposer = "global"
         self.proposals_per_proposer = 2 * num_units
-        self.max_candidates = 16
+        self.max_new_per_level = 16
         # The old single flag covered both dedupe stages.
         self.dedupe_live = dedupe
         self.dedupe_step = dedupe

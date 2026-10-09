@@ -100,7 +100,9 @@ def _run_growth_driver(
     """Grow-heavy churn via the Driver: overflow -> grow_bucket -> retrace."""
     # grow-heavy but bounded, so growth overflows into a couple of grow_bucket
     # rounds (enough to exercise the retrace path) without many recompiles.
-    churn_net = make_net(_OPT, method="set", mode="churn", zeta=0.1, max_candidates=256)
+    churn_net = make_net(
+        _OPT, method="set", mode="churn", zeta=0.1, max_new_per_level=256
+    )
     driver = px.Driver(churn_net, static, state)
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
     for _ in range(3):

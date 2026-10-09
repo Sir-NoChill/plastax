@@ -199,8 +199,10 @@ def test_structural_phases_run_once_per_batched_step() -> None:
     reference = jax.tree.map(jnp.copy, state)  # step donates `state`
     result = step(state, px.StepInputs(inputs=x.astype(jnp.float32), targets=None))
     grown = int(px.state.live_conn_count(result.state)) - live0
-    # One growth pass (<= max_candidates per bucket), not one per sample.
-    assert 0 < grown <= churn._FanoutGrow.max_candidates * len(static.level_capacities)
+    # One growth pass (<= max_new_per_level per bucket), not one per sample.
+    assert (
+        0 < grown <= churn._FanoutGrow.max_new_per_level * len(static.level_capacities)
+    )
     # The stored units are the batch mean of the per-sample forwards.
     per_sample = []
     fwd = px.make_step(churn._ForwardOnly, static)

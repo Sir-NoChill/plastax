@@ -103,7 +103,7 @@ def test_growth_expands_interior_without_touching_the_ends() -> None:
     alone would not reveal it.
     """
     optimizer, static, state = _build(initial_density=0.2, terminal_density=1.0)
-    churn = ne.make_net(optimizer, mode="churn", max_candidates=1024, shortlist=32)
+    churn = ne.make_net(optimizer, mode="churn", max_new_per_level=1024, shortlist=32)
     step = px.make_step(churn, static)
     before = _bucket_live(state)
     state = ne.set_growth_rate(state, 0.5)
@@ -126,7 +126,7 @@ def test_dormant_unit_loses_its_incoming_edges() -> None:
     directly by forcing the statistic instead.
     """
     optimizer, static, state = _build(initial_density=0.5)
-    churn = ne.make_net(optimizer, mode="churn", tau=1e-6, max_candidates=8)
+    churn = ne.make_net(optimizer, mode="churn", tau=1e-6, max_new_per_level=8)
     step = px.make_step(churn, static)
 
     elastic = np.flatnonzero(np.asarray(state.units[ne.NE_ELASTIC.name]) > 0.5)

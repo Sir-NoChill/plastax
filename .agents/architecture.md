@@ -153,6 +153,7 @@ The policy Protocols:
 | `Loss[GS]` | `calculate_loss(u,outputs,targets,g)→(scalar, seed)`; attr `seed_field:FieldSpec` | the seed field, at the output units |
 | `UpdateUnit[GS]` | `update(u,i,g)→UnitWrite` | every live unit |
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
+| `PruneUnit[GS]` | `predicate(u,i,g)→Bool` | permanently prunes live non-I/O units; kills their edges |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
 | `ScoreAddConn[GS]` | `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite`; optional `importance(u,i,g)→Float` (shortlists) | grows edges (scored pairs) |
 | `ProposeAddConn[GS]` | attr `proposals_per_proposer:int`; `propose(...)→(src,dst,score)` per `proposer`, `init(...)→ConnWrite` | grows edges (proposals) |
@@ -174,6 +175,13 @@ count and adds the `PRUNED` column (free slots marked); `_apply_masked`, the
 fused prune's forwarded fields and growth's candidate validity skip any slot
 `state.live_unit_mask` excludes. Inputs and outputs are built units and never
 pruned, so the loss has no mask.
+`Network.prune_unit` (requires the capacity) prunes for good: the selected
+units are marked `PRUNED`, reset to their column defaults except `LEVEL`, and
+their incident edges are tombstoned in the same phase. It does not set
+`needs_resort` (edge removal keeps the leveling invariant); the next resort's
+`recompute_levels` puts every unit without a live input edge at level 0. It is
+not gated by `structural_interval`, it disables prune fusion, and it is
+refused under Scheme-A sharding (`NotImplementedError`).
 `Network.max_levels` (default 1024) bounds the unit levels unit addition may
 assign.
 
@@ -208,7 +216,7 @@ tuple of pure `state → (state, loss_contribution)` phase functions in the
 **fixed order**:
 
 ```
-forward → loss → backward → update_unit → update_conn → prune_conn → add_conn → reset_global
+forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_conn → reset_global
 ```
 
 Each phase is appended **iff its trait slot is not `None`** (forward is
@@ -250,7 +258,7 @@ with conns/globals broadcast; the **update** reduced over the batch
 (`build_batched_update_conn`: the exact `per_sample` + `incoming_batched` pair
 if the UpdateConn declares it -- every `optim/` bundle does -- else the mean of
 the per-sample writes; both accumulate in a `fori_loop`, O(capacity) memory);
-and **structural** (prune, add, reset) run once on `batch_mean_units`. Unit
+and **structural** (prune_unit, prune_conn, add, reset) run once on `batch_mean_units`. Unit
 columns in the state stay `(num_units,)` and hold the batch mean. PIPELINE nets
 are rejected. Measured on GPU the per-sample cost falls only ~2x from B = 1 to
 128 on the edge-list layout (each pass touches every edge once per sample);

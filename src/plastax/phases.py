@@ -1,8 +1,8 @@
 """Phase builders: each builds a pure state->state function for one Do* phase.
 
 Returns None when the trait slot is absent (trace-time elision). Phase
-order: forward, loss, backward, update_conn, prune_conn, add_conn,
-reset_global.
+order: forward, loss, backward, update_unit, update_conn, prune_conn,
+add_conn, reset_global.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ def build_phases[GS](
 
     Topological forward walks buckets 1..L (Python loop, static slices);
     backward walks L..1; pipeline is the 1-bucket flat sweep. Phase order:
-    forward, loss, backward, update_conn, prune_conn, add_conn,
+    forward, loss, backward, update_unit, update_conn, prune_conn, add_conn,
     reset_global.
 
     Type Args:
@@ -174,6 +174,8 @@ def build_phases[GS](
         phases.append(_build_loss_phase(net, static))
     if net.backward_pass is not None:
         phases.append(_build_backward_phase(net, static))
+    if net.update_unit is not None:
+        phases.append(build_update_unit_phase(net, static))
     if net.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
     interval = int(getattr(net, "structural_interval", 1))
@@ -210,6 +212,9 @@ class BatchedPhases[GS]:
         forward: the per-sample forward phase (vmapped over the batch).
         loss: the per-sample loss phase, or None.
         backward: the per-sample backward phase, or None.
+        update_unit: the per-sample unit update phase, or None. It runs on
+            every sample's units after backward and before the connection
+            update, as in the streaming step.
         csr_forward: the whole-batch CSR forward replacing `forward`, or None
             for the edge-list layout (see build_csr_forward).
         csr_backward: likewise for `backward`.
@@ -223,6 +228,7 @@ class BatchedPhases[GS]:
     forward: Phase[GS]
     loss: Phase[GS] | None
     backward: Phase[GS] | None
+    update_unit: Phase[GS] | None
     csr_forward: Callable[[NetworkState[GS], Columns], Columns] | None
     csr_backward: Callable[[NetworkState[GS], Columns], Columns] | None
     update_conn: Callable[[NetworkState[GS], Columns], NetworkState[GS]] | None
@@ -259,6 +265,9 @@ def build_batched_phases[GS](
     backward = (
         _build_backward_phase(net, static) if net.backward_pass is not None else None
     )
+    update_unit = (
+        build_update_unit_phase(net, static) if net.update_unit is not None else None
+    )
     csr_forward = (
         build_csr_forward(net, static, engine=engine)
         if engine is not None and linear_input_field(net.forward_pass) is not None
@@ -291,6 +300,7 @@ def build_batched_phases[GS](
         forward,
         loss,
         backward,
+        update_unit,
         csr_forward,
         csr_backward,
         update,
@@ -1091,6 +1101,54 @@ def _build_reset_global_phase[GS](net: type[Network[GS]]) -> Phase[GS]:
     return reset_global_phase
 
 
+def build_update_unit_phase[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Phase[GS]:
+    """Write every live unit's update, inputs and outputs included.
+
+    `update_unit.update` is vmapped over every unit slot against the
+    pre-phase unit columns (no unit sees another's write of this phase), and
+    each written column is merged back where the slot holds a live unit
+    (`state.live_unit_mask`; every slot without a unit capacity).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying the update_unit policy.
+        static: static network configuration giving the arena shapes.
+
+    Returns:
+        The update_unit phase function.
+    """
+    uu = net.update_unit
+    assert uu is not None  # build_phases only calls this when set
+    num_units = static.num_units
+
+    def update_unit_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        u_view = UnitView(state.units)
+        g = state.globals_
+
+        def one(i: jax.Array) -> dict[str, jax.Array]:
+            # UnitWrite is not pytree-registered; vmap carries its fields.
+            return dict(uu.update(u_view, UnitIdx(i), g).fields)
+
+        writes = jax.vmap(one)(jnp.arange(num_units, dtype=jnp.int32))
+        live = live_unit_mask(state.units)
+        units = dict(state.units)
+        for name, written in writes.items():
+            written = written.astype(units[name].dtype)
+            units[name] = (
+                written if live is None else jnp.where(live, written, units[name])
+            )
+        return dataclasses.replace(state, units=units), jnp.float32(0.0)
+
+    return update_unit_phase
+
+
 def build_update_conn_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
@@ -1340,7 +1398,8 @@ def plan_prune_fusion[GS](
     control flow). The rules:
 
     - The predicate's reads (plus DEAD, which the prune merges into) must
-      not be written by loss, backward or update_conn, which run in between.
+      not be written by loss, backward, update_unit or update_conn, which run
+      in between.
     - A unit field the predicate reads that the forward's `apply` writes
       must provably not depend on the accumulator or on any other field the
       forward writes (only on the unit id, the globals and unwritten unit
@@ -1434,6 +1493,15 @@ def plan_prune_fusion[GS](
             between |= {
                 ("unit", k)
                 for k in _write_keys(backward_apply, units, scalar_i, g, bacc)
+            }
+        if net.update_unit is not None:
+            uu = net.update_unit
+
+            def unit_update(u: Columns, i: jax.Array, g_: Any) -> Any:
+                return dict(uu.update(UnitView(u), UnitIdx(i), g_).fields)
+
+            between |= {
+                ("unit", k) for k in _write_keys(unit_update, units, scalar_i, g)
             }
         if net.update_conn is not None:
             uc = net.update_conn

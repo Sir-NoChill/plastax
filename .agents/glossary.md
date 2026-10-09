@@ -14,8 +14,13 @@ group, ordered roughly by how fundamental they are.
   `default`. Frozen, hashable, generic over the scalar type `DT`. Built via
   `FieldSpec.float32/int32/boolean/field`.
 - **Built-in columns** — framework-owned specs: `FROM_ID`, `TO_ID`, `DEAD`
-  (conn); `WEIGHT` (conn); `ACTIVATION`, `LEVEL` (unit). Their names are
-  reserved.
+  (conn); `WEIGHT` (conn); `ACTIVATION`, `LEVEL`, `PRUNED` (unit). Their names
+  are reserved. `PRUNED` exists only when the net declares a unit capacity.
+- **Unit capacity / live unit** — `Network.unit_capacity` sizes the unit
+  columns to that many slots; the built units are live and the slots above
+  them are free, marked `PRUNED`. A slot holding no live unit is skipped by
+  every apply, by the loss and by growth (`state.live_unit_mask`). Without a
+  capacity there is no `PRUNED` column and no masking is traced.
 - **Unit / connection (edge)** — a node and a directed weighted edge. Indices
   are distinct NewTypes `UnitIdx` / `ConnIdx` (erased to `Int32` arrays at
   runtime; the separation is a static-typing discipline).

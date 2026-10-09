@@ -168,6 +168,12 @@ two Protocols; `predicate_add_conn` adapts a boolean predicate to a
 `ScoreAddConn`. Growth reports `grown` and `overflow` on the state, and
 `Network.structural_interval` gates the structural phases to every n-th step.
 
+`Network.unit_capacity` (default None) sizes the unit columns to a fixed slot
+count and adds the `PRUNED` column (free slots marked); `_apply_masked`, the
+loss, the fused prune's forwarded fields and growth's candidate validity skip
+any slot `state.live_unit_mask` excludes. `Network.max_levels` (default 1024)
+bounds the unit levels unit addition may assign.
+
 ### Assembly (`phases.py`)
 
 `build_phases(net, static, *, overflow_sink)` (`phases.py:64`) emits an ordered

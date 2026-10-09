@@ -80,6 +80,9 @@ class Propose(px.ProposeAddConn):
         self.num_units, self.width = num_units, width
         self.proposer = "global"
         self.proposals_per_proposer = self.max_new_per_level = num_proposals
+        # No dedupe: hash proposals rarely repeat, and the check times the
+        # fused prune, not the dedupe sort.
+        self.dedupe_live = self.dedupe_step = False
 
     def propose(
         self, u: Any, j: jax.Array, g: G, rng: px.rng.Rng

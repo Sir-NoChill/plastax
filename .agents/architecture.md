@@ -170,9 +170,9 @@ two Protocols; `predicate_add_conn` adapts a boolean predicate to a
 
 `Network.unit_capacity` (default None) sizes the unit columns to a fixed slot
 count and adds the `PRUNED` column (free slots marked); `_apply_masked`, the
-loss's seed write, the fused prune's forwarded fields and growth's candidate
-validity skip any slot `state.live_unit_mask` excludes; a loss policy reads
-the same mask through `UnitView.live` to leave such an output out of the loss.
+fused prune's forwarded fields and growth's candidate validity skip any slot
+`state.live_unit_mask` excludes. Inputs and outputs are built units and never
+pruned, so the loss has no mask.
 `Network.max_levels` (default 1024) bounds the unit levels unit addition may
 assign.
 

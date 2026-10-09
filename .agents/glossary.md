@@ -19,8 +19,9 @@ group, ordered roughly by how fundamental they are.
 - **Unit capacity / live unit** — `Network.unit_capacity` sizes the unit
   columns to that many slots; the built units are live and the slots above
   them are free, marked `PRUNED`. A slot holding no live unit is skipped by
-  every apply, by the loss and by growth (`state.live_unit_mask`). Without a
-  capacity there is no `PRUNED` column and no masking is traced.
+  every apply and by growth (`state.live_unit_mask`). Input and output units
+  are never pruned, so the loss needs no mask. Without a capacity there is no
+  `PRUNED` column and no masking is traced.
 - **Unit / connection (edge)** — a node and a directed weighted edge. Indices
   are distinct NewTypes `UnitIdx` / `ConnIdx` (erased to `Int32` arrays at
   runtime; the separation is a static-typing discipline).

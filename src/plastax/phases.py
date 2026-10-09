@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, no_type_check
 
 import jax
@@ -19,6 +19,7 @@ from jax.experimental import sparse as jsparse
 from jaxtyping import Array, Bool, Float, Int32, Shaped
 
 from plastax import monoid
+from plastax import rng as rng_mod
 from plastax._types import (
     DEAD,
     FROM_ID,
@@ -3082,17 +3083,34 @@ def candidates_per_level(
     return src, dst
 
 
+def _propose_rngs(
+    seed: int, step: jax.Array, proposer_key: jax.Array, j: jax.Array
+) -> rng_mod.Rng:
+    """The draw stream of one proposal site (growth stream).
+
+    Args:
+        seed: the network seed (static).
+        step: the framework step counter (scalar int32).
+        proposer_key: the proposing entity's key word.
+        j: the proposal index within the proposer.
+
+    Returns:
+        The site's Rng, sub-counter at 0.
+    """
+    return rng_mod.Rng.for_site(seed, step, 1, proposer_key, j)
+
+
 def candidates_propose[GS](
-    propose_fn: Callable[
-        [UnitView, jax.Array, GS],
-        tuple[Float[Array, ""] | jax.Array, Float[Array, ""] | jax.Array, jax.Array],
-    ],
+    propose_fn: Callable[..., Any],
     u_view: UnitView,
     g: GS,
     num_proposals: int,
     num_units: int,
+    *,
+    seed: int,
+    step: jax.Array,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """This step's proposal candidates, with out-of-range ids clamped.
+    """The global proposer's candidates: P proposals, order index = j.
 
     An out-of-range id is vetoed through the returned mask and clamped to 0 so
     every downstream gather stays in bounds.
@@ -3101,22 +3119,22 @@ def candidates_propose[GS](
         GS: the user's global-state pytree, opaque to the framework.
 
     Args:
-        propose_fn: the ProposeAddConn's `propose(u, j, g)` method.
+        propose_fn: the rule's `propose(u, j, g, rng)` method.
         u_view: the unit view.
         g: the global state.
-        num_proposals: how many proposals to draw.
+        num_proposals: how many proposals to draw (P).
         num_units: the number of unit slots, bounding valid ids.
+        seed: the network seed keying each site's rng.
+        step: the framework step counter (scalar int32).
 
     Returns:
         `(src, dst, score, in_range)`: int32 endpoint arrays (clamped), the
-        float32 proposal scores, and the in-range mask, each of length
-        `num_proposals`.
+        float32 proposal scores, and the in-range mask, each of length P.
     """
 
-    def propose_one(
-        j: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        s_, d_, score_ = propose_fn(u_view, j, g)
+    def propose_one(j: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        rng = _propose_rngs(seed, step, jnp.uint32(0), j)
+        s_, d_, score_ = propose_fn(u_view, j, g, rng)
         return (
             jnp.asarray(s_, jnp.int32),
             jnp.asarray(d_, jnp.int32),
@@ -3126,6 +3144,161 @@ def candidates_propose[GS](
     p_src, p_dst, p_score = jax.vmap(propose_one)(
         jnp.arange(num_proposals, dtype=jnp.int32)
     )
+    return _clamp_proposals(p_src, p_dst, p_score, num_units)
+
+
+def candidates_propose_per_unit[GS](
+    propose_fn: Callable[..., Any],
+    u_view: UnitView,
+    g: GS,
+    num_proposals: int,
+    num_units: int,
+    *,
+    seed: int,
+    step: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-unit proposals: units x P candidates, order index = i * P + j.
+
+    Every unit slot proposes (there is no unit pruning yet, so every slot is
+    live); the flat candidate position `i * P + j` is the deterministic total
+    order's candidate index.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        propose_fn: the rule's `propose(u, i, j, g, rng)` method.
+        u_view: the unit view.
+        g: the global state.
+        num_proposals: proposals per proposing unit (P).
+        num_units: the number of unit slots.
+        seed: the network seed keying each site's rng.
+        step: the framework step counter (scalar int32).
+
+    Returns:
+        `(src, dst, score, in_range)` of length `num_units * P`, laid out
+        unit-major so position equals the candidate index.
+    """
+
+    def propose_one(
+        i: jax.Array, j: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        rng = _propose_rngs(seed, step, i.astype(jnp.uint32), j)
+        s_, d_, score_ = propose_fn(u_view, UnitIdx(i), j, g, rng)
+        return (
+            jnp.asarray(s_, jnp.int32),
+            jnp.asarray(d_, jnp.int32),
+            jnp.asarray(score_, jnp.float32),
+        )
+
+    i_flat = jnp.repeat(jnp.arange(num_units, dtype=jnp.int32), num_proposals)
+    j_flat = jnp.tile(jnp.arange(num_proposals, dtype=jnp.int32), num_units)
+    p_src, p_dst, p_score = jax.vmap(propose_one)(i_flat, j_flat)
+    return _clamp_proposals(p_src, p_dst, p_score, num_units)
+
+
+def candidates_propose_per_conn[GS](
+    propose_fn: Callable[..., Any],
+    u_view: UnitView,
+    conns: Sequence[Columns],
+    g: GS,
+    num_proposals: int,
+    num_units: int,
+    *,
+    seed: int,
+    step: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-connection proposals in rank order: index = r * P + j.
+
+    The proposing connections are the live edges, ranked ascending by
+    `(src, dst, occurrence)` -- occurrence counts a pair's parallel edges in
+    ascending arena slot order (buckets ascending, slots ascending within a
+    bucket). The flat candidate position `r * P + j` is then the total
+    order's candidate index; dead slots rank after every live edge and their
+    candidates are vetoed.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        propose_fn: the rule's `propose(u, c, cid, j, g, rng)` method; `cid`
+            is the proposing edge's flat arena slot (bucket-major).
+        u_view: the unit view.
+        conns: the per-bucket connection columns.
+        g: the global state.
+        num_proposals: proposals per live connection (P).
+        num_units: the number of unit slots, bounding valid ids.
+        seed: the network seed keying each site's rng.
+        step: the framework step counter (scalar int32).
+
+    Returns:
+        `(src, dst, score, valid)` of length `total_slots * P`, laid out
+        rank-major; `valid` is false for dead proposers and out-of-range ids.
+    """
+    flat_cols = {name: jnp.concatenate([b[name] for b in conns]) for name in conns[0]}
+    c_view = ConnView(flat_cols)
+    c_src = flat_cols[FROM_ID.name].astype(jnp.int32)
+    c_dst = flat_cols[TO_ID.name].astype(jnp.int32)
+    dead = flat_cols[DEAD.name]
+    total = c_src.shape[0]
+    iota = jnp.arange(total, dtype=jnp.int32)
+    # Rank live edges ascending by (src, dst, slot): within an equal pair,
+    # slot order is occurrence order, so the sorted position is the
+    # (src, dst, occurrence) rank. Dead slots sort last.
+    big = jnp.int32(num_units)  # > any live id; dead keys sort after live
+    k_src = jnp.where(dead, big, c_src)
+    k_dst = jnp.where(dead, big, c_dst)
+    _, _, _, perm = jax.lax.sort((k_src, k_dst, iota, iota), num_keys=3)
+    r_src = c_src[perm]
+    r_dst = c_dst[perm]
+    r_dead = dead[perm]
+    # occurrence = position within the run of equal (src, dst): the run start
+    # is the last position whose key differs from its predecessor.
+    pos = jnp.arange(total, dtype=jnp.int32)
+    new_run = jnp.concatenate(
+        [
+            jnp.ones((1,), dtype=bool),
+            (r_src[1:] != r_src[:-1]) | (r_dst[1:] != r_dst[:-1]),
+        ]
+    )
+    run_start = jax.lax.associative_scan(jnp.maximum, jnp.where(new_run, pos, 0))
+    r_occ = pos - run_start
+
+    def propose_one(
+        r: jax.Array, j: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        key = rng_mod.conn_key(r_src[r], r_dst[r], r_occ[r])
+        rng = _propose_rngs(seed, step, key, j)
+        cid = perm[r]
+        s_, d_, score_ = propose_fn(u_view, c_view, ConnIdx(cid), j, g, rng)
+        return (
+            jnp.asarray(s_, jnp.int32),
+            jnp.asarray(d_, jnp.int32),
+            jnp.asarray(score_, jnp.float32),
+        )
+
+    r_flat = jnp.repeat(pos, num_proposals)
+    j_flat = jnp.tile(jnp.arange(num_proposals, dtype=jnp.int32), total)
+    p_src, p_dst, p_score = jax.vmap(propose_one)(r_flat, j_flat)
+    src, dst, score, in_range = _clamp_proposals(p_src, p_dst, p_score, num_units)
+    live_proposer = ~r_dead[r_flat]
+    return src, dst, score, in_range & live_proposer
+
+
+def _clamp_proposals(
+    p_src: jax.Array, p_dst: jax.Array, p_score: jax.Array, num_units: int
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Veto out-of-range proposal ids and clamp them for safe gathers.
+
+    Args:
+        p_src: proposed source ids.
+        p_dst: proposed destination ids.
+        p_score: proposal scores.
+        num_units: the number of unit slots, bounding valid ids.
+
+    Returns:
+        `(src, dst, score, in_range)` with out-of-range ids clamped to 0.
+    """
     in_range = (p_src >= 0) & (p_src < num_units) & (p_dst >= 0) & (p_dst < num_units)
     src = jnp.where(in_range, p_src, jnp.int32(0))
     dst = jnp.where(in_range, p_dst, jnp.int32(0))
@@ -3367,6 +3540,8 @@ def build_add_conn_phase[GS](
 
     Raises:
         ValueError: If `growth` is not one of the engines.
+        NotImplementedError: If a per-connection proposer is declared under
+            Scheme-A sharding (proposer ranks are not shard-local yet).
     """
     ac = net.add_conn
     assert ac is not None  # build_phases only calls this when set
@@ -3408,8 +3583,22 @@ def build_add_conn_phase[GS](
     if growth not in ("auto", "xla", "triton"):
         raise ValueError(f"build_add_conn_phase: unknown growth engine {growth!r}")
     use_propose = isinstance(ac, ProposeAddConn)
-    dedupe = bool(getattr(ac, "dedupe", not use_propose))
-    num_proposals = ac.num_proposals if isinstance(ac, ProposeAddConn) else 0
+    # The grid's duplicate check stays on by default; a propose rule opts into
+    # its two dedupe stages separately (both default False: parallel edges and
+    # within-step repeats are allowed by design).
+    dedupe = bool(getattr(ac, "dedupe", True)) and not use_propose
+    ded_live = use_propose and bool(getattr(ac, "dedupe_live", False))
+    ded_step = use_propose and bool(getattr(ac, "dedupe_step", False))
+    proposer = str(getattr(ac, "proposer", "per_unit")) if use_propose else ""
+    num_proposals = ac.proposals_per_proposer if isinstance(ac, ProposeAddConn) else 0
+    total_conn_slots = sum(static.level_capacities)
+    if use_propose and proposer == "per_connection" and _shard_axis(static):
+        raise NotImplementedError(
+            "per-connection proposers are not supported under Scheme-A "
+            "sharding yet: the proposing connections are sharded, so their "
+            "(src, dst, occurrence) ranks are not shard-local. Use a "
+            "per_unit or global proposer, or run unsharded."
+        )
 
     max_candidate_units: int | None = getattr(ac, "max_candidate_units", None)
     importance_fn = getattr(ac, "importance", None)
@@ -3428,7 +3617,14 @@ def build_add_conn_phase[GS](
     assert pool_side is not None  # use_shortlist implies max_candidate_units set
     # Static (Python-int) candidate-pool bound: top_k requires k <= pool size,
     # and a small test network's pool can undercut a generous max_candidates.
-    pool = num_proposals if use_propose else pool_side * pool_side
+    if use_propose:
+        pool = {
+            "per_unit": num_units * num_proposals,
+            "per_connection": total_conn_slots * num_proposals,
+            "global": num_proposals,
+        }[proposer]
+    else:
+        pool = pool_side * pool_side
     k = max(0, min(ac.max_candidates, pool))
     use_triton = k > 0 and triton_claim_applies(static, growth)
 
@@ -3460,10 +3656,40 @@ def build_add_conn_phase[GS](
             imp = None
         if isinstance(ac, ProposeAddConn):
             # The proposals are this step's global candidate list: computed
-            # once, filtered per bucket in the loop.
-            global_src, global_dst, p_score, in_range = candidates_propose(
-                ac.propose, u_view, g, num_proposals, num_units
-            )
+            # once, filtered per bucket in the loop. The flat layout is the
+            # total order's candidate index (i*P+j / r*P+j / j), and every
+            # site's rng is keyed by (seed, step, growth stream, site, j).
+            if proposer == "per_unit":
+                global_src, global_dst, p_score, in_range = candidates_propose_per_unit(
+                    ac.propose,
+                    u_view,
+                    g,
+                    num_proposals,
+                    num_units,
+                    seed=static.seed,
+                    step=state.step,
+                )
+            elif proposer == "per_connection":
+                global_src, global_dst, p_score, in_range = candidates_propose_per_conn(
+                    ac.propose,
+                    u_view,
+                    state.conns,
+                    g,
+                    num_proposals,
+                    num_units,
+                    seed=static.seed,
+                    step=state.step,
+                )
+            else:
+                global_src, global_dst, p_score, in_range = candidates_propose(
+                    ac.propose,
+                    u_view,
+                    g,
+                    num_proposals,
+                    num_units,
+                    seed=static.seed,
+                    step=state.step,
+                )
         elif use_shortlist:
             assert importance_fn is not None  # use_shortlist implies it is set
             global_src, global_dst = candidates_shortlist(
@@ -3499,13 +3725,13 @@ def build_add_conn_phase[GS](
             )
             if use_propose:
                 valid = valid & in_range
-            if dedupe:
+            if dedupe or ded_live:
                 valid = valid & dedupe_live(
                     bucket_conns, flat_src, flat_dst, num_units, shard_axis
                 )
             if use_propose:
                 flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
-                if dedupe:
+                if ded_step:
                     flat_scores = dedupe_step(flat_scores, flat_src, flat_dst)
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)

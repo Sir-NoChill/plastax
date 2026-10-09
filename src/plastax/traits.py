@@ -6,7 +6,8 @@ Python analogue of the C++ policy concepts; static checking via ty / mypy
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+import inspect
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
 from jaxtyping import Array, Bool, Float, Int32
@@ -25,6 +26,7 @@ from plastax._types import (
     UnitIdx,
 )
 from plastax.monoid import Monoid, MonoidTree
+from plastax.rng import Rng
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 
@@ -328,35 +330,71 @@ class AddConn[GS](Protocol):
         ...
 
 
+class Proposal(NamedTuple):
+    """One growth proposal: a directed candidate edge and its priority.
+
+    Attributes:
+        src: proposed source unit id (int32 scalar).
+        dst: proposed destination unit id (int32 scalar).
+        score: the candidate's priority; ``-inf`` vetoes it.
+    """
+
+    src: Int32[Array, ""]
+    dst: Int32[Array, ""]
+    score: Float[Array, ""]
+
+
+# The namedtuple field descriptors carry "Alias for field number N" docstrings
+# that autodoc would document on top of the Attributes entries above
+# (duplicate object descriptions under sphinx -W). The Attributes section is
+# the documentation of record; silence the aliases.
+for _field in Proposal._fields:
+    getattr(Proposal, _field).__doc__ = None
+
+
 @runtime_checkable
 class ProposeAddConn[GS](Protocol):
-    """Connection growth policy: K-bounded growth from sampled proposals.
+    """Connection growth policy: bounded growth from sampled proposals.
 
     The counterpart of `AddConn` whose cost follows the churn, not the arena.
-    Instead of scoring a candidate grid, the policy emits `num_proposals`
-    candidates itself, one per proposal index `j`: typically a few random
-    partners per unit (plastax-cpp's sampled `GrowFanout`), or k uniform draws. The
-    phase then routes each proposal to its source level's bucket, applies the
-    level window (the rule's own `max_level_gap`, read structurally, default 1:
-    `abs(level[dst] - level[src]) <= max_level_gap`, no self-loops), and keeps
-    each bucket's `max_candidates` best finite-scored proposals, exactly as on
-    the grid. A score of -inf vetoes a proposal.
+    Instead of scoring a candidate grid, the policy emits proposals through
+    `propose`, called `proposals_per_proposer` times (index `j`) for each
+    proposing site. Who proposes is the rule's `proposer` (read structurally,
+    default ``"per_unit"``):
+
+    - ``"per_unit"``: every unit proposes; `propose(u, i, j, g, rng)` with `i`
+      the proposing unit. Candidate order index is ``i * P + j``.
+    - ``"per_connection"``: every live connection proposes;
+      `propose(u, c, cid, j, g, rng)` with `cid` the proposing connection's
+      arena slot. Candidate order index is ``r * P + j`` with ``r`` the
+      connection's rank in ascending ``(src, dst, occurrence)`` order over the
+      live connections (occurrence counts parallel edges in ascending slot
+      order). A unit with no live connections proposes nothing.
+    - ``"global"``: one proposer; `propose(u, j, g, rng)`. Order index ``j``.
+
+    Each proposal site receives its own counter-based `Rng`
+    (see `plastax.rng`), keyed by the network seed, the step counter, the
+    growth stream, the proposer (unit id, connection key, or 0) and `j` --
+    so proposal streams vary per step and replay exactly. A rule is free to
+    ignore `rng` and derive proposals from state instead.
+
+    Downstream, every proposal passes the shared pipeline: the level-gap
+    window (the rule's own `max_level_gap`, read structurally, default 1:
+    `abs(level[dst] - level[src]) <= max_level_gap`, no self-loops), the
+    opt-in dedupe stages, and each bucket's `max_candidates`-bounded
+    selection in the deterministic total candidate order. A score of -inf
+    vetoes a proposal, as do ids outside [0, num_units).
 
     **Duplicates.** By default nothing checks a proposal against the live
-    edges, so a proposal that repeats a live pair grows a *parallel edge* (the
-    network becomes a multigraph; parallel edges contribute independently, so
-    a weighted-sum forward sees their weights add). With random proposals at
-    density d, about a fraction d of proposals repeat a live pair. A policy
-    that must never grow a duplicate either proposes only absent pairs by
-    construction (the fast route) or sets `dedupe = True`, which checks every
-    proposal against its bucket's live edges and the step's other proposals at
-    O(capacity log capacity) per step.
-
-    **Seeding.** Proposals must vary between steps -- derive them from a
-    step-dependent value in the globals or unit state (a step counter, a
-    per-unit cursor). A proposal stream that depends only on structure that
-    in-place growth holds fixed (for example the live edge count) re-proposes
-    the same candidates every step.
+    edges or this step's other proposals: a proposal equal to a live pair
+    grows a *parallel edge* (the network becomes a multigraph; parallel edges
+    contribute independently, so a weighted-sum forward sees their weights
+    add), and two equal proposals in one step grow two edges. A policy that
+    must never grow a duplicate either proposes only absent pairs by
+    construction (the fast route) or sets `dedupe_live = True` (veto
+    proposals equal to a live edge; costs a sort of the live keys every
+    growth step) and/or `dedupe_step = True` (keep only the first copy, in
+    the total candidate order, of equal proposals within the step).
 
     Type Args:
         GS: the global state type threaded through the network.
@@ -364,27 +402,37 @@ class ProposeAddConn[GS](Protocol):
     Attributes:
         max_candidates: the maximum number of connections grown per bucket
             per step.
-        num_proposals: how many proposals `propose` is called for each step,
-            a static int.
+        proposals_per_proposer: how many proposals each proposing site emits
+            per step, a static int >= 1.
     """
 
     max_candidates: int
-    num_proposals: int
+    proposals_per_proposer: int
 
     def propose(
-        self, u: UnitView, j: Int32[Array, ""], g: GS
-    ) -> tuple[Int32[Array, ""], Int32[Array, ""], Float[Array, ""]]:
-        """Emit proposal `j` of this step.
+        self,
+        u: UnitView,
+        i: UnitIdx,
+        j: Int32[Array, ""],
+        g: GS,
+        rng: Rng,
+    ) -> Proposal:
+        """Emit proposal `j` of proposing unit `i` (the per-unit shape).
+
+        The ``"per_connection"`` and ``"global"`` proposers use the
+        signatures documented on the class; the declared `proposer` selects
+        which shape is validated and called.
 
         Args:
             u: the unit view.
-            j: the proposal index, in [0, num_proposals).
+            i: the proposing unit (per-unit proposer).
+            j: the proposal index, in [0, proposals_per_proposer).
             g: the global state.
+            rng: this site's draw stream.
 
         Returns:
-            `(src, dst, score)`: the proposed edge's unit ids and its priority
-            within its bucket. -inf vetoes it; ids outside [0, num_units)
-            are vetoed too.
+            The proposed edge and its priority. -inf vetoes it; ids outside
+            [0, num_units) are vetoed too.
         """
         ...
 
@@ -606,13 +654,7 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
                 f"(score) or ProposeAddConn (propose); got {cls.add_conn!r}"
             )
         if isinstance(cls.add_conn, ProposeAddConn) and not grid:
-            # Typed int, but a user attribute: check it really is one.
-            n: object = cls.add_conn.num_proposals
-            if not isinstance(n, int) or isinstance(n, bool) or n < 1:
-                raise TypeError(
-                    f"{cls.__name__}.add_conn.num_proposals must be an int >= 1; "
-                    f"got {n!r}"
-                )
+            _validate_propose_rule(cls, cls.add_conn)
 
     if cls.reset_global is not None and not isinstance(cls.reset_global, ResetGlobal):
         raise TypeError(
@@ -621,3 +663,65 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         )
 
     _validate_field_names(cls)
+
+
+_PROPOSE_ARITY = {
+    # positional parameters of `propose` after self: (names, shape hint)
+    "per_unit": (5, "propose(self, u, i, j, g, rng)"),
+    "per_connection": (6, "propose(self, u, c, cid, j, g, rng)"),
+    "global": (4, "propose(self, u, j, g, rng)"),
+}
+
+
+def _validate_propose_rule(cls: type[Network[Any]], ac: ProposeAddConn[Any]) -> None:
+    """Check a ProposeAddConn's knobs and `propose` shape at class definition.
+
+    Args:
+        cls: the Network subclass being validated (for error messages).
+        ac: the declared propose rule.
+
+    Raises:
+        TypeError: on a removed attribute (`num_proposals`, `dedupe`), a bad
+            `proposer` / `proposals_per_proposer`, or a `propose` whose
+            positional arity does not match the declared proposer.
+    """
+    if hasattr(ac, "num_proposals"):
+        raise TypeError(
+            f"{cls.__name__}.add_conn.num_proposals was renamed: declare "
+            "`proposals_per_proposer` (int >= 1) on the propose rule instead."
+        )
+    if hasattr(ac, "dedupe"):
+        raise TypeError(
+            f"{cls.__name__}.add_conn.dedupe does not apply to propose rules: "
+            "set `dedupe_live` and/or `dedupe_step` (bool, default False) "
+            "on the rule instead."
+        )
+    n: object = getattr(ac, "proposals_per_proposer", None)
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.proposals_per_proposer must be an "
+            f"int >= 1; got {n!r}"
+        )
+    proposer = getattr(ac, "proposer", "per_unit")
+    if not isinstance(proposer, str) or proposer not in _PROPOSE_ARITY:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.proposer must be one of "
+            f"{sorted(_PROPOSE_ARITY)}; got {proposer!r}"
+        )
+    want, shape = _PROPOSE_ARITY[proposer]
+    sig = inspect.signature(ac.propose)
+    if any(
+        prm.kind is inspect.Parameter.VAR_POSITIONAL for prm in sig.parameters.values()
+    ):
+        return  # *args adapters are arity-unverifiable; the call site decides
+    got = sum(
+        1
+        for prm in sig.parameters.values()
+        if prm.kind
+        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    )
+    if got != want:
+        raise TypeError(
+            f"{cls.__name__}.add_conn: a {proposer!r} proposer's propose "
+            f"takes {want} arguments after self -- expected `{shape}`, got {got}."
+        )

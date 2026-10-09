@@ -78,9 +78,13 @@ class Propose(px.ProposeAddConn):
 
     def __init__(self, num_units: int, width: int, num_proposals: int) -> None:
         self.num_units, self.width = num_units, width
-        self.num_proposals = self.max_candidates = num_proposals
+        self.proposer = "global"
+        self.proposals_per_proposer = self.max_candidates = num_proposals
 
-    def propose(self, u: Any, j: jax.Array, g: G) -> tuple[Any, Any, Any]:
+    def propose(
+        self, u: Any, j: jax.Array, g: G, rng: px.rng.Rng
+    ) -> tuple[Any, Any, Any]:
+        del rng
         src = (
             _hash01(j, g["step"], jnp.int32(1)) * (self.num_units - self.width)
         ).astype(jnp.int32)

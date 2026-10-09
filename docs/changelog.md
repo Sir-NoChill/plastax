@@ -35,6 +35,24 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** `ProposeAddConn` declares who proposes. Rules carry a
+  `proposer` ("per_unit" — the default — "per_connection", or "global"), and
+  `propose` takes the proposer-specific signature with a counter-based `rng`
+  argument (`plastax.rng`) keyed by the network seed, the step counter and the
+  proposing site, so proposal streams replay exactly and vary per step. The
+  `num_proposals` attribute is now `proposals_per_proposer`, and the single
+  `dedupe` flag is two opt-in stages, `dedupe_live` and `dedupe_step`, both
+  defaulting off (a duplicate proposal grows a parallel edge by design).
+  Existing rules: declare `proposer = "global"`, accept (and ignore) `rng`,
+  and spell out the dedupe stages. A new `Proposal` NamedTuple names the
+  `(src, dst, score)` triple.
+- Topological networks with a growth rule now allocate a connection bucket
+  for the deepest unit level, so growth can source edges there (they commit
+  backward and trigger a resort), matching the C++ implementation and the
+  conformance goldens. Candidates sourced at the deepest level were
+  previously dropped without trace; score rules that relied on that silent
+  window should veto with `-inf` (a merely-low finite score is still a
+  candidate).
 - Growth selection follows a deterministic total candidate order:
   `(-score, src, dst, candidate index)` ascending. Distinct scores select
   exactly as before; score ties now resolve by the lower source id, then the

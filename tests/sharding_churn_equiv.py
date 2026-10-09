@@ -155,14 +155,17 @@ class _HashPropose(px.ProposeAddConn[None]):
 
     def __init__(self, num_units: int, *, dedupe: bool) -> None:
         self.num_units = num_units
-        self.num_proposals = 2 * num_units
+        self.proposer = "global"
+        self.proposals_per_proposer = 2 * num_units
         self.max_candidates = 16
-        self.dedupe = dedupe
+        # The old single flag covered both dedupe stages.
+        self.dedupe_live = dedupe
+        self.dedupe_step = dedupe
 
     def propose(
-        self, u: px.UnitView, j: jax.Array, g: None
+        self, u: px.UnitView, j: jax.Array, g: None, rng: px.rng.Rng
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del g
+        del g, rng
         src = j // 2
         h = (j.astype(jnp.uint32) * jnp.uint32(0x9E3779B1)) ^ jnp.uint32(0x85EBCA77)
         h = (h ^ (h >> 13)) * jnp.uint32(0xC2B2AE3D)

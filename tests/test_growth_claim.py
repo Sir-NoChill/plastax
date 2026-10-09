@@ -98,14 +98,18 @@ class _HashProposals(px.ProposeAddConn):
         self, num_units: int, num_proposals: int, max_candidates: int, dedupe: bool
     ) -> None:
         self.num_units = num_units
-        self.num_proposals = num_proposals
+        self.proposer = "global"
+        self.proposals_per_proposer = num_proposals
         self.max_candidates = max_candidates
-        self.dedupe = dedupe
+        # The pinned digests predate the split flags; the old single flag
+        # meant both stages at once.
+        self.dedupe_live = dedupe
+        self.dedupe_step = dedupe
 
     def propose(
-        self, u: px.UnitView, j: jax.Array, g: Any
+        self, u: px.UnitView, j: jax.Array, g: Any, rng: px.rng.Rng
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del u
+        del u, rng
         h = _h(j, g["t"], jnp.uint32(11))
         src = (h % jnp.uint32(self.num_units)).astype(jnp.int32)
         h2 = _h(h, jnp.uint32(13))
@@ -295,12 +299,16 @@ def _run(
 # propose_small_claim were re-pinned when selection adopted the total candidate
 # order (-score, src, dst, candidate_index): their hashed scores are coarse
 # (deliberate ties), and ties now resolve by (src, dst) before candidate index.
+# All five were re-pinned again when growth gained the deepest-level bucket:
+# candidates sourced at the deepest level, previously dropped for lack of a
+# bucket, now commit (verified: the grid config churns 64 live edges into the
+# new bucket), and the arena hash covers the extra bucket itself.
 _GOLDEN: dict[str, str] = {
-    "grid": "c2f0954e163ec8d4",
-    "propose_dedupe": "e70bf7ba72d6d67d",
-    "propose_overflow": "226df2f917a66999",
-    "propose_small_claim": "afd4d3527c4bce08",
-    "propose_window2": "648fb55c2a57e20d",
+    "grid": "4e8864fe12526877",
+    "propose_dedupe": "e9b8e9998f5449b8",
+    "propose_overflow": "052b11bb31cb9ce7",
+    "propose_small_claim": "84b5c49d0d202d72",
+    "propose_window2": "fecc2e9c83061b02",
 }
 
 
@@ -315,7 +323,9 @@ def test_the_configs_exercise_overflow_and_resort() -> None:
     assert any(overflows) and not all(overflows)
     net, static, state = _build(_CONFIGS["propose_small_claim"])
     k = _CONFIGS["propose_small_claim"]["k"]
-    assert all(k * 1024 <= cap for cap in static.level_capacities)
+    # The deepest (growth-only) bucket starts empty and small; the big-bucket
+    # claim-path property is about the populated buckets.
+    assert all(k * 1024 <= cap for cap in static.level_capacities[:-1])
     net, static, state = _build(_CONFIGS["propose_window2"])
     assert any(cap % 64 for cap in static.level_capacities)
     step = px.make_step(net, static, growth="xla")

@@ -135,10 +135,14 @@ class _Grow(px.AddConn):
 class _Propose(px.ProposeAddConn):
     """Re-grow random deeper edges (the C++ synthetic benchmark's growth, hashed)."""
 
+    proposer = "global"
     max_candidates = 64
-    num_proposals = 2 * _NUM_UNITS
+    proposals_per_proposer = 2 * _NUM_UNITS
 
-    def propose(self, u: Any, j: jax.Array, g: G) -> tuple[Any, Any, Any]:
+    def propose(
+        self, u: Any, j: jax.Array, g: G, rng: px.rng.Rng
+    ) -> tuple[Any, Any, Any]:
+        del rng
         src = j // 2
         dst = (_hash01(j, g["step"], jnp.int32(5)) * _NUM_UNITS).astype(jnp.int32)
         deeper = u[px.LEVEL, dst] == u[px.LEVEL, src] + 1

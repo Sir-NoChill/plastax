@@ -57,18 +57,21 @@ class _TableProposals(px.ProposeAddConn[None]):
         max_candidates: int,
         dedupe: bool | None = None,
     ) -> None:
+        self.proposer = "global"
         self.src = jnp.asarray([r[0] for r in table], dtype=jnp.int32)
         self.dst = jnp.asarray([r[1] for r in table], dtype=jnp.int32)
         self.scores = jnp.asarray([r[2] for r in table], dtype=jnp.float32)
-        self.num_proposals = len(table)
+        self.proposals_per_proposer = len(table)
         self.max_candidates = max_candidates
         if dedupe is not None:
-            self.dedupe = dedupe
+            # The old single flag covered both stages; keep that meaning.
+            self.dedupe_live = dedupe
+            self.dedupe_step = dedupe
 
     def propose(
-        self, u: px.UnitView, j: jax.Array, g: None
+        self, u: px.UnitView, j: jax.Array, g: None, rng: px.rng.Rng
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del u, g
+        del u, g, rng
         return self.src[j], self.dst[j], self.scores[j]
 
     def init(
@@ -131,28 +134,30 @@ def test_proposals_route_to_their_source_level_and_respect_the_window() -> None:
         (3, 5, -jnp.inf),  # vetoed
         (99, 5, 1.0),  # out-of-range id, vetoed
     ]
-    bucket0, bucket1 = _grow(table, max_candidates=4)
+    bucket0, bucket1, bucket2 = _grow(table, max_candidates=4)
     assert bucket0 == [(1, 4)]
     assert bucket1 == [(5, 8)]
+    assert bucket2 == []  # the deepest level proposed nothing
 
 
 def test_each_bucket_keeps_its_own_top_k_by_score() -> None:
     table = [(1, 4, 1.0), (2, 4, 3.0), (3, 4, 2.0), (5, 8, 0.5)]
-    bucket0, bucket1 = _grow(table, max_candidates=2)
+    bucket0, bucket1, bucket2 = _grow(table, max_candidates=2)
     assert bucket0 == [(2, 4), (3, 4)]  # the top 2 of 3 in bucket 0
     assert bucket1 == [(5, 8)]  # bucket 1's lone proposal
+    assert bucket2 == []  # the deepest level proposed nothing
 
 
 def test_default_allows_parallel_edges() -> None:
     table = [(0, 4, 2.0), (1, 4, 1.0), (1, 4, 1.0)]
-    (bucket0, _) = _grow(table, max_candidates=3)
+    (bucket0, *_) = _grow(table, max_candidates=3)
     # A repeat of the live (0, 4) and a within-step repeat both grow.
     assert bucket0 == [(0, 4), (1, 4), (1, 4)]
 
 
 def test_dedupe_excludes_live_and_within_step_duplicates() -> None:
     table = [(0, 4, 2.0), (1, 4, 1.0), (1, 4, 1.0), (2, 4, 0.5)]
-    (bucket0, _) = _grow(table, max_candidates=4, dedupe=True)
+    (bucket0, *_) = _grow(table, max_candidates=4, dedupe=True)
     assert bucket0 == [(1, 4), (2, 4)]
 
 
@@ -173,25 +178,62 @@ def test_within_step_repeats_do_not_consume_top_k_slots_under_dedupe() -> None:
     # Two copies of (1, 4) outscore (2, 4); with k = 2 the repeat must be
     # vetoed before top_k so (2, 4) still grows.
     table = [(1, 4, 1.0), (1, 4, 1.0), (2, 4, 0.5)]
-    (bucket0, _) = _grow(table, max_candidates=2, dedupe=True)
+    (bucket0, *_) = _grow(table, max_candidates=2, dedupe=True)
     assert bucket0 == [(1, 4), (2, 4)]
 
 
-def test_num_proposals_must_be_positive() -> None:
+def test_proposals_per_proposer_must_be_positive() -> None:
     policy = _TableProposals([(1, 4, 1.0)], 1)
-    policy.num_proposals = 0
-    with pytest.raises(TypeError, match="num_proposals"):
+    policy.proposals_per_proposer = 0
+    with pytest.raises(TypeError, match="proposals_per_proposer"):
         _net(policy)
 
 
+def test_removed_num_proposals_names_the_replacement() -> None:
+    policy = _TableProposals([(1, 4, 1.0)], 1)
+    policy.num_proposals = 1
+    with pytest.raises(TypeError, match="proposals_per_proposer"):
+        _net(policy)
+
+
+def test_removed_dedupe_flag_names_the_split_flags() -> None:
+    policy = _TableProposals([(1, 4, 1.0)], 1)
+    policy.dedupe = True  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="dedupe_live"):
+        _net(policy)
+
+
+def test_wrong_propose_arity_for_declared_proposer_is_rejected() -> None:
+    class _PerUnitShapeMismatch(px.ProposeAddConn[None]):
+        proposer = "per_unit"
+        max_candidates = 1
+        proposals_per_proposer = 1
+
+        def propose(  # type: ignore[override]
+            self, u: px.UnitView, j: jax.Array, g: None, rng: px.rng.Rng
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            del u, g, rng
+            return j, j, jnp.float32(0.0)
+
+        def init(
+            self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+        ) -> px.ConnWrite:
+            del u, src, dst, g
+            return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.0)))
+
+    with pytest.raises(TypeError, match="propose\\(self, u, i, j, g, rng\\)"):
+        _net(_PerUnitShapeMismatch())
+
+
 class _WideProposals(px.ProposeAddConn[None]):
+    proposer = "global"
     max_candidates = 4
-    num_proposals = 8
+    proposals_per_proposer = 8
 
     def propose(
-        self, u: px.UnitView, j: jax.Array, g: None
+        self, u: px.UnitView, j: jax.Array, g: None, rng: px.rng.Rng
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del u, g
+        del u, g, rng
         return j, j + 1, jnp.float32(1.0)
 
     def init(
@@ -278,7 +320,7 @@ def test_new_edges_fill_interleaved_holes_and_leave_live_edges_intact() -> None:
     before = {k: np.asarray(v) for k, v in b0.items()}
     state = px.NetworkState(
         units=state.units,
-        conns=(b0, state.conns[1]),
+        conns=(b0, *state.conns[1:]),
         globals_=None,
         needs_resort=state.needs_resort,
     )
@@ -324,7 +366,10 @@ def test_a_small_claim_in_a_large_bucket_uses_the_two_level_search() -> None:
     b0[px.DEAD.name] = b0[px.DEAD.name].at[jnp.asarray(holes)].set(True)
     before = {k: np.asarray(v) for k, v in b0.items()}
     state = px.NetworkState(
-        units=state.units, conns=(b0,), globals_=None, needs_resort=state.needs_resort
+        units=state.units,
+        conns=(b0, *state.conns[1:]),
+        globals_=None,
+        needs_resort=state.needs_resort,
     )
     new_state, _ = phases.build_add_conn_phase(net, static)(state, _DUMMY_INPUTS)
     after = {k: np.asarray(v) for k, v in new_state.conns[0].items()}

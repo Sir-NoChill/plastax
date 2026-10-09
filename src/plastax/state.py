@@ -41,6 +41,12 @@ class NetworkStatic:
             power of two, an int for a multiple of it (topo.capacity_policy).
         seed: the network seed keying the framework's counter-based RNG
             (`plastax.rng`), copied from `Network.seed` at build time.
+        deepest_grows: whether the TOPOLOGICAL bucket list includes a bucket
+            for the deepest unit level. Set when the net declares a growth
+            rule: a forward DAG never sources an edge at its deepest level,
+            but growth may (the committed edge is backward and triggers a
+            resort), so the bucket must exist for the claim to land in.
+            Resort preserves the convention.
     """
 
     num_units: int = dataclasses.field(metadata=dict(static=True))
@@ -65,6 +71,7 @@ class NetworkStatic:
         default=None, metadata=dict(static=True)
     )
     seed: int = dataclasses.field(default=0, metadata=dict(static=True))
+    deepest_grows: bool = dataclasses.field(default=False, metadata=dict(static=True))
 
 
 Columns = dict[str, Array]  # keyed by FieldSpec.name; one array per SOA tag

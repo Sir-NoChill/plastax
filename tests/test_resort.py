@@ -328,7 +328,10 @@ class _SafeAddConn(px.AddConn[None]):
         del g
         ahead = u[px.LEVEL, dst] > u[px.LEVEL, src]
         from_src = src == jnp.int32(_R_SRC)
-        return jnp.where(ahead & from_src, jnp.float32(1.0), jnp.float32(-1e9))
+        # -inf is the hard veto; a merely-low finite score would still commit
+        # in a bucket with no better candidates (the deepest level's bucket
+        # exists for growth and offers only non-ahead pairs).
+        return jnp.where(ahead & from_src, jnp.float32(1.0), -jnp.inf)
 
     def init(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -549,12 +552,16 @@ def _build_e2e_net() -> tuple[px.NetworkStatic, px.NetworkState[None]]:
     builder.add_conn(_E_ANCHOR, _E_DST_B, weight=1.0)
     builder.add_conn(_E_DST_A, _E_SINK, weight=1.0)
     static, state = builder.finalize()
-    assert len(static.level_capacities) == 2
+    # Two populated buckets plus the growth rule's deepest-level bucket.
+    assert len(static.level_capacities) == 3
     truncated = {name: col[:1] for name, col in state.conns[1].items()}
     small_static = dataclasses.replace(
-        static, level_capacities=(static.level_capacities[0], 1)
+        static,
+        level_capacities=(static.level_capacities[0], 1, *static.level_capacities[2:]),
     )
-    small_state = dataclasses.replace(state, conns=(state.conns[0], truncated))
+    small_state = dataclasses.replace(
+        state, conns=(state.conns[0], truncated, *state.conns[2:])
+    )
     return small_static, small_state
 
 
@@ -600,5 +607,10 @@ def test_driver_end_to_end_exercises_overflow_grow_and_needs_resort_resort() -> 
     # Stable afterward: further steps neither overflow nor resort again.
     for _ in range(3):
         driver.step(inputs)
-    assert len(driver.static.level_capacities) == 2
+    # Deepest level 3 after the resort deepens the chain; growth keeps a
+    # bucket for it: max_level + 1 buckets.
+    assert (
+        len(driver.static.level_capacities)
+        == int(np.asarray(driver.state.units[px.LEVEL.name]).max()) + 1
+    )
     assert bool(driver.state.needs_resort) is False

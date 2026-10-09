@@ -82,7 +82,11 @@ class _WindowAddConn(px.AddConn[None]):
         bonus = jnp.where(
             src == jnp.int32(_SRC), jnp.float32(_SRC_BONUS), jnp.float32(0.0)
         )
-        return u[px.ACTIVATION, dst] + bonus
+        # Deeper-only: the deepest level sources candidates too (its bucket
+        # exists for growth), so lateral pairs must be vetoed explicitly for
+        # the committed set to stay level-preserving.
+        deeper = u[px.LEVEL, dst] > u[px.LEVEL, src]
+        return jnp.where(deeper, u[px.ACTIVATION, dst] + bonus, -jnp.inf)
 
     def init(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None

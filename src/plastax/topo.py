@@ -301,7 +301,7 @@ def resort[GS](
         # histogram alone -- a mid-graph level can be a legitimate unit
         # level with zero live OUTGOING conns of its own this round).
         max_level = int(jnp.max(new_level)) if num_units else 0
-        new_num_buckets = max(max_level, 1)
+        new_num_buckets = max(max_level + (1 if static.deepest_grows else 0), 1)
         safe_bucket = jnp.where(dead, jnp.int32(num_units), bucket_of)
         histogram = monoid.sum_.segment_reduce(
             jnp.ones_like(safe_bucket, dtype=jnp.int32),

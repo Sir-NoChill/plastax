@@ -56,7 +56,9 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 - `Network.unit_capacity` (default None): the number of unit slots. The built
   units are live and the slots above them are free, marked in the new
   built-in `PRUNED` unit column. A slot holding no live unit is skipped by
-  every pass's apply, adds no loss and takes no part in growth. A net without
+  every pass's apply, gets no loss seed and takes no part in growth;
+  `UnitView.live` lets a loss leave it out (`SoftmaxCrossEntropyLoss` drops it
+  from the normalisation). A net without
   a capacity has no `PRUNED` column and steps exactly as before.
   `Network.max_levels` (default 1024) bounds unit levels.
 - `UpdateUnit` and the `Network.update_unit` slot: `update(u, i, g)` writes
@@ -64,7 +66,14 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   before the connection update. A batched step runs it on each sample's
   units. The unit-update conformance goldens are enforced.
 - All growth_v2 conformance goldens are enforced: scoring, selection, the
-  validity window, triggers and growth on the batch-mean state.
+  validity window, triggers and growth on the batch-mean state, including
+  the per-level shortlist.
+- `SoftmaxCrossEntropyLoss(seed_field)`: softmax over the output activations
+  with cross-entropy against a target distribution, in the max-subtracted
+  log-sum-exp form, so it stays finite for logits whose exponentials
+  overflow. It matches plastax-cpp's loss bit for bit on the `loss_v1`
+  conformance goldens, which both libraries enforce.
+- `UnitView.gather(spec, ids)` reads one field at several units.
 - Per-connection proposers (`proposer = "per_connection"`) run under Scheme-A
   sharding. Each shard proposes for its own connections; their
   `(src, dst, occurrence)` ranks and rng keys are global across shards, so
@@ -73,6 +82,16 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** the loss is whole-output. A `Loss` declares `seed_field` (the
+  float unit column its gradient seed goes to) and implements
+  `calculate_loss(u, outputs, targets, g) -> (loss, seed)`, called once over
+  every output unit; the framework writes `seed` into `seed_field` at the
+  output ids. This replaces `per_output(u, i, target, g)`, which saw one
+  output at a time and so could not express losses that couple the outputs.
+  Port a per-output loss by computing over `u.gather(px.ACTIVATION, outputs)`
+  and returning the summed loss with the seed vector; a loss that still
+  defines `per_output` fails validation with a pointer to the new shape.
+  MSE-style losses ported this way produce bit-identical results.
 - **Breaking:** `AddConn` is renamed `ScoreAddConn`, and growth rules
   declare `max_new_per_level` instead of `max_candidates` (including the
   examples' `make_net(max_new_per_level=...)`). The shortlist attributes are

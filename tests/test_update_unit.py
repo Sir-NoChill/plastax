@@ -82,14 +82,16 @@ class Backward(px.BackwardPass):
 
 
 class Loss(px.Loss):
-    """0.5 * (activation - target)^2."""
+    """sum(0.5 * (activation - target)^2), seeding the difference."""
 
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jax.Array, g: None
-    ) -> tuple[jax.Array, px.UnitWrite]:
+    seed_field = LOSS_GRAD
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array]:
         del g
-        diff = u[px.ACTIVATION, i] - target
-        return jnp.float32(0.5) * diff * diff, px.UnitWrite.of((LOSS_GRAD, diff))
+        diff = u.gather(px.ACTIVATION, outputs) - targets
+        return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
 class Trace(px.UpdateUnit[None]):

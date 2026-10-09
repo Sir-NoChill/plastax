@@ -50,8 +50,8 @@ class StepResult[GS]:
     Attributes:
         state: The network state after the step.
         overflow: growth overflow flag for the step (also on the state).
-        loss: Reduced per-output loss for the step; 0.0 when the net has no
-            loss phase.
+        loss: The scalar the loss policy returned for the step; 0.0 when the
+            net has no loss phase.
     """
 
     state: NetworkState[GS]

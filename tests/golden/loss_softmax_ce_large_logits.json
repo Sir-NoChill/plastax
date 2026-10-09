@@ -1,0 +1,192 @@
+{
+ "_comment": "Logits whose unshifted exponentials overflow float32: only the max-subtracted form stays finite. Compare exactly: the seed is the loss's gradient seed on each output (in output order), the loss the scalar it returns. Forward is linear_v1 over identity_weight_v1, so each output's activation is its input logit.",
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 0
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 2
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 3
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 3
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.0
+   },
+   "src": 3
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 3
+  }
+ ],
+ "name": "loss_softmax_ce_large_logits",
+ "network": {
+  "input_dim": 4,
+  "layers": [
+   4
+  ]
+ },
+ "requires": "loss_v1",
+ "rules": {
+  "forward": "linear_v1",
+  "loss": "softmax_ce_v1",
+  "weights": "identity_weight_v1"
+ },
+ "schema": "registry_v1",
+ "steps": [
+  {
+   "expect": {
+    "activations": [
+     300.0,
+     150.0,
+     180.0,
+     64.0
+    ],
+    "loss": 135.0,
+    "seed": [
+     1.0,
+     -0.5,
+     -0.5,
+     0.0
+    ]
+   },
+   "inputs": [
+    300.0,
+    150.0,
+    180.0,
+    64.0
+   ],
+   "targets": [
+    0.0,
+    0.5,
+    0.5,
+    0.0
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     96.0,
+     224.0,
+     88.0,
+     100.0
+    ],
+    "loss": 124.0,
+    "seed": [
+     0.0,
+     1.0,
+     0.0,
+     -1.0
+    ]
+   },
+   "inputs": [
+    96.0,
+    224.0,
+    88.0,
+    100.0
+   ],
+   "targets": [
+    0.0,
+    0.0,
+    0.0,
+    1.0
+   ]
+  }
+ ]
+}

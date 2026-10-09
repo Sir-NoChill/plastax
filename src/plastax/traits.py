@@ -6,6 +6,7 @@ Python analogue of the C++ policy concepts; static checking via ty / mypy
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from collections.abc import Callable
 from typing import Any, NamedTuple, Protocol, runtime_checkable
@@ -150,31 +151,123 @@ class BackwardPass[Acc, GS](Protocol):
 
 @runtime_checkable
 class Loss[GS](Protocol):
-    """Per-output loss policy producing a loss contribution and a unit write.
+    """Whole-output loss policy: one call sees every output unit.
+
+    `calculate_loss` reads the output units (any field, through the unit view)
+    and the targets, and returns the scalar loss together with the gradient
+    seed dL/d(output) of every output. The framework writes the seed into the
+    unit column the policy declares as `seed_field`, at the output ids only;
+    the loss writes nothing else. A whole-output signature is what makes losses
+    that couple the outputs expressible, e.g. softmax cross-entropy
+    (`SoftmaxCrossEntropyLoss`).
+
+    The backward accumulator is not writable by any policy: it reaches a rule
+    only as `BackwardPass.apply`'s `acc` argument, read-only. The backward pass
+    picks the seed up from `seed_field` (the output level's own `acc` is the
+    identity, since no edge sources from the deepest level).
+
+    With a unit capacity (`Network.unit_capacity`) an output slot may hold no
+    live unit. The framework never writes such an output's seed, and the
+    policy must leave it out of the loss: `u.live(outputs)` gives the live
+    flags, or None when every slot is live.
 
     Type Args:
         GS: the global state type threaded through the network.
+
+    Attributes:
+        seed_field: the float unit column the gradient seed is written to; one
+            of the network's unit columns (normally an `extra_unit_fields`
+            entry).
     """
 
-    def per_output(
+    seed_field: FieldSpec[np.float32]
+
+    def calculate_loss(
         self,
         u: UnitView,
-        i: UnitIdx,
-        target: Float[Array, ""],
+        outputs: Int32[Array, " num_outputs"],
+        targets: Float[Array, " num_outputs"],
         g: GS,
-    ) -> tuple[Float[Array, ""], UnitWrite]:
-        """Compute the loss contribution and gradient write for one output.
+    ) -> tuple[Float[Array, ""], Float[Array, " num_outputs"]]:
+        """Compute the scalar loss and the gradient seed over every output.
 
         Args:
             u: the unit view.
-            i: index of the output unit.
-            target: the target value for this output.
+            outputs: the output unit ids, in the builder's output order;
+                `targets[k]` is the target of unit `outputs[k]`.
+            targets: the target value of every output.
             g: the global state.
 
         Returns:
-            A (loss-contribution, UnitWrite) pair.
+            A (loss, seed) pair: the scalar loss and the `(num_outputs,)`
+            gradient seed, aligned with `outputs`.
         """
         ...
+
+
+@dataclasses.dataclass(frozen=True)
+class SoftmaxCrossEntropyLoss:
+    """Softmax over the output activations, cross-entropy against the targets.
+
+    The targets are a distribution over the outputs (one-hot or soft). With
+    logits ``a``, ``m = max(a)``, ``z = a - m`` and ``s = sum(exp(z))``:
+
+    - loss ``L = sum(t * (log(s) - z))``, the max-subtracted log-sum-exp form
+      of ``-sum(t * log(softmax(a)))``, finite for any finite logits;
+    - seed ``dL/da = exp(z) / s - t``, written to `seed_field`.
+
+    Matches plastax-cpp's `SoftmaxCrossEntropyLoss` operation for operation in
+    float32 (max, then the shifted exponentials and their sum, then the
+    per-output quotient and the target-weighted log-sum-exp).
+
+    An output slot holding no live unit (`UnitView.live`) takes no part: it is
+    left out of the max and the normalising sum, its target is ignored, and
+    its seed is 0. The softmax is then over the live outputs alone.
+
+    Attributes:
+        seed_field: the unit column the gradient seed is written to.
+    """
+
+    seed_field: FieldSpec[np.float32]
+
+    def calculate_loss(
+        self,
+        u: UnitView,
+        outputs: Int32[Array, " num_outputs"],
+        targets: Float[Array, " num_outputs"],
+        g: object,
+    ) -> tuple[Float[Array, ""], Float[Array, " num_outputs"]]:
+        """Compute the cross-entropy and the softmax-minus-target seed.
+
+        Args:
+            u: the unit view.
+            outputs: the output unit ids.
+            targets: the target distribution over the outputs.
+            g: the global state (unused).
+
+        Returns:
+            The (loss, seed) pair.
+        """
+        del g
+        logits = u.gather(ACTIVATION, outputs)
+        live = u.live(outputs)
+        if live is None:
+            z = logits - jnp.max(logits)
+            shifted = jnp.exp(z)
+            total = jnp.sum(shifted)
+            seed = shifted / total - targets
+            loss = jnp.sum(targets * (jnp.log(total) - z))
+            return loss, seed
+        zero = jnp.zeros_like(logits)
+        z = jnp.where(live, logits - jnp.max(jnp.where(live, logits, -jnp.inf)), zero)
+        shifted = jnp.where(live, jnp.exp(z), zero)
+        # >= 1 whenever an output is live (its max term is exp(0)); the floor
+        # only keeps an all-masked output set finite.
+        total = jnp.maximum(jnp.sum(shifted), jnp.float32(1.0))
+        t = jnp.where(live, targets, zero)
+        seed = jnp.where(live, shifted / total - t, zero)
+        loss = jnp.sum(t * (jnp.log(total) - z))
+        return loss, seed
 
 
 @runtime_checkable
@@ -648,6 +741,44 @@ def _validate_monoid_tree(
     )
 
 
+def _validate_loss(cls: type[Network[Any]], loss: object) -> None:
+    """Check the loss policy's shape and its declared seed field.
+
+    Args:
+        cls: the Network subclass being validated.
+        loss: the candidate loss policy.
+
+    Raises:
+        TypeError: if `loss` still has the per-output signature, does not
+            satisfy Loss, or declares a seed field that is not a float unit
+            column of `cls`.
+    """
+    if hasattr(loss, "per_output") and not hasattr(loss, "calculate_loss"):
+        raise TypeError(
+            f"{cls.__name__}.loss: the per-output loss signature was replaced by "
+            "the whole-output one. Declare `seed_field` (the unit column the "
+            "gradient seed is written to) and implement "
+            "`calculate_loss(u, outputs, targets, g) -> (loss, seed)`."
+        )
+    if not isinstance(loss, Loss):
+        raise TypeError(
+            f"{cls.__name__}.loss must satisfy Loss (seed_field, calculate_loss); "
+            f"got {loss!r}"
+        )
+    seed: object = loss.seed_field
+    unit_fields = (ACTIVATION, *cls.extra_unit_fields)
+    if not isinstance(seed, FieldSpec) or seed not in unit_fields:
+        raise TypeError(
+            f"{cls.__name__}.loss.seed_field must be one of the network's unit "
+            f"columns (ACTIVATION or an extra_unit_fields entry); got {seed!r}"
+        )
+    if not np.issubdtype(seed.dtype, np.floating):
+        raise TypeError(
+            f"{cls.__name__}.loss.seed_field {seed.name!r} must be a float "
+            f"column; got dtype {seed.dtype}"
+        )
+
+
 def _validate_field_names(cls: type[Network[Any]]) -> None:
     """Check field-name uniqueness and reject reserved builtin names.
 
@@ -716,8 +847,8 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             )
         _validate_monoid_tree(cls.backward_pass.combine, cls, "backward_pass")
 
-    if cls.loss is not None and not isinstance(cls.loss, Loss):
-        raise TypeError(f"{cls.__name__}.loss must satisfy Loss; got {cls.loss!r}")
+    if cls.loss is not None:
+        _validate_loss(cls, cls.loss)
 
     if cls.update_unit is not None and not isinstance(cls.update_unit, UpdateUnit):
         raise TypeError(

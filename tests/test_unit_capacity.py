@@ -89,14 +89,24 @@ class OffsetBackward(px.BackwardPass):
 
 
 class HalfSquaredLoss(px.Loss):
-    """0.5 * (activation - target)^2, staging the difference in loss_grad."""
+    """sum(0.5 * (activation - target)^2) over the live outputs.
 
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jax.Array, g: None
-    ) -> tuple[jax.Array, px.UnitWrite]:
+    The seed is the difference at every output, masked or not, so it is the
+    framework that must keep a masked output's seed column untouched.
+    """
+
+    seed_field = LOSS_GRAD
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array]:
         del g
-        diff = u[px.ACTIVATION, i] - target
-        return jnp.float32(0.5) * diff * diff, px.UnitWrite.of((LOSS_GRAD, diff))
+        diff = u.gather(px.ACTIVATION, outputs) - targets
+        terms = jnp.float32(0.5) * diff * diff
+        live = u.live(outputs)
+        if live is not None:
+            terms = jnp.where(live, terms, jnp.zeros_like(terms))
+        return jnp.sum(terms), diff
 
 
 class DeltaRule(px.UpdateConn):
@@ -404,6 +414,58 @@ def test_a_masked_output_adds_no_loss() -> None:
     assert float(result.loss) == float(want)
     assert loss_grad[5] == 0.0
     assert loss_grad[4] == act[4] - np.float32(0.25)
+
+
+class _SoftmaxNet(px.Network[None]):
+    forward_pass = OffsetForward()
+    loss = px.SoftmaxCrossEntropyLoss(seed_field=LOSS_GRAD)
+    extra_unit_fields = (LOSS_GRAD, APPLIED)
+    unit_capacity = 6
+
+
+def test_softmax_cross_entropy_leaves_a_masked_output_out() -> None:
+    """A masked output is out of the normalisation, the loss and the seed.
+
+    Inputs 0, 1 feed outputs 2, 3, 4; output 4 is masked. The loss and seed
+    must be the softmax cross-entropy over outputs 2 and 3 alone.
+    """
+    src = np.asarray([0, 1, 0, 1, 0, 1], np.int32)
+    dst = np.asarray([2, 2, 3, 3, 4, 4], np.int32)
+    w = np.asarray([0.5, -0.25, 1.5, 0.75, 2.0, 1.0], np.float32)
+    static, state = px.NetworkBuilder.from_edges(
+        _SoftmaxNet,
+        5,
+        src,
+        dst,
+        weights=w,
+        input_ids=(0, 1),
+        output_ids=(2, 3, 4),
+        globals_=None,
+    )
+    state = _kill_unit(state, 4, prune=True)
+    targets = np.asarray([0.25, 0.75, 0.5], np.float32)
+    result = px.make_step(_SoftmaxNet, static)(
+        state,
+        px.StepInputs(
+            inputs=jnp.asarray([0.5, -1.0], jnp.float32), targets=jnp.asarray(targets)
+        ),
+    )
+    act = np.asarray(result.state.units[px.ACTIVATION.name])
+    seed = np.asarray(result.state.units[LOSS_GRAD.name])
+    assert act[4] == 0.0  # masked: never applied
+    logits = act[[2, 3]].astype(np.float64)
+    z = logits - logits.max()
+    total = np.exp(z).sum()
+    t = targets[:2].astype(np.float64)
+    want_loss = float(np.sum(t * (np.log(total) - z)))
+    np.testing.assert_allclose(float(result.loss), want_loss, rtol=1e-6)
+    np.testing.assert_allclose(seed[[2, 3]], np.exp(z) / total - t, rtol=1e-6)
+    assert seed[4] == 0.0
+    # Not vacuous: output 4's logit (0, its default) and target would change
+    # both numbers if it took part.
+    z3 = np.asarray([*logits, 0.0]) - max(*logits, 0.0)
+    with_masked = float(np.sum(targets * (np.log(np.exp(z3).sum()) - z3)))
+    assert abs(with_masked - want_loss) > 1e-3
 
 
 # ---------------------------------------------------------------------------

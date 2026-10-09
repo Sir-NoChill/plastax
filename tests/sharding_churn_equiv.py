@@ -151,7 +151,7 @@ def _check_churn_step_shards(
 
 
 class _HashPropose(px.ProposeAddConn[None]):
-    """Two random deeper partners per unit (plastax-cpp's sampled GrowFanout)."""
+    """Two random deeper partners per unit, from one global proposer."""
 
     def __init__(self, num_units: int, *, dedupe: bool) -> None:
         self.num_units = num_units

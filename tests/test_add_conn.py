@@ -9,10 +9,9 @@ weight (5.0, 4.0, 3.0, 2.0, 1.0) so a plain weighted-sum forward pass gives
 each DST a distinct, predictable activation to score candidates against.
 SRC starts with NO outgoing edges, so every (SRC, dst) pair is a genuinely
 fresh add_conn candidate; the (ANCHOR, dst) pairs are already-live edges
-that add_conn's own window would also propose (native tolerates such
-duplicate/parallel proposals in its sampled GrowFanout path,
-dispatch_cpu.hpp:849-856) -- the score policy below gives any SRC-sourced
-candidate a large bonus so top_k always prefers the (SRC, dst) set under
+that add_conn's own window would also propose (growth admits such parallel
+edges unless the rule sets dedupe_live) -- the score policy below gives any
+SRC-sourced candidate a large bonus so top_k always prefers the (SRC, dst) set under
 test over the (ANCHOR, dst) duplicates, keeping every assertion below fully
 deterministic.
 """

@@ -52,8 +52,9 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 - `NetworkState.grown` (connections the step's growth committed),
   `NetworkState.overflow` (whether it dropped any for lack of capacity) and
   `NetworkState.units_added` (units the step's unit addition placed).
-- `Network.structural_interval` (default 1) runs the structural phases
-  (pruning and growth) only on every n-th step.
+- `Network.structural_interval` (default 1) runs unit addition and growth
+  (and so the resort growth triggers) only on every n-th step. Connection and
+  unit pruning run every step, as in plastax-cpp.
 - `Network.unit_capacity` (default None): the number of unit slots. The built
   units are live and the slots above them are free, marked in the new
   built-in `PRUNED` unit column. A slot holding no live unit is skipped by

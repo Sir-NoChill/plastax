@@ -169,7 +169,8 @@ in `_validate_traits`): `selection` / `max_new_per_level` / `max_new_per_step`
 `shortlist_size` + `importance`). `add_conn` must satisfy exactly one of the
 two Protocols; `predicate_add_conn` adapts a boolean predicate to a
 `ScoreAddConn`. Growth reports `grown` and `overflow` on the state, and
-`Network.structural_interval` gates the structural phases to every n-th step.
+`Network.structural_interval` gates unit addition and growth to every n-th
+step; unit and connection pruning run every step, as in plastax-cpp.
 
 `Network.unit_capacity` (default None) sizes the unit columns to a fixed slot
 count and adds the `PRUNED` column (free slots marked); `_apply_masked`, the

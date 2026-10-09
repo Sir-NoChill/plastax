@@ -272,6 +272,54 @@ def test_structural_interval_gates_growth_to_every_nth_step() -> None:
     assert fired == [True, False, False, True, False, False, True]
 
 
+class _PruneAll:
+    """Tombstone every live connection."""
+
+    def predicate(
+        self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: Any
+    ) -> jax.Array:
+        del u, c, cid, g
+        return jnp.bool_(True)
+
+
+@pytest.mark.parametrize(
+    ("propagation", "batch_size", "fuse_prune"),
+    [
+        (px.Propagation.TOPOLOGICAL, None, "off"),
+        (px.Propagation.TOPOLOGICAL, None, "xla"),
+        (px.Propagation.TOPOLOGICAL, 2, "off"),
+        (px.Propagation.PIPELINE, None, "off"),
+    ],
+)
+def test_structural_interval_does_not_gate_connection_pruning(
+    propagation: px.Propagation, batch_size: int | None, fuse_prune: Any
+) -> None:
+    """With interval 3, prune_conn runs every step; growth only on 0 and 3.
+
+    prune_conn runs before add_conn within a step, so the edges a growth step
+    adds survive that step and the next step's pruning removes them.
+    """
+    net = _net(
+        type("_All", (_Base,), {"selection": "all", "max_new_per_level": None})(),
+        structural_interval=3,
+        prune_conn=_PruneAll(),
+        propagation=propagation,
+    )
+    static, state = _build(net)
+    step = px.make_step(net, static, batch_size=batch_size, fuse_prune=fuse_prune)
+    shape = (3,) if batch_size is None else (batch_size, 3)
+    grew, alive = [], []
+    for _ in range(6):
+        result = step(state, px.StepInputs(inputs=jnp.zeros(shape), targets=None))
+        state = result.state
+        grew.append(int(state.grown) > 0)
+        alive.append(len(_live(state)) > 0)
+    if fuse_prune == "xla":
+        assert step.prune_fusion.plan.fused
+    assert grew == [True, False, False, True, False, False]
+    assert alive == grew
+
+
 # --- predicate_add_conn -------------------------------------------------------
 
 

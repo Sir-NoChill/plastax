@@ -719,12 +719,12 @@ class Network[GS]:
         sharding: Scheme-A sharding config, or None for a single device.
         seed: the network seed keying the framework's counter-based RNG
             (`plastax.rng`); identical seeds give identical draw streams.
-        structural_interval: run the structural phases (connection pruning,
-            unit addition and growth) only every this many steps --
-            ``step % n == 0`` fires them. Default 1 (every step, the
-            historical behavior). The growth rule's own ``trigger``
-            composes on top: both gates must pass for growth to run. Unit
-            pruning is not gated: it runs every step, as in plastax-cpp.
+        structural_interval: run the structural phases (unit addition and
+            growth, and so the resort growth triggers) only every this many
+            steps -- ``step % n == 0`` fires them. Default 1 (every step).
+            The growth rule's own ``trigger`` composes on top: both gates
+            must pass for growth to run. Pruning is not gated: unit and
+            connection pruning run every step, as in plastax-cpp.
         unit_capacity: the number of unit slots, or None (the default) for
             exactly the built unit count. A capacity sizes every unit column
             to that many slots and adds the built-in `PRUNED` column: the

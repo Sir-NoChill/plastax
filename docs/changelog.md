@@ -30,6 +30,10 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 - Benchmarks: `examples/benchmarks/fused_prune_check.py`;
   `churn_probe.py --growth`; `triton_check.py` times the backward product
   and a dead-slot fraction.
+- `examples/benchmarks/growth_bench.py`, `run_growth.sh` and `plot_growth.py`:
+  the time of one growth phase per strategy against live units, live
+  connections and P on CPU and GPU, with a per-unit N x P fit and a
+  point-by-point comparison against plastax-cpp (`benchmarks/growth.md`).
 - `CITATION.cff`, contributing guide, CODEOWNERS and Dependabot config; CI
   now checks docstrings with pydoclint and builds the docs with warnings as
   errors.

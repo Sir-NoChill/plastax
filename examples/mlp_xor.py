@@ -17,17 +17,13 @@ import jax.numpy as jnp
 import plastax as px
 
 GradPreAct = px.FieldSpec.float32("grad_pre_act")
-# dL/dActivation, staged by MSELoss for output units only and consumed by
-# SigmoidBackward.apply at the output level. dispatch_cpu.hpp stages this
-# into BackwardAcc, a framework-internal per-unit column that is always
-# fresh (zeroed right after the Apply that consumes it) -- plastax's
-# backward accumulator instead lives as a value local to backward_phase's
-# own trace closure (phases.py's build_phases), with no channel for an
-# earlier, separate phase function to write into it. LossGrad bridges
-# the gap: written only for output_ids (every step,
-# always fresh), permanently 0.0 for every other unit since nothing else
-# ever touches it, so -- unlike reusing GradPreAct itself -- it can never
-# carry a stale value from a previous step into a hidden unit's gradient.
+# dL/dActivation: MSELoss's declared seed field, written for the output units
+# only and consumed by SigmoidBackward.apply at the output level. The loss
+# never writes the backward accumulator (BackwardPass.apply receives it
+# read-only), so the seed travels through this column. Written only for
+# output_ids (every step, always fresh) and permanently 0.0 for every other
+# unit, so -- unlike reusing GradPreAct itself -- it can never carry a stale
+# value from a previous step into a hidden unit's gradient.
 LossGrad = px.FieldSpec.float32("loss_grad")
 
 NUM_HIDDEN = 4
@@ -86,7 +82,7 @@ class SigmoidBackward(px.BackwardPass):
     output level (dispatch_cpu.hpp:328-333: no edge sources from the
     deepest level, so the output unit's own `acc` here is always the fresh
     identity 0.0); `u[LossGrad, i]` is 0.0 for every unit except the
-    output_ids MSELoss.per_output wrote this step. Summing them reproduces
+    output_ids MSELoss seeded this step. Summing them reproduces
     the oracle's single BackwardAcc value (module docstring, LossGrad).
     """
 
@@ -114,17 +110,18 @@ class SigmoidBackward(px.BackwardPass):
 
 
 class MSELoss(px.Loss):
-    """0.5*(pred-target)**2 per output unit (mlp_xor.cpp's
-    plastax::MSELoss); stages dL/dActivation = pred-target into LossGrad
+    """0.5*sum((pred-target)**2) over the outputs (mlp_xor.cpp's
+    plastax::MSELoss); seeds dL/dActivation = pred-target into LossGrad
     for SigmoidBackward.apply to pick up at the output level."""
 
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jnp.ndarray, g: None
-    ) -> tuple[jnp.ndarray, px.UnitWrite]:
-        pred = u[px.ACTIVATION, i]
-        diff = pred - target
-        loss = jnp.float32(0.5) * diff * diff
-        return loss, px.UnitWrite.of((LossGrad, diff))
+    seed_field = LossGrad
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jnp.ndarray, targets: jnp.ndarray, g: None
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        pred = u.gather(px.ACTIVATION, outputs)
+        diff = pred - targets
+        return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
 def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[None]]:

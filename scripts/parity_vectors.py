@@ -149,18 +149,20 @@ class SigmoidBackward(px.BackwardPass):
 
 
 class MSELoss(px.Loss):
-    """L = 0.5*(pred - target)^2 per output; dL/dpred = pred - target.
+    """L = 0.5*sum((pred - target)^2); seed dL/dpred = pred - target.
 
-    Matches plastax::MSELoss, which stages the same gradient into BackwardAcc.
+    Matches plastax::MSELoss, which seeds the same gradient into BackwardAcc.
     """
 
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jax.Array, g: None
-    ) -> tuple[jax.Array, px.UnitWrite]:
-        """Return the loss contribution and stage dL/dActivation."""
+    seed_field = LOSS_GRAD
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array]:
+        """Return the loss and the dL/dActivation seed of every output."""
         del g
-        diff = u[px.ACTIVATION, i] - target
-        return jnp.float32(0.5) * diff * diff, px.UnitWrite.of((LOSS_GRAD, diff))
+        diff = u.gather(px.ACTIVATION, outputs) - targets
+        return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
 # ---------------------------------------------------------------------------

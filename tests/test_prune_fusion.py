@@ -160,10 +160,14 @@ class _Tick(px.ResetGlobal):
 
 
 class _MseLoss(px.Loss):
-    def per_output(self, u: Any, i: Any, target: Any, g: G) -> tuple[Any, Any]:
+    seed_field = TRACE
+
+    def calculate_loss(
+        self, u: Any, outputs: Any, targets: Any, g: G
+    ) -> tuple[Any, Any]:
         del g
-        err = u[px.ACTIVATION, i] - target
-        return 0.5 * err * err, px.UnitWrite.of((TRACE, err))
+        err = u.gather(px.ACTIVATION, outputs) - targets
+        return jnp.sum(0.5 * err * err), err
 
 
 class _Backward(px.BackwardPass):

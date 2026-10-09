@@ -211,7 +211,7 @@ def recompute_levels[GS](
     rejects such a graph in TOPOLOGICAL mode (`has_cycle`).
 
     Type Args:
-        GS: Growth-state type parameter carried by NetworkState.
+        GS: Global-state type parameter carried by NetworkState.
 
     Args:
         static: Static network configuration.
@@ -261,7 +261,7 @@ def has_cycle[GS](static: NetworkStatic, state: NetworkState[GS]) -> Bool[Array,
     acyclic graph costs its depth plus one round.
 
     Type Args:
-        GS: Growth-state type parameter carried by NetworkState.
+        GS: Global-state type parameter carried by NetworkState.
 
     Args:
         static: Static network configuration.
@@ -318,7 +318,9 @@ def resort[GS](
     highest level ever used as a source is max(levels) - 1" derivation --
     unlike construction, a resort's bucket count can move in EITHER
     direction versus the old static: growth can deepen the graph (more
-    buckets) and PruneConn can orphan a formerly-deep subtree (fewer).
+    buckets) and PruneConn or PruneUnit can orphan a formerly-deep subtree
+    (fewer). A unit AddUnit spawned holds a provisional level until here,
+    where its live edges decide it.
 
     Redistribution is two device-side passes per new bucket, both reusing
     the prefix-sum null-slot idiom `build_add_conn_phase` already
@@ -340,7 +342,7 @@ def resort[GS](
     next step, so no sweep passes a sorted-segment hint.
 
     Type Args:
-        GS: Growth-state type parameter carried by NetworkState.
+        GS: Global-state type parameter carried by NetworkState.
 
     Args:
         static: Static network configuration.

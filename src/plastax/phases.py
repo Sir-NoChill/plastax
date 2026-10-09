@@ -3815,21 +3815,47 @@ def dedupe_step(
     return jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
 
 
+def total_order(
+    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
+) -> jax.Array:
+    """The permutation sorting candidates into the total candidate order.
+
+    The sort key is ``(-score, src, dst, candidate_index)`` ascending, where
+    the candidate index is the candidate's flat position (the grid's
+    ``src * n + dst``, a shortlist grid's row-major position, a proposal's
+    draw index). Score ties therefore resolve to the lower source id, then the
+    lower destination id, then the earlier candidate -- deterministically,
+    identically on every backend, and identically in the C++ implementation.
+    A NaN score sorts last, like the -inf veto it becomes at commit time
+    (`isfinite` gates growability), rather than first as a raw descending
+    float sort would place it.
+
+    Args:
+        flat_scores: candidate scores.
+        flat_src: candidate source ids, parallel to `flat_scores`.
+        flat_dst: candidate destination ids, parallel to `flat_scores`.
+
+    Returns:
+        The candidate indices, in the total order.
+    """
+    neg_score = jnp.where(
+        jnp.isnan(flat_scores), jnp.float32(jnp.inf), -flat_scores
+    ).astype(jnp.float32)
+    cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
+    *_, perm = jax.lax.sort(
+        (neg_score, flat_src.astype(jnp.int32), flat_dst.astype(jnp.int32), cand_idx),
+        num_keys=4,
+    )
+    return perm
+
+
 def select(
     flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array, k: int
 ) -> jax.Array:
     """Indices of the bucket's k selection winners, in selection order.
 
-    Winners follow the total candidate order: sort key
-    ``(-score, src, dst, candidate_index)`` ascending, where the candidate
-    index is the candidate's flat position (the grid's ``src * n + dst``, a
-    shortlist grid's row-major position, a proposal's draw index). Score ties
-    therefore resolve to the lower source id, then the lower destination id,
-    then the earlier candidate -- deterministically, identically on every
-    backend, and identically in the C++ implementation. A NaN score sorts
-    last, like the -inf veto it becomes at commit time (`isfinite` gates
-    growability), rather than first as a raw descending float sort would
-    place it.
+    Winners are the first k candidates of the total candidate order (see
+    `total_order`).
 
     Args:
         flat_scores: the bucket's candidate scores.
@@ -3843,16 +3869,51 @@ def select(
         winners in this order, so an unsorted full pool would commit in
         candidate order instead.
     """
-    neg_score = jnp.where(
-        jnp.isnan(flat_scores), jnp.float32(jnp.inf), -flat_scores
-    ).astype(jnp.float32)
-    cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
-    *_, perm = jax.lax.sort(
-        (neg_score, flat_src.astype(jnp.int32), flat_dst.astype(jnp.int32), cand_idx),
-        num_keys=4,
-    )
-    top_idx: jax.Array = perm[:k]
+    top_idx: jax.Array = total_order(flat_scores, flat_src, flat_dst)[:k]
     return top_idx
+
+
+def select_per_segment(
+    flat_scores: jax.Array,
+    flat_src: jax.Array,
+    flat_dst: jax.Array,
+    segment: jax.Array,
+    num_segments: int,
+    k: int,
+) -> list[tuple[jax.Array, jax.Array]]:
+    """Each segment's first k candidates in the total order, from one sort.
+
+    The candidates are sorted once into the total candidate order (see
+    `total_order`); segment s's winners are then its own members in that
+    order, ranked by a running count of them. Restricted to one segment, this
+    is exactly `select` over that segment's candidates. A candidate whose
+    segment is outside ``[0, num_segments)`` belongs to none.
+
+    Args:
+        flat_scores: candidate scores.
+        flat_src: candidate source ids, parallel to `flat_scores`.
+        flat_dst: candidate destination ids, parallel to `flat_scores`.
+        segment: each candidate's segment id.
+        num_segments: the static segment count.
+        k: the static per-segment budget.
+
+    Returns:
+        Per segment, the `(k,)` indices of its winners in the total order, and
+        a `(k,)` mask that is False past the segment's member count (those
+        indices are placeholders).
+    """
+    perm = total_order(flat_scores, flat_src, flat_dst)
+    sorted_segment = segment[perm]
+    winners: list[tuple[jax.Array, jax.Array]] = []
+    for s in range(num_segments):
+        member = sorted_segment == s
+        member32 = member.astype(jnp.int32)
+        rank = jnp.cumsum(member32) - 1
+        slot = jnp.where(member & (rank < k), rank, jnp.int32(k))
+        top_idx = jnp.zeros((k,), jnp.int32).at[slot].set(perm, mode="drop")
+        filled = jnp.arange(k, dtype=jnp.int32) < member32.sum()
+        winners.append((top_idx, filled))
+    return winners
 
 
 def build_add_conn_phase[GS](
@@ -3893,7 +3954,10 @@ def build_add_conn_phase[GS](
     bucket then selects independently (`selection`: top_k of
     `max_new_per_level`, threshold or all) in the total candidate order
     `(-score, src, dst, candidate index)`, and `max_new_per_step` caps the
-    step across levels, level-ascending. A candidate with a non-finite score
+    step across levels, level-ascending. When every bucket draws from one
+    shared candidate list (everything but `"shortlist_per_level"`), the list
+    is scored and sorted into that order once, and each bucket takes its own
+    source level's members (`select_per_segment`). A candidate with a non-finite score
     is never committed -- the framework scores every invalid candidate
     -inf, and a growth policy returns -inf to veto one it must never grow
     (e.g. a non-deeper edge) -- so a bucket with more free slots than
@@ -4129,16 +4193,9 @@ def build_add_conn_phase[GS](
             write = ac.init(u_view, UnitIdx(s), UnitIdx(d), g)
             return dict(write.fields)
 
-        claims: list[GrowthClaim] = []
-        for bucket_idx in range(num_buckets):
-            bucket_conns = state.conns[bucket_idx]
-            if use_per_level:
-                assert imp is not None  # use_per_level implies importance is set
-                flat_src, flat_dst = candidates_per_level(
-                    imp, unit_level, bucket_idx, pool_side, max_level_gap, direction
-                )
-            else:
-                flat_src, flat_dst = global_src, global_dst
+        def bucket_valid(
+            bucket_idx: int, flat_src: jax.Array, flat_dst: jax.Array
+        ) -> jax.Array:
             valid = apply_validity(
                 flat_src,
                 flat_dst,
@@ -4155,15 +4212,68 @@ def build_add_conn_phase[GS](
                 valid = valid & live[flat_src] & live[flat_dst]
             if ded_live:
                 valid = valid & dedupe_live(
-                    bucket_conns, flat_src, flat_dst, num_units, shard_axis
+                    state.conns[bucket_idx], flat_src, flat_dst, num_units, shard_axis
                 )
+            return valid
+
+        def scores_of(
+            flat_src: jax.Array, flat_dst: jax.Array, valid: jax.Array
+        ) -> jax.Array:
             if use_propose:
                 flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
             if ded_step:
                 flat_scores = dedupe_step(flat_scores, flat_src, flat_dst)
-            top_idx = select(flat_scores, flat_src, flat_dst, k)
+            return flat_scores
+
+        # Per bucket: its candidates (src, dst), their validity and scores,
+        # its k winners' indices in the total order, and which winner slots
+        # hold a candidate.
+        selections: list[tuple[jax.Array, ...]] = []
+        if use_per_level:
+            assert imp is not None  # use_per_level implies importance is set
+            for bucket_idx in range(num_buckets):
+                flat_src, flat_dst = candidates_per_level(
+                    imp, unit_level, bucket_idx, pool_side, max_level_gap, direction
+                )
+                valid = bucket_valid(bucket_idx, flat_src, flat_dst)
+                flat_scores = scores_of(flat_src, flat_dst, valid)
+                top_idx = select(flat_scores, flat_src, flat_dst, k)
+                filled = jnp.ones((k,), jnp.bool_)
+                selections.append(
+                    (flat_src, flat_dst, valid, flat_scores, top_idx, filled)
+                )
+        else:
+            # Every bucket draws from the one shared candidate list. A
+            # topological bucket admits only candidates sourced at its own
+            # level, so the buckets' valid sets partition the list by source
+            # level (PIPELINE keeps a single bucket): each candidate can only
+            # be valid for its source level's bucket, and every other bucket
+            # scores it -inf. Validity therefore merges into one mask, and
+            # scoring, the within-step dedupe (a pair's copies share a source,
+            # so a bucket) and the total-order sort run once over the whole
+            # list. Each bucket's winners are then its own members in that
+            # order, which is what a sort of the list with every other level
+            # vetoed puts ahead of its first -inf candidate.
+            valid = bucket_valid(0, global_src, global_dst)
+            for bucket_idx in range(1, num_buckets):
+                valid = valid | bucket_valid(bucket_idx, global_src, global_dst)
+            flat_scores = scores_of(global_src, global_dst, valid)
+            if is_pipeline:
+                assert num_buckets == 1  # PIPELINE keeps one bucket
+                segment = jnp.zeros(global_src.shape, jnp.int32)
+            else:
+                segment = unit_level[global_src].astype(jnp.int32)
+            for top_idx, filled in select_per_segment(
+                flat_scores, global_src, global_dst, segment, num_buckets, k
+            ):
+                selections.append(
+                    (global_src, global_dst, valid, flat_scores, top_idx, filled)
+                )
+
+        claims: list[GrowthClaim] = []
+        for flat_src, flat_dst, valid, flat_scores, top_idx, filled in selections:
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]
@@ -4177,7 +4287,7 @@ def build_add_conn_phase[GS](
             # its finite-scored candidates would back-fill the surplus with
             # vetoed edges, since top_k still surfaces them and `has_room`
             # alone would admit them.
-            top_growable = top_valid & jnp.isfinite(flat_scores[top_idx])
+            top_growable = filled & top_valid & jnp.isfinite(flat_scores[top_idx])
             if selection == "threshold":
                 assert threshold_fn is not None  # _validate_growth_knobs
                 thresh = jnp.asarray(threshold_fn(g), jnp.float32)

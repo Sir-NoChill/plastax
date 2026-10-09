@@ -9,6 +9,12 @@ Reads growth_cpu.csv and/or growth_gpu.csv from DIR and writes, into DIR:
 - growth_compile.png: compile time of each point vs its candidates.
 - growth_fit.csv: the per-unit fits (slope in N x P, and in N and P apart).
 
+When DIR also holds growth_cpu_before.csv / growth_gpu_before.csv (an
+earlier run of the same grid, e.g. before a change), it writes:
+
+- growth_before_after.png: per point, the before/after speedup vs candidates.
+- growth_before_after.csv: every point both runs hold, with the speedup.
+
 With ``--cx CX_DIR`` (plastax-cpp's ``benchmarks/results/growth``, holding
 growth_host.csv and growth_device.csv) it also writes:
 
@@ -467,6 +473,69 @@ def plot_vs_cx(df: pd.DataFrame, cx: pd.DataFrame, out: Path) -> None:
     plt.close(fig)
 
 
+def compare_before(df: pd.DataFrame, d: Path) -> pd.DataFrame | None:
+    """Every point of the earlier run in `d`, with the before/after speedup.
+
+    Args:
+        df: the current rows.
+        d: the results directory, holding growth_{cpu,gpu}_before.csv.
+
+    Returns:
+        The matched rows (also written to growth_before_after.csv), or None
+        when there is no earlier run.
+    """
+    paths = [d / f"growth_{b}_before.csv" for b in ("cpu", "gpu")]
+    frames = [pd.read_csv(p) for p in paths if p.exists()]
+    if not frames:
+        return None
+    before = pd.concat(frames, ignore_index=True)
+    key = ["backend", "sweep", "strategy", "N", "C", "P"]
+    m = before[[*key, "candidates", "median_ms"]].merge(
+        df[[*key, "median_ms"]], on=key, suffixes=("_before", "_after")
+    )
+    m = m.rename(
+        columns={"median_ms_before": "before_ms", "median_ms_after": "after_ms"}
+    )
+    m["speedup"] = m.before_ms / m.after_ms
+    m = m.sort_values(key)
+    m.to_csv(d / "growth_before_after.csv", index=False, float_format="%.4f")
+    return m
+
+
+def plot_before_after(m: pd.DataFrame, out: Path) -> None:
+    """Before/after speedup of every point vs its candidates, per backend.
+
+    Args:
+        m: the matched rows from `compare_before`.
+        out: the output directory.
+    """
+    bs = backends(m)
+    fig, axes = subplots(len(bs))
+    for ax, b in zip(axes[0], bs, strict=True):
+        g = m[m.backend == b]
+        for name, (color, marker, label) in STRATEGIES.items():
+            s = g[g.strategy == name]
+            if s.empty:
+                continue
+            ax.scatter(
+                s.candidates,
+                s.speedup,
+                marker=marker,
+                s=18,
+                color=color,
+                edgecolors="white",
+                linewidths=0.5,
+                label=label,
+            )
+        ax.axhline(1.0, color=INK2, linewidth=0.8)
+        style(ax, "candidates per call", "speedup (before / after)", f"Speedup, {b}")
+        ax.set_yscale("linear")
+        ax.legend(fontsize=8, framealpha=0.9, edgecolor="none")
+    fig.tight_layout()
+    fig.savefig(out / "growth_before_after.png", dpi=140)
+    plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("dir", type=Path)
@@ -481,6 +550,12 @@ def main() -> None:
     plot_sweep(df, args.dir, "c", "C", "live connections C", "Growth vs live conns")
     plot_p(df, args.dir)
     plot_compile(df, args.dir)
+    before = compare_before(df, args.dir)
+    if before is not None:
+        plot_before_after(before, args.dir)
+        med = before.groupby(["backend", "strategy"]).speedup.median()
+        print(f"{len(before)} points matched against the earlier run")
+        print(med.to_string(float_format="%.2f"))
     with pd.option_context("display.width", 160):
         print(fits.to_string(index=False))
     if args.cx is not None and args.cx.is_dir():

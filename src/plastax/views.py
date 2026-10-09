@@ -13,10 +13,10 @@ from collections.abc import Mapping
 from typing import TypeVar
 
 import numpy as np
-from jaxtyping import Array, Shaped
+from jaxtyping import Array, Bool, Int32, Shaped
 
 from plastax._types import ConnIdx, FieldSpec, UnitIdx
-from plastax.state import Columns
+from plastax.state import Columns, live_unit_mask
 
 DT = TypeVar("DT", bound=np.generic)
 
@@ -38,6 +38,39 @@ class UnitView:
         """
         spec, idx = key
         return self._cols[spec.name][idx]
+
+    def gather(
+        self, spec: FieldSpec[DT], ids: Int32[Array, " n"]
+    ) -> Shaped[Array, " n"]:
+        """Return a field's values at several units, in the order of `ids`.
+
+        Whole-output rules (`Loss.calculate_loss`) read every output at once
+        through this.
+
+        Args:
+            spec: Field spec to read.
+            ids: Unit indices to read, any order.
+
+        Returns:
+            The field's values at `ids`.
+        """
+        return self._cols[spec.name][ids]
+
+    def live(self, ids: Int32[Array, " n"]) -> Bool[Array, " n"] | None:
+        """Return whether each of several unit slots holds a live unit.
+
+        Only a network that declares a unit capacity has slots without a live
+        unit; for any other the answer is None (every slot is live), so a
+        rule can skip the masking at trace time.
+
+        Args:
+            ids: Unit indices to test, any order.
+
+        Returns:
+            The live flags at `ids`, or None when every slot is live.
+        """
+        live = live_unit_mask(self._cols)
+        return None if live is None else live[ids]
 
 
 @dataclasses.dataclass(frozen=True)

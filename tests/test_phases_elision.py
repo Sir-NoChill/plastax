@@ -54,12 +54,16 @@ class _ResetToZero(px.ResetGlobal):
 
 
 class _SquaredErrorLoss(px.Loss):
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jax.Array, g: jax.Array
-    ) -> tuple[jax.Array, UnitWrite]:
-        pred = u[px.ACTIVATION, i]
-        diff = pred - target
-        return jnp.float32(0.5) * diff * diff, UnitWrite.of((px.ACTIVATION, pred))
+    # Seeds into ACTIVATION with the prediction itself, so the write leaves
+    # the column unchanged and the nets here share one field layout.
+    seed_field = px.ACTIVATION
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        pred = u.gather(px.ACTIVATION, outputs)
+        diff = pred - targets
+        return jnp.sum(jnp.float32(0.5) * diff * diff), pred
 
 
 _shared_forward = _SumForward()

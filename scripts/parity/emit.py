@@ -11,6 +11,9 @@ Golden families, by their ``requires`` tag:
 
 - ``passes_v1``: forward/backward/MSE on a fixed dyadic ReLU MLP. Consumed by
   both libraries today, with exact float equality.
+- ``loss_v1``: the whole-output loss contract, through softmax
+  cross-entropy on a linear identity layer: the scalar loss and every output's
+  gradient seed. Consumed by both libraries, with exact float equality.
 - ``unit_lifecycle_v1``: the unit update/prune/add semantics. Spec-only until
   the libraries implement the unit lifecycle; consumers skip them loudly.
 - ``growth_v2``: the shared growth selection pipeline. Spec-only until the
@@ -187,6 +190,164 @@ def _passes_pipeline() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# loss_v1
+# ---------------------------------------------------------------------------
+
+_LOSS_WIDTH = 4
+
+# (name, comment, steps of (logits, targets)). Every shifted logit is 0 or
+# <= -104, so each exp is exactly 1 or 0 in every float32 implementation, and
+# the exponential sum is the (power-of-two) number of tied maxima.
+_LossStep = tuple[list[float], list[float]]
+_LOSS_CASES: tuple[tuple[str, str, tuple[_LossStep, ...]], ...] = (
+    (
+        "loss_softmax_ce_one_hot",
+        "One-hot targets, on and off the argmax: the seed is softmax - target "
+        "on every output and the loss is the target's log-sum-exp margin.",
+        (
+            ([3.0, -125.0, -130.0, -141.0], [0.0, 0.0, 1.0, 0.0]),
+            ([-128.0, 0.0, -136.0, -200.0], [0.0, 1.0, 0.0, 0.0]),
+            ([-110.0, -250.0, 4.0, -112.0], [1.0, 0.0, 0.0, 0.0]),
+        ),
+    ),
+    (
+        "loss_softmax_ce_soft_targets",
+        "A soft (dyadic) target distribution: the loss weights every "
+        "output's log-sum-exp margin by its target mass.",
+        (
+            ([-2.0, -130.0, -134.0, -150.0], [0.25, 0.5, 0.125, 0.125]),
+            ([-160.0, -140.0, 12.0, -120.0], [0.5, 0.0, 0.25, 0.25]),
+        ),
+    ),
+    (
+        "loss_softmax_ce_large_logits",
+        "Logits whose unshifted exponentials overflow float32: only the "
+        "max-subtracted form stays finite.",
+        (
+            ([300.0, 150.0, 180.0, 64.0], [0.0, 0.5, 0.5, 0.0]),
+            ([96.0, 224.0, 88.0, 100.0], [0.0, 0.0, 0.0, 1.0]),
+        ),
+    ),
+    (
+        "loss_softmax_ce_negative_logits",
+        "Logits whose unshifted exponentials all underflow to 0: only the "
+        "max-subtracted form avoids 0 / 0.",
+        (
+            ([-420.0, -300.0, -500.0, -410.0], [0.25, 0.0, 0.25, 0.5]),
+            ([-250.0, -480.0, -360.0, -380.0], [0.0, 1.0, 0.0, 0.0]),
+        ),
+    ),
+    (
+        "loss_softmax_ce_tied_max",
+        "Two tied maxima share the softmax mass (exactly 1/2 each), so the "
+        "seed exercises the division by the exponential sum; the loss adds "
+        "log(2) to a margin large enough to absorb its last bits.",
+        (
+            ([5.0, 5.0, -128.0, -140.0], [0.0, 0.0, 1.0, 0.0]),
+            ([-300.0, 40.0, -100.0, 40.0], [0.0, 0.0, 1.0, 0.0]),
+        ),
+    ),
+)
+
+
+def _loss_state() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``_LOSS_WIDTH`` inputs, each copied to one output (identity weights)."""
+    n = _LOSS_WIDTH
+    units = [
+        ref.make_unit(i, 0, is_input=True, fields={"activation": 0.0}) for i in range(n)
+    ]
+    units += [
+        ref.make_unit(n + k, 1, is_output=True, fields={"activation": 0.0})
+        for k in range(n)
+    ]
+    edges = [
+        ref.make_edge(s, n + d, weight=rules.identity_weight_v1(s, n + d, n))
+        for d in range(n)
+        for s in range(n)
+    ]
+    return units, edges
+
+
+def _check_exact(units: list[dict[str, Any]], targets: list[float]) -> np.float32:
+    """Run the reference, asserting the golden is exact by construction.
+
+    Every shifted logit must be 0 or underflow (so exp is exact everywhere),
+    the tie count a power of two (so the softmax quotient is exact), and the
+    loss unchanged by +-64 ulp in log(s) or by reversing the summation. A
+    single maximum makes s = 1, whose logarithm is exactly 0 everywhere.
+    """
+    acts = [np.float32(u["fields"]["activation"]) for u in units if u["is_output"]]
+    peak = max(acts)
+    shifted = [np.float32(a - peak) for a in acts]
+    assert all(z == 0 or z <= -104 for z in shifted), shifted
+    assert sum(z == 0 for z in shifted) in (1, 2, 4), shifted
+
+    def nudged(ulps: int) -> Any:
+        def log(x: np.float32) -> np.float32:
+            v = np.float32(np.log(x))
+            if x == 1:
+                return v
+            step = np.float32(np.inf if ulps > 0 else -np.inf)
+            for _ in range(abs(ulps)):
+                v = np.nextafter(v, step, dtype=np.float32)
+            return v
+
+        return log
+
+    loss = ref.softmax_ce_loss_grad(units, targets)
+    for ulps in (-64, 64):
+        probe = copy.deepcopy(units)
+        assert ref.softmax_ce_loss_grad(probe, targets, log=nudged(ulps)) == loss
+    flipped = copy.deepcopy(units)
+    outs = [u for u in flipped if u["is_output"]]
+    for u, a in zip(outs, reversed(acts), strict=True):
+        u["fields"]["activation"] = float(a)
+    assert ref.softmax_ce_loss_grad(flipped, targets[::-1]) == loss
+    return loss
+
+
+def _loss_cases() -> list[dict[str, Any]]:
+    docs = []
+    for name, comment, case_steps in _LOSS_CASES:
+        units, edges = _loss_state()
+        steps = []
+        for logits, targets in case_steps:
+            ref.forward_topological(units, edges, logits, lambda acc: acc)
+            loss = _check_exact(units, targets)
+            outs = [u for u in units if u["is_output"]]
+            steps.append(
+                {
+                    "inputs": logits,
+                    "targets": targets,
+                    "expect": {
+                        "activations": [u["fields"]["activation"] for u in outs],
+                        "seed": [u["fields"]["loss_grad"] for u in outs],
+                        "loss": float(loss),
+                    },
+                }
+            )
+        docs.append(
+            _doc(
+                name,
+                "loss_v1",
+                comment + " Compare exactly: the seed is the loss's gradient "
+                "seed on each output (in output order), the loss the scalar it "
+                "returns. Forward is linear_v1 over identity_weight_v1, so each "
+                "output's activation is its input logit.",
+                rules={
+                    "loss": rules.SOFTMAX_CE_V1,
+                    "forward": rules.LINEAR_V1,
+                    "weights": "identity_weight_v1",
+                },
+                network={"input_dim": _LOSS_WIDTH, "layers": [_LOSS_WIDTH]},
+                initial_edges=_edges_json(edges),
+                steps=steps,
+            )
+        )
+    return docs
+
+
+# ---------------------------------------------------------------------------
 # unit_lifecycle_v1
 # ---------------------------------------------------------------------------
 
@@ -357,6 +518,35 @@ def _growth_state(
     ]
     if isolated_unit:
         units.append(ref.make_unit(6, 1, fields={"activation": 1.0}))
+    return units, edges
+
+
+def _per_level_state() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """9 units, three per level, so each level's top-M (M=2) is a real choice.
+
+    importance_v1 ranks level 0 as 1 > 2 > 0, level 1 as 5 > 3 > 4 and
+    level 2 as 7 > 8 > 6.
+    """
+    units = [
+        ref.make_unit(i, 0, is_input=True, fields={"activation": 0.25 * i})
+        for i in range(3)
+    ]
+    units += [
+        ref.make_unit(3 + i, 1, fields={"activation": 0.5 - 0.25 * i}) for i in range(3)
+    ]
+    units += [
+        ref.make_unit(6 + i, 2, is_output=True, fields={"activation": 0.125 * (1 - i)})
+        for i in range(3)
+    ]
+    edges = [
+        ref.make_edge(0, 3, weight=0.5),
+        ref.make_edge(1, 4, weight=-0.25),
+        ref.make_edge(2, 5, weight=0.75),
+        ref.make_edge(1, 3, weight=0.125),
+        ref.make_edge(3, 6, weight=-0.5),
+        ref.make_edge(4, 7, weight=0.25),
+        ref.make_edge(5, 8, weight=1.0),
+    ]
     return units, edges
 
 
@@ -647,6 +837,53 @@ def _grow_cases() -> list[dict[str, Any]]:
             )
         )
 
+    # Per-level shortlist: one M x M grid per source level. M = 2 of the 3
+    # units on every level, so both the source and the destination rankings
+    # decide the grid, and it differs from the single global grid's.
+    for name, direction in (
+        ("grow_score_shortlist_per_level_any", "any"),
+        ("grow_score_shortlist_per_level_deeper", "deeper"),
+    ):
+        units, edges = _per_level_state()
+        iu, ie = _units_json(units), _edges_json(edges)
+        cands = ref.candidates_shortlist_per_level(
+            units,
+            shortlist_size=2,
+            max_level_gap=1,
+            direction=direction,
+            importance=rules.importance_v1,
+            score=rules.grid_score_v1,
+        )
+        cases.append(
+            _grow_doc(
+                name,
+                "Per-level shortlist (M=2): per source level, ascending, the "
+                "sources are the level's top-M live units by importance and "
+                "the destinations the top-M live units inside that level's "
+                "validity window (level gap and direction), by importance; "
+                "importance ties break by ascending unit id; index = "
+                "level_rank * M * M + row-major position in the level's grid.",
+                cands=cands,
+                units=units,
+                edges=edges,
+                params={
+                    "candidates": "shortlist_per_level",
+                    "shortlist_size": 2,
+                    "selection": "top_k",
+                    "max_new_per_level": 2,
+                    "max_level_gap": 1,
+                    "direction": direction,
+                },
+                rules_used={
+                    "score": "grid_score_v1",
+                    "importance": "importance_v1",
+                    "init": "grow_init_v1",
+                },
+                initial_units=iu,
+                initial_edges=ie,
+            )
+        )
+
     # Selection stages on the exhaustive grid.
     selection_cases = (
         (
@@ -874,6 +1111,7 @@ def _grow_cases() -> list[dict[str, Any]]:
 def build_all() -> dict[str, dict[str, Any]]:
     """Every registry golden, keyed by filename."""
     docs = [_passes_topological(), _passes_pipeline()]
+    docs.extend(_loss_cases())
     docs.extend(_unit_cases())
     docs.extend(_grow_cases())
     return {f"{d['name']}.json": d for d in docs}

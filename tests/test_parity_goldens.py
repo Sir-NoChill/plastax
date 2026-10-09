@@ -6,9 +6,12 @@ files. Each golden names the feature set it `requires`:
 
 - ``passes_v1`` runs here today, with exact float equality (every value in
   those goldens is a dyadic fraction, so float32 arithmetic on them is exact).
+- ``loss_v1`` runs the shipped `SoftmaxCrossEntropyLoss` through a real step:
+  the gradient seed on every output and the returned loss, exactly.
 - ``growth_v2`` is enforced in full: the propose cases and the score cases
-  (exhaustive/shortlist/predicate scoring, every selection mode, the
-  validity window, the triggers, and growth on the batch-mean state).
+  (exhaustive/shortlist/per-level shortlist/predicate scoring, every
+  selection mode, the validity window, the triggers, and growth on the
+  batch-mean state).
 - ``unit_lifecycle_v1`` is the specification of phases this library does not
   implement yet; its goldens are skipped loudly below, one visible skip per
   file, until the features land.
@@ -38,7 +41,7 @@ import reference as ref  # noqa: E402
 from _plastax_cpp import plastax_cpp_dir  # noqa: E402
 
 _GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "golden"
-_IMPLEMENTED = {"passes_v1"}
+_IMPLEMENTED = {"passes_v1", "loss_v1"}
 _SPEC_ONLY = {
     "unit_lifecycle_v1": "the unit lifecycle (update/prune/add) is not implemented",
     "growth_v2": "no consumer covers this growth_v2 case",
@@ -56,6 +59,14 @@ _ENFORCED_SCORE = {
     for path in sorted(_GOLDEN_DIR.glob("grow_*.json"))
     if json.loads(path.read_text()).get("requires") == "growth_v2"
     and "score" in json.loads(path.read_text())["rules"]
+}
+
+
+# loss_v1 cases (enforced by test_loss_golden), discovered by tag.
+_ENFORCED_LOSS = {
+    path.stem
+    for path in sorted(_GOLDEN_DIR.glob("loss_*.json"))
+    if json.loads(path.read_text()).get("requires") == "loss_v1"
 }
 
 
@@ -157,15 +168,17 @@ class ReluBackward(px.BackwardPass):
 
 
 class MSELoss(px.Loss):
-    """L = 0.5*(pred - target)^2 per output; stages dL/dpred to loss_grad."""
+    """L = 0.5*sum((pred - target)^2); seeds dL/dpred into loss_grad."""
 
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jax.Array, g: None
-    ) -> tuple[jax.Array, px.UnitWrite]:
-        """Return the loss contribution and stage the gradient."""
+    seed_field = LOSS_GRAD
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array]:
+        """Return the loss and the gradient seed of every output."""
         del g
-        diff = u[px.ACTIVATION, i] - target
-        return jnp.float32(0.5) * diff * diff, px.UnitWrite.of((LOSS_GRAD, diff))
+        diff = u.gather(px.ACTIVATION, outputs) - targets
+        return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
 class _ReluMlpNet(px.Network[None]):
@@ -247,6 +260,69 @@ def test_passes_relu_pipeline_matches_golden_exactly() -> None:
 
 
 # ---------------------------------------------------------------------------
+# loss_v1: the whole-output loss contract, through softmax cross-entropy.
+# ---------------------------------------------------------------------------
+
+
+class LinearForward(_WeightedSumMap, px.ForwardPass):
+    """apply = acc; golden rule linear_v1."""
+
+    def apply(
+        self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jax.Array
+    ) -> px.UnitWrite:
+        """Write the accumulated input unchanged."""
+        del u, i, g
+        return px.UnitWrite.of((px.ACTIVATION, acc))
+
+
+class _SoftmaxNet(px.Network[None]):
+    forward_pass = LinearForward()
+    loss = px.SoftmaxCrossEntropyLoss(LOSS_GRAD)
+    extra_unit_fields = (LOSS_GRAD,)
+    propagation = px.Propagation.TOPOLOGICAL
+
+
+@pytest.mark.parametrize("name", sorted(_ENFORCED_LOSS))
+def test_loss_golden(name: str) -> None:
+    """The shipped softmax cross-entropy reproduces seed and loss exactly."""
+    doc = _load(f"{name}.json")
+    assert doc["rules"] == {
+        "loss": "softmax_ce_v1",
+        "forward": "linear_v1",
+        "weights": "identity_weight_v1",
+    }
+    n_in = doc["network"]["input_dim"]
+    (n_out,) = doc["network"]["layers"]
+    edges = doc["initial_edges"]
+    output_ids = list(range(n_in, n_in + n_out))
+    static, state = px.NetworkBuilder.from_edges(
+        _SoftmaxNet,
+        n_in + n_out,
+        np.asarray([e["src"] for e in edges], dtype=np.int32),
+        np.asarray([e["dst"] for e in edges], dtype=np.int32),
+        weights=np.asarray([e["fields"]["weight"] for e in edges], dtype=np.float32),
+        input_ids=list(range(n_in)),
+        output_ids=output_ids,
+        globals_=None,
+    )
+    step = px.make_step(_SoftmaxNet, static)
+    for i, s in enumerate(doc["steps"]):
+        result = step(
+            state,
+            px.StepInputs(
+                inputs=jnp.asarray(s["inputs"], jnp.float32),
+                targets=jnp.asarray(s["targets"], jnp.float32),
+            ),
+        )
+        state = result.state
+        acts = np.asarray(state.units[px.ACTIVATION.name])[output_ids]
+        seed = np.asarray(state.units[LOSS_GRAD.name])[output_ids]
+        assert acts.tolist() == s["expect"]["activations"], f"step {i} activations"
+        assert seed.tolist() == s["expect"]["seed"], f"step {i} seed"
+        assert float(result.loss) == s["expect"]["loss"], f"step {i} loss"
+
+
+# ---------------------------------------------------------------------------
 # Spec-only goldens: loud per-file skips until the features land.
 # ---------------------------------------------------------------------------
 
@@ -257,10 +333,14 @@ def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) ->
     doc = json.loads(path.read_text())
     requires = doc["requires"]
     if requires in _IMPLEMENTED:
-        assert doc["name"] in {
-            "passes_relu_topological",
-            "passes_relu_pipeline",
-        }, f"{doc['name']} claims {requires} but no consumer covers it"
+        assert (
+            doc["name"]
+            in {
+                "passes_relu_topological",
+                "passes_relu_pipeline",
+            }
+            | _ENFORCED_LOSS
+        ), f"{doc['name']} claims {requires} but no consumer covers it"
         return
     assert requires in _SPEC_ONLY, f"unknown requires tag {requires!r} in {path.name}"
     if doc["name"] in _ENFORCED_GROWTH | _ENFORCED_SCORE:
@@ -492,8 +572,8 @@ def _make_score_rule(
         return px.predicate_add_conn(should_add, init, **knobs)
 
     class _Rule:
-        if params["candidates"] == "shortlist":
-            candidates = "shortlist"
+        if params["candidates"] in ("shortlist", "shortlist_per_level"):
+            candidates = params["candidates"]
             shortlist_size = int(params["shortlist_size"])
 
         def score(

@@ -36,6 +36,7 @@ from plastax.traits import (
     PruneConn,
     ResetGlobal,
     ScoreAddConn,
+    SoftmaxCrossEntropyLoss,
     UpdateConn,
     predicate_add_conn,
 )
@@ -68,6 +69,7 @@ __all__ = [
     "ResetGlobal",
     "ShardSpec",
     "ShortlistCoverage",
+    "SoftmaxCrossEntropyLoss",
     "StepInputs",
     "StepResult",
     "TO_ID",

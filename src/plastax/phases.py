@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse as jsparse
-from jaxtyping import Array, Bool, Float, Int32, Shaped
+from jaxtyping import Array, Bool, Float, Int32
 
 from plastax import monoid
 from plastax import rng as rng_mod
@@ -1032,14 +1032,13 @@ def _build_backward_topological_phase[GS](
 def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phase[GS]:
     loss = net.loss
     assert loss is not None  # build_phases only calls this when set
-    # vmapped over the whole output set rather than unrolled per output id:
-    # `per_output` is a pure scalar policy over views (views.py docstring), so
-    # one trace of it serves every output. The unrolled Python loop this
-    # replaced emitted a gather + a scatter *per output unit*, so trace and XLA
-    # compile cost grew superlinearly in the output count -- fine for the 1-10
-    # outputs of an MLP, but the wall for extreme multi-label classification,
-    # whose whole point is 10^5-10^6 output units.
+    # One call over the whole output set: the policy returns the scalar loss
+    # and the (num_outputs,) seed, and the seed lands in its declared column
+    # with one scatter. Trace and compile cost stay independent of the output
+    # count, which matters for extreme multi-label classification (10^5-10^6
+    # output units).
     output_ids = jnp.asarray(static.output_ids, dtype=jnp.int32)
+    seed_name = loss.seed_field.name
 
     def loss_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -1048,31 +1047,17 @@ def _build_loss_phase[GS](net: type[Network[GS]], static: NetworkStatic) -> Phas
         # docstring); build_phases only reaches here when net.loss is set.
         assert inputs.targets is not None
         u_view = UnitView(state.units)
-        globals_ = state.globals_
-
-        def one(
-            unit_id: Int32[Array, ""], target: Float[Array, ""]
-        ) -> tuple[Float[Array, ""], dict[str, Shaped[Array, ""]]]:
-            # UnitWrite is not a registered pytree, so vmap carries the
-            # underlying field mapping and the scatter below rebuilds columns.
-            value, write = loss.per_output(u_view, UnitIdx(unit_id), target, globals_)
-            return value, dict(write.fields)
-
-        values, columns = jax.vmap(one)(output_ids, inputs.targets)
+        value, seed = loss.calculate_loss(
+            u_view, output_ids, inputs.targets, state.globals_
+        )
         units = dict(state.units)
-        live = live_unit_mask(state.units)
+        live = u_view.live(output_ids)
         if live is not None:
-            # An output slot holding no live unit adds no loss and keeps its
-            # columns.
-            out_live = live[output_ids]
-            values = jnp.where(out_live, values, jnp.zeros_like(values))
-            columns = {
-                name: jnp.where(out_live, column, units[name][output_ids])
-                for name, column in columns.items()
-            }
-        for name, column in columns.items():
-            units[name] = units[name].at[output_ids].set(column)
-        return dataclasses.replace(state, units=units), jnp.sum(values)
+            # An output slot holding no live unit gets no seed write; the
+            # policy leaves it out of the loss (see `Loss`).
+            seed = jnp.where(live, seed, units[seed_name][output_ids])
+        units[seed_name] = units[seed_name].at[output_ids].set(seed)
+        return dataclasses.replace(state, units=units), value
 
     return loss_phase
 
@@ -1415,15 +1400,8 @@ def plan_prune_fusion[GS](
         fwd_writes = _write_keys(forward_apply, *apply_args)
         between: set[tuple[str, str]] = set()
         if net.loss is not None:
-            loss = net.loss
-
-            def loss_write(u: Columns, i: jax.Array, t: jax.Array, g_: Any) -> Any:
-                return dict(loss.per_output(UnitView(u), UnitIdx(i), t, g_)[1].fields)
-
-            target = _sds((), np.dtype(np.float32))
-            between |= {
-                ("unit", k) for k in _write_keys(loss_write, units, scalar_i, target, g)
-            }
+            # The loss writes exactly its declared seed column.
+            between.add(("unit", net.loss.seed_field.name))
         if net.backward_pass is not None:
             bp = net.backward_pass
 

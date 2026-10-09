@@ -77,41 +77,6 @@ class StepInputs:
     targets: Float[Array, "*batch num_outputs"] | None
 
 
-def _step_gated[GS](phase: Phase[GS], interval: int) -> Phase[GS]:
-    """Run `phase` only on steps where ``step % interval == 0``.
-
-    The skip branch returns the state unchanged, so a gated structural phase
-    simply does not happen on off-steps (`Network.structural_interval`).
-
-    Type Args:
-        GS: the user's global-state pytree, opaque to the framework.
-
-    Args:
-        phase: the phase to gate.
-        interval: the structural cadence, a static int >= 2.
-
-    Returns:
-        The gated phase.
-    """
-
-    def gated(
-        state: NetworkState[GS], inputs: StepInputs
-    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
-        fire = (state.step % jnp.int32(interval)) == jnp.int32(0)
-
-        def skip(
-            st: NetworkState[GS], _: StepInputs
-        ) -> tuple[NetworkState[GS], Float[Array, ""]]:
-            return st, jnp.float32(0.0)
-
-        out: tuple[NetworkState[GS], Float[Array, ""]] = jax.lax.cond(
-            fire, phase, skip, state, inputs
-        )
-        return out
-
-    return gated
-
-
 def build_phases[GS](
     net: type[Network[GS]],
     static: NetworkStatic,
@@ -181,16 +146,12 @@ def build_phases[GS](
         phases.append(build_update_conn_phase(net, static))
     if net.prune_unit is not None:
         phases.append(build_prune_unit_phase(net, static))
-    interval = int(getattr(net, "structural_interval", 1))
     if net.prune_conn is not None:
-        prune_phase = (
+        phases.append(
             build_prune_merge_phase(dead_sink)
             if fused
             else build_prune_conn_phase(net, static)
         )
-        if interval > 1:
-            prune_phase = _step_gated(prune_phase, interval)
-        phases.append(prune_phase)
     if net.add_unit is not None:
         phases.append(build_add_unit_phase(net, static))
     if net.add_conn is not None:
@@ -285,15 +246,11 @@ def build_batched_phases[GS](
         and linear_input_field(net.backward_pass) is not None
         else None
     )
-    interval = int(getattr(net, "structural_interval", 1))
     structural: list[Phase[GS]] = []
     if net.prune_unit is not None:
         structural.append(build_prune_unit_phase(net, static))
     if net.prune_conn is not None:
-        prune_phase = build_prune_conn_phase(net, static)
-        if interval > 1:
-            prune_phase = _step_gated(prune_phase, interval)
-        structural.append(prune_phase)
+        structural.append(build_prune_conn_phase(net, static))
     if net.add_unit is not None:
         structural.append(build_add_unit_phase(net, static))
     if net.add_conn is not None:

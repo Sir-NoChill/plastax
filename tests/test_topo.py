@@ -106,6 +106,23 @@ def test_raises_on_cycle_without_allow_cycles() -> None:
         topo.initial_levels(3, edges)
 
 
+def test_an_edge_into_an_input_does_not_raise_its_level() -> None:
+    """Inputs 0, 1; 1 -> 2 -> 0 -> 3. Unit 0 stays at level 0, so 3 is level 1."""
+    edges = np.array([[1, 2], [2, 0], [0, 3]], dtype=np.int32)
+    got = topo.initial_levels(4, edges, input_ids=(0, 1))
+    assert got.tolist() == [0, 0, 1, 1]
+    # Without the inputs declared, the edge into 0 deepens it and its subtree.
+    assert topo.initial_levels(4, edges).tolist() == [2, 0, 1, 3]
+
+
+def test_a_cycle_through_an_input_still_raises() -> None:
+    edges = np.array([[0, 2], [1, 2], [2, 0]], dtype=np.int32)
+    with pytest.raises(ValueError, match="cycle"):
+        topo.initial_levels(3, edges, input_ids=(0, 1))
+    pinned = topo.initial_levels(3, edges, allow_cycles=True, input_ids=(0, 1))
+    assert pinned.tolist() == [0, 0, 1]
+
+
 def test_allow_cycles_matches_scalar_best_effort() -> None:
     """allow_cycles keeps cycle units at their acyclic-predecessor level.
 

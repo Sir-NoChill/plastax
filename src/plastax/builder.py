@@ -504,6 +504,7 @@ class NetworkBuilder[GS]:
             num_units,
             edges,
             allow_cycles=self.net.propagation is Propagation.PIPELINE,
+            input_ids=tuple(input_ids),
         )
 
         # sharding overrides net.sharding when given; None -> single device.

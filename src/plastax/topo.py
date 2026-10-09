@@ -14,7 +14,7 @@ from typing import cast
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Int32
+from jaxtyping import Array, Bool, Int32
 
 from plastax import monoid
 from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID, Propagation
@@ -36,6 +36,7 @@ def initial_levels(
     edges: np.ndarray,
     *,
     allow_cycles: bool = False,
+    input_ids: tuple[int, ...] = (),
 ) -> np.ndarray:
     """Compute initial longest-path levels host-side, before jit.
 
@@ -43,6 +44,10 @@ def initial_levels(
     incoming edges (u -> v) of level(u) + 1. Raises on a cycle (topological
     propagation needs a DAG; the dense/conv2d/sequential topologies always
     give one) unless `allow_cycles` is set.
+
+    The `input_ids` sit at level 0: an edge into an input does not raise
+    the input's level, as in `recompute_levels`. It still counts toward the
+    cycle check, so a cycle through an input raises.
 
     Computed by a **vectorized frontier Kahn** (BFS by level): each round
     relaxes, in one numpy scatter, every out-edge whose source settled last
@@ -66,6 +71,7 @@ def initial_levels(
         edges: (E, 2) int32 host array of edges, from builder.
         allow_cycles: If True, tolerate cycles and return best-effort
             levels instead of raising.
+        input_ids: The input unit ids, pinned to level 0.
 
     Returns:
         Per-unit levels as an int32 host array.
@@ -73,6 +79,15 @@ def initial_levels(
     Raises:
         ValueError: The edges do not form a DAG and `allow_cycles` is False.
     """
+    if input_ids and edges.shape[0]:
+        into_input = np.isin(edges[:, 1], np.asarray(input_ids))
+        if into_input.any():
+            if not allow_cycles:
+                # The cycle check sees every edge, the edges into inputs too.
+                initial_levels(num_units, edges)
+            return initial_levels(
+                num_units, edges[~into_input], allow_cycles=allow_cycles
+            )
     levels = np.zeros(num_units, dtype=np.int32)
     if edges.shape[0] == 0:
         return levels
@@ -191,7 +206,9 @@ def recompute_levels[GS](
     converges to the exact same longest-path level `initial_levels`
     computes host-side from the same edge set, when the graph's
     structurally-in-degree-0 units are exactly the declared inputs (true
-    for every topology in this module's own test graphs).
+    for every topology in this module's own test graphs). On a graph with a
+    cycle among non-input units the levels do not converge; `resort`
+    rejects such a graph in TOPOLOGICAL mode (`has_cycle`).
 
     Type Args:
         GS: Growth-state type parameter carried by NetworkState.
@@ -232,6 +249,56 @@ def recompute_levels[GS](
     )
 
 
+def has_cycle[GS](static: NetworkStatic, state: NetworkState[GS]) -> Bool[Array, ""]:
+    """Whether the live connections contain a directed cycle.
+
+    Every live edge counts, edges into input units included, so a cycle
+    through an input is a cycle (a topological schedule cannot order it).
+    Longest-path relaxation over the live edges with no unit pinned: on an
+    acyclic graph every level settles within num_units - 1 rounds, while on
+    a cycle some level rises every round. A `jax.lax.while_loop` relaxes
+    until a round changes nothing or num_units rounds have run, so an
+    acyclic graph costs its depth plus one round.
+
+    Type Args:
+        GS: Growth-state type parameter carried by NetworkState.
+
+    Args:
+        static: Static network configuration.
+        state: Current network state.
+
+    Returns:
+        A scalar bool, True when the live edges contain a cycle.
+    """
+    num_units = static.num_units
+    from_id = jnp.concatenate([bucket[FROM_ID.name] for bucket in state.conns])
+    to_id = jnp.concatenate([bucket[TO_ID.name] for bucket in state.conns])
+    dead = jnp.concatenate([bucket[DEAD.name] for bucket in state.conns])
+    safe_to = jnp.where(dead, jnp.int32(num_units), to_id)
+
+    def cond(carry: tuple[Int32[Array, ""], Int32[Array, " n"], Array]) -> Array:
+        rounds, _, changed = carry
+        return changed & (rounds < num_units)
+
+    def body(
+        carry: tuple[Int32[Array, ""], Int32[Array, " n"], Array],
+    ) -> tuple[Int32[Array, ""], Int32[Array, " n"], Array]:
+        rounds, level, _ = carry
+        incoming_max = monoid.max_.segment_reduce(
+            level[from_id] + jnp.int32(1), safe_to, num_units, indices_are_sorted=False
+        )
+        relaxed = jnp.maximum(level, incoming_max.astype(jnp.int32))
+        return rounds + jnp.int32(1), relaxed, jnp.any(relaxed != level)
+
+    init = (
+        jnp.int32(0),
+        jnp.zeros((num_units,), dtype=jnp.int32),
+        jnp.bool_(num_units > 0),
+    )
+    changed: Bool[Array, ""] = jax.lax.while_loop(cond, body, init)[2]
+    return changed
+
+
 def resort[GS](
     static: NetworkStatic, state: NetworkState[GS]
 ) -> tuple[NetworkStatic, NetworkState[GS]]:
@@ -241,7 +308,9 @@ def resort[GS](
     (gather per level), stable sort each bucket by (dead, from_id) via
     lax.sort_key_val -- doubles as compaction -- then derive new
     level_capacities via capacity_policy. Per-level live counts are the
-    only host transfer. Returns new (static, state); caller retraces.
+    only host transfer besides, in TOPOLOGICAL mode, the `has_cycle` flag:
+    a cycle in the live edges (through an input or not) has no level
+    schedule and raises. Returns new (static, state); caller retraces.
 
     PIPELINE mode keeps exactly one bucket, mirrored from
     NetworkBuilder.finalize's own PIPELINE branch; TOPOLOGICAL's new
@@ -279,8 +348,19 @@ def resort[GS](
 
     Returns:
         The new (static, state) pair with resorted conns.
+
+    Raises:
+        ValueError: The network propagates TOPOLOGICALLY and its live
+            connections contain a cycle.
     """
     num_units = static.num_units
+    if static.propagation is not Propagation.PIPELINE and bool(
+        has_cycle(static, state)
+    ):
+        raise ValueError(
+            "resort: topological propagation requires an acyclic graph; the "
+            "live connections contain a cycle"
+        )
     new_level = recompute_levels(static, state)
 
     flat: Columns = {

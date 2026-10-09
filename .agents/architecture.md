@@ -169,7 +169,8 @@ in `_validate_traits`): `selection` / `max_new_per_level` / `max_new_per_step`
 `shortlist_size` + `importance`). `add_conn` must satisfy exactly one of the
 two Protocols; `predicate_add_conn` adapts a boolean predicate to a
 `ScoreAddConn`. Growth reports `grown` and `overflow` on the state, and
-`Network.structural_interval` gates the structural phases to every n-th step.
+`Network.structural_interval` gates unit addition and growth to every n-th
+step; unit and connection pruning run every step, as in plastax-cpp.
 
 `Network.unit_capacity` (default None) sizes the unit columns to a fixed slot
 count and adds the `PRUNED` column (free slots marked); `_apply_masked`, the
@@ -353,8 +354,11 @@ no retry of an overflowing step (buckets short of `max_new_per_level` free slots
 grow at the check) and a resort deferred to the check. Opt-in, for launch-
 bound small nets; N = 1 is the exact protocol above.
 
-`topo.resort` (`topo.py:149`) recomputes levels (`recompute_levels`,
-Bellman-Ford relaxation bounded by `kahn_max_depth`), redistributes edges into
+`topo.resort` first rejects, in topological mode, a cycle in the live edges
+(`has_cycle`; edges into inputs count, so a cycle through an input is
+rejected), then recomputes levels (`recompute_levels`, Bellman-Ford
+relaxation bounded by `kahn_max_depth`; inputs stay at level 0 whatever feeds
+them, as in the builder's `initial_levels`), redistributes edges into
 new per-level buckets (prefix-sum compacting scatter + stable sort on
 `dead*num_units + from_id` to restore the builder's source-major order -- live
 edges first, grouped by source, for scatter-add performance; in-place churn

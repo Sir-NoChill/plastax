@@ -129,7 +129,8 @@ class MyProposeGrow:
 #   dedupe_step = False (first of equal candidates in the step)
 #   trigger = "every_step" | ("every", n) | "on_units_added" | "when" (def when(self, g))
 #   on_overflow = "flag" | "error"
-# Network.structural_interval = n runs prune + growth on every n-th step only.
+# Network.structural_interval = n runs add_unit + growth on every n-th step only
+# (prune_unit and prune_conn run every step).
 
 # Linear passes (optional): a ForwardPass whose map is exactly
 #   c[WEIGHT, cid] * u[F, src]  (BackwardPass: ... * u[F, dst]) with combine

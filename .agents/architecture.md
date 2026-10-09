@@ -405,3 +405,50 @@ convnet is just a different topology"). Reuse existing trait definitions
 `mlp_xor.py`). An example must use only **public** traits — if it needs an
 internal API, that is a signal the public surface is missing something. Cross-
 reference the C++ oracle file when porting.
+
+## 10. Growth: the target model (design record)
+
+The growth rework lands in stages; this section is the normative design the
+stages implement. Where current code disagrees (single scored-grid `AddConn`,
+network-level `neighbourhood`, dedupe on by default in grid mode), current code
+loses.
+
+Two strategies, one deterministic selection pipeline:
+
+- **Propose** (default): a proposer emits `proposals_per_proposer` candidates
+  `(src, dst, score)` per step. Proposers: `per_unit` (default, every live
+  unit), `per_connection` (every live connection), `global` (one). Neither
+  endpoint need be the proposer.
+- **Score**: `score(u, src, dst, g)` over candidate pairs from `exhaustive`
+  (every windowed pair), or `shortlist` (top-M units by a user `importance`,
+  score the M x M grid). A boolean predicate adapts via `predicate_add_conn`
+  (True -> 0.0, False -> -inf).
+
+Pipeline, in order: trigger (`every_step` default, `every(n)`,
+`on_units_added`, `when(g)`); candidates from live proposers; validity (each
+failure scores -inf): live in-range endpoints, `src != dst` unless
+`allow_self_loops`, `|level(dst) - level(src)| <= max_level_gap` (a growth-rule
+attribute — the network-level `neighbourhood` is removed), `direction`
+(`any`/`deeper`/`same_or_deeper`); non-finite scores veto; `dedupe_live`
+(default **False**) vetoes candidates equal to a live edge; `dedupe_step`
+(default **False**) keeps the first of equal keys; per-source-level selection
+(`top_k` of `max_new_per_level` / `threshold(g)` / `all`, then
+`max_new_per_step` across levels) in the total order; claim of free slots in
+order (drops raise `overflow`); `init` with declared field defaults; flags
+(`needs_resort`, `grown`). Without dedupe, duplicate candidates create
+parallel edges — by design; live dedupe costs a sort of live keys per step.
+
+Total order: sort key `(-score, src, dst, candidate_index)` ascending.
+Candidate index: per_unit `unit_id * P + j`; per_connection `rank * P + j`
+(rank = ascending `(src, dst, occurrence)` among live connections); global
+`j`; exhaustive `src * capacity + dst`; shortlist row-major over the
+importance-ranked grid (importance ties break by ascending unit id).
+
+Randomness: proposal rules receive an `Rng` keyed by
+`(Network.seed, state.step, stream=1, proposer_key, j)` per the normative
+contract in `plastax.rng`'s module docstring, pinned bit-exactly by the
+`rng_philox32.json` golden shared with plastax-cpp.
+
+The golden files under `tests/golden/` tagged `growth_v2` encode this
+pipeline's expected outputs case by case and flip from skipped to enforced as
+the stages land.

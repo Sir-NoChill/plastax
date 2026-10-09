@@ -25,6 +25,7 @@ from plastax.phases import (
     dedupe_live,
     dedupe_step,
     select,
+    select_per_segment,
 )
 
 
@@ -128,6 +129,22 @@ def test_select_is_identical_under_jit() -> None:
     eager = np.asarray(select(scores, src, dst, 3))
     jitted = np.asarray(jax.jit(select, static_argnums=3)(scores, src, dst, 3))
     assert eager.tolist() == jitted.tolist() == [3, 2, 1]
+
+
+def test_select_per_segment_takes_each_segments_members_in_total_order() -> None:
+    scores = jnp.asarray([3.0, 9.0, 3.0, 5.0, 7.0, 1.0], dtype=jnp.float32)
+    src = jnp.asarray([4, 1, 2, 0, 3, 5], dtype=jnp.int32)
+    dst = jnp.zeros((6,), jnp.int32)
+    segment = jnp.asarray([0, 1, 0, 1, 0, 7], dtype=jnp.int32)  # 7: no segment
+    (top0, filled0), (top1, filled1), (top2, filled2) = select_per_segment(
+        scores, src, dst, segment, 3, 2
+    )
+    # each segment's first k in the total order: select over its own members
+    assert np.asarray(top0).tolist() == [4, 2]  # 7.0, then the 3.0 tie by src
+    assert np.asarray(filled0).tolist() == [True, True]
+    assert np.asarray(top1).tolist() == [1, 3]
+    # a segment with fewer members than k marks the rest unfilled
+    assert np.asarray(filled2).tolist() == [False, False]
 
 
 def test_select_sorts_nan_scores_last() -> None:

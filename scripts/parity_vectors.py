@@ -1,10 +1,12 @@
 """Reference networks for the plastax-cpp conformance vectors.
 
 plastax is the oracle: each network here defines what a step *should* produce,
-and plastax-cpp's `tests/test_parity_plastax.cpp` checks that the C++ implementation
+and plastax-cpp's `tests/test_parity_goldens.cpp` checks that the C++ implementation
 agrees within tolerance. Every net in this file has a counterpart traits struct
 in plastax-cpp's `tests/parity/parity_fixtures.hpp` under the same `traits` name --
-that pairing is the contract, and the two must be edited together.
+that pairing is the contract, and the two must be edited together. A vector
+with no fixture on the C++ side has no consumer (its runner fails on an unknown
+`traits`), so it does not belong here.
 
 These are deliberately self-contained rather than imported from `examples/`.
 Example code changes for algorithmic reasons; a conformance vector has to stay
@@ -77,17 +79,6 @@ class _WeightedSumMap:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
 
-class TanhForward(_WeightedSumMap, px.ForwardPass):
-    """apply = tanh(acc). Mirrors the fixture's TanhForward."""
-
-    def apply(
-        self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jax.Array
-    ) -> px.UnitWrite:
-        """Write tanh of the accumulated input."""
-        del u, i, g
-        return px.UnitWrite.of((px.ACTIVATION, jnp.tanh(acc)))
-
-
 class SigmoidForward(_WeightedSumMap, px.ForwardPass):
     """apply = sigmoid(acc). Mirrors the fixture's SigmoidForward."""
 
@@ -97,17 +88,6 @@ class SigmoidForward(_WeightedSumMap, px.ForwardPass):
         """Write the logistic sigmoid of the accumulated input."""
         del u, i, g
         return px.UnitWrite.of((px.ACTIVATION, jax.nn.sigmoid(acc)))
-
-
-class LinearForward(_WeightedSumMap, px.ForwardPass):
-    """apply = acc (identity activation). Mirrors the fixture's LinearForward."""
-
-    def apply(
-        self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jax.Array
-    ) -> px.UnitWrite:
-        """Write the accumulated input unchanged."""
-        del u, i, g
-        return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
 class SigmoidBackward(px.BackwardPass):
@@ -168,22 +148,6 @@ class MSELoss(px.Loss):
 # ---------------------------------------------------------------------------
 # Vector specification
 # ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass(frozen=True)
-class ConstantInit:
-    """Every weight in the layer set to one value."""
-
-    value: float
-
-    def as_json(self) -> dict[str, Any]:
-        """Return the JSON form the C++ runner parses."""
-        return {"kind": "constant", "value": self.value}
-
-    def weights(self, n_src: int, n_dst: int, base_conn_id: int) -> np.ndarray:
-        """Return the (n_src, n_dst) weight matrix."""
-        del base_conn_id
-        return np.full((n_src, n_dst), self.value, dtype=np.float32)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,7 +216,7 @@ class Layer:
     """One fully connected layer."""
 
     units: int
-    init: ConstantInit | UniformInit
+    init: UniformInit
 
 
 @dataclasses.dataclass(frozen=True)
@@ -340,57 +304,13 @@ def build_topology(vector: Vector) -> Callable[[Any], Any]:
 
 
 # ---------------------------------------------------------------------------
-# The vectors
-# ---------------------------------------------------------------------------
-
-_XOR = ((0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0))
-_XOR_TARGETS = (0.0, 1.0, 1.0, 0.0)
-
-
-class _ManualFccNet(px.Network[None]):
-    forward_pass = TanhForward()
-    propagation = px.Propagation.TOPOLOGICAL
-
-
-class _FccSigmoidNet(px.Network[None]):
-    forward_pass = SigmoidForward()
-    propagation = px.Propagation.TOPOLOGICAL
-
-
-class _PipelineSigmoidNet(px.Network[None]):
-    forward_pass = SigmoidForward()
-    propagation = px.Propagation.PIPELINE
-
-
-class _MlpNet(px.Network[None]):
-    forward_pass = SigmoidForward()
-    backward_pass = SigmoidBackward()
-    loss = MSELoss()
-    update_conn = px.optim.sgd(0.5, grad_field=GRAD_PRE_ACT).update_conn()
-    extra_unit_fields = (GRAD_PRE_ACT, LOSS_GRAD)
-    propagation = px.Propagation.TOPOLOGICAL
-
-
-class _LinRegNet(px.Network[None]):
-    forward_pass = LinearForward()
-    loss = MSELoss()
-    # No backward pass: with a single layer, dL/dActivation at the output *is*
-    # dL/dz, so the update reads the loss's staged gradient directly. plastax-cpp
-    # does the same by reading BackwardAcc, which nothing clears when the
-    # backward pass is elided.
-    update_conn = px.optim.sgd(0.01, grad_field=LOSS_GRAD).update_conn()
-    extra_unit_fields = (LOSS_GRAD,)
-    propagation = px.Propagation.TOPOLOGICAL
-
-
-# ---------------------------------------------------------------------------
-# Optimizer vectors (plastax-cpp notes/parity/02-optimizers.md)
+# The vectors (plastax-cpp notes/parity/02-optimizers.md)
 # ---------------------------------------------------------------------------
 #
-# One net per plastax.optim bundle, all sharing _MlpNet's traits and differing
-# only in `update_conn` -- the same showcase examples/mlp_xor.py makes, and the
-# shape that lets the vectors attribute any divergence to the update rule
-# rather than to anything around it.
+# One net per plastax.optim bundle, all sharing the same sigmoid MLP traits
+# (forward, MSE loss, backward) and differing only in `update_conn` -- the
+# same showcase examples/mlp_xor.py makes, and the shape that lets the vectors
+# attribute any divergence to the update rule rather than to anything around it.
 #
 # Because plastax's bundles are themselves validated against optax, pinning
 # plastax-cpp to these vectors pins it transitively to optax. That is the point:
@@ -399,7 +319,7 @@ class _LinRegNet(px.Network[None]):
 # Hyperparameters other than the learning rate are the bundles' own defaults on
 # both sides, restated in `hyper` only so the C++ runner can assert its
 # compile-time constants still match (CheckOptimHyper in
-# test_parity_plastax.cpp). The learning rate is plumbed through GlobalState so
+# test_parity_goldens.cpp). The learning rate is plumbed through GlobalState so
 # both implementations read the one value in the JSON.
 
 _OPTIM_LR = 0.1
@@ -407,6 +327,9 @@ _ADAM_B1, _ADAM_B2, _ADAM_EPS = 0.9, 0.999, 1e-8
 _ADAMW_DECAY = 1e-4
 _MOMENTUM = 0.9
 _RMSPROP_DECAY, _RMSPROP_EPS = 0.9, 1e-8
+
+_XOR = ((0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 0.0, 1.0), (1.0, 1.0, 1.0))
+_XOR_TARGETS = (0.0, 1.0, 1.0, 0.0)
 
 
 def _optim_net(update_conn: Any, extra_conn_fields: tuple[Any, ...]) -> Any:
@@ -417,7 +340,8 @@ def _optim_net(update_conn: Any, extra_conn_fields: tuple[Any, ...]) -> Any:
         extra_conn_fields: The bundle's per-connection state columns.
 
     Returns:
-        A Network subclass identical to _MlpNet apart from the update rule.
+        A Network subclass that differs from its siblings only in the update
+        rule.
     """
 
     class _OptimNet(px.Network[None]):
@@ -496,17 +420,6 @@ _OPTIM_BUNDLES: tuple[tuple[str, str, Any, dict[str, float], str], ...] = (
 )
 
 
-def _linreg_steps() -> tuple[tuple[tuple[float, ...], tuple[float, ...] | None], ...]:
-    """Deterministic regression samples for y = 2*x1 - x2 + 0.5*x3."""
-    rng = np.random.default_rng(20260830)
-    steps = []
-    for _ in range(24):
-        x = rng.uniform(-1.0, 1.0, size=3).astype(np.float32)
-        y = float(2.0 * x[0] - 1.0 * x[1] + 0.5 * x[2])
-        steps.append((tuple(float(v) for v in x), (y,)))
-    return tuple(steps)
-
-
 def _optim_vectors() -> tuple[Vector, ...]:
     """One vector per optim bundle, all on the same XOR problem.
 
@@ -514,6 +427,9 @@ def _optim_vectors() -> tuple[Vector, ...]:
         A vector for each entry in _OPTIM_BUNDLES.
     """
     steps = tuple((_XOR[i % 4], (_XOR_TARGETS[i % 4],)) for i in range(24))
+    # The description names mlp_xor_seeded, a hand-written-SGD vector that was
+    # retired because plastax-cpp never consumed it. The text is part of every
+    # committed golden, so it is kept verbatim rather than churn all five.
     return tuple(
         Vector(
             name=name,
@@ -533,93 +449,4 @@ def _optim_vectors() -> tuple[Vector, ...]:
     )
 
 
-VECTORS: tuple[Vector, ...] = (
-    Vector(
-        name="manual_fcc",
-        traits="manual_fcc_tanh",
-        description=(
-            "Topological forward with constant weights and no learning. The one "
-            "vector with no RNG involvement at all, so it isolates the forward "
-            "kernel from the initialiser."
-        ),
-        net=_ManualFccNet,
-        input_dim=2,
-        layers=(Layer(4, ConstantInit(0.5)), Layer(1, ConstantInit(-0.3))),
-        steps=(
-            ((0.1, 0.2), None),
-            ((0.5, -0.5), None),
-            ((1.0, 1.0), None),
-            ((-0.75, 0.25), None),
-        ),
-    ),
-    Vector(
-        name="fcc_sigmoid_seeded",
-        traits="fcc_sigmoid_forward",
-        description=(
-            "Topological forward from seeded weights. End-to-end check that the "
-            "NumPy RNG port lands the same weight on the same edge as "
-            "plastax::RandomUniformWeight, including the cross-layer connection-id "
-            "offset."
-        ),
-        net=_FccSigmoidNet,
-        input_dim=3,
-        layers=(Layer(4, UniformInit(seed=1)), Layer(2, UniformInit(seed=2))),
-        steps=(
-            ((0.5, -0.25, 1.0), None),
-            ((-1.0, 0.75, 0.5), None),
-            ((0.0, 0.0, 0.0), None),
-            ((2.0, -2.0, 1.5), None),
-        ),
-    ),
-    Vector(
-        name="mlp_xor_seeded",
-        traits="mlp_sigmoid_mse_sgd",
-        description=(
-            "The full differentiable path -- forward, MSE loss, backward, SGD -- "
-            "on XOR from seeded weights. The vector that actually exercises "
-            "learning; weight drift here is cumulative, so it is the most "
-            "sensitive of the set."
-        ),
-        net=_MlpNet,
-        input_dim=3,
-        layers=(Layer(4, UniformInit(seed=1)), Layer(1, UniformInit(seed=2))),
-        steps=tuple((_XOR[i % 4], (_XOR_TARGETS[i % 4],)) for i in range(24)),
-        learning_rate=0.5,
-    ),
-    Vector(
-        name="linreg_mse",
-        traits="linear_mse_sgd",
-        description=(
-            "Single layer, no backward pass: isolates loss-gradient staging and "
-            "the update rule from the backward walk. Weights start at zero, so "
-            "every value present is one the update produced."
-        ),
-        net=_LinRegNet,
-        input_dim=3,
-        layers=(Layer(1, ConstantInit(0.0)),),
-        steps=_linreg_steps(),
-        learning_rate=0.01,
-    ),
-    Vector(
-        name="pipeline_sigmoid",
-        traits="pipeline_sigmoid",
-        description=(
-            "Pipeline propagation: one flat sweep per step, so a signal advances "
-            "exactly one layer per step and the network's output lags its input. "
-            "A substantially different dispatch path from every topological "
-            "vector, and the reason those are kept in separate files on both sides."
-        ),
-        net=_PipelineSigmoidNet,
-        input_dim=3,
-        layers=(Layer(4, UniformInit(seed=5)), Layer(2, UniformInit(seed=6))),
-        steps=(
-            ((1.0, 0.0, 0.5), None),
-            ((0.0, 1.0, 0.5), None),
-            ((0.0, 0.0, 0.0), None),
-            ((-1.0, 1.0, 0.25), None),
-            ((0.5, 0.5, 0.5), None),
-            ((0.0, 0.0, 0.0), None),
-        ),
-    ),
-    *_optim_vectors(),
-)
+VECTORS: tuple[Vector, ...] = _optim_vectors()

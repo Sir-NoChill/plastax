@@ -63,13 +63,13 @@ group, ordered roughly by how fundamental they are.
 ## The step pipeline
 
 - **Trait** — a declared policy slot on a `Network` subclass (`forward_pass`,
-  `loss`, `backward_pass`, `update_conn`, `prune_conn`, `add_conn`,
-  `reset_global`). Left `None` ⇒ elided.
+  `loss`, `backward_pass`, `update_unit`, `update_conn`, `prune_unit`,
+  `prune_conn`, `add_conn`, `reset_global`). Left `None` ⇒ elided.
 - **Policy** — a pure per-element instance implementing a Protocol; assigned to
   a trait slot.
 - **Phase** — a pure `state → (state, loss)` function `build_phases` produces
   from a present trait. Fixed order: forward → loss → backward → update_unit →
-  update_conn → prune_conn → add_conn → reset_global.
+  update_conn → prune_unit → prune_conn → add_conn → reset_global.
 - **Phase elision** — an absent trait produces no phase and no jaxpr equations
   (Python-level, never `lax.cond`).
 - **`StepInputs` / `StepResult`** — the jit input (`inputs`, optional `targets`)

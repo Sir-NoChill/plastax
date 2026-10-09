@@ -30,7 +30,7 @@ from plastax._types import (
 from plastax.distributed import _addressable_window, _place, _shardings_for_spec
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.topology import Topology
-from plastax.traits import Network
+from plastax.traits import Network, reject_sharded_unit_pruning
 
 # Values a caller may pass into add_unit/add_conn **kwargs, widened with the
 # numpy-scalar FieldSpec.default that fills in unset fields (kept private to
@@ -467,6 +467,8 @@ class NetworkBuilder[GS]:
             ValueError: A referenced unit id or edge endpoint is out of range,
                 a bucket capacity is not divisible by the shard count, or the
                 unit capacity is below the built unit count.
+            NotImplementedError: The network declares `prune_unit` and is
+                built sharded.
         """
         capacity = self.net.unit_capacity
         num_slots = num_units if capacity is None else capacity
@@ -506,6 +508,7 @@ class NetworkBuilder[GS]:
 
         # sharding overrides net.sharding when given; None -> single device.
         effective = sharding if sharding is not None else self.net.sharding
+        reject_sharded_unit_pruning(self.net, effective)
         conn_sharding: NamedSharding | None = None
         repl_sharding: NamedSharding | None = None
         num_shards = 0

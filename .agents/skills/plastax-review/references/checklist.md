@@ -44,11 +44,21 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
   resort"? No segment reduction may pass `indices_are_sorted=True`: bucket order
   (source-major after build/resort) is a performance layout, not a contract.
 - **Phase order assumptions:** does new code rely on a read that the fixed phase
-  order (forward → loss → backward → update_conn → prune_conn → add_conn →
-  reset_global) actually guarantees? (e.g. an update reading a grad the backward
-  pass writes.)
-- **Growth veto:** is `-inf` still treated as a hard veto (never grown), distinct
-  from a low finite score?
+  order (forward → loss → backward → update_unit → update_conn → prune_unit →
+  prune_conn → add_unit → add_conn → reset_global) actually guarantees? (e.g.
+  an update reading a grad the backward pass writes.)
+- **Growth veto:** is `-inf` (any non-finite score) still treated as a hard
+  veto (never grown), distinct from a low finite score?
+- **Growth duplicates:** nothing is deduplicated by default. Does a rule that
+  must never grow a parallel edge set `dedupe_live` (and `dedupe_step`
+  against within-step repeats), or propose only absent pairs by construction?
+- **Growth determinism:** do candidates still commit in the total order
+  `(-score, src, dst, candidate_index)` per source level, and does a proposal
+  rule draw only from the `rng` it is handed (no ad-hoc keys), so growth
+  replays exactly and matches plastax-cpp?
+- **Unit lifecycle:** does a change that touches unit addition or pruning
+  keep the `NotImplementedError` refusal under Scheme-A sharding, and keep
+  input and output units unprunable?
 - **Reserved names:** do new `extra_*_fields` avoid the reserved column names?
 
 ## Oracle parity (numerics)

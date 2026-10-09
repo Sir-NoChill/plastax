@@ -113,7 +113,9 @@ MLIR emission; densification (dense-bucket → `dot_general` rewrite). Static
 dense-matmul parity is a **non-goal**, not a missing feature.
 
 In scope and *implemented*: `Propagation.PIPELINE` and `TOPOLOGICAL`;
-growth/pruning dynamics; named monoids (incl. pytree-of-monoids struct
+structural dynamics -- connection growth (`ScoreAddConn`, `ProposeAddConn`)
+and pruning everywhere, unit addition and pruning (`AddUnit`, `PruneUnit`)
+on a single device; named monoids (incl. pytree-of-monoids struct
 accumulators); donation-based in-place state; host driver retrace protocol;
 Scheme-A multi-device sharding.
 
@@ -149,8 +151,9 @@ These follow from the above but are worth stating for anyone touching `topo`,
 - **Deletion never resorts. Level-preserving adds never resort.** `resort` runs
   only when `add_conn` set `needs_resort` (a non-level-preserving commit).
 - **A `-inf` growth score is a hard veto** — never committed even with free
-  slots — distinct from a merely-low finite score. This holds for a
-  `ScoreAddConn` score and a `ProposeAddConn` proposal's score alike.
+  slots — distinct from a merely-low finite score. Any non-finite score
+  (NaN, +inf) vetoes too. This holds for a `ScoreAddConn` score and a
+  `ProposeAddConn` proposal's score alike.
 - **Duplicates follow `dedupe_live` / `dedupe_step`:** both default False for
   both rule kinds, so growth grows parallel edges (each contributing
   independently) unless a rule opts in. `dedupe_live` vetoes candidates equal
@@ -161,5 +164,5 @@ These follow from the above but are worth stating for anyone touching `topo`,
   when the budget equals the candidate pool, so overflow drops the same
   candidates on every backend and in plastax-cpp.
 - **Reserved field names** (`from_id`, `to_id`, `dead`, `weight`, `activation`,
-  `level`) cannot be reused by `extra_unit_fields`/`extra_conn_fields`; enforced
+  `level`, `pruned`) cannot be reused by `extra_unit_fields`/`extra_conn_fields`; enforced
   at subclass definition (`traits._validate_field_names`).

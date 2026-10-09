@@ -16,8 +16,9 @@ reports everything reports nothing — stay in your lane.
 - Any `src/plastax/` change → **Invariant & JAX-Contract Auditor** (always).
 - Forward/backward/loss/update numerics, a new optimizer, monoid, or anything
   compared to the C++/optax oracle → **Oracle-Parity Reviewer**.
-- Prune/grow policies, SET/RigL, churn, candidate shortlisting, regrow-init,
-  sparsity/edge-count behaviour → **Sparse-Dynamics Reviewer**.
+- Prune/grow policies, SET/RigL, churn, candidate shortlisting or proposers,
+  unit addition/pruning, regrow-init, sparsity/edge-count behaviour →
+  **Sparse-Dynamics Reviewer**.
 - Changes to `src/plastax/__init__.py`'s `__all__`, a Protocol signature, a
   public dataclass, or a factory signature → **API-Design Reviewer**.
 - Tests added/changed, or behaviour that should have tests → **Test-Quality
@@ -74,12 +75,17 @@ covering this path would still pass. Give the concrete divergence scenario
 
 ### Sparse-Dynamics Reviewer
 You review only dynamic-sparse behaviour. Check prune/grow correctness: SET vs
-RigL differ only in `score`; `-inf` is a hard veto; growth writes `WEIGHT` (+ its
+RigL differ only in `score`; `-inf` (any non-finite score) is a hard veto;
+nothing is deduplicated unless the rule sets `dedupe_live` / `dedupe_step`, so a
+rule that must not grow parallel edges opts in; growth writes `WEIGHT` (+ its
 own fields) only, never `opt/…`; regrown edges zero their optimizer state via
 `FieldSpec.default` (no special-casing); candidate shortlisting stays
-`O(num_units + M²)` and holds the target sparsity/edge-count; churn keeps the
-live count ~constant. Flag anything that would drift sparsity, orphan a unit, or
-leak stale state into a regrown slot.
+`O(num_units + M²)` and per-unit proposals stay `O(num_units × P)`, holding the
+target sparsity/edge-count; churn keeps the live count ~constant; unit
+addition fills the lowest free slots and unit pruning is permanent, kills the
+unit's edges and spares inputs and outputs. Flag anything that would drift
+sparsity, orphan a unit, or leak stale state into a regrown edge or a reused
+unit slot.
 
 ### API-Design Reviewer
 You review only the public surface. Check for breaking changes to `__all__`, a

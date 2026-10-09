@@ -52,7 +52,7 @@ group, ordered roughly by how fundamental they are.
   bucket capacities, I/O ids, propagation, sharding). The `jax.jit` cache key.
   Changes only on structural events.
 - **`NetworkState[GS]`** — the mutable SoA pytree (`units`, `conns`, `globals_`,
-  `needs_resort`). `GS` is the user's opaque globals pytree.
+  `needs_resort`, the `step` counter and the per-step structural flags). `GS` is the user's opaque globals pytree.
 - **Retrace** — a re-trace + recompile of the step, triggered *only* by a new
   `NetworkStatic` (bucket growth or resort).
 - **Donation** — `jax.jit(..., donate_argnums=0)`; the step consumes the input
@@ -109,8 +109,31 @@ group, ordered roughly by how fundamental they are.
   non-level-preserving change; produces a new `NetworkStatic` → retrace.
 - **`needs_resort`** — a device flag set only by the add_conn phase when it
   commits a non-level-preserving edge; checked host-side by the driver.
+- **Growth rule** — the `add_conn` policy: a `ScoreAddConn` (scores candidate
+  pairs from the exhaustive grid or a `shortlist` / `shortlist_per_level`
+  grid) or a `ProposeAddConn` (emits proposals). Both feed one deterministic
+  pipeline: trigger, validity window (`max_level_gap`, `direction`,
+  `allow_self_loops`), the opt-in dedupe stages, per-source-level selection
+  in the total candidate order, then the free-slot claim. A non-finite score
+  vetoes a candidate.
+- **Proposer** — who emits a `ProposeAddConn`'s proposals: `per_unit` (the
+  default; every live unit), `per_connection` (every live connection) or
+  `global` (one). Each emits `proposals_per_proposer` (P) per step, each
+  proposal with its own keyed `Rng` (`plastax.rng`). Per-unit proposal growth
+  is the default for networks with unit addition (candidates scale as
+  num_units × P); algorithms that add no units may pick `per_connection`.
+- **Unit lifecycle** — `PruneUnit` prunes live non-I/O units for good (marks
+  them `PRUNED`, tombstones their edges); `AddUnit` spawns children into the
+  lowest free unit slots and reports `units_added`, which the
+  `on_units_added` growth trigger reads. Both need `Network.unit_capacity`
+  and run on a single device only (refused under Scheme-A sharding).
+- **`structural_interval`** — `Network.structural_interval` (default 1) runs
+  unit addition and growth every n-th step; unit and connection pruning run
+  every step.
 - **Overflow** — an add_conn candidate that was selected but found no free slot
-  in its bucket; the driver grows the bucket and retries.
+  in its bucket; the driver grows the bucket and retries. Its unit-side
+  counterpart, `unit_overflow`, flags a spawn that found no free unit slot
+  (the child is dropped; the capacity is fixed).
 - **Retrace protocol** — the driver's host loop: run step; on overflow grow +
   retrace + retry; on `needs_resort` resort + retrace.
 

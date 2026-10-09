@@ -7,6 +7,12 @@ recompile the code. The user can check the number of
 retraces performed via
 jax.test_util.assert_num_jit_and_pmap_compilations .
 
+The overflow flag is connection overflow: a selected growth candidate found
+no free slot in its bucket, which the driver fixes by growing the bucket.
+Unit overflow (`NetworkState.unit_overflow`, an AddUnit spawn that found no
+free unit slot) is not a retrace event: `Network.unit_capacity` is fixed, so
+the dropped spawn stays dropped and the flag is the caller's to read.
+
 ## Recommendations for Poor Performance
 
 1. If your algorithm exhibits many overflow events then

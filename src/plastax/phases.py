@@ -3270,6 +3270,64 @@ def candidates_propose_per_unit[GS](
     return _clamp_proposals(p_src, p_dst, p_score, num_units)
 
 
+def _gather_replicated(
+    local: jax.Array, shard_axis: str | None, num_shards: int
+) -> jax.Array:
+    """Concatenate every shard's `local` along a new leading axis, replicated.
+
+    An all-gather built from a psum of disjoint bands: each shard writes its
+    own band of a zero buffer and the sum leaves every band filled on every
+    device. Unlike `jax.lax.all_gather`, a psum is a collective shard_map
+    recognises as replicating, so values derived from the result may flow into
+    the step's replicated outputs (`overflow`, `grown`). Integer sums with a
+    single non-zero term are exact.
+
+    Args:
+        local: this shard's int32 block.
+        shard_axis: the Scheme-A shard axis name, or None when unsharded.
+        num_shards: the Scheme-A shard count (1 when unsharded).
+
+    Returns:
+        A `(num_shards, *local.shape)` array, shard `r`'s block at index `r`.
+    """
+    if shard_axis is None:
+        return local[None]
+    my_index = jax.lax.axis_index(shard_axis)
+    banded = jnp.zeros((num_shards, *local.shape), local.dtype).at[my_index].set(local)
+    gathered: jax.Array = monoid.sum_.collective(banded, shard_axis)
+    return gathered
+
+
+def _global_conn_slots(
+    local_caps: Sequence[int], num_shards: int
+) -> Int32[Array, " slots"]:
+    """The global arena slot of every gathered connection position.
+
+    Gathered positions are shard-major: shard `r`'s local flat slots (its
+    capacity band of each bucket, bucket-major) follow shard `r - 1`'s. Shard
+    `r` holds positions `[r * cap / G, (r + 1) * cap / G)` of each bucket, so
+    local slot `s` of bucket `b` is global slot `offset(b) + r * cap_b / G + s`
+    in the single-device bucket-major arena.
+
+    Args:
+        local_caps: each bucket's per-shard capacity.
+        num_shards: the Scheme-A shard count (1 when unsharded).
+
+    Returns:
+        The global slot of each gathered position, length `G * sum(local_caps)`.
+    """
+    local_total = sum(local_caps)
+    starts = np.cumsum([0, *local_caps])
+    pos = jnp.arange(num_shards * local_total, dtype=jnp.int32)
+    shard = pos // jnp.int32(local_total)
+    slot = pos % jnp.int32(local_total)
+    bucket = jnp.searchsorted(jnp.asarray(starts[1:], jnp.int32), slot, side="right")
+    start = jnp.asarray(starts[:-1], jnp.int32)[bucket]
+    cap = jnp.asarray(local_caps, jnp.int32)[bucket]
+    global_slot: jax.Array = start * jnp.int32(num_shards) + shard * cap + slot - start
+    return global_slot
+
+
 def candidates_propose_per_conn[GS](
     propose_fn: Callable[..., Any],
     u_view: UnitView,
@@ -3280,6 +3338,8 @@ def candidates_propose_per_conn[GS](
     *,
     seed: int,
     step: jax.Array,
+    shard_axis: str | None = None,
+    num_shards: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Per-connection proposals in rank order: index = r * P + j.
 
@@ -3290,44 +3350,63 @@ def candidates_propose_per_conn[GS](
     order's candidate index; dead slots rank after every live edge and their
     candidates are vetoed.
 
+    Under Scheme-A each shard holds only its band of the arena, so rank and
+    occurrence are computed over every shard's edges: the edge keys are
+    gathered and ranked on every device by global arena slot. Each shard then
+    proposes for its own connections, and the proposals are gathered and laid
+    out in rank order, so the returned candidates are replicated and equal the
+    single-device ones.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
     Args:
         propose_fn: the rule's `propose(u, c, cid, j, g, rng)` method; `cid`
-            is the proposing edge's flat arena slot (bucket-major).
+            is the proposing edge's flat slot in `conns` (bucket-major; under
+            Scheme-A, within this shard's band).
         u_view: the unit view.
-        conns: the per-bucket connection columns.
+        conns: the per-bucket connection columns (this shard's band).
         g: the global state.
         num_proposals: proposals per live connection (P).
         num_units: the number of unit slots, bounding valid ids.
         seed: the network seed keying each site's rng.
         step: the framework step counter (scalar int32).
+        shard_axis: the Scheme-A shard axis name, or None when unsharded.
+        num_shards: the Scheme-A shard count (1 when unsharded).
 
     Returns:
-        `(src, dst, score, valid)` of length `total_slots * P`, laid out
-        rank-major; `valid` is false for dead proposers and out-of-range ids.
+        `(src, dst, score, valid)` of length `total_slots * P` (every shard's
+        slots), laid out rank-major; `valid` is false for dead proposers and
+        out-of-range ids.
     """
     flat_cols = {name: jnp.concatenate([b[name] for b in conns]) for name in conns[0]}
     c_view = ConnView(flat_cols)
     c_src = flat_cols[FROM_ID.name].astype(jnp.int32)
     c_dst = flat_cols[TO_ID.name].astype(jnp.int32)
     dead = flat_cols[DEAD.name]
-    total = c_src.shape[0]
-    iota = jnp.arange(total, dtype=jnp.int32)
+    local_total = c_src.shape[0]
+    # Every shard's edge keys, shard-major; a gathered position's arena slot
+    # orders a pair's parallel edges into occurrences.
+    keys = _gather_replicated(
+        jnp.stack([c_src, c_dst, dead.astype(jnp.int32)]), shard_axis, num_shards
+    )
+    g_src, g_dst, g_dead_i = jnp.moveaxis(keys, 1, 0).reshape(3, -1)
+    g_dead = g_dead_i != jnp.int32(0)
+    g_slot = _global_conn_slots([b[DEAD.name].shape[0] for b in conns], num_shards)
+    total = g_src.shape[0]
+    pos = jnp.arange(total, dtype=jnp.int32)
     # Rank live edges ascending by (src, dst, slot): within an equal pair,
     # slot order is occurrence order, so the sorted position is the
-    # (src, dst, occurrence) rank. Dead slots sort last.
+    # (src, dst, occurrence) rank. Dead slots sort last. `perm[r]` is the
+    # gathered position of rank r.
     big = jnp.int32(num_units)  # > any live id; dead keys sort after live
-    k_src = jnp.where(dead, big, c_src)
-    k_dst = jnp.where(dead, big, c_dst)
-    _, _, _, perm = jax.lax.sort((k_src, k_dst, iota, iota), num_keys=3)
-    r_src = c_src[perm]
-    r_dst = c_dst[perm]
-    r_dead = dead[perm]
+    k_src = jnp.where(g_dead, big, g_src)
+    k_dst = jnp.where(g_dead, big, g_dst)
+    _, _, _, perm = jax.lax.sort((k_src, k_dst, g_slot, pos), num_keys=3)
+    r_src = g_src[perm]
+    r_dst = g_dst[perm]
     # occurrence = position within the run of equal (src, dst): the run start
     # is the last position whose key differs from its predecessor.
-    pos = jnp.arange(total, dtype=jnp.int32)
     new_run = jnp.concatenate(
         [
             jnp.ones((1,), dtype=bool),
@@ -3335,14 +3414,16 @@ def candidates_propose_per_conn[GS](
         ]
     )
     run_start = jax.lax.associative_scan(jnp.maximum, jnp.where(new_run, pos, 0))
-    r_occ = pos - run_start
+    occ = jnp.zeros_like(pos).at[perm].set(pos - run_start)
+    if shard_axis is not None:
+        my_index = jax.lax.axis_index(shard_axis)
+        occ = jax.lax.dynamic_slice_in_dim(occ, my_index * local_total, local_total)
 
     def propose_one(
-        r: jax.Array, j: jax.Array
+        cid: jax.Array, j: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        key = rng_mod.conn_key(r_src[r], r_dst[r], r_occ[r])
+        key = rng_mod.conn_key(c_src[cid], c_dst[cid], occ[cid])
         rng = _propose_rngs(seed, step, key, j)
-        cid = perm[r]
         s_, d_, score_ = propose_fn(u_view, c_view, ConnIdx(cid), j, g, rng)
         return (
             jnp.asarray(s_, jnp.int32),
@@ -3350,11 +3431,20 @@ def candidates_propose_per_conn[GS](
             jnp.asarray(score_, jnp.float32),
         )
 
-    r_flat = jnp.repeat(pos, num_proposals)
-    j_flat = jnp.tile(jnp.arange(num_proposals, dtype=jnp.int32), total)
-    p_src, p_dst, p_score = jax.vmap(propose_one)(r_flat, j_flat)
+    cid_flat = jnp.repeat(jnp.arange(local_total, dtype=jnp.int32), num_proposals)
+    j_flat = jnp.tile(jnp.arange(num_proposals, dtype=jnp.int32), local_total)
+    p_src, p_dst, p_score = jax.vmap(propose_one)(cid_flat, j_flat)
+    # Gather every shard's proposals (scores as their bit patterns, so the
+    # gather is exact) and lay them out rank-major.
+    local_props = jnp.stack(
+        [p_src, p_dst, jax.lax.bitcast_convert_type(p_score, jnp.int32)]
+    ).reshape(3, local_total, num_proposals)
+    props = _gather_replicated(local_props, shard_axis, num_shards)
+    by_rank = jnp.moveaxis(props, 1, 0).reshape(3, total, num_proposals)[:, perm]
+    p_src, p_dst, p_bits = by_rank.reshape(3, total * num_proposals)
+    p_score = jax.lax.bitcast_convert_type(p_bits, jnp.float32)
     src, dst, score, in_range = _clamp_proposals(p_src, p_dst, p_score, num_units)
-    live_proposer = ~r_dead[r_flat]
+    live_proposer = jnp.repeat(~g_dead[perm], num_proposals)
     return src, dst, score, in_range & live_proposer
 
 
@@ -3621,8 +3711,6 @@ def build_add_conn_phase[GS](
 
     Raises:
         ValueError: If `growth` is not one of the engines.
-        NotImplementedError: If a per-connection proposer is declared under
-            Scheme-A sharding (proposer ranks are not shard-local yet).
     """
     ac = net.add_conn
     assert ac is not None  # build_phases only calls this when set
@@ -3676,13 +3764,6 @@ def build_add_conn_phase[GS](
     proposer = str(getattr(ac, "proposer", "per_unit")) if use_propose else ""
     num_proposals = ac.proposals_per_proposer if isinstance(ac, ProposeAddConn) else 0
     total_conn_slots = sum(static.level_capacities)
-    if use_propose and proposer == "per_connection" and _shard_axis(static):
-        raise NotImplementedError(
-            "per-connection proposers are not supported under Scheme-A "
-            "sharding yet: the proposing connections are sharded, so their "
-            "(src, dst, occurrence) ranks are not shard-local. Use a "
-            "per_unit or global proposer, or run unsharded."
-        )
 
     candidates_kind = (
         str(getattr(ac, "candidates", "exhaustive")) if not use_propose else ""
@@ -3775,6 +3856,8 @@ def build_add_conn_phase[GS](
                     num_units,
                     seed=static.seed,
                     step=state.step,
+                    shard_axis=shard_axis,
+                    num_shards=num_shards,
                 )
             else:
                 global_src, global_dst, p_score, in_range = candidates_propose(

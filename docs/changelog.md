@@ -55,6 +55,11 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   (pruning and growth) only on every n-th step.
 - All growth_v2 conformance goldens are enforced: scoring, selection, the
   validity window, triggers and growth on the batch-mean state.
+- Per-connection proposers (`proposer = "per_connection"`) run under Scheme-A
+  sharding. Each shard proposes for its own connections; their
+  `(src, dst, occurrence)` ranks and rng keys are global across shards, so
+  the sharded step commits exactly what the single-device step does.
+  Previously this combination raised `NotImplementedError`.
 
 ### Changed
 

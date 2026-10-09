@@ -2,7 +2,7 @@
 
 Returns None when the trait slot is absent (trace-time elision). Phase
 order: forward, loss, backward, update_unit, update_conn, prune_unit,
-prune_conn, add_conn, reset_global.
+prune_conn, add_unit, add_conn, reset_global.
 """
 
 from __future__ import annotations
@@ -125,7 +125,7 @@ def build_phases[GS](
     Topological forward walks buckets 1..L (Python loop, static slices);
     backward walks L..1; pipeline is the 1-bucket flat sweep. Phase order:
     forward, loss, backward, update_unit, update_conn, prune_unit, prune_conn,
-    add_conn, reset_global.
+    add_unit, add_conn, reset_global.
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -191,6 +191,8 @@ def build_phases[GS](
         if interval > 1:
             prune_phase = _step_gated(prune_phase, interval)
         phases.append(prune_phase)
+    if net.add_unit is not None:
+        phases.append(build_add_unit_phase(net, static))
     if net.add_conn is not None:
         # build_add_conn_phase folds the interval into its own trigger gate.
         phases.append(
@@ -224,8 +226,8 @@ class BatchedPhases[GS]:
         update_conn: the batched connection update, or None when the net has
             no update_conn: `(state, batched_units) -> state`, reducing the
             per-sample contributions to one update per connection.
-        structural: prune_unit, prune_conn, add_conn, and reset_global: run
-            once, on the batch-mean unit state.
+        structural: prune_unit, prune_conn, add_unit, add_conn, and
+            reset_global: run once, on the batch-mean unit state.
     """
 
     forward: Phase[GS]
@@ -292,6 +294,8 @@ def build_batched_phases[GS](
         if interval > 1:
             prune_phase = _step_gated(prune_phase, interval)
         structural.append(prune_phase)
+    if net.add_unit is not None:
+        structural.append(build_add_unit_phase(net, static))
     if net.add_conn is not None:
         structural.append(
             build_add_conn_phase(
@@ -1245,6 +1249,140 @@ def build_prune_unit_phase[GS](
         return new_state, jnp.float32(0.0)
 
     return prune_unit_phase
+
+
+def build_add_unit_phase[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Phase[GS]:
+    """Place each spawning unit's child in the lowest free slot left.
+
+    `add_unit.spawn` is vmapped over every unit slot against the pre-phase
+    state; a slot is a parent when it holds a live unit and its rule spawns.
+    The parents are ranked by ascending id and the k-th takes the k-th lowest
+    free slot, the free slots being every slot marked `PRUNED` at the start of
+    the phase (those pruned earlier in the step included, the never-allocated
+    ones above them last). A parent ranked past the last free slot is dropped
+    and raises `unit_overflow`. A child is not a parent: the parents are
+    fixed before any child is placed.
+
+    A child slot is reset to its column defaults, marked live, and given the
+    level ``clamp(level(parent) + offset, 1, max_levels - 1)``; then
+    `add_unit.init` is vmapped over the slots against that state and its
+    writes land on the child slots only. The phase sets `units_added` and
+    `unit_overflow` and leaves `needs_resort` alone: a child has no edges, so
+    the leveling invariant holds, and the next resort recomputes its level
+    from the live edges. With `structural_interval` > 1 it runs only on steps
+    where ``step % interval == 0``, and the skipped steps read 0 units added
+    and no overflow.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying the add_unit policy, the
+            level bound and the structural interval.
+        static: static network configuration giving the unit count and the
+            unit column defaults.
+
+    Returns:
+        The add_unit phase function.
+    """
+    au = net.add_unit
+    assert au is not None  # build_phases only calls this when set
+    num_units = static.num_units
+    max_level = int(net.max_levels) - 1
+    interval = int(getattr(net, "structural_interval", 1))
+    defaults = {
+        spec.name: np.asarray(spec.default, dtype=spec.dtype)
+        for spec in static.unit_fields
+        if spec.name not in (LEVEL.name, PRUNED.name)
+    }
+    slots = jnp.arange(num_units, dtype=jnp.int32)
+
+    def add_unit_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        g = state.globals_
+        pre = UnitView(state.units)
+
+        def spawn_one(i: jax.Array) -> tuple[jax.Array, jax.Array]:
+            wants, offset = au.spawn(pre, UnitIdx(i), g)
+            return jnp.asarray(wants, jnp.bool_), jnp.asarray(offset, jnp.int32)
+
+        wants, offset = jax.vmap(spawn_one)(slots)
+        free = state.units[PRUNED.name]
+        parent = wants & ~free
+        # The k-th parent (ascending id) takes the k-th free slot (ascending).
+        rank = jnp.cumsum(parent, dtype=jnp.int32) - jnp.int32(1)
+        free_ids = jnp.nonzero(free, size=num_units, fill_value=num_units)[0]
+        num_free = jnp.sum(free, dtype=jnp.int32)
+        placed = parent & (rank < num_free)
+        child_id = jnp.where(placed, free_ids[jnp.clip(rank, 0, num_units - 1)], -1)
+        # parent_of[c] is the parent of child slot c, or -1; dropped parents
+        # scatter to the out-of-range index and are discarded.
+        parent_of = (
+            jnp.full((num_units,), -1, jnp.int32)
+            .at[jnp.where(placed, child_id, num_units)]
+            .set(slots, mode="drop")
+        )
+        is_child = parent_of >= 0
+        src = jnp.maximum(parent_of, 0)
+
+        units = dict(state.units)
+        for name, default in defaults.items():
+            units[name] = jnp.where(is_child, default, units[name])
+        level = units[LEVEL.name]
+        child_level = jnp.clip(
+            level[src].astype(jnp.int32) + offset[src], 1, max_level
+        ).astype(level.dtype)
+        units[LEVEL.name] = jnp.where(is_child, child_level, level)
+        units[PRUNED.name] = free & ~is_child
+
+        seeded = UnitView(units)
+
+        def init_one(c: jax.Array, p: jax.Array) -> dict[str, jax.Array]:
+            # UnitWrite is not pytree-registered; vmap carries its fields.
+            return dict(au.init(seeded, UnitIdx(c), UnitIdx(p), g).fields)
+
+        writes = jax.vmap(init_one)(slots, src)
+        for name, written in writes.items():
+            units[name] = jnp.where(
+                is_child, written.astype(units[name].dtype), units[name]
+            )
+        new_state = dataclasses.replace(
+            state,
+            units=units,
+            units_added=jnp.sum(placed, dtype=jnp.int32),
+            unit_overflow=jnp.any(parent & ~placed),
+        )
+        return new_state, jnp.float32(0.0)
+
+    if interval == 1:
+        return add_unit_phase
+
+    def gated_add_unit_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        fire = (state.step % jnp.int32(interval)) == jnp.int32(0)
+
+        def skip(
+            st: NetworkState[GS], _: StepInputs
+        ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+            return (
+                dataclasses.replace(
+                    st, units_added=jnp.int32(0), unit_overflow=jnp.bool_(False)
+                ),
+                jnp.float32(0.0),
+            )
+
+        out: tuple[NetworkState[GS], Float[Array, ""]] = jax.lax.cond(
+            fire, add_unit_phase, skip, state, inputs
+        )
+        return out
+
+    gated_add_unit_phase.__name__ = "add_unit_phase"
+    return gated_add_unit_phase
 
 
 def build_prune_conn_phase[GS](

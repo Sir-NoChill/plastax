@@ -440,6 +440,8 @@ class Network[GS]:
         kahn_max_depth: max depth for Kahn-order propagation, or None if unbounded.
         neighbourhood: the neighbourhood radius used by the propagation strategy.
         sharding: Scheme-A sharding config, or None for a single device.
+        seed: the network seed keying the framework's counter-based RNG
+            (`plastax.rng`); identical seeds give identical draw streams.
     """
 
     forward_pass: ForwardPass[object, GS]
@@ -456,6 +458,7 @@ class Network[GS]:
     kahn_max_depth: int | None = None
     neighbourhood: int = 1
     sharding: ShardSpec | None = None
+    seed: int = 0
 
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""

@@ -194,7 +194,12 @@ def distribute_state[GS](
         lambda leaf: place(leaf, repl_sharding), state.globals_
     )
     needs_resort = place(state.needs_resort, repl_sharding)
+    step = place(state.step, repl_sharding)
 
     return NetworkState(
-        units=units, conns=conns, globals_=globals_, needs_resort=needs_resort
+        units=units,
+        conns=conns,
+        globals_=globals_,
+        needs_resort=needs_resort,
+        step=step,
     )

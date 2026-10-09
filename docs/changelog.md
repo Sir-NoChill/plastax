@@ -24,8 +24,9 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   pick the same slots. "auto" uses Triton where it can run.
 - Conformance-vector scripts (`scripts/parity_vectors.py`,
   `scripts/emit_parity_goldens.py`) that emit plastax results as goldens for
-  the plastax-cpp C++ library, and a bit-exact NumPy port of plastax-cpp's
-  `UniformReal` pinned to the C++ golden.
+  the plastax-cpp C++ library (the five `mlp_optim_*` optimizer vectors), and
+  a bit-exact NumPy port of plastax-cpp's `UniformReal` pinned to the C++
+  golden.
 - Benchmarks: `examples/benchmarks/fused_prune_check.py`;
   `churn_probe.py --growth`; `triton_check.py` times the backward product
   and a dead-slot fraction.

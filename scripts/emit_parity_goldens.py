@@ -2,7 +2,7 @@
 
 Runs each network in `parity_vectors.py` and writes what it produced, step by
 step, to `tests/golden/*.json` in the plastax-cpp checkout (located through
-`PLASTAX_CPP_DIR`; see `tests/_plastax_cpp.py`). plastax-cpp's `test_parity_plastax.cpp`
+`PLASTAX_CPP_DIR`; see `tests/_plastax_cpp.py`). plastax-cpp's `test_parity_goldens.cpp`
 rebuilds the same networks in C++ and checks it agrees within tolerance.
 
 plastax is the oracle here: these files are the specification, not a record of
@@ -14,7 +14,7 @@ contract.
 Usage::
 
     uv run python scripts/emit_parity_goldens.py            # all vectors
-    uv run python scripts/emit_parity_goldens.py --only mlp_xor_seeded
+    uv run python scripts/emit_parity_goldens.py --only mlp_optim_adam
     uv run python scripts/emit_parity_goldens.py --check    # fail if stale
 
 `--check` regenerates in memory and diffs against what is on disk without

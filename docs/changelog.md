@@ -59,6 +59,10 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   every pass's apply, adds no loss and takes no part in growth. A net without
   a capacity has no `PRUNED` column and steps exactly as before.
   `Network.max_levels` (default 1024) bounds unit levels.
+- `UpdateUnit` and the `Network.update_unit` slot: `update(u, i, g)` writes
+  every live unit, inputs and outputs included, after the backward pass and
+  before the connection update. A batched step runs it on each sample's
+  units. The unit-update conformance goldens are enforced.
 - All growth_v2 conformance goldens are enforced: scoring, selection, the
   validity window, triggers and growth on the batch-mean state.
 - Per-connection proposers (`proposer = "per_connection"`) run under Scheme-A

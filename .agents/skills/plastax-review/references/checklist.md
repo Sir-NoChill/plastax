@@ -33,7 +33,7 @@ project's own docs win over any generic default here: `.agents/invariants.md`,
   to end, and would `mypy --strict` pass? Any new `ty`-ignore explained in
   a comment? (invariant #7)
 - **v1 scope:** does the change implement (even partially) something out of
-  scope — AddUnit/PruneUnit, generic `Monoid(op, identity)` lowering, `jax.Ref`
+  scope — sharded unit pruning/addition, generic `Monoid(op, identity)` lowering, `jax.Ref`
   arenas, hijax, MLIR, densification? Do the `Monoid` methods still raise
   `UnsupportedMonoidError` for non-named monoids? (invariant #8)
 

@@ -105,7 +105,8 @@ end (views return arrays typed by the spec's `DT`).
 
 ### 8. Scope contract: what is out of v1
 
-**Do not implement, even partially:** AddUnit / PruneUnit; generic
+**Do not implement, even partially:** unit pruning or addition under Scheme-A
+sharding (both raise `NotImplementedError` there); generic
 `Monoid(op, identity)` lowering (the three `Monoid` methods must keep raising
 `UnsupportedMonoidError` for non-named monoids); `jax.Ref` arenas; hijax; any
 MLIR emission; densification (dense-bucket → `dot_general` rewrite). Static

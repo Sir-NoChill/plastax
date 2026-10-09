@@ -51,7 +51,7 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   `dedupe_step = True`).
 - `NetworkState.grown` (connections the step's growth committed),
   `NetworkState.overflow` (whether it dropped any for lack of capacity) and
-  `NetworkState.units_added` (0 until the unit lifecycle lands).
+  `NetworkState.units_added` (units the step's unit addition placed).
 - `Network.structural_interval` (default 1) runs the structural phases
   (pruning and growth) only on every n-th step.
 - `Network.unit_capacity` (default None): the number of unit slots. The built
@@ -74,6 +74,20 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   update and before connection pruning, and once on the batch-mean state of a
   batched step. Declaring it under Scheme-A sharding raises
   `NotImplementedError`. The unit-prune conformance goldens are enforced.
+- `AddUnit` and the `Network.add_unit` slot (requires `unit_capacity`):
+  `spawn(u, parent, g)` returns whether a unit live at the start of the
+  phase spawns a child and the child's level offset; `init(u, child, parent,
+  g)` writes the child's fields. The i-th spawning parent by ascending id
+  takes the i-th lowest free slot, ids pruned earlier in the same step
+  included; a spawn with no free slot left is dropped and sets the new
+  `NetworkState.unit_overflow`. A child starts at its column defaults with
+  the level `clamp(level(parent) + offset, 1, max_levels - 1)`, has no
+  connections, and is not a parent in its own step. The phase runs after
+  connection pruning and before growth, gated by `structural_interval`, once
+  on the batch-mean state of a batched step; it sets
+  `NetworkState.units_added`, which the "on_units_added" growth trigger reads
+  in the same step. Declaring it under Scheme-A sharding raises
+  `NotImplementedError`. All unit-lifecycle conformance goldens are enforced.
 - All growth_v2 conformance goldens are enforced: scoring, selection, the
   validity window, triggers and growth on the batch-mean state, including
   the per-level shortlist.

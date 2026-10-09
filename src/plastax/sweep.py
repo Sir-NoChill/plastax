@@ -44,7 +44,7 @@ from jaxtyping import Array, Bool
 
 from plastax._types import DEAD, FROM_ID, TO_ID, ConnIdx, FieldSpec, UnitIdx
 from plastax.monoid import Monoid, MonoidTree
-from plastax.state import Columns
+from plastax.state import Columns, live_unit_mask
 from plastax.traits import BackwardPass, ForwardPass
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
@@ -195,9 +195,16 @@ def _apply_masked[GS](
     mask keep their previous `units` value and carry their in-progress
     `acc` to a later call, which is exactly what lets the accumulator
     persist across topological buckets.
+
+    A slot holding no live unit (see `state.live_unit_mask`) is never
+    finalized: its columns keep their values and its accumulator is left
+    alone.
     """
 
     def apply(units: Columns, acc: Any, g: GS, mask: jax.Array) -> tuple[Columns, Any]:
+        live = live_unit_mask(units)
+        if live is not None:
+            mask = mask & live
         u_view = UnitView(units)
         unit_ids = jnp.arange(num_units)
 

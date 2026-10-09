@@ -259,6 +259,7 @@ def _shard_map_step(
         grown=repl,
         overflow=repl,
         units_added=repl,
+        unit_overflow=repl,
     )
     in_specs: Any = (state_spec, _spec(StepInputs, inputs=repl, targets=repl))
     out_specs: Any = _spec(StepResult, state=state_spec, overflow=repl, loss=repl)

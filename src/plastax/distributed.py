@@ -198,6 +198,7 @@ def distribute_state[GS](
     grown = place(state.grown, repl_sharding)
     overflow = place(state.overflow, repl_sharding)
     units_added = place(state.units_added, repl_sharding)
+    unit_overflow = place(state.unit_overflow, repl_sharding)
 
     return NetworkState(
         units=units,
@@ -208,4 +209,5 @@ def distribute_state[GS](
         grown=grown,
         overflow=overflow,
         units_added=units_added,
+        unit_overflow=unit_overflow,
     )

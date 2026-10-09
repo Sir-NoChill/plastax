@@ -101,9 +101,11 @@ class NetworkState[GS]:
             phase was elided, skipped by its trigger, or grew nothing).
         overflow: whether this step's growth phase dropped selected
             candidates for lack of free capacity.
-        units_added: units added by this step's unit-addition phase. Always 0
-            until the unit lifecycle lands; the growth trigger
-            "on_units_added" reads it.
+        units_added: units added by this step's unit-addition phase (0 when
+            the phase was elided or skipped by `structural_interval`); the
+            growth trigger "on_units_added" reads it.
+        unit_overflow: whether this step's unit-addition phase dropped a
+            spawn for lack of a free unit slot.
     """
 
     units: Columns
@@ -117,6 +119,9 @@ class NetworkState[GS]:
     )
     units_added: Int32[Array, ""] = dataclasses.field(
         default_factory=lambda: jnp.int32(0)
+    )
+    unit_overflow: Bool[Array, ""] = dataclasses.field(
+        default_factory=lambda: jnp.bool_(False)
     )
 
 
@@ -157,6 +162,7 @@ def make_empty_state[GS](static: NetworkStatic, globals_: GS) -> NetworkState[GS
         grown=jnp.int32(0),
         overflow=jnp.bool_(False),
         units_added=jnp.int32(0),
+        unit_overflow=jnp.bool_(False),
     )
 
 
@@ -289,5 +295,6 @@ def grow_bucket[GS](
         grown=state.grown,
         overflow=state.overflow,
         units_added=state.units_added,
+        unit_overflow=state.unit_overflow,
     )
     return new_static, new_state

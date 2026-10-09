@@ -38,8 +38,18 @@ _GOLDEN_DIR = pathlib.Path(__file__).resolve().parent / "golden"
 _IMPLEMENTED = {"passes_v1"}
 _SPEC_ONLY = {
     "unit_lifecycle_v1": "the unit lifecycle (update/prune/add) is not implemented",
-    "growth_v2": "the shared growth selection pipeline is not implemented",
+    "growth_v2": (
+        "this growth_v2 case needs selection/score/trigger semantics the "
+        "pipeline does not implement yet"
+    ),
 }
+# growth_v2 cases the propose pipeline implements today (enforced below);
+# the score/selection/window/trigger/batched cases stay spec-only.
+_ENFORCED_GROWTH = {
+    f"grow_propose_{kind}_{var}"
+    for kind in ("per_unit", "per_conn", "global")
+    for var in ("plain", "dedupe_live", "dedupe_step", "dedupe_both")
+} | {"grow_per_conn_isolated_unit_no_growth"}
 
 
 def _registry_goldens() -> list[pathlib.Path]:
@@ -246,4 +256,144 @@ def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) ->
         }, f"{doc['name']} claims {requires} but no consumer covers it"
         return
     assert requires in _SPEC_ONLY, f"unknown requires tag {requires!r} in {path.name}"
+    if doc["name"] in _ENFORCED_GROWTH:
+        return  # consumed by test_grow_propose_golden below
     pytest.skip(f"{doc['name']}: {_SPEC_ONLY[requires]} ({requires})")
+
+
+# ---------------------------------------------------------------------------
+# growth_v2, propose cases: the real pipeline against the reference, exactly.
+# ---------------------------------------------------------------------------
+
+
+def _dyadic_weight_arr(src: jax.Array, dst: jax.Array) -> jax.Array:
+    """grow_init_v1's weight, vectorized: (((3*src + 5*dst) % 16) - 8) / 8."""
+    return (((3 * src + 5 * dst) % 16) - 8).astype(jnp.float32) / jnp.float32(8.0)
+
+
+def _registry_score(rng: Any) -> jax.Array:
+    """The registry propose rules' score: floor(uniform * 256) / 256."""
+    return jnp.floor(rng.uniform() * jnp.float32(256.0)) / jnp.float32(256.0)
+
+
+def _make_propose_rule(doc: dict[str, Any], n_units: int) -> px.ProposeAddConn[None]:
+    """The golden's registry propose rule, on the shipped rng."""
+    params = doc["params"]
+    assert doc["rules"]["propose"] in {
+        "hash_propose_v1",
+        "conn_propose_v1",
+        "global_propose_v1",
+    }
+    assert doc["rules"]["init"] == "grow_init_v1"
+    kind = params["proposer"]
+
+    class _Rule(px.ProposeAddConn[None]):
+        proposer = kind
+        proposals_per_proposer = int(params["proposals_per_proposer"])
+        max_candidates = int(params["max_new_per_level"])
+        max_level_gap = int(params["max_level_gap"])
+        dedupe_live = bool(params.get("dedupe_live", False))
+        dedupe_step = bool(params.get("dedupe_step", False))
+
+        def propose(  # type: ignore[override]
+            self, *args: Any
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            if kind == "per_unit":
+                u, i, j, g, rng = args
+                del u, j, g
+                src = jnp.asarray(i, jnp.int32)
+            elif kind == "per_connection":
+                u, c, cid, j, g, rng = args
+                del u, j, g
+                src = jnp.asarray(c[px.FROM_ID, cid], jnp.int32)
+            else:
+                u, j, g, rng = args
+                del u, j, g
+                src = rng.uniform_int(n_units).astype(jnp.int32)
+            dst = rng.uniform_int(n_units).astype(jnp.int32)
+            return src, dst, _registry_score(rng)
+
+        def init(
+            self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+        ) -> px.ConnWrite:
+            del u, g
+            return px.ConnWrite.of((px.WEIGHT, _dyadic_weight_arr(src, dst)))
+
+    return _Rule()
+
+
+def _live_pairs(state: Any) -> list[tuple[int, int, float]]:
+    out = []
+    for bucket in state.conns:
+        dead = np.asarray(bucket[px.DEAD.name])
+        srcs = np.asarray(bucket[px.FROM_ID.name])
+        dsts = np.asarray(bucket[px.TO_ID.name])
+        ws = np.asarray(bucket[px.WEIGHT.name])
+        for i in range(len(dead)):
+            if not dead[i]:
+                out.append((int(srcs[i]), int(dsts[i]), float(ws[i])))
+    return sorted(out)
+
+
+@pytest.mark.parametrize("name", sorted(_ENFORCED_GROWTH))
+def test_grow_propose_golden(name: str) -> None:
+    """The propose pipeline reproduces the reference commit set exactly."""
+    import dataclasses
+
+    from plastax.phases import build_add_conn_phase
+
+    doc = _load(f"{name}.json")
+    params = doc["params"]
+    units = doc["initial_units"]
+    n_units = len(units)
+    rule = _make_propose_rule(doc, n_units)
+
+    class _Net(px.Network[None]):
+        forward_pass = ReluForward()
+        add_conn = rule
+        seed = int(params["network_seed"])
+        propagation = px.Propagation.TOPOLOGICAL
+
+    edges = doc["initial_edges"]
+    static, state = px.NetworkBuilder.from_edges(
+        _Net,
+        n_units,
+        np.asarray([e["src"] for e in edges], dtype=np.int32),
+        np.asarray([e["dst"] for e in edges], dtype=np.int32),
+        weights=np.asarray([e["fields"]["weight"] for e in edges], dtype=np.float32),
+        input_ids=[u["id"] for u in units if u["is_input"]],
+        output_ids=[u["id"] for u in units if u["is_output"]],
+        globals_=None,
+        capacity_headroom=4.0,
+    )
+    # The builder derives levels by Kahn; the golden's declared levels must
+    # agree, or the window/bucket routing would diverge from the reference.
+    # Exception: a unit with no incident edges always derives level 0 in px,
+    # whatever the golden declares -- tolerated only because such a unit
+    # proposes nothing per-connection and the committed-set assertion below
+    # still catches any window effect of the differing level.
+    touched = {e["src"] for e in edges} | {e["dst"] for e in edges}
+    got_levels = np.asarray(state.units[px.LEVEL.name]).tolist()
+    for u in units:
+        if u["id"] in touched:
+            assert got_levels[u["id"]] == u["level"], f"unit {u['id']} level"
+    state = dataclasses.replace(state, step=jnp.int32(params["step"]))
+    before = _live_pairs(state)
+    phase = build_add_conn_phase(_Net, static)
+    new_state, _ = phase(state, px.StepInputs(inputs=jnp.zeros((0,)), targets=None))
+
+    after = _live_pairs(new_state)
+    grown = sorted(after)
+    for pair in before:
+        grown.remove(pair)
+    want = sorted(
+        (
+            int(c["src"]),
+            int(c["dst"]),
+            float(np.float32((((3 * c["src"] + 5 * c["dst"]) % 16) - 8) / 8.0)),
+        )
+        for c in doc["expect"]["committed"]
+    )
+    assert grown == want, f"{name}: committed edges diverge from the reference"
+    assert len(grown) == doc["expect"]["grown"]
+    assert bool(new_state.needs_resort) == doc["expect"]["needs_resort"]

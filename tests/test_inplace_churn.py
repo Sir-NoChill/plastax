@@ -180,13 +180,18 @@ _FANOUT = 2
 class _FanoutGrow(px.ProposeAddConn[dict[str, jax.Array]]):
     """Each unit proposes _FANOUT random partners; only src < dst (a DAG)."""
 
+    proposer = "global"
     max_candidates = 24
-    num_proposals = _NUM_UNITS * _FANOUT
+    proposals_per_proposer = _NUM_UNITS * _FANOUT
 
     def propose(
-        self, u: px.UnitView, j: jax.Array, g: dict[str, jax.Array]
+        self,
+        u: px.UnitView,
+        j: jax.Array,
+        g: dict[str, jax.Array],
+        rng: px.rng.Rng,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        del u
+        del u, rng
         src = j // _FANOUT
         dst = (_hash01(j, g["step"], jnp.int32(5)) * _NUM_UNITS).astype(jnp.int32)
         score = jnp.where(src < dst, _hash01(dst, j, g["step"]), -jnp.inf)

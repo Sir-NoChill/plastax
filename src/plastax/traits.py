@@ -250,6 +250,34 @@ class SoftmaxCrossEntropyLoss:
 
 
 @runtime_checkable
+class UpdateUnit[GS](Protocol):
+    """Unit update policy: one write per live unit, inputs and outputs included.
+
+    Runs after the backward pass and before the connection update, so it
+    reads this step's forward, loss and backward values and the connection
+    update reads its writes. A slot holding no live unit (see
+    `Network.unit_capacity`) is skipped. Under a batched step it runs on every
+    sample's unit state, like forward and backward.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+    """
+
+    def update(self, u: UnitView, i: UnitIdx, g: GS) -> UnitWrite:
+        """Compute the update of one unit.
+
+        Args:
+            u: the unit view.
+            i: index of the unit.
+            g: the global state.
+
+        Returns:
+            The UnitWrite for that unit.
+        """
+        ...
+
+
+@runtime_checkable
 class UpdateConn[GS](Protocol):
     """Connection update policy: two full passes, incoming then outgoing.
 
@@ -585,6 +613,7 @@ class Network[GS]:
         forward_pass: the forward propagation policy.
         backward_pass: the backward propagation policy, or None to elide it.
         loss: the loss policy, or None to elide it.
+        update_unit: the unit update policy, or None to elide it.
         update_conn: the connection update policy, or None to elide it.
         prune_conn: the connection pruning policy, or None to elide it.
         add_conn: the connection growth policy, or None to elide it.
@@ -617,6 +646,7 @@ class Network[GS]:
     forward_pass: ForwardPass[object, GS]
     backward_pass: BackwardPass[object, GS] | None = None
     loss: Loss[GS] | None = None
+    update_unit: UpdateUnit[GS] | None = None
     update_conn: UpdateConn[GS] | None = None
     prune_conn: PruneConn[GS] | None = None
     add_conn: ScoreAddConn[GS] | ProposeAddConn[GS] | None = None
@@ -799,6 +829,12 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
 
     if cls.loss is not None:
         _validate_loss(cls, cls.loss)
+
+    if cls.update_unit is not None and not isinstance(cls.update_unit, UpdateUnit):
+        raise TypeError(
+            f"{cls.__name__}.update_unit must satisfy UpdateUnit (update); "
+            f"got {cls.update_unit!r}"
+        )
 
     if cls.update_conn is not None and not isinstance(cls.update_conn, UpdateConn):
         raise TypeError(

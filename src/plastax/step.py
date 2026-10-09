@@ -79,11 +79,11 @@ def make_step[GS](
     plastax is built for streaming, one sample per step. `batch_size=B` is a
     convenience for mini-batch training and evaluation of feed-forward
     (TOPOLOGICAL) nets: `StepInputs` then carries `(B, num_inputs)` inputs and
-    `(B, num_outputs)` targets; forward, loss, and backward run per sample
-    against the shared connections; the connection update is reduced over the
-    batch (see `phases.build_batched_update_conn`: exact for the `optim/`
-    bundles, mean-of-writes otherwise); prune, add, and reset run once on the
-    batch-mean unit state, which is also what the returned state holds; and
+    `(B, num_outputs)` targets; forward, loss, backward, and the unit update
+    run per sample against the shared connections; the connection update is
+    reduced over the batch (see `phases.build_batched_update_conn`: exact for
+    the `optim/` bundles, mean-of-writes otherwise); prune, add, and reset run
+    once on the batch-mean unit state, which is also what the returned state holds; and
     `StepResult.loss` is the batch mean.
 
     `layout` picks how a batched step runs a *linear* forward or backward pass
@@ -335,6 +335,8 @@ def _batched_step(
         elif phases.backward is not None:
             units_b, c = per_sample(phases.backward, state, units_b, inputs)
             losses = losses + c
+        if phases.update_unit is not None:
+            units_b, _ = per_sample(phases.update_unit, state, units_b, inputs)
         if phases.update_conn is not None:
             state = phases.update_conn(state, units_b)
         state = dataclasses.replace(state, units=batch_mean_units(units_b))

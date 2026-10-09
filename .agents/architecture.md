@@ -151,6 +151,7 @@ The policy Protocols:
 | `ForwardPass[Acc,GS]` | `map(u,dst,src,c,cid,g)→Acc`, `apply(u,i,g,acc)→UnitWrite`; attr `combine:MonoidTree` | destination unit |
 | `BackwardPass[Acc,GS]` | same shape | source unit |
 | `Loss[GS]` | `calculate_loss(u,outputs,targets,g)→(scalar, seed)`; attr `seed_field:FieldSpec` | the seed field, at the output units |
+| `UpdateUnit[GS]` | `update(u,i,g)→UnitWrite` | every live unit |
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
 | `ScoreAddConn[GS]` | `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite`; optional `importance(u,i,g)→Float` (shortlists) | grows edges (scored pairs) |
@@ -207,7 +208,7 @@ tuple of pure `state → (state, loss_contribution)` phase functions in the
 **fixed order**:
 
 ```
-forward → loss → backward → update_conn → prune_conn → add_conn → reset_global
+forward → loss → backward → update_unit → update_conn → prune_conn → add_conn → reset_global
 ```
 
 Each phase is appended **iff its trait slot is not `None`** (forward is
@@ -244,7 +245,7 @@ the whole state pytree, so the step **must be shape-preserving** on every leaf
 ### Batched step (`step.py` `make_step(..., batch_size=B)`, `phases.build_batched_phases`)
 
 Streaming (B = None) is the primary mode. With a batch size, the phases split
-three ways: **per-sample** (forward, loss, backward) vmapped over the batch
+three ways: **per-sample** (forward, loss, backward, update_unit) vmapped over the batch
 with conns/globals broadcast; the **update** reduced over the batch
 (`build_batched_update_conn`: the exact `per_sample` + `incoming_batched` pair
 if the UpdateConn declares it -- every `optim/` bundle does -- else the mean of

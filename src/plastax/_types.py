@@ -125,5 +125,9 @@ WEIGHT: FieldSpec[np.float32] = FieldSpec.float32("weight")
 # monoid leaf by the sweep builder, not declared here).
 ACTIVATION: FieldSpec[np.float32] = FieldSpec.float32("activation")
 LEVEL: FieldSpec[np.int32] = FieldSpec.int32("level")
+# Unit-slot liveness: True for a slot that holds no live unit (never
+# allocated, or pruned). Materialized only when the network declares a unit
+# capacity; every apply, the loss and growth skip a slot it marks.
+PRUNED: FieldSpec[np.bool_] = FieldSpec.boolean("pruned", default=True)
 
 DeadMask = Bool[Array, " capacity"]

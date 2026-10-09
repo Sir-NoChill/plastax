@@ -248,7 +248,7 @@ def resort[GS](
     bucket count is `max(new_level.max(), 1)`, exactly finalize's "the
     highest level ever used as a source is max(levels) - 1" derivation --
     unlike construction, a resort's bucket count can move in EITHER
-    direction versus the old static: AddConn can deepen the graph (more
+    direction versus the old static: growth can deepen the graph (more
     buckets) and PruneConn can orphan a formerly-deep subtree (fewer).
 
     Redistribution is two device-side passes per new bucket, both reusing

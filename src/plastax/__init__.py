@@ -26,7 +26,6 @@ from plastax.phases import (
 from plastax.state import NetworkState, NetworkStatic, make_empty_state
 from plastax.step import StepResult, make_step
 from plastax.traits import (
-    AddConn,
     BackwardPass,
     ForwardPass,
     Loss,
@@ -35,13 +34,15 @@ from plastax.traits import (
     ProposeAddConn,
     PruneConn,
     ResetGlobal,
+    ScoreAddConn,
     UpdateConn,
+    predicate_add_conn,
 )
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 __all__ = [
     "ACTIVATION",
-    "AddConn",
+    "ScoreAddConn",
     "BackwardPass",
     "ConnIdx",
     "ConnView",
@@ -60,6 +61,7 @@ __all__ = [
     "Propagation",
     "Proposal",
     "ProposeAddConn",
+    "predicate_add_conn",
     "PruneConn",
     "ResetGlobal",
     "ShardSpec",

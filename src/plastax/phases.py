@@ -1,8 +1,8 @@
 """Phase builders: each builds a pure state->state function for one Do* phase.
 
 Returns None when the trait slot is absent (trace-time elision). Phase
-order: forward, loss, backward, update_unit, update_conn, prune_conn,
-add_conn, reset_global.
+order: forward, loss, backward, update_unit, update_conn, prune_unit,
+prune_conn, add_conn, reset_global.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from plastax._types import (
     DEAD,
     FROM_ID,
     LEVEL,
+    PRUNED,
     TO_ID,
     WEIGHT,
     ConnIdx,
@@ -123,8 +124,8 @@ def build_phases[GS](
 
     Topological forward walks buckets 1..L (Python loop, static slices);
     backward walks L..1; pipeline is the 1-bucket flat sweep. Phase order:
-    forward, loss, backward, update_unit, update_conn, prune_conn, add_conn,
-    reset_global.
+    forward, loss, backward, update_unit, update_conn, prune_unit, prune_conn,
+    add_conn, reset_global.
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -178,6 +179,8 @@ def build_phases[GS](
         phases.append(build_update_unit_phase(net, static))
     if net.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
+    if net.prune_unit is not None:
+        phases.append(build_prune_unit_phase(net, static))
     interval = int(getattr(net, "structural_interval", 1))
     if net.prune_conn is not None:
         prune_phase = (
@@ -221,8 +224,8 @@ class BatchedPhases[GS]:
         update_conn: the batched connection update, or None when the net has
             no update_conn: `(state, batched_units) -> state`, reducing the
             per-sample contributions to one update per connection.
-        structural: prune_conn, add_conn, and reset_global: run once, on the
-            batch-mean unit state.
+        structural: prune_unit, prune_conn, add_conn, and reset_global: run
+            once, on the batch-mean unit state.
     """
 
     forward: Phase[GS]
@@ -282,6 +285,8 @@ def build_batched_phases[GS](
     )
     interval = int(getattr(net, "structural_interval", 1))
     structural: list[Phase[GS]] = []
+    if net.prune_unit is not None:
+        structural.append(build_prune_unit_phase(net, static))
     if net.prune_conn is not None:
         prune_phase = build_prune_conn_phase(net, static)
         if interval > 1:
@@ -1177,6 +1182,71 @@ def build_update_conn_phase[GS](
     return update_conn_phase
 
 
+def build_prune_unit_phase[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Phase[GS]:
+    """Permanently prune the units the predicate selects.
+
+    `prune_unit.predicate` is vmapped over every unit slot against the
+    pre-phase state, and a unit is pruned when it selects it, it is live, and
+    it is neither an input nor an output unit (those are exempt, whatever the
+    predicate says). A pruned unit is marked `PRUNED` and every other column
+    is reset to its declared default, except `LEVEL`, which it keeps. Every
+    connection with a pruned endpoint is tombstoned in the same phase. The
+    phase leaves `needs_resort` alone, as connection pruning does: removing
+    edges never breaks the leveling invariant, and the next resort recomputes
+    the levels from the live edges.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class, supplying the prune_unit policy.
+        static: static network configuration giving the unit count, the I/O
+            ids and the unit column defaults.
+
+    Returns:
+        The prune_unit phase function.
+    """
+    pu = net.prune_unit
+    assert pu is not None  # build_phases only calls this when set
+    num_units = static.num_units
+    exempt = unit_id_mask(static.input_ids + static.output_ids, num_units)
+    defaults = {
+        spec.name: np.asarray(spec.default, dtype=spec.dtype)
+        for spec in static.unit_fields
+        if spec.name not in (LEVEL.name, PRUNED.name)
+    }
+
+    def prune_unit_phase(
+        state: NetworkState[GS], inputs: StepInputs
+    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        del inputs
+        u_view = UnitView(state.units)
+        g = state.globals_
+
+        def one(i: jax.Array) -> jax.Array:
+            return jnp.asarray(pu.predicate(u_view, UnitIdx(i), g), jnp.bool_)
+
+        selected = jax.vmap(one)(jnp.arange(num_units, dtype=jnp.int32))
+        pruned = state.units[PRUNED.name]
+        doomed = selected & ~pruned & ~exempt
+        units = dict(state.units)
+        for name, default in defaults.items():
+            units[name] = jnp.where(doomed, default, units[name])
+        units[PRUNED.name] = pruned | doomed
+
+        def kill_incident(bucket: Columns) -> Columns:
+            incident = doomed[bucket[FROM_ID.name]] | doomed[bucket[TO_ID.name]]
+            return {**bucket, DEAD.name: bucket[DEAD.name] | incident}
+
+        conns = tuple(kill_incident(bucket) for bucket in state.conns)
+        new_state = dataclasses.replace(state, units=units, conns=conns)
+        return new_state, jnp.float32(0.0)
+
+    return prune_unit_phase
+
+
 def build_prune_conn_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
@@ -1418,6 +1488,10 @@ def plan_prune_fusion[GS](
     pc = net.prune_conn
     if pc is None:
         return PruneFusionPlan(False, "no prune_conn")
+    if net.prune_unit is not None:
+        # The fused forward's tombstones replace the dead masks at the
+        # prune_conn slot, which would revive the edges prune_unit killed.
+        return PruneFusionPlan(False, "prune_unit tombstones edges before prune_conn")
     fp = net.forward_pass
     n = static.num_units
     units = {s.name: _sds((n,), np.dtype(s.dtype)) for s in static.unit_fields}

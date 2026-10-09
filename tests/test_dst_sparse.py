@@ -1,6 +1,7 @@
-"""Dynamic sparse training (SET + RigL, one switch): both hold sparsity and
-learn, and the growth *signature* distinguishes them -- RigL grows high-gradient
-edges, SET grows at random.
+"""Dynamic sparse training (SET + RigL, one switch; SET also in proposal form):
+all hold sparsity, learn, and never grow a duplicate, and the growth
+*signature* distinguishes them -- RigL grows high-gradient edges, SET grows at
+random.
 
 examples/dst_sparse.py is loaded by file path after mlp_xor (which it imports),
 mirroring the other example-backed tests.
@@ -52,7 +53,12 @@ def _train_and_probe(method: str) -> dict[str, object]:
     optimizer = px.optim.adam(0.05, GradPreAct)
     train_net = dst.make_net(optimizer, method=method, mode="train")
     churn_net = dst.make_net(
-        optimizer, method=method, mode="churn", zeta=0.3, max_new_per_level=max(budgets)
+        optimizer,
+        method=method,
+        mode="churn",
+        zeta=0.3,
+        max_new_per_level=max(budgets),
+        layer_sizes=layers,
     )
     eval_net = dst.make_net(optimizer, method=method, mode="eval")
     static, state = dst.build_sparse_mlp(train_net, layers, budgets, 0)
@@ -103,6 +109,7 @@ def _train_and_probe(method: str) -> dict[str, object]:
     grown_g = np.array([abs(float(gpa[d]) * float(act[s])) for (s, d) in grown])
     acc_after, state = dst.evaluate(eval_step, static, state, teacher, rng, 512)
     return {
+        "distinct": len(_live_pairs(state)) == int(px.state.live_conn_count(state)),
         "budget": sum(budgets),
         "live": live,
         "grown_ratio": float(grown_g.mean() / pool.mean()),
@@ -112,7 +119,7 @@ def _train_and_probe(method: str) -> dict[str, object]:
     }
 
 
-@pytest.fixture(scope="module", params=["set", "rigl"])
+@pytest.fixture(scope="module", params=["set", "set_propose", "rigl"])
 def trained(request: pytest.FixtureRequest) -> dict[str, object]:
     result = _train_and_probe(request.param)
     result["method"] = request.param
@@ -123,6 +130,10 @@ def test_holds_sparsity(trained: dict[str, object]) -> None:
     assert set(trained["live"]) == {trained["budget"]}
 
 
+def test_never_grows_a_duplicate(trained: dict[str, object]) -> None:
+    assert trained["distinct"]
+
+
 def test_learns(trained: dict[str, object]) -> None:
     assert trained["acc_after"] > trained["acc_before"]
     assert trained["acc_after"] > 0.6
@@ -130,7 +141,7 @@ def test_learns(trained: dict[str, object]) -> None:
 
 def test_growth_signature(trained: dict[str, object]) -> None:
     # RigL grows the highest-gradient absent edges (mean |dL/dw| far above the
-    # candidate pool's); SET grows at random (mean ~ the pool's).
+    # candidate pool's); SET (scored or proposed) grows at random (mean ~ the pool's).
     assert trained["n_grown"] > 0
     if trained["method"] == "rigl":
         assert trained["grown_ratio"] > 2.0, trained["grown_ratio"]

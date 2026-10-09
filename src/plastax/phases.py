@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Any, cast, no_type_check
+from typing import Any, no_type_check
 
 import jax
 import jax.numpy as jnp
@@ -2894,7 +2894,7 @@ class ShortlistCoverage:
         candidate_units: the shortlist size M the AddConn declares.
         source_units: units sitting at this bucket's source level.
         destination_units: units this bucket may grow INTO, i.e. those within
-            the neighbourhood window and strictly deeper.
+            the level-gap window and strictly deeper.
         covered: whether M reaches every eligible destination.
     """
 
@@ -2938,14 +2938,14 @@ def shortlist_coverage[GS](
     if add_conn is None or max_candidate_units is None:
         return ()
     levels = np.asarray(state.units[LEVEL.name])
-    neighbourhood = net.neighbourhood
+    max_level_gap = int(getattr(add_conn, "max_level_gap", 1))
     out: list[ShortlistCoverage] = []
     for bucket in range(len(static.level_capacities)):
         sources = int(np.sum(levels == bucket))
         # matches build_add_conn_phase's own window: strictly deeper, within
-        # the neighbourhood radius.
+        # the rule's level-gap window.
         destinations = int(
-            np.sum((levels > bucket) & (levels <= bucket + neighbourhood))
+            np.sum((levels > bucket) & (levels <= bucket + max_level_gap))
         )
         out.append(
             ShortlistCoverage(
@@ -2982,6 +2982,278 @@ def recommended_shortlist[GS](
     return max((c.destination_units for c in coverage), default=0)
 
 
+def importance_scores[GS](
+    importance_fn: Callable[[UnitView, UnitIdx, GS], Float[Array, ""]],
+    u_view: UnitView,
+    g: GS,
+    num_units: int,
+) -> jax.Array:
+    """The per-unit importance vector, for either shortlist flavour.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        importance_fn: the AddConn's `importance(u, i, g)` method.
+        u_view: the unit view.
+        g: the global state.
+        num_units: the number of unit slots.
+
+    Returns:
+        A `(num_units,)` float32 vector of importances.
+    """
+    unit_ids = jnp.arange(num_units, dtype=jnp.int32)
+
+    def one(i: jax.Array) -> jax.Array:
+        return importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
+
+    return jax.vmap(one)(unit_ids)
+
+
+def candidates_grid(num_units: int) -> tuple[jax.Array, jax.Array]:
+    """The exhaustive candidate grid: every ordered `(src, dst)` unit pair.
+
+    Args:
+        num_units: the number of unit slots.
+
+    Returns:
+        `(flat_src, flat_dst)` int32 arrays of length `num_units**2`.
+    """
+    unit_ids = jnp.arange(num_units, dtype=jnp.int32)
+    full_src = jnp.repeat(unit_ids, num_units, total_repeat_length=num_units**2)
+    full_dst = jnp.tile(unit_ids, num_units)
+    return full_src, full_dst
+
+
+def candidates_shortlist(
+    importance: jax.Array, pool_side: int
+) -> tuple[jax.Array, jax.Array]:
+    """The global shortlist grid: the top-M most important units, crossed.
+
+    Args:
+        importance: per-unit importance scores, `(num_units,)`.
+        pool_side: M, the shortlist size.
+
+    Returns:
+        `(flat_src, flat_dst)` int32 arrays of length `pool_side**2`.
+    """
+    _, top = jax.lax.top_k(importance, pool_side)
+    src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
+    dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
+    return src, dst
+
+
+def candidates_per_level(
+    importance: jax.Array,
+    unit_level: jax.Array,
+    bucket_idx: int,
+    pool_side: int,
+    max_level_gap: int,
+) -> tuple[jax.Array, jax.Array]:
+    """One bucket's shortlist grid: top-M sources at its level x top-M deeper dests.
+
+    A source top_k that pulls in a wrong-level unit (fewer than M sit at the
+    level) is harmless -- the bucket's own `src_ok` filter drops it. The
+    destination side is strictly deeper within the window, matching how this
+    shortlist flavour has always drawn its candidates.
+
+    Args:
+        importance: per-unit importance scores, `(num_units,)`.
+        unit_level: per-unit level column, `(num_units,)`.
+        bucket_idx: the source-level bucket this grid serves.
+        pool_side: M, the shortlist size.
+        max_level_gap: the growth rule's level-gap window.
+
+    Returns:
+        `(flat_src, flat_dst)` int32 arrays of length `pool_side**2`.
+    """
+    src_imp = jnp.where(unit_level == bucket_idx, importance, -jnp.inf)
+    _, src_top = jax.lax.top_k(src_imp, pool_side)
+    deeper = (unit_level > bucket_idx) & (unit_level <= bucket_idx + max_level_gap)
+    _, dst_top = jax.lax.top_k(jnp.where(deeper, importance, -jnp.inf), pool_side)
+    src = jnp.broadcast_to(src_top[:, None], (pool_side, pool_side)).reshape(-1)
+    dst = jnp.broadcast_to(dst_top[None, :], (pool_side, pool_side)).reshape(-1)
+    return src, dst
+
+
+def candidates_propose[GS](
+    propose_fn: Callable[
+        [UnitView, jax.Array, GS],
+        tuple[Float[Array, ""] | jax.Array, Float[Array, ""] | jax.Array, jax.Array],
+    ],
+    u_view: UnitView,
+    g: GS,
+    num_proposals: int,
+    num_units: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """This step's proposal candidates, with out-of-range ids clamped.
+
+    An out-of-range id is vetoed through the returned mask and clamped to 0 so
+    every downstream gather stays in bounds.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        propose_fn: the ProposeAddConn's `propose(u, j, g)` method.
+        u_view: the unit view.
+        g: the global state.
+        num_proposals: how many proposals to draw.
+        num_units: the number of unit slots, bounding valid ids.
+
+    Returns:
+        `(src, dst, score, in_range)`: int32 endpoint arrays (clamped), the
+        float32 proposal scores, and the in-range mask, each of length
+        `num_proposals`.
+    """
+
+    def propose_one(
+        j: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        s_, d_, score_ = propose_fn(u_view, j, g)
+        return (
+            jnp.asarray(s_, jnp.int32),
+            jnp.asarray(d_, jnp.int32),
+            jnp.asarray(score_, jnp.float32),
+        )
+
+    p_src, p_dst, p_score = jax.vmap(propose_one)(
+        jnp.arange(num_proposals, dtype=jnp.int32)
+    )
+    in_range = (p_src >= 0) & (p_src < num_units) & (p_dst >= 0) & (p_dst < num_units)
+    src = jnp.where(in_range, p_src, jnp.int32(0))
+    dst = jnp.where(in_range, p_dst, jnp.int32(0))
+    return src, dst, p_score, in_range
+
+
+def apply_validity(
+    flat_src: jax.Array,
+    flat_dst: jax.Array,
+    unit_level: jax.Array,
+    bucket_idx: int,
+    max_level_gap: int,
+    is_pipeline: bool,
+) -> jax.Array:
+    """The framework validity mask for one bucket's candidates.
+
+    A candidate is valid when it sits in the level-gap window
+    (`abs(level[dst] - level[src]) <= max_level_gap`, self-loops excluded --
+    the window admits same-level and toward-shallower pairs, which a growth
+    policy's score vetoes if unwanted) and, in TOPOLOGICAL mode, sources from
+    this bucket's own level. PIPELINE's single bucket accepts any source level.
+
+    Args:
+        flat_src: candidate source ids.
+        flat_dst: candidate destination ids.
+        unit_level: per-unit level column.
+        bucket_idx: the destination bucket index.
+        max_level_gap: the growth rule's level-gap window.
+        is_pipeline: whether the net propagates in PIPELINE mode.
+
+    Returns:
+        A boolean mask over the candidates.
+    """
+    src_level = unit_level[flat_src]
+    window_ok = (jnp.abs(unit_level[flat_dst] - src_level) <= max_level_gap) & (
+        flat_src != flat_dst
+    )
+    src_ok = (
+        jnp.ones_like(src_level, dtype=jnp.bool_)
+        if is_pipeline
+        else src_level == bucket_idx
+    )
+    return window_ok & src_ok
+
+
+def dedupe_live(
+    bucket_conns: Columns,
+    cand_src: jax.Array,
+    cand_dst: jax.Array,
+    num_units: int,
+    shard_axis: str | None,
+) -> jax.Array:
+    """Candidates that are not already a live edge of this bucket.
+
+    A sort of the live pairs plus a binary search per candidate,
+    O((P + cap) * log cap) with no num_units**2 occupancy grid, so a
+    shortlisted or proposal phase stays free of any num_units**2 term.
+
+    Args:
+        bucket_conns: the bucket's connection columns.
+        cand_src: candidate source ids.
+        cand_dst: candidate destination ids.
+        num_units: the number of unit slots (pair-id base).
+        shard_axis: the Scheme-A shard axis name, or None when unsharded.
+
+    Returns:
+        A boolean mask, True where the candidate duplicates no live edge.
+    """
+    not_duplicate = ~live_pair_member(
+        bucket_conns[FROM_ID.name],
+        bucket_conns[TO_ID.name],
+        bucket_conns[DEAD.name],
+        cand_src,
+        cand_dst,
+        num_units,
+    )
+    if shard_axis is None:
+        return not_duplicate
+    # Under Scheme-A the live edges are split across shards, so the
+    # binary search above only sees THIS shard's slice. A candidate
+    # already live on any other shard must count as a duplicate
+    # everywhere -- otherwise shards would score a different candidate
+    # set, top_k differently, and disagree on the global slot
+    # assignment below. All-reduce the local duplicate mask (pmax ==
+    # boolean OR) so valid/scores/top_k are identical on every shard.
+    dup_any = monoid.max_.collective((~not_duplicate).astype(jnp.int32), shard_axis)
+    nowhere_live: jax.Array = dup_any == jnp.int32(0)
+    return nowhere_live
+
+
+def dedupe_step(
+    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
+) -> jax.Array:
+    """Veto within-step repeats, keeping each pair's highest-scored copy.
+
+    Proposals, unlike grid cells, can repeat within a step. The veto runs
+    BEFORE top_k, so repeats never take a bucket's k slots.
+
+    Args:
+        flat_scores: candidate scores (vetoes already applied as -inf).
+        flat_src: candidate source ids.
+        flat_dst: candidate destination ids.
+
+    Returns:
+        The scores with every repeated pair's lower-scored copies at -inf.
+    """
+    by_score = jnp.argsort(-flat_scores, stable=True)
+    repeat = (
+        jnp.zeros_like(flat_scores, dtype=jnp.bool_)
+        .at[by_score]
+        .set(repeats_earlier(flat_src[by_score], flat_dst[by_score]))
+    )
+    return jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
+
+
+def select(flat_scores: jax.Array, k: int) -> jax.Array:
+    """Indices of the bucket's k selection winners, in selection order.
+
+    Args:
+        flat_scores: the bucket's candidate scores.
+        k: the static per-bucket budget.
+
+    Returns:
+        Indices of the k selected candidates. When every candidate fits the
+        budget, selection is moot: the (full-sort) top_k is skipped, since
+        order only decides which free slot a candidate takes and the claim
+        tolerates vetoed (-inf) candidates anywhere.
+    """
+    if k == flat_scores.shape[0]:
+        return jnp.arange(k, dtype=jnp.int32)
+    _, top_idx = jax.lax.top_k(flat_scores, k)
+    return top_idx
+
+
 def build_add_conn_phase[GS](
     net: type[Network[GS]],
     static: NetworkStatic,
@@ -2997,9 +3269,10 @@ def build_add_conn_phase[GS](
     `importance(u, i, g)` method, the M x M grid of that step's top-M most
     important units (an O(num_units + M^2) shortlist replacing the O(num_units^2)
     sweep) -- filtered to a level-gap window:
-    `abs(level[dst] - level[src]) <= net.neighbourhood`,
-    self-loops excluded (see the `window_ok` comment below for the
-    per-ordered-pair derivation). In TOPOLOGICAL mode a bucket only
+    `abs(level[dst] - level[src]) <= max_level_gap` (the growth rule's own
+    attribute, read structurally, default 1),
+    self-loops excluded (see
+    per-ordered-pair derivation in `apply_validity`). In TOPOLOGICAL mode a bucket only
     sources candidates from units at its own level (matching
     NetworkBuilder.finalize's bucket-of-conn convention); PIPELINE's
     single bucket accepts a source at any level, since every live conn
@@ -3064,7 +3337,7 @@ def build_add_conn_phase[GS](
     assert ac is not None  # build_phases only calls this when set
     num_units = static.num_units
     num_buckets = len(static.level_capacities)
-    neighbourhood = net.neighbourhood
+    max_level_gap = int(getattr(ac, "max_level_gap", 1))
     is_pipeline = net.propagation is Propagation.PIPELINE
 
     # Scheme-A sharding: the conn arena is split across `num_shards` devices on
@@ -3130,45 +3403,6 @@ def build_add_conn_phase[GS](
     # shortlist policy that never reads it (4 * num_units^2 bytes per column,
     # terabytes at a million units). Traced, an unused grid is dead code.
 
-    def importance_scores(u_view: UnitView, g: GS) -> jax.Array:
-        """The per-unit importance vector (num_units,), for either shortlist."""
-        assert importance_fn is not None  # only called when shortlisting
-        unit_ids = jnp.arange(num_units, dtype=jnp.int32)
-
-        def one(i: jax.Array) -> jax.Array:
-            score = importance_fn(u_view, UnitIdx(i), g).astype(jnp.float32)
-            return cast(jax.Array, score)
-
-        return jax.vmap(one)(unit_ids)
-
-    def candidate_grid(u_view: UnitView, g: GS) -> tuple[jax.Array, jax.Array]:
-        """The global (flat_src, flat_dst) grid: full num_units^2 or top-M^2."""
-        if not use_shortlist:
-            unit_ids = jnp.arange(num_units, dtype=jnp.int32)
-            full_src = jnp.repeat(unit_ids, num_units, total_repeat_length=num_units**2)
-            full_dst = jnp.tile(unit_ids, num_units)
-            return full_src, full_dst
-        _, top = jax.lax.top_k(importance_scores(u_view, g), pool_side)
-        src = jnp.broadcast_to(top[:, None], (pool_side, pool_side)).reshape(-1)
-        dst = jnp.broadcast_to(top[None, :], (pool_side, pool_side)).reshape(-1)
-        return src, dst
-
-    def per_level_grid(
-        imp: jax.Array, unit_level: jax.Array, bucket_idx: int
-    ) -> tuple[jax.Array, jax.Array]:
-        """One bucket's grid: top-M sources at its level x top-M deeper dests.
-
-        A source top_k that pulls in a wrong-level unit (fewer than M sit at the
-        level) is harmless -- the bucket's own `src_ok` filter drops it.
-        """
-        src_imp = jnp.where(unit_level == bucket_idx, imp, -jnp.inf)
-        _, src_top = jax.lax.top_k(src_imp, pool_side)
-        deeper = (unit_level > bucket_idx) & (unit_level <= bucket_idx + neighbourhood)
-        _, dst_top = jax.lax.top_k(jnp.where(deeper, imp, -jnp.inf), pool_side)
-        src = jnp.broadcast_to(src_top[:, None], (pool_side, pool_side)).reshape(-1)
-        dst = jnp.broadcast_to(dst_top[None, :], (pool_side, pool_side)).reshape(-1)
-        return src, dst
-
     def add_conn_phase(
         state: NetworkState[GS], inputs: StepInputs
     ) -> tuple[NetworkState[GS], Float[Array, ""]]:
@@ -3179,38 +3413,29 @@ def build_add_conn_phase[GS](
         unit_level = units[LEVEL.name]
         # Per-level shortlisting draws each bucket its own grid in the loop
         # below; every other mode reuses this one global grid. Its per-bucket
-        # window (`abs(gap) <= neighbourhood`, self-loops excluded -- the window
-        # admits same-level and toward-shallower pairs, which a growth policy's
-        # score vetoes if unwanted) is also computed in the loop, cheap on the
-        # shared grid. The global grid is built unconditionally so the loop's two
-        # branches both bind flat_src/flat_dst; when per-level it is the (small)
-        # top-M grid and goes unused, dead-code-eliminated -- never the
+        # window (`apply_validity`) is also computed in the loop, cheap on the
+        # shared grid. The global grid is built unconditionally so the loop's
+        # two branches both bind flat_src/flat_dst; when per-level it is the
+        # (small) top-M grid and goes unused, dead-code-eliminated -- never the
         # num_units^2 full grid.
-        imp = importance_scores(u_view, g) if use_per_level else None
+        if use_per_level:
+            assert importance_fn is not None  # use_per_level implies it is set
+            imp = importance_scores(importance_fn, u_view, g, num_units)
+        else:
+            imp = None
         if isinstance(ac, ProposeAddConn):
             # The proposals are this step's global candidate list: computed
-            # once, filtered per bucket in the loop. An out-of-range id is
-            # vetoed and clamped to 0 so every gather below stays in bounds.
-            def propose_one(
-                j: jax.Array,
-            ) -> tuple[jax.Array, jax.Array, jax.Array]:
-                s_, d_, score_ = ac.propose(u_view, j, g)
-                return (
-                    jnp.asarray(s_, jnp.int32),
-                    jnp.asarray(d_, jnp.int32),
-                    jnp.asarray(score_, jnp.float32),
-                )
-
-            p_src, p_dst, p_score = jax.vmap(propose_one)(
-                jnp.arange(num_proposals, dtype=jnp.int32)
+            # once, filtered per bucket in the loop.
+            global_src, global_dst, p_score, in_range = candidates_propose(
+                ac.propose, u_view, g, num_proposals, num_units
             )
-            in_range = (
-                (p_src >= 0) & (p_src < num_units) & (p_dst >= 0) & (p_dst < num_units)
+        elif use_shortlist:
+            assert importance_fn is not None  # use_shortlist implies it is set
+            global_src, global_dst = candidates_shortlist(
+                importance_scores(importance_fn, u_view, g, num_units), pool_side
             )
-            global_src = jnp.where(in_range, p_src, jnp.int32(0))
-            global_dst = jnp.where(in_range, p_dst, jnp.int32(0))
         else:
-            global_src, global_dst = candidate_grid(u_view, g)
+            global_src, global_dst = candidates_grid(num_units)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
             assert isinstance(ac, AddConn)  # the grid path only
@@ -3224,83 +3449,32 @@ def build_add_conn_phase[GS](
             write = ac.init(u_view, UnitIdx(s), UnitIdx(d), g)
             return dict(write.fields)
 
-        def not_live_duplicate(
-            bucket_conns: Columns, cand_src: jax.Array, cand_dst: jax.Array
-        ) -> jax.Array:
-            """Candidates that are not already a live edge of this bucket.
-
-            A sort of the live pairs plus a binary search per candidate,
-            O((P + cap) * log cap) with no num_units**2 occupancy grid, so a
-            shortlisted or proposal phase stays free of any num_units**2 term.
-            """
-            not_duplicate = ~live_pair_member(
-                bucket_conns[FROM_ID.name],
-                bucket_conns[TO_ID.name],
-                bucket_conns[DEAD.name],
-                cand_src,
-                cand_dst,
-                num_units,
-            )
-            if shard_axis is None:
-                return not_duplicate
-            # Under Scheme-A the live edges are split across shards, so the
-            # binary search above only sees THIS shard's slice. A candidate
-            # already live on any other shard must count as a duplicate
-            # everywhere -- otherwise shards would score a different candidate
-            # set, top_k differently, and disagree on the global slot
-            # assignment below. All-reduce the local duplicate mask (pmax ==
-            # boolean OR) so valid/scores/top_k are identical on every shard.
-            dup_any = monoid.max_.collective(
-                (~not_duplicate).astype(jnp.int32), shard_axis
-            )
-            nowhere_live: jax.Array = dup_any == jnp.int32(0)
-            return nowhere_live
-
         claims: list[GrowthClaim] = []
         for bucket_idx in range(num_buckets):
             bucket_conns = state.conns[bucket_idx]
             if use_per_level:
                 assert imp is not None  # use_per_level implies importance is set
-                flat_src, flat_dst = per_level_grid(imp, unit_level, bucket_idx)
+                flat_src, flat_dst = candidates_per_level(
+                    imp, unit_level, bucket_idx, pool_side, max_level_gap
+                )
             else:
                 flat_src, flat_dst = global_src, global_dst
-            src_level = unit_level[flat_src]
-            window_ok = (jnp.abs(unit_level[flat_dst] - src_level) <= neighbourhood) & (
-                flat_src != flat_dst
+            valid = apply_validity(
+                flat_src, flat_dst, unit_level, bucket_idx, max_level_gap, is_pipeline
             )
-            src_ok = (
-                jnp.ones_like(src_level, dtype=jnp.bool_)
-                if is_pipeline
-                else src_level == bucket_idx
-            )
-            valid = window_ok & src_ok
             if use_propose:
                 valid = valid & in_range
             if dedupe:
-                valid = valid & not_live_duplicate(bucket_conns, flat_src, flat_dst)
+                valid = valid & dedupe_live(
+                    bucket_conns, flat_src, flat_dst, num_units, shard_axis
+                )
             if use_propose:
                 flat_scores = jnp.where(valid, p_score, jnp.float32(-jnp.inf))
                 if dedupe:
-                    # Proposals, unlike grid cells, can repeat within a step.
-                    # Keep each pair's highest-scored copy and veto the rest
-                    # BEFORE top_k, so repeats never take a bucket's k slots.
-                    by_score = jnp.argsort(-flat_scores, stable=True)
-                    repeat = (
-                        jnp.zeros_like(valid)
-                        .at[by_score]
-                        .set(repeats_earlier(flat_src[by_score], flat_dst[by_score]))
-                    )
-                    flat_scores = jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
+                    flat_scores = dedupe_step(flat_scores, flat_src, flat_dst)
             else:
                 flat_scores = jax.vmap(scored)(flat_src, flat_dst, valid)
-            if k == flat_scores.shape[0]:
-                # Every candidate fits the budget, so selection is moot: skip
-                # the (full-sort) top_k. Order only decides which free slot a
-                # candidate takes, and growth_rank below tolerates vetoed
-                # (-inf) candidates anywhere.
-                top_idx = jnp.arange(k, dtype=jnp.int32)
-            else:
-                _, top_idx = jax.lax.top_k(flat_scores, k)
+            top_idx = select(flat_scores, k)
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
             top_valid = valid[top_idx]

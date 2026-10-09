@@ -492,6 +492,18 @@ class _E2EAddConn(px.AddConn[None]):
     bucket has no room for on the first attempt."""
 
     max_candidates = 1
+    # 0 (not the default of 1): restricts the window to STRICTLY
+    # same-level pairs, so bucket 0 (ANCHOR, the only level-0 unit, with no
+    # other level-0 unit to pair against) has NO valid candidates at all --
+    # without this, ANCHOR's own bucket would ALSO have valid (if
+    # low-scored) in-window candidates every step (any dst within
+    # max_level_gap 1, including plain duplicates of ANCHOR's existing
+    # edges), and since top_k + prefix-sum commits WHATEVER it selects
+    # once that candidate is valid and a slot is free -- regardless of how
+    # low build_add_conn_phase's caller-supplied `score` rated it -- bucket
+    # 0 would commit an unplanned parallel edge every step, muddying this
+    # test's edge-set assertions for no reason relevant to what it checks.
+    max_level_gap = 0
 
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -511,18 +523,6 @@ class _E2ENet(px.Network[None]):
     forward_pass = _SumForward()
     add_conn = _E2EAddConn()
     propagation = px.Propagation.TOPOLOGICAL
-    # 0 (not the class default of 1): restricts the window to STRICTLY
-    # same-level pairs, so bucket 0 (ANCHOR, the only level-0 unit, with no
-    # other level-0 unit to pair against) has NO valid candidates at all --
-    # without this, ANCHOR's own bucket would ALSO have valid (if
-    # low-scored) in-window candidates every step (any dst within
-    # neighbourhood 1, including plain duplicates of ANCHOR's existing
-    # edges), and since top_k + prefix-sum commits WHATEVER it selects
-    # once that candidate is valid and a slot is free -- regardless of how
-    # low build_add_conn_phase's caller-supplied `score` rated it -- bucket
-    # 0 would commit an unplanned parallel edge every step, muddying this
-    # test's edge-set assertions for no reason relevant to what it checks.
-    neighbourhood = 0
 
 
 def _build_e2e_net() -> tuple[px.NetworkStatic, px.NetworkState[None]]:

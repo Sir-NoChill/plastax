@@ -324,7 +324,6 @@ def make_net(
             extra_unit_fields = _EXTRA_UNIT_FIELDS
             extra_conn_fields = optimizer.state_fields
             propagation = px.Propagation.TOPOLOGICAL
-            neighbourhood = 1
 
         return _Churn
 

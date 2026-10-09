@@ -54,11 +54,24 @@ Unit lifecycle
   its fields, unwritten fields take their declared defaults; the child starts
   with no connections.
 
+Loss
+----
+The loss is one call over every output unit: it returns the scalar loss and
+writes the gradient seed dL/d(activation) of each output into its declared
+seed field (``loss_grad`` here); nothing else is written. Softmax
+cross-entropy uses the max-subtracted log-sum-exp form, in this float32
+operation order: ``m = max(a)`` (a running ``>`` scan from ``-inf``),
+``s = sum(exp(a - m))`` (output order), then per output ``z = a - m``,
+``seed = exp(z) / s - t`` and ``loss += t * (log(s) - z)``.
+
 Growth selection pipeline
 -------------------------
 1. Trigger: if false this step, the phase is a no-op.
 2. Candidates come from live proposers only (units or connections), or from
-   the exhaustive / shortlist grids.
+   the exhaustive / shortlist grids. ``shortlist_per_level`` draws one grid
+   per source level, levels ascending: sources are the level's top-M live
+   units by importance, destinations the top-M live units inside that
+   level's validity window (level gap and direction), by importance.
 3. Validity (each failure scores the candidate ``-inf``): endpoints live and
    in range; ``src != dst`` unless self-loops are allowed;
    ``|level(dst) - level(src)| <= max_level_gap``; the direction constraint
@@ -75,7 +88,9 @@ Growth selection pipeline
    ``(src, dst, occurrence)`` over live connections (per-connection), ``j``
    (global), ``src * capacity + dst`` (exhaustive), or the row-major position
    in the importance-ranked M x M grid (shortlist; importance ties break by
-   ascending unit id). Selection runs per source level in that order --
+   ascending unit id), or ``level_rank * M * M`` plus the row-major position
+   in that level's grid (shortlist_per_level; level_rank counts the levels
+   holding live units, ascending). Selection runs per source level in that order --
    ``top_k`` takes the first ``max_new_per_level`` finite candidates,
    ``threshold`` those with score >= threshold(g) up to ``max_new_per_level``,
    ``all`` every finite candidate -- then ``max_new_per_step`` applies across
@@ -314,6 +329,41 @@ def mse_loss_grad(units: list[dict[str, Any]], targets: list[float]) -> np.float
         diff = np.float32(np.float32(u["fields"]["activation"]) - np.float32(t))
         u["fields"]["loss_grad"] = float(diff)
         total = np.float32(total + np.float32(0.5) * diff * diff)
+    return total
+
+
+def softmax_ce_loss_grad(
+    units: list[dict[str, Any]],
+    targets: list[float],
+    *,
+    log: Callable[[np.float32], np.float32] = np.log,
+) -> np.float32:
+    """Softmax cross-entropy over the outputs; stages the seed into loss_grad.
+
+    The float32 operation order is the specification (module docstring,
+    Loss). ``log`` exists so the emitter can prove a golden insensitive to
+    the last bits of ``log(s)``, which libraries need not round identically.
+
+    Returns:
+        The scalar loss.
+    """
+    outs = [u for u in units if u["is_output"]]
+    acts = [np.float32(u["fields"]["activation"]) for u in outs]
+    peak = np.float32(-np.inf)
+    for a in acts:
+        if a > peak:
+            peak = a
+    total_exp = np.float32(0.0)
+    for a in acts:
+        total_exp = np.float32(total_exp + np.exp(np.float32(a - peak)))
+    log_sum = np.float32(log(total_exp))
+    total = np.float32(0.0)
+    for u, a, t in zip(outs, acts, targets, strict=True):
+        z = np.float32(a - peak)
+        t32 = np.float32(t)
+        seed = np.float32(np.float32(np.exp(z) / total_exp) - t32)
+        u["fields"]["loss_grad"] = float(seed)
+        total = np.float32(total + np.float32(t32 * np.float32(log_sum - z)))
     return total
 
 
@@ -589,6 +639,57 @@ def candidates_shortlist(
                     "index": i * len(ranked) + k,
                 }
             )
+    return out
+
+
+def candidates_shortlist_per_level(
+    units: list[dict[str, Any]],
+    *,
+    shortlist_size: int,
+    max_level_gap: int,
+    direction: str = "any",
+    importance: Callable[[int], float],
+    score: Callable[[int, int], float],
+) -> list[dict[str, Any]]:
+    """One M x M grid per source level, levels ascending.
+
+    Sources are the level's top-M live units by importance; destinations are
+    the top-M live units inside the level's validity window (level gap and
+    direction), by importance. Importance ties break by ascending unit id.
+    Index = level_rank * M * M + row-major position in the level's grid.
+    """
+
+    def ranked(eligible: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+        pool = [u for u in live_units(units) if eligible(u)]
+        return sorted(pool, key=lambda u: (-importance(u["id"]), u["id"]))[
+            :shortlist_size
+        ]
+
+    def in_window(src_level: int, dst_level: int) -> bool:
+        if abs(dst_level - src_level) > max_level_gap:
+            return False
+        if direction == "deeper":
+            return dst_level > src_level
+        if direction == "same_or_deeper":
+            return dst_level >= src_level
+        return True
+
+    levels = sorted({u["level"] for u in live_units(units)})
+    m = shortlist_size
+    out = []
+    for rank, level in enumerate(levels):
+        srcs = ranked(lambda u, lv=level: u["level"] == lv)
+        dsts = ranked(lambda u, lv=level: in_window(lv, u["level"]))
+        for i, s in enumerate(srcs):
+            for k, d in enumerate(dsts):
+                out.append(
+                    {
+                        "src": s["id"],
+                        "dst": d["id"],
+                        "score": score(s["id"], d["id"]),
+                        "index": rank * m * m + i * len(dsts) + k,
+                    }
+                )
     return out
 
 

@@ -195,6 +195,9 @@ def distribute_state[GS](
     )
     needs_resort = place(state.needs_resort, repl_sharding)
     step = place(state.step, repl_sharding)
+    grown = place(state.grown, repl_sharding)
+    overflow = place(state.overflow, repl_sharding)
+    units_added = place(state.units_added, repl_sharding)
 
     return NetworkState(
         units=units,
@@ -202,4 +205,7 @@ def distribute_state[GS](
         globals_=globals_,
         needs_resort=needs_resort,
         step=step,
+        grown=grown,
+        overflow=overflow,
+        units_added=units_added,
     )

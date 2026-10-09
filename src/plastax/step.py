@@ -49,7 +49,7 @@ class StepResult[GS]:
 
     Attributes:
         state: The network state after the step.
-        overflow: AddConn overflow flag for the step.
+        overflow: growth overflow flag for the step (also on the state).
         loss: Reduced per-output loss for the step; 0.0 when the net has no
             loss phase.
     """
@@ -256,6 +256,9 @@ def _shard_map_step(
         globals_=repl,
         needs_resort=repl,
         step=repl,
+        grown=repl,
+        overflow=repl,
+        units_added=repl,
     )
     in_specs: Any = (state_spec, _spec(StepInputs, inputs=repl, targets=repl))
     out_specs: Any = _spec(StepResult, state=state_spec, overflow=repl, loss=repl)

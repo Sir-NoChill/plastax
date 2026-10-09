@@ -96,6 +96,13 @@ class NetworkState[GS]:
             the first step's phases and is incremented once at the end of
             every step (a batched step counts as one); rules and the
             counter-based RNG key on the pre-increment value.
+        grown: connections committed by this step's growth phase (0 when the
+            phase was elided, skipped by its trigger, or grew nothing).
+        overflow: whether this step's growth phase dropped selected
+            candidates for lack of free capacity.
+        units_added: units added by this step's unit-addition phase. Always 0
+            until the unit lifecycle lands; the growth trigger
+            "on_units_added" reads it.
     """
 
     units: Columns
@@ -103,6 +110,13 @@ class NetworkState[GS]:
     globals_: GS
     needs_resort: Bool[Array, ""]
     step: Int32[Array, ""] = dataclasses.field(default_factory=lambda: jnp.int32(0))
+    grown: Int32[Array, ""] = dataclasses.field(default_factory=lambda: jnp.int32(0))
+    overflow: Bool[Array, ""] = dataclasses.field(
+        default_factory=lambda: jnp.bool_(False)
+    )
+    units_added: Int32[Array, ""] = dataclasses.field(
+        default_factory=lambda: jnp.int32(0)
+    )
 
 
 def _filled_columns(specs: tuple[FieldSpec[np.generic], ...], capacity: int) -> Columns:
@@ -139,6 +153,9 @@ def make_empty_state[GS](static: NetworkStatic, globals_: GS) -> NetworkState[GS
         globals_=globals_,
         needs_resort=jnp.bool_(False),
         step=jnp.int32(0),
+        grown=jnp.int32(0),
+        overflow=jnp.bool_(False),
+        units_added=jnp.int32(0),
     )
 
 
@@ -231,5 +248,8 @@ def grow_bucket[GS](
         globals_=state.globals_,
         needs_resort=state.needs_resort,
         step=state.step,
+        grown=state.grown,
+        overflow=state.overflow,
+        units_added=state.units_added,
     )
     return new_static, new_state

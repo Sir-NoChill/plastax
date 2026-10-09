@@ -8,6 +8,7 @@ behaviour is pinned separately by `test_growth_claim.py`'s sha digests.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -87,9 +88,47 @@ def test_dedupe_step_keeps_each_pairs_highest_scored_copy() -> None:
 
 def test_select_skips_the_sort_when_everything_fits() -> None:
     scores = jnp.asarray([5.0, -jnp.inf, 7.0], dtype=jnp.float32)
-    assert np.asarray(select(scores, 3)).tolist() == [0, 1, 2]
-    # k < n: genuine top-k by score
-    assert np.asarray(select(scores, 2)).tolist() == [2, 0]
+    src = jnp.asarray([0, 1, 2], dtype=jnp.int32)
+    dst = jnp.asarray([1, 2, 3], dtype=jnp.int32)
+    assert np.asarray(select(scores, src, dst, 3)).tolist() == [0, 1, 2]
+    # k < n: genuine selection, descending by score
+    assert np.asarray(select(scores, src, dst, 2)).tolist() == [2, 0]
+
+
+def test_select_breaks_score_ties_by_src_then_dst_then_candidate_index() -> None:
+    scores = jnp.asarray([4.0, 4.0, 4.0, 4.0, 9.0], dtype=jnp.float32)
+    src = jnp.asarray([7, 2, 2, 2, 5], dtype=jnp.int32)
+    dst = jnp.asarray([3, 9, 6, 6, 0], dtype=jnp.int32)
+    # total order among the 4.0 ties: src 2 before src 7; within src 2,
+    # dst 6 before dst 9; within (2, 6), candidate 2 before candidate 3.
+    assert np.asarray(select(scores, src, dst, 5)).tolist() == [0, 1, 2, 3, 4]
+    assert np.asarray(select(scores, src, dst, 4)).tolist() == [4, 2, 3, 1]
+
+
+def test_select_is_identical_under_jit() -> None:
+    scores = jnp.asarray([1.0, 1.0, 1.0, 2.0, -jnp.inf], dtype=jnp.float32)
+    src = jnp.asarray([3, 1, 1, 0, 0], dtype=jnp.int32)
+    dst = jnp.asarray([0, 5, 4, 2, 1], dtype=jnp.int32)
+    eager = np.asarray(select(scores, src, dst, 3))
+    jitted = np.asarray(jax.jit(select, static_argnums=3)(scores, src, dst, 3))
+    assert eager.tolist() == jitted.tolist() == [3, 2, 1]
+
+
+def test_select_sorts_nan_scores_last() -> None:
+    scores = jnp.asarray([jnp.nan, 1.0, 0.5], dtype=jnp.float32)
+    src = jnp.asarray([0, 1, 2], dtype=jnp.int32)
+    dst = jnp.asarray([1, 2, 0], dtype=jnp.int32)
+    # a NaN score must not outrank finite candidates (it is vetoed at commit)
+    assert np.asarray(select(scores, src, dst, 2)).tolist() == [1, 2]
+
+
+def test_dedupe_step_keeps_the_total_order_first_copy_on_equal_scores() -> None:
+    src = jnp.asarray([4, 4, 4], dtype=jnp.int32)
+    dst = jnp.asarray([6, 6, 6], dtype=jnp.int32)
+    scores = jnp.asarray([2.0, 2.0, 2.0], dtype=jnp.float32)
+    out = np.asarray(dedupe_step(scores, src, dst))
+    # equal pair, equal scores: the earliest candidate index survives
+    assert out.tolist() == [2.0, -np.inf, -np.inf]
 
 
 def test_dedupe_live_masks_live_edges_but_not_dead_ones() -> None:

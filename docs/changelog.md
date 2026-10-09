@@ -35,6 +35,13 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- Growth selection follows a deterministic total candidate order:
+  `(-score, src, dst, candidate index)` ascending. Distinct scores select
+  exactly as before; score ties now resolve by the lower source id, then the
+  lower destination id, then the earlier candidate, instead of by candidate
+  position alone — identical across backends and matching the C++
+  implementation. A NaN score now sorts last (it was already vetoed at
+  commit).
 - **Breaking:** the growth window moved off the network onto the growth rule.
   `Network.neighbourhood` is removed; set `max_level_gap` (int, default 1, read
   structurally) on the `AddConn`/`ProposeAddConn` policy instead. A subclass

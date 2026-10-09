@@ -291,12 +291,15 @@ def _run(
     return digests, overflows
 
 
-# Final-state digests of the pre-kernel claim path (7ff7cc6, CPU).
+# Final-state digests of the pre-kernel claim path (CPU). propose_dedupe and
+# propose_small_claim were re-pinned when selection adopted the total candidate
+# order (-score, src, dst, candidate_index): their hashed scores are coarse
+# (deliberate ties), and ties now resolve by (src, dst) before candidate index.
 _GOLDEN: dict[str, str] = {
     "grid": "c2f0954e163ec8d4",
-    "propose_dedupe": "731104b129f640fd",
+    "propose_dedupe": "e70bf7ba72d6d67d",
     "propose_overflow": "226df2f917a66999",
-    "propose_small_claim": "dd61286a530888e5",
+    "propose_small_claim": "afd4d3527c4bce08",
     "propose_window2": "648fb55c2a57e20d",
 }
 

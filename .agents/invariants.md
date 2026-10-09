@@ -112,7 +112,7 @@ MLIR emission; densification (dense-bucket → `dot_general` rewrite). Static
 dense-matmul parity is a **non-goal**, not a missing feature.
 
 In scope and *implemented*: `Propagation.PIPELINE` and `TOPOLOGICAL`;
-AddConn/PruneConn dynamics; named monoids (incl. pytree-of-monoids struct
+growth/pruning dynamics; named monoids (incl. pytree-of-monoids struct
 accumulators); donation-based in-place state; host driver retrace protocol;
 Scheme-A multi-device sharding.
 
@@ -147,13 +147,18 @@ These follow from the above but are worth stating for anyone touching `topo`,
   `indices_are_sorted=True` (a violated hint is undefined in XLA).
 - **Deletion never resorts. Level-preserving adds never resort.** `resort` runs
   only when `add_conn` set `needs_resort` (a non-level-preserving commit).
-- **`-inf` AddConn score is a hard veto** — never committed even with free
-  slots — distinct from a merely-low finite score. The same holds for a
-  `ProposeAddConn` proposal's score.
-- **Duplicates follow `dedupe`:** it defaults to True for the grid path
-  (`AddConn`), which then never grows a copy of a live edge, and to False for
-  the proposal path (`ProposeAddConn`), which then grows parallel edges (each
-  contributing independently). Either policy may set it explicitly.
+- **A `-inf` growth score is a hard veto** — never committed even with free
+  slots — distinct from a merely-low finite score. This holds for a
+  `ScoreAddConn` score and a `ProposeAddConn` proposal's score alike.
+- **Duplicates follow `dedupe_live` / `dedupe_step`:** both default False for
+  both rule kinds, so growth grows parallel edges (each contributing
+  independently) unless a rule opts in. `dedupe_live` vetoes candidates equal
+  to a live edge; `dedupe_step` keeps the first of equal candidates in the
+  total order.
+- **Selection commits in the total order** `(-score, src, dst, index)` per
+  source level, then `max_new_per_step` across levels ascending -- including
+  when the budget equals the candidate pool, so overflow drops the same
+  candidates on every backend and in plastax-cpp.
 - **Reserved field names** (`from_id`, `to_id`, `dead`, `weight`, `activation`,
   `level`) cannot be reused by `extra_unit_fields`/`extra_conn_fields`; enforced
   at subclass definition (`traits._validate_field_names`).

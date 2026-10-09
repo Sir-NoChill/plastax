@@ -36,9 +36,9 @@ group, ordered roughly by how fundamental they are.
   its map is `WEIGHT * u[F, other]` and its combine is `sum_`, so its
   accumulation is a sparse matrix product (the CSR layout).
 - **Parallel edge** — two live connections with the same `(src, dst)`, each
-  contributing independently. `ProposeAddConn` growth can create them unless
-  the policy sets `dedupe = True`; grid growth (`AddConn`) never does by
-  default.
+  contributing independently. Either growth rule (`ScoreAddConn`,
+  `ProposeAddConn`) creates them unless it sets `dedupe_live = True` (and
+  `dedupe_step = True` against within-step repeats); both default False.
 
 ## State & compilation
 

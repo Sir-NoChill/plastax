@@ -153,21 +153,20 @@ The policy Protocols:
 | `Loss[GS]` | `per_output(u,i,target,g)→(scalar, UnitWrite)` | output units |
 | `UpdateConn[GS]` | `incoming(...)→ConnWrite`, `outgoing(...)→ConnWrite` | the edge (two-pass) |
 | `PruneConn[GS]` | `predicate(u,c,cid,g)→Bool` | tombstones edges |
-| `AddConn[GS]` | attr `max_candidates:int`; `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite` | grows edges (grid) |
-| `ProposeAddConn[GS]` | attrs `max_candidates:int`, `num_proposals:int`; `propose(u,j,g)→(src,dst,score)`, `init(...)→ConnWrite` | grows edges (proposals) |
+| `ScoreAddConn[GS]` | `score(u,src,dst,g)→Float`, `init(u,src,dst,g)→ConnWrite`; optional `importance(u,i,g)→Float` (shortlists) | grows edges (scored pairs) |
+| `ProposeAddConn[GS]` | attr `proposals_per_proposer:int`; `propose(...)→(src,dst,score)` per `proposer`, `init(...)→ConnWrite` | grows edges (proposals) |
 | `ResetGlobal[GS]` | `reset(g)→GS` | globals, between episodes |
 
-`AddConn` may *structurally* (via `getattr`, not in the Protocol) also declare
-`max_candidate_units:int` + `importance(u,i,g)→Float` to switch from the
-`O(num_units²)` full grid to an `O(num_units + M²)` shortlist, and
-`shortlist_per_level:bool` for a per-bucket grid.
-
-`ProposeAddConn` replaces the grid as the candidate source: `propose` is
-vmapped over `j in [0, num_proposals)` and everything downstream (routing to
-the source level's bucket, the window, top-k, slot claim, `init`) is shared.
-`add_conn` must satisfy exactly one of the two Protocols. Either may set
-`dedupe:bool` structurally (grid default True, proposals default False: the
-proposal path grows parallel edges unless asked not to).
+Both rule kinds carry the §10 knobs *structurally* (via `getattr`, validated
+in `_validate_traits`): `selection` / `max_new_per_level` / `max_new_per_step`
+/ `threshold(g)`, the window (`max_level_gap`, `direction`,
+`allow_self_loops`), `dedupe_live` / `dedupe_step` (both default False),
+`trigger` and `on_overflow`. A `ScoreAddConn` also picks `candidates`
+(`exhaustive`, `shortlist`, `shortlist_per_level`; the shortlists take
+`shortlist_size` + `importance`). `add_conn` must satisfy exactly one of the
+two Protocols; `predicate_add_conn` adapts a boolean predicate to a
+`ScoreAddConn`. Growth reports `grown` and `overflow` on the state, and
+`Network.structural_interval` gates the structural phases to every n-th step.
 
 ### Assembly (`phases.py`)
 
@@ -298,7 +297,7 @@ flags it returns — the **retrace protocol**:
 
 `Driver(..., check_every=N)` with N > 1 reads the flags back only every N
 steps (overflow OR-accumulated on device; `needs_resort` is sticky in state):
-no retry of an overflowing step (buckets short of `max_candidates` free slots
+no retry of an overflowing step (buckets short of `max_new_per_level` free slots
 grow at the check) and a resort deferred to the check. Opt-in, for launch-
 bound small nets; N = 1 is the exact protocol above.
 
@@ -343,7 +342,7 @@ An optimizer is **not** a special object — it is a trait bundle
 
 - `state_fields: tuple[FieldSpec[np.generic], ...]` — extra per-connection
   columns, namespaced `opt/…` (e.g. `opt/m`, `opt/v`, `opt/t`). Each
-  `FieldSpec.default` **is** the regrow-init: on `AddConn` growth the framework
+  `FieldSpec.default` **is** the regrow-init: on growth the framework
   resets an edge's untouched fields to their defaults, so a stateful
   optimizer's moments start at zero on a regrown edge — exactly RigL/SET's
   "zero the moments for regrown weights", with no work from the growth policy. A
@@ -409,9 +408,9 @@ reference the C++ oracle file when porting.
 ## 10. Growth: the target model (design record)
 
 The growth rework lands in stages; this section is the normative design the
-stages implement. Where current code disagrees (single scored-grid `AddConn`,
-network-level `neighbourhood`, dedupe on by default in grid mode), current code
-loses.
+stages implement; as of G5 the code implements all of it except the unit
+lifecycle that `on_units_added` reads (`NetworkState.units_added` stays 0
+until it lands). Where code disagrees with this section, the code loses.
 
 Two strategies, one deterministic selection pipeline:
 

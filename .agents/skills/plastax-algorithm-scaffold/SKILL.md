@@ -100,24 +100,33 @@ class MyUpdate:
 class MyPrune:
     def predicate(self, u, c, cid, g) -> Bool[Array, ""]: ...      # True ⇒ prune this edge
 
-# AddConn[GS]: K-bounded growth
+# ScoreAddConn[GS]: growth from scored candidate pairs
 class MyGrow:
-    max_candidates: int = ...
+    max_new_per_level: int = ...   # per source level per step (omit for selection="all")
     def score(self, u, src, dst, g) -> Float[Array, ""]: ...   # -inf = HARD VETO (never grown)
     def init(self, u, src, dst, g) -> ConnWrite: ...           # new edge's fields (WEIGHT + yours only)
     # optional shortlist to avoid the O(num_units^2) grid:
-    # max_candidate_units: int; def importance(self, u, i, g) -> Float[Array, ""]: ...
-    # shortlist_per_level: bool = True
+    # candidates = "shortlist" | "shortlist_per_level"; shortlist_size: int
+    # def importance(self, u, i, g) -> Float[Array, ""]: ...
+    # a boolean rule: px.predicate_add_conn(should_add, init, **knobs)
 
 # ProposeAddConn[GS]: growth from sampled proposals (cost follows the churn)
 class MyProposeGrow:
-    max_candidates: int = ...        # grown per bucket per step, at most
-    num_proposals: int = ...         # static; e.g. num_units * fanout
-    def propose(self, u, j, g) -> tuple[Int32, Int32, Float]: ...  # (src, dst, score)
+    max_new_per_level: int = ...     # grown per source level per step, at most
+    proposals_per_proposer: int = ...
+    proposer = "per_unit"            # | "per_connection" | "global"
+    def propose(self, u, i, j, g, rng) -> Proposal: ...  # (src, dst, score)
     def init(self, u, src, dst, g) -> ConnWrite: ...
-    # dedupe: bool = False  -> parallel edges allowed; True = exact check,
-    #   O(capacity log capacity) per step. Seed proposals from a step-dependent
-    #   value (step counter / per-unit cursor) or they repeat every step.
+
+# Knobs shared by both (all optional, structural):
+#   selection = "top_k" | "threshold" (def threshold(self, g)) | "all"
+#   max_new_per_step: int | None; max_level_gap = 1
+#   direction = "any" | "deeper" | "same_or_deeper"; allow_self_loops = False
+#   dedupe_live = False (veto a live edge's copy; a sort per step)
+#   dedupe_step = False (first of equal candidates in the step)
+#   trigger = "every_step" | ("every", n) | "on_units_added" | "when" (def when(self, g))
+#   on_overflow = "flag" | "error"
+# Network.structural_interval = n runs prune + growth on every n-th step only.
 
 # Linear passes (optional): a ForwardPass whose map is exactly
 #   c[WEIGHT, cid] * u[F, src]  (BackwardPass: ... * u[F, dst]) with combine
@@ -155,10 +164,11 @@ Direction & ordering facts to get right:
   (e.g. `grad_pre_act`), and `prune_conn` sees `update_conn`'s fresh weights.
 - `UpdateConn` runs *all* incoming writes across every bucket before *any*
   outgoing pass, so the two sub-passes never race.
-- A `-inf` `AddConn.score` (or proposal score) is a hard veto, distinct from a
-  low finite score.
-- Grid growth never duplicates a live edge; proposal growth does unless
-  `dedupe = True`. Prefer proposals that are distinct by construction.
+- A `-inf` `ScoreAddConn.score` (or proposal score) is a hard veto, distinct
+  from a low finite score.
+- Neither rule kind deduplicates by default: set `dedupe_live = True` to never
+  regrow a live edge (and `dedupe_step = True` against within-step repeats).
+  Prefer candidates that are distinct by construction.
   For dynamic-sparse (SET/RigL), read `examples/dst_sparse.py`: SET and RigL are
   the same class differing only in `score` (random hash vs delta-rule gradient).
 

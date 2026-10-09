@@ -230,7 +230,13 @@ class UniformInit:
 
     def as_json(self) -> dict[str, Any]:
         """Return the JSON form the C++ runner parses."""
-        return {"kind": "uniform", "seed": self.seed, "min": self.lo, "max": self.hi}
+        return {
+            "kind": "uniform",
+            "engine": "philox",
+            "seed": self.seed,
+            "min": self.lo,
+            "max": self.hi,
+        }
 
     def weights(self, n_src: int, n_dst: int, base_conn_id: int) -> np.ndarray:
         """Return the (n_src, n_dst) weight matrix in plastax-cpp's edge order."""

@@ -56,6 +56,9 @@ jobs:
       - name: Pytest
         run: uv run pytest
 
+      - name: Registry goldens match their generator
+        run: uv run python scripts/parity/emit.py --check
+
   docs:
     name: docs
     runs-on: ubuntu-24.04

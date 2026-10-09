@@ -26,8 +26,17 @@ Pinned by ``tests/test_plastax_cpp_rng.py`` against
 
 from __future__ import annotations
 
+import pathlib
+import sys
+
 import numpy as np
 import numpy.typing as npt
+
+# The Philox engine lives with the registry-golden reference; reuse it rather
+# than keeping a third port in sync (tests/test_parity_goldens.py pins it to
+# plastax-cpp's rng_philox32.json word stream).
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "scripts/parity"))
+from reference import philox32, unit_float  # noqa: E402
 
 # Scalars or arrays: every function here is elementwise, so a whole layer's
 # connection ids can be drawn in one call.
@@ -145,6 +154,7 @@ def fully_connected_weights(
     base_conn_id: int = 0,
     lo: float = -1.0,
     hi: float = 1.0,
+    engine: str = "philox",
 ) -> npt.NDArray[np.float32]:
     """Weights for one `plastax::FullyConnected` layer, as a ``(n_src, n_dst)`` matrix.
 
@@ -169,6 +179,8 @@ def fully_connected_weights(
         base_conn_id: Global connection id of this layer's first edge.
         lo: Range lower bound.
         hi: Range upper bound.
+        engine: ``"philox"`` (plastax-cpp's default `UniformReal` engine) or
+            ``"minstd"`` (the `PLASTAX_RNG_MINSTD` parity path).
 
     Returns:
         A ``(n_src, n_dst)`` float32 matrix, indexable as ``w[src, dst]``.
@@ -179,5 +191,17 @@ def fully_connected_weights(
         indexing="ij",
     )
     conn_ids = np.uint64(base_conn_id) + dst_idx * np.uint64(n_src) + src_idx
+    if engine == "philox":
+        # plastax-cpp's default engine: min + (max-min) * unit_float(word).
+        flat = [
+            np.float32(lo)
+            + np.float32(np.float32(hi) - np.float32(lo))
+            * unit_float(philox32(seed, int(cid)))
+            for cid in conn_ids.ravel()
+        ]
+        w = np.asarray(flat, dtype=np.float32).reshape(conn_ids.shape)
+        return w.T.copy()
+    if engine != "minstd":
+        raise ValueError(f"unknown rng engine {engine!r}")
     # (n_dst, n_src) in allocation order -> (n_src, n_dst) for w[src, dst].
     return uniform_real(seed, conn_ids, lo, hi).T.copy()

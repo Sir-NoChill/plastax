@@ -1,0 +1,200 @@
+{
+ "_comment": "Forward (ReLU), MSE loss and backward on a fixed dyadic MLP, topological mode. All values are dyadic; compare exactly. The loss value is reference-only. Weights are dyadic_weight_v1 over global unit ids; grad_pre_act = (sum_out w*grad_dst + loss_grad) * [act>0].",
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": 0.875
+   },
+   "src": 0
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.625
+   },
+   "src": 1
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": -0.75
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": -0.125
+   },
+   "src": 1
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.875
+   },
+   "src": 2
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.75
+   },
+   "src": 3
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": -0.125
+   },
+   "src": 3
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.375
+   },
+   "src": 4
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 4
+  }
+ ],
+ "mode": "topological",
+ "name": "passes_relu_topological",
+ "network": {
+  "input_dim": 2,
+  "layers": [
+   3,
+   2
+  ]
+ },
+ "requires": "passes_v1",
+ "rules": {
+  "passes": "relu_mlp_v1",
+  "weights": "dyadic_weight_v1"
+ },
+ "schema": "registry_v1",
+ "steps": [
+  {
+   "expect": {
+    "activations": [
+     1.0,
+     -0.5,
+     0.0,
+     1.25,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "grad_pre_act": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     -0.0,
+     0.0
+    ],
+    "loss": 0.3125
+   },
+   "inputs": [
+    1.0,
+    -0.5
+   ],
+   "targets": [
+    0.25,
+    -0.75
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     0.5,
+     0.5,
+     0.4375,
+     0.0625,
+     0.0,
+     0.3359375,
+     0.0
+    ],
+    "grad_pre_act": [
+     0.0,
+     0.0,
+     -0.5810546875,
+     0.498046875,
+     0.0,
+     -0.6640625,
+     0.0
+    ],
+    "loss": 0.220489501953125
+   },
+   "inputs": [
+    0.5,
+    0.5
+   ],
+   "targets": [
+    1.0,
+    0.0
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     -1.0,
+     2.0,
+     1.0,
+     0.0,
+     0.25,
+     0.78125,
+     0.0
+    ],
+    "grad_pre_act": [
+     0.0,
+     0.0,
+     0.24609375,
+     -0.0,
+     -0.10546875,
+     0.28125,
+     -0.0
+    ],
+    "loss": 0.16455078125
+   },
+   "inputs": [
+    -1.0,
+    2.0
+   ],
+   "targets": [
+    0.5,
+    0.5
+   ]
+  }
+ ]
+}

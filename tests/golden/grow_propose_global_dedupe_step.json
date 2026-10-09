@@ -1,0 +1,154 @@
+{
+ "_comment": "Global proposals: one site (key 0), P=6, index = j.",
+ "expect": {
+  "committed": [
+   {
+    "dst": 4,
+    "score": 0.62890625,
+    "src": 0
+   },
+   {
+    "dst": 1,
+    "score": 0.609375,
+    "src": 0
+   },
+   {
+    "dst": 1,
+    "score": 0.015625,
+    "src": 2
+   },
+   {
+    "dst": 3,
+    "score": 0.80078125,
+    "src": 4
+   },
+   {
+    "dst": 2,
+    "score": 0.55078125,
+    "src": 4
+   }
+  ],
+  "conn_overflow": false,
+  "grown": 5,
+  "needs_resort": true
+ },
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.125
+   },
+   "src": 2
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.25
+   },
+   "src": 3
+  }
+ ],
+ "initial_units": [
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 0,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.25
+   },
+   "id": 1,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.125
+   },
+   "id": 2,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.75
+   },
+   "id": 3,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.5
+   },
+   "id": 4,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 5,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  }
+ ],
+ "name": "grow_propose_global_dedupe_step",
+ "params": {
+  "capacity": 16,
+  "dedupe_step": true,
+  "free_slots": 8,
+  "max_level_gap": 2,
+  "max_new_per_level": 2,
+  "network_seed": 7,
+  "proposals_per_proposer": 6,
+  "proposer": "global",
+  "selection": "top_k",
+  "step": 3
+ },
+ "requires": "growth_v2",
+ "rules": {
+  "init": "grow_init_v1",
+  "propose": "global_propose_v1"
+ },
+ "schema": "registry_v1"
+}

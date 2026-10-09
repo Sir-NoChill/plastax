@@ -1,0 +1,159 @@
+{
+ "_comment": "Per-unit proposals (P=2) under the site-rng contract; dedupe flags are opt-in and default off, so the plain variant may commit parallel and duplicate edges.",
+ "expect": {
+  "committed": [
+   {
+    "dst": 4,
+    "score": 0.41015625,
+    "src": 0
+   },
+   {
+    "dst": 2,
+    "score": 0.22265625,
+    "src": 0
+   },
+   {
+    "dst": 0,
+    "score": 0.93359375,
+    "src": 3
+   },
+   {
+    "dst": 1,
+    "score": 0.6953125,
+    "src": 3
+   },
+   {
+    "dst": 0,
+    "score": 0.9609375,
+    "src": 5
+   },
+   {
+    "dst": 1,
+    "score": 0.875,
+    "src": 4
+   }
+  ],
+  "conn_overflow": false,
+  "grown": 6,
+  "needs_resort": true
+ },
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.125
+   },
+   "src": 2
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.25
+   },
+   "src": 3
+  }
+ ],
+ "initial_units": [
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 0,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.25
+   },
+   "id": 1,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.125
+   },
+   "id": 2,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.75
+   },
+   "id": 3,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.5
+   },
+   "id": 4,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 5,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  }
+ ],
+ "name": "grow_propose_per_unit_dedupe_step",
+ "params": {
+  "capacity": 16,
+  "dedupe_step": true,
+  "free_slots": 8,
+  "max_level_gap": 2,
+  "max_new_per_level": 2,
+  "network_seed": 7,
+  "proposals_per_proposer": 2,
+  "proposer": "per_unit",
+  "selection": "top_k",
+  "step": 3
+ },
+ "requires": "growth_v2",
+ "rules": {
+  "init": "grow_init_v1",
+  "propose": "hash_propose_v1"
+ },
+ "schema": "registry_v1"
+}

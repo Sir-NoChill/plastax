@@ -1,0 +1,175 @@
+{
+ "_comment": "Forward-only pipeline mode on the same dyadic MLP: every non-input unit updates simultaneously from the previous step's activations, so a signal crosses one connection per step. Compare exactly.",
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": 0.875
+   },
+   "src": 0
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.625
+   },
+   "src": 1
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": -0.75
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": -0.125
+   },
+   "src": 1
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.875
+   },
+   "src": 2
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.75
+   },
+   "src": 3
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": -0.125
+   },
+   "src": 3
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.375
+   },
+   "src": 4
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 4
+  }
+ ],
+ "mode": "pipeline",
+ "name": "passes_relu_pipeline",
+ "network": {
+  "input_dim": 2,
+  "layers": [
+   3,
+   2
+  ]
+ },
+ "requires": "passes_v1",
+ "rules": {
+  "passes": "relu_mlp_v1",
+  "weights": "dyadic_weight_v1"
+ },
+ "schema": "registry_v1",
+ "steps": [
+  {
+   "expect": {
+    "activations": [
+     1.0,
+     -0.5,
+     0.0,
+     1.25,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "inputs": [
+    1.0,
+    -0.5
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     0.5,
+     0.5,
+     0.4375,
+     0.0625,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   "inputs": [
+    0.5,
+    0.5
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     -1.0,
+     2.0,
+     1.0,
+     0.0,
+     0.25,
+     0.3359375,
+     0.0
+    ]
+   },
+   "inputs": [
+    -1.0,
+    2.0
+   ]
+  },
+  {
+   "expect": {
+    "activations": [
+     0.25,
+     0.25,
+     0.21875,
+     0.03125,
+     0.0,
+     0.78125,
+     0.0
+    ]
+   },
+   "inputs": [
+    0.25,
+    0.25
+   ]
+  }
+ ]
+}

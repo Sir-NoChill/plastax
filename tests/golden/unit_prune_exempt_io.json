@@ -1,0 +1,204 @@
+{
+ "_comment": "Input and output units are exempt from pruning even when the predicate would select them: unit 5 (output, activation -0.875) survives; only hidden unit 1 is pruned.",
+ "capacity": 8,
+ "expect": {
+  "edges": [
+   {
+    "dst": 2,
+    "fields": {
+     "weight": -0.25
+    },
+    "src": 0
+   },
+   {
+    "dst": 4,
+    "fields": {
+     "weight": 0.25
+    },
+    "src": 2
+   },
+   {
+    "dst": 5,
+    "fields": {
+     "weight": -0.5
+    },
+    "src": 4
+   }
+  ],
+  "pruned": [
+   1
+  ],
+  "units": [
+   {
+    "fields": {
+     "activation": 0.25
+    },
+    "id": 0,
+    "is_input": true,
+    "is_output": false,
+    "level": 0,
+    "pruned": false
+   },
+   {
+    "fields": {
+     "activation": 0.0
+    },
+    "id": 1,
+    "is_input": false,
+    "is_output": false,
+    "level": 1,
+    "pruned": true
+   },
+   {
+    "fields": {
+     "activation": 0.5
+    },
+    "id": 2,
+    "is_input": false,
+    "is_output": false,
+    "level": 1,
+    "pruned": false
+   },
+   {
+    "fields": {
+     "activation": 0.0
+    },
+    "id": 3,
+    "is_input": false,
+    "is_output": false,
+    "level": 2,
+    "pruned": true
+   },
+   {
+    "fields": {
+     "activation": 0.75
+    },
+    "id": 4,
+    "is_input": false,
+    "is_output": false,
+    "level": 2,
+    "pruned": false
+   },
+   {
+    "fields": {
+     "activation": -0.875
+    },
+    "id": 5,
+    "is_input": false,
+    "is_output": true,
+    "level": 3,
+    "pruned": false
+   }
+  ]
+ },
+ "field_defaults": {
+  "activation": 0.0
+ },
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 1,
+   "fields": {
+    "weight": 0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 2,
+   "fields": {
+    "weight": -0.25
+   },
+   "src": 0
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.125
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 4
+  }
+ ],
+ "initial_units": [
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 0,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.75
+   },
+   "id": 1,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 2,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.0
+   },
+   "id": 3,
+   "is_input": false,
+   "is_output": false,
+   "level": 2,
+   "pruned": true
+  },
+  {
+   "fields": {
+    "activation": 0.75
+   },
+   "id": 4,
+   "is_input": false,
+   "is_output": false,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.875
+   },
+   "id": 5,
+   "is_input": false,
+   "is_output": true,
+   "level": 3,
+   "pruned": false
+  }
+ ],
+ "max_levels": 1024,
+ "name": "unit_prune_exempt_io",
+ "requires": "unit_lifecycle_v1",
+ "rules": {
+  "prune_unit": "unit_prune_v1"
+ },
+ "schema": "registry_v1"
+}

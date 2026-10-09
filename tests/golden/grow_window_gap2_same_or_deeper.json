@@ -1,0 +1,167 @@
+{
+ "_comment": "Validity window: |level(dst) - level(src)| <= gap plus the direction constraint; failures score -inf.",
+ "expect": {
+  "committed": [
+   {
+    "dst": 3,
+    "score": 0.875,
+    "src": 0
+   },
+   {
+    "dst": 2,
+    "score": 0.625,
+    "src": 1
+   },
+   {
+    "dst": 5,
+    "score": 0.375,
+    "src": 1
+   },
+   {
+    "dst": 2,
+    "score": 0.25,
+    "src": 0
+   },
+   {
+    "dst": 5,
+    "score": 0.0,
+    "src": 0
+   },
+   {
+    "dst": 4,
+    "score": -0.25,
+    "src": 1
+   },
+   {
+    "dst": 1,
+    "score": -0.375,
+    "src": 0
+   },
+   {
+    "dst": 4,
+    "score": -0.625,
+    "src": 0
+   }
+  ],
+  "conn_overflow": true,
+  "grown": 8,
+  "needs_resort": true
+ },
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.125
+   },
+   "src": 2
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.25
+   },
+   "src": 3
+  }
+ ],
+ "initial_units": [
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 0,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.25
+   },
+   "id": 1,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.125
+   },
+   "id": 2,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.75
+   },
+   "id": 3,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.5
+   },
+   "id": 4,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 5,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  }
+ ],
+ "name": "grow_window_gap2_same_or_deeper",
+ "params": {
+  "candidates": "exhaustive",
+  "capacity": 16,
+  "direction": "same_or_deeper",
+  "free_slots": 8,
+  "max_level_gap": 2,
+  "network_seed": 7,
+  "selection": "all",
+  "step": 3
+ },
+ "requires": "growth_v2",
+ "rules": {
+  "init": "grow_init_v1",
+  "score": "grid_score_v1"
+ },
+ "schema": "registry_v1"
+}

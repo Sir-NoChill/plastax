@@ -106,13 +106,31 @@ def test_fully_connected_weights_uses_destination_major_ids() -> None:
     a conformance vector to notice.
     """
     n_src, n_dst, base, seed = 3, 4, 12, 2
-    w = fully_connected_weights(seed, n_src, n_dst, base_conn_id=base)
+    w = fully_connected_weights(seed, n_src, n_dst, base_conn_id=base, engine="minstd")
     assert w.shape == (n_src, n_dst)
     for dst in range(n_dst):
         for src in range(n_src):
             expected = uniform_real(
                 np.uint64(seed), np.uint64(base + dst * n_src + src), -1.0, 1.0
             )
+            assert _bits(w[src, dst]) == _bits(expected), f"({src}, {dst})"
+
+
+def test_fully_connected_weights_philox_engine_matches_the_scalar_form() -> None:
+    """The default (philox) engine: min + (max-min) * unit_float(word).
+
+    Same destination-major id mapping as the minstd branch; the scalar form is
+    pinned to plastax-cpp's rng_philox32.json through the parity reference.
+    """
+    from reference import philox32, unit_float
+
+    n_src, n_dst, base, seed = 3, 4, 12, 2
+    w = fully_connected_weights(seed, n_src, n_dst, base_conn_id=base)
+    assert w.shape == (n_src, n_dst)
+    for dst in range(n_dst):
+        for src in range(n_src):
+            word = philox32(seed, base + dst * n_src + src)
+            expected = np.float32(-1.0) + np.float32(2.0) * unit_float(word)
             assert _bits(w[src, dst]) == _bits(expected), f"({src}, {dst})"
 
 

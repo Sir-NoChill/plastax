@@ -65,6 +65,15 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   every live unit, inputs and outputs included, after the backward pass and
   before the connection update. A batched step runs it on each sample's
   units. The unit-update conformance goldens are enforced.
+- `PruneUnit` and the `Network.prune_unit` slot (requires `unit_capacity`):
+  `predicate(u, i, g)` is evaluated on the pre-phase state of every live unit
+  except the inputs and outputs, which are never pruned. Pruning is
+  permanent: a selected unit is marked `PRUNED`, its columns reset to their
+  declared defaults (it keeps its level), and every connection incident to it
+  is tombstoned in the same phase. It runs every step after the connection
+  update and before connection pruning, and once on the batch-mean state of a
+  batched step. Declaring it under Scheme-A sharding raises
+  `NotImplementedError`. The unit-prune conformance goldens are enforced.
 - All growth_v2 conformance goldens are enforced: scoring, selection, the
   validity window, triggers and growth on the batch-mean state, including
   the per-level shortlist.

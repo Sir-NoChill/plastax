@@ -13,7 +13,7 @@ two per-unit columns the forward and backward already wrote, so it is a local
 read rather than a dense gradient over missing edges.
 
 What is new is the *rate*. The paper anneals k by `(alpha/2)(1 + cos(t*pi/T_end))`.
-`max_candidates` is a static trace-time bound and cannot be a traced value, so
+`max_new_per_level` is a static trace-time bound and cannot be a traced value, so
 the count cannot be scheduled directly. Instead each candidate is thinned
 stochastically against a per-unit rate column the host rewrites each cycle: the
 expected number grown follows the schedule exactly, the decision stays local,
@@ -118,7 +118,7 @@ class NeStats(px.ForwardPass):
         return px.UnitWrite.of((SET_CURSOR, u[SET_CURSOR, i] + jnp.int32(1)))
 
 
-class NeGrow(px.AddConn[None]):
+class NeGrow(px.ScoreAddConn[None]):
     """Gradient-scored growth, thinned to a cosine-annealed rate, interior only.
 
     The score is RigL's absent-edge gradient. Two gates sit on top: the edge's
@@ -129,14 +129,19 @@ class NeGrow(px.AddConn[None]):
     """
 
     def __init__(
-        self, max_candidates: int, grow_scale: float, shortlist: int | None = None
+        self, max_new_per_level: int, grow_scale: float, shortlist: int | None = None
     ) -> None:
         """Bind the growth budget, init weight and optional shortlist size."""
-        self.max_candidates = max_candidates
+        self.max_new_per_level = max_new_per_level
         self.grow_scale = grow_scale
+        # Strictly deeper edges (the per-level shortlist's destination pool
+        # follows the direction), never a regrown live edge (nothing is
+        # deduplicated by default).
+        self.direction = "deeper"
+        self.dedupe_live = True
         if shortlist is not None:
-            self.max_candidate_units = shortlist
-            self.shortlist_per_level = True
+            self.candidates = "shortlist_per_level"
+            self.shortlist_size = shortlist
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
         """Per-unit shortlist score: activity plus gradient magnitude."""
@@ -197,7 +202,7 @@ def make_net(
     *,
     mode: str,
     tau: float = 1e-6,
-    max_candidates: int = 4096,
+    max_new_per_level: int = 4096,
     grow_scale: float = 0.0,
     shortlist: int | None = None,
     ema_decay: float = 0.05,
@@ -208,7 +213,7 @@ def make_net(
         optimizer: the plastax.optim bundle.
         mode: ``"train"``, ``"churn"`` or ``"eval"``.
         tau: dormancy threshold (churn); the paper's value is 0.
-        max_candidates: per-bucket growth bound (churn).
+        max_new_per_level: per-bucket growth bound (churn).
         grow_scale: grown-edge init weight (churn).
         shortlist: M for the candidate grid, or None for exhaustive (churn).
         ema_decay: activation-EMA rate feeding the dormancy statistic.
@@ -247,7 +252,7 @@ def make_net(
         class _Churn(px.Network[None]):
             forward_pass = NeStats()
             prune_conn = NePrune(tau)
-            add_conn = NeGrow(max_candidates, grow_scale, shortlist)
+            add_conn = NeGrow(max_new_per_level, grow_scale, shortlist)
             extra_unit_fields = _UNIT_FIELDS
             extra_conn_fields = optimizer.state_fields
             propagation = px.Propagation.TOPOLOGICAL
@@ -496,7 +501,7 @@ def run(
         optimizer,
         mode="churn",
         tau=tau,
-        max_candidates=grow_budget,
+        max_new_per_level=grow_budget,
         shortlist=shortlist,
     )
     static, state = build_ne_net(

@@ -20,9 +20,10 @@ Pruning is identical for both: `MagnitudeStats` reduces each unit's incoming
 Scaling: the growth phase's exhaustive candidate grid is O(num_units^2), the one
 term that is not O(E) -- it is the wall (empirically ~5k units before a churn
 costs seconds and >1GB). Passing `shortlist=M` makes each growth policy declare
-`max_candidate_units`, so the phase draws candidates from the M x M grid of the
-M most *important* units (here |grad_pre_act| + |activation|) -- O(num_units + M^2)
--- and num_units scales far past the exhaustive wall.
+`candidates = "shortlist_per_level"`, so the phase draws candidates from the
+M x M grids of the M most *important* units (here |grad_pre_act| +
+|activation|) -- O(num_units + M^2) -- and num_units scales far past the
+exhaustive wall.
 
 **Sizing M has TWO constraints, and the second is usually the binding one.**
 
@@ -43,7 +44,7 @@ static, state)` reports it per bucket against a built state, and
 `plastax.recommended_shortlist(net, static, state)` returns the floor that
 satisfies it. Both are host-side; neither changes what the traced phase does.
 
-`shortlist_per_level` (set by the growth policies here) already fixes the
+the per-level shortlist (set by the growth policies here) already fixes the
 *separate* problem that a single global top-M concentrates on one level and
 starves the others.
 
@@ -192,7 +193,7 @@ class SetPrune(px.PruneConn):
         return jnp.abs(c[px.WEIGHT, cid]) < u[SET_THRESH, dst]
 
 
-class _Growth(px.AddConn[None]):
+class _Growth(px.ScoreAddConn[None]):
     """Shared growth: deeper-only (non-deeper vetoed with -inf), fill-to-capacity,
     small weight init, and -- when `shortlist` is set -- an `importance`-driven
     M x M candidate grid instead of the exhaustive num_units^2 one.
@@ -201,10 +202,15 @@ class _Growth(px.AddConn[None]):
     """
 
     def __init__(
-        self, max_candidates: int, grow_scale: float, shortlist: int | None = None
+        self, max_new_per_level: int, grow_scale: float, shortlist: int | None = None
     ) -> None:
         """Bind the growth budget, init weight, and optional shortlist size."""
-        self.max_candidates = max_candidates
+        self.max_new_per_level = max_new_per_level
+        # SET/RigL semantics: strictly deeper edges, never duplicates of a
+        # live edge (the scores already veto non-deeper; the flags make the
+        # contract explicit now that nothing is deduplicated by default).
+        self.direction = "deeper"
+        self.dedupe_live = True
         self.grow_scale = grow_scale
         if shortlist is not None:
             # Read structurally by build_add_conn_phase (getattr): the phase
@@ -212,15 +218,15 @@ class _Growth(px.AddConn[None]):
             # level x top-M deeper destinations), so every layer transition of
             # the MLP is served -- a global top-M would concentrate on one level
             # and let sparsity drift down.
-            self.max_candidate_units = shortlist
-            self.shortlist_per_level = True
+            self.candidates = "shortlist_per_level"
+            self.shortlist_size = shortlist
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
         """Per-unit shortlist score: activity + gradient magnitude.
 
         Favors units carrying signal (|activation|) or wanting more input
         (|grad_pre_act|), so the M x M grid concentrates on the edges most worth
-        forming. Only consulted when `max_candidate_units` is set.
+        forming. Only consulted when the shortlist is set.
         """
         del g
         return jnp.abs(u[px.ACTIVATION, i]) + jnp.abs(u[GradPreAct, i])
@@ -267,7 +273,7 @@ def make_net(
     method: str = "set",
     mode: str,
     zeta: float = 0.3,
-    max_candidates: int = 256,
+    max_new_per_level: int = 256,
     grow_scale: float = 0.0,
     shortlist: int | None = None,
 ) -> type[px.Network[None]]:
@@ -278,7 +284,7 @@ def make_net(
         method: ``"set"`` (random growth) or ``"rigl"`` (gradient growth).
         mode: ``"train"``, ``"churn"``, or ``"eval"``.
         zeta: target per-unit prune fraction (churn).
-        max_candidates: per-bucket growth bound (churn).
+        max_new_per_level: per-bucket growth bound (churn).
         grow_scale: regrown-edge init weight (churn).
         shortlist: M for the M x M candidate grid, or None for the exhaustive
             num_units^2 grid (churn).
@@ -315,7 +321,7 @@ def make_net(
         return _Eval
 
     if mode == "churn":
-        grow = _GROWTH[method](max_candidates, grow_scale, shortlist)
+        grow = _GROWTH[method](max_new_per_level, grow_scale, shortlist)
 
         class _Churn(px.Network[None]):
             forward_pass = MagnitudeStats(zeta)
@@ -512,7 +518,7 @@ def run(
         method=method,
         mode="churn",
         zeta=zeta,
-        max_candidates=grow,
+        max_new_per_level=grow,
         shortlist=shortlist,
     )
     eval_net = make_net(optimizer, method=method, mode="eval")

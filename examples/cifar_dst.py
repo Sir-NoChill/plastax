@@ -88,7 +88,7 @@ def run_plastax(
     mc = shortlist * shortlist if shortlist else max(budgets)
     train_net = D.make_net(opt, method=method, mode="train")
     churn_net = D.make_net(
-        opt, method=method, mode="churn", max_candidates=mc, shortlist=shortlist
+        opt, method=method, mode="churn", max_new_per_level=mc, shortlist=shortlist
     )
     eval_net = D.make_net(opt, method=method, mode="eval")
     static, state = D.build_sparse_mlp(train_net, layers, budgets, seed)

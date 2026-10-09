@@ -79,7 +79,7 @@ class Propose(px.ProposeAddConn):
     def __init__(self, num_units: int, width: int, num_proposals: int) -> None:
         self.num_units, self.width = num_units, width
         self.proposer = "global"
-        self.proposals_per_proposer = self.max_candidates = num_proposals
+        self.proposals_per_proposer = self.max_new_per_level = num_proposals
 
     def propose(
         self, u: Any, j: jax.Array, g: G, rng: px.rng.Rng

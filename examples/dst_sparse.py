@@ -12,6 +12,11 @@ The RigL score is the delta-rule factorization of the loss gradient of an *absen
 edge into two per-unit columns the forward/backward already compute -- a local
 read, no dense gradient over missing edges.
 
+`method="set_propose"` is SET in the proposal form (`RandomGrowPropose`): each
+unit proposes random next-layer edges from the framework's keyed rng instead of
+the growth phase scoring a candidate grid, so candidates per step are
+num_units x P and no shortlist is needed.
+
 Pruning is identical for both: `MagnitudeStats` reduces each unit's incoming
 `(count, sum|w|)` with a product monoid and writes a per-unit threshold
 `tau = sqrt(pi)*erfinv(zeta)*mean|w|` (the mean-zero half-normal zeta-quantile);
@@ -264,7 +269,64 @@ class GradientGrow(_Growth):
         return jnp.where(deeper, jnp.abs(grad), -jnp.inf)
 
 
+class RandomGrowPropose(px.ProposeAddConn[None]):
+    """SET by proposal: each unit draws random edges into the next layer.
+
+    The per-unit proposal form of `RandomGrow`. Instead of scoring a
+    candidate grid, every unit proposes `proposals_per_proposer` edges from
+    itself to uniformly drawn units of the next layer, each with a uniform
+    random priority, all from the framework's keyed `rng` (so the draws vary
+    per step and replay exactly). Candidates per step are num_units x P, not
+    num_units^2, so no shortlist is needed. Same contract as `RandomGrow`:
+    strictly deeper edges, never a duplicate of a live edge or of another
+    proposal in the step, fill-to-capacity, small weight init.
+    """
+
+    proposer = "per_unit"
+
+    def __init__(
+        self,
+        max_new_per_level: int,
+        grow_scale: float,
+        layer_sizes: tuple[int, ...],
+        proposals_per_unit: int = 16,
+    ) -> None:
+        """Bind the growth budget, init weight, layer layout and proposal count."""
+        self.max_new_per_level = max_new_per_level
+        self.proposals_per_proposer = proposals_per_unit
+        self.direction = "deeper"
+        self.dedupe_live = True
+        self.dedupe_step = True
+        self.grow_scale = grow_scale
+        sizes = np.asarray(layer_sizes, dtype=np.int32)
+        starts = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int32)
+        # Per layer: where the next layer starts (= where this one ends) and
+        # how wide it is (0 for the output layer, whose units propose nothing).
+        self._next_start = jnp.asarray(starts[1:])
+        self._next_width = jnp.asarray(np.append(sizes[1:], 0).astype(np.int32))
+
+    def propose(
+        self, u: px.UnitView, i: px.UnitIdx, j: jax.Array, g: None, rng: px.rng.Rng
+    ) -> px.Proposal:
+        """Propose edge `j` of unit `i`: a random next-layer target, random priority."""
+        del u, j, g
+        layer = jnp.sum(i >= self._next_start)
+        width = self._next_width[layer]
+        offset = (rng.uniform() * width.astype(jnp.float32)).astype(jnp.int32)
+        dst = self._next_start[layer] + jnp.minimum(offset, width - 1)
+        score = jnp.where(width > 0, rng.uniform(), -jnp.inf)
+        return px.Proposal(src=i, dst=dst, score=score)
+
+    def init(
+        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
+    ) -> px.ConnWrite:
+        """Initialize a regrown edge at `grow_scale` (optimizer state auto-zeroes)."""
+        del u, src, dst, g
+        return px.ConnWrite.of((px.WEIGHT, jnp.float32(self.grow_scale)))
+
+
 _GROWTH = {"set": RandomGrow, "rigl": GradientGrow}
+_METHODS = (*_GROWTH, "set_propose")
 
 
 def make_net(
@@ -276,27 +338,33 @@ def make_net(
     max_new_per_level: int = 256,
     grow_scale: float = 0.0,
     shortlist: int | None = None,
+    layer_sizes: tuple[int, ...] | None = None,
 ) -> type[px.Network[None]]:
     """Build one of the three DST nets; churn selects SET vs RigL growth.
 
     Args:
         optimizer: the plastax.optim bundle.
-        method: ``"set"`` (random growth) or ``"rigl"`` (gradient growth).
+        method: ``"set"`` (random growth, scored grid), ``"set_propose"``
+            (random growth, per-unit proposals) or ``"rigl"`` (gradient
+            growth).
         mode: ``"train"``, ``"churn"``, or ``"eval"``.
         zeta: target per-unit prune fraction (churn).
         max_new_per_level: per-bucket growth bound (churn).
         grow_scale: regrown-edge init weight (churn).
         shortlist: M for the M x M candidate grid, or None for the exhaustive
-            num_units^2 grid (churn).
+            num_units^2 grid (churn; scored methods only).
+        layer_sizes: units per layer, input first (churn; required by
+            ``"set_propose"``, which draws targets from the next layer).
 
     Returns:
         A Network subclass for the requested mode.
 
     Raises:
-        ValueError: on an unknown mode or method.
+        ValueError: on an unknown mode or method, or a ``"set_propose"`` churn
+            net given a shortlist or no layer sizes.
     """
-    if method not in _GROWTH:
-        raise ValueError(f"make_net: unknown method {method!r} (set|rigl)")
+    if method not in _METHODS:
+        raise ValueError(f"make_net: unknown method {method!r} (set|set_propose|rigl)")
     if mode == "train":
 
         class _Train(px.Network[None]):
@@ -321,7 +389,15 @@ def make_net(
         return _Eval
 
     if mode == "churn":
-        grow = _GROWTH[method](max_new_per_level, grow_scale, shortlist)
+        grow: px.ScoreAddConn[None] | px.ProposeAddConn[None]
+        if method == "set_propose":
+            if shortlist is not None or layer_sizes is None:
+                raise ValueError(
+                    "make_net: set_propose takes layer_sizes and no shortlist"
+                )
+            grow = RandomGrowPropose(max_new_per_level, grow_scale, layer_sizes)
+        else:
+            grow = _GROWTH[method](max_new_per_level, grow_scale, shortlist)
 
         class _Churn(px.Network[None]):
             forward_pass = MagnitudeStats(zeta)
@@ -496,7 +572,7 @@ def run(
     """Train a sparse MLP online with SET-or-RigL rewiring each cycle.
 
     Args:
-        method: ``"set"`` or ``"rigl"``.
+        method: ``"set"``, ``"set_propose"`` or ``"rigl"``.
         layer_sizes: units per layer (input first, includes a bias input).
         budgets: live edges per consecutive layer pair.
         shortlist: M for the shortlisted growth grid, or None for exhaustive.
@@ -520,6 +596,7 @@ def run(
         zeta=zeta,
         max_new_per_level=grow,
         shortlist=shortlist,
+        layer_sizes=layer_sizes,
     )
     eval_net = make_net(optimizer, method=method, mode="eval")
 
@@ -569,8 +646,8 @@ _DEMO_BUDGETS = (256, 64)
 
 
 def main() -> None:
-    """Train both SET and RigL on the small synthetic task and report."""
-    for method in ("set", "rigl"):
+    """Train SET (scored and proposed) and RigL on the small task and report."""
+    for method in ("set", "set_propose", "rigl"):
         _, live_history, accuracy = run(
             method, _DEMO_LAYERS, _DEMO_BUDGETS, num_cycles=120, verbose=True
         )

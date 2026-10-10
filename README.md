@@ -35,7 +35,9 @@ plastax is built for **streaming**: one sample per step, with structure
 changing between steps. For mini-batch training or evaluation of feed-forward
 (topological) nets, `make_step(net, static, batch_size=B)` runs B samples per
 step against shared connections and reduces the connection update over the
-batch (exactly, for the `plastax.optim` bundles); see its docstring.
+batch (exactly, for the `plastax.optim` bundles); see its docstring. How the
+per-sample unit state combines is the network's explicit `batch_reduction`
+policy (`FieldReductions` per column, or `MeanFloatFirstRest()`).
 Deferred: unit addition and pruning under Scheme-A sharding (they run on a
 single device today), generic associative combines, jax.Ref arena,
 hijax-based primitive surface.

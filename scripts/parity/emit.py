@@ -1103,6 +1103,162 @@ def _grow_cases() -> list[dict[str, Any]]:
     return cases
 
 
+def _claim_select(
+    params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """The shared growth net's exhaustive grid_score_v1 selection."""
+    units, edges = _growth_state()
+    cands = ref.candidates_exhaustive(
+        units, capacity=_GROW_CAPACITY, score=rules.grid_score_v1
+    )
+    selected = ref.select_growth(units, edges, cands, capacity=_GROW_CAPACITY, **params)
+    return units, edges, selected
+
+
+def _claim_cases() -> list[dict[str, Any]]:
+    """The per-model slot claim: per-level free accounting and regrow."""
+    cases: list[dict[str, Any]] = []
+    init_rules = {"score": "grid_score_v1", "init": "grow_init_v1"}
+    base = {
+        "capacity": _GROW_CAPACITY,
+        "network_seed": _GROW_SEED,
+        "step": _GROW_STEP,
+        "candidates": "exhaustive",
+    }
+
+    # Topological: strict per-level buckets, then a regrow and a retry.
+    select = {
+        "max_level_gap": 1,
+        "selection": "top_k",
+        "max_new_per_level": 3,
+        "dedupe_live": True,
+    }
+    free = {0: 1, 1: 6, 2: 3}
+    units, edges, selected = _claim_select(select)
+    iu, ie = _units_json(units), _edges_json(edges)
+    first = ref.commit_growth(
+        units,
+        edges,
+        selected,
+        free_per_level=free,
+        init=rules.grow_init_v1,
+        field_defaults={"weight": 0.0},
+    )
+    assert first["conn_overflow"] and first["regrow_levels"] == [0, 2]
+    # The retry: the next step's growth over the attempt's output edges; a
+    # regrown bucket holds 8 free slots, the others what the attempt left.
+    retry_free = {
+        lvl: 8
+        if lvl in first["regrow_levels"]
+        else f - sum(units[c["src"]]["level"] == lvl for c in first["committed"])
+        for lvl, f in free.items()
+    }
+    after_edges = copy.deepcopy(edges)
+    cands = ref.candidates_exhaustive(
+        units, capacity=_GROW_CAPACITY, score=rules.grid_score_v1
+    )
+    retry_selected = ref.select_growth(
+        units, after_edges, cands, capacity=_GROW_CAPACITY, **select
+    )
+    retry = ref.commit_growth(
+        units,
+        after_edges,
+        retry_selected,
+        free_per_level=retry_free,
+        init=rules.grow_init_v1,
+        field_defaults={"weight": 0.0},
+    )
+    assert not retry["conn_overflow"]
+    doc = _doc(
+        "grow_claim_topological_regrow",
+        "growth_v2",
+        "Topological claim: each source level claims only its own bucket's "
+        "free slots, so level 0 overflows while level 1 keeps spare slots. "
+        "The host loop then grows every full bucket (regrow_levels) and "
+        "re-runs the step; the retry block is that step's growth, at step + "
+        "1, over the attempt's output edges with the regrown free counts.",
+        rules=init_rules,
+        params={
+            **base,
+            "model": "topological",
+            "free_per_level": {str(k): v for k, v in free.items()},
+            **select,
+        },
+        initial_units=iu,
+        initial_edges=ie,
+        expect=first,
+    )
+    doc["retry"] = {
+        "step": _GROW_STEP + 1,
+        "free_per_level": {str(k): v for k, v in retry_free.items()},
+        "expect": retry,
+    }
+    cases.append(doc)
+
+    # Pipeline: a level's own dead slots first, then the shared tail.
+    select = {"max_level_gap": 1, "direction": "deeper", "selection": "all"}
+    pipeline_cases = (
+        (
+            "grow_claim_pipeline_spill",
+            [(0, 2), (1, 3), (2, 5), (4, 5)],
+            6,
+            "Pipeline claim: each level first takes the dead slots whose "
+            "former occupant it sourced, then spills to the never-used tail, "
+            "levels ascending. Level 2's dead slot stays free: no level "
+            "borrows another's.",
+        ),
+        (
+            "grow_claim_pipeline_overflow",
+            [(0, 2), (2, 5)],
+            2,
+            "Pipeline claim overflow: each level's best candidate takes its "
+            "own dead slot; the spills reach the tail levels ascending, not "
+            "by score, so level 0's exhaust it ahead of level 1's "
+            "better-scored ones, which are dropped with conn_overflow.",
+        ),
+    )
+    for name, dead_pairs, tail, comment in pipeline_cases:
+        units, edges, selected = _claim_select(select)
+        iu, ie = _units_json(units), _edges_json(edges)
+        dead_per_level: dict[int, int] = {}
+        for src, _ in dead_pairs:
+            lvl = units[src]["level"]
+            dead_per_level[lvl] = dead_per_level.get(lvl, 0) + 1
+        outcome = ref.commit_growth(
+            units,
+            edges,
+            selected,
+            dead_per_level=dead_per_level,
+            tail=tail,
+            init=rules.grow_init_v1,
+            field_defaults={"weight": 0.0},
+        )
+        cases.append(
+            _doc(
+                name,
+                "growth_v2",
+                comment,
+                rules=init_rules,
+                params={
+                    **base,
+                    "model": "pipeline",
+                    "dead_per_level": {
+                        str(k): v for k, v in sorted(dead_per_level.items())
+                    },
+                    "tail": tail,
+                    **select,
+                },
+                initial_units=iu,
+                initial_edges=ie,
+                initial_dead_edges=[
+                    {"src": src, "dst": dst} for src, dst in dead_pairs
+                ],
+                expect=outcome,
+            )
+        )
+    return cases
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -1114,6 +1270,7 @@ def build_all() -> dict[str, dict[str, Any]]:
     docs.extend(_loss_cases())
     docs.extend(_unit_cases())
     docs.extend(_grow_cases())
+    docs.extend(_claim_cases())
     return {f"{d['name']}.json": d for d in docs}
 
 

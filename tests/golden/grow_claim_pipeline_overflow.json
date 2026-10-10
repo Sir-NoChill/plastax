@@ -1,0 +1,163 @@
+{
+ "_comment": "Pipeline claim overflow: each level's best candidate takes its own dead slot; the spills reach the tail levels ascending, not by score, so level 0's exhaust it ahead of level 1's better-scored ones, which are dropped with conn_overflow.",
+ "expect": {
+  "committed": [
+   {
+    "dst": 3,
+    "score": 0.875,
+    "src": 0
+   },
+   {
+    "dst": 2,
+    "score": 0.625,
+    "src": 1
+   },
+   {
+    "dst": 2,
+    "score": 0.25,
+    "src": 0
+   },
+   {
+    "dst": 5,
+    "score": 0.75,
+    "src": 2
+   }
+  ],
+  "conn_overflow": true,
+  "grown": 4,
+  "needs_resort": false,
+  "tail_used": 2
+ },
+ "generator": "scripts/parity/emit.py",
+ "initial_dead_edges": [
+  {
+   "dst": 2,
+   "src": 0
+  },
+  {
+   "dst": 5,
+   "src": 2
+  }
+ ],
+ "initial_edges": [
+  {
+   "dst": 2,
+   "fields": {
+    "weight": 0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.125
+   },
+   "src": 2
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 2
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": -0.25
+   },
+   "src": 3
+  }
+ ],
+ "initial_units": [
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 0,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.25
+   },
+   "id": 1,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.125
+   },
+   "id": 2,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.75
+   },
+   "id": 3,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.5
+   },
+   "id": 4,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 5,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  }
+ ],
+ "name": "grow_claim_pipeline_overflow",
+ "params": {
+  "candidates": "exhaustive",
+  "capacity": 16,
+  "dead_per_level": {
+   "0": 1,
+   "1": 1
+  },
+  "direction": "deeper",
+  "max_level_gap": 1,
+  "model": "pipeline",
+  "network_seed": 7,
+  "selection": "all",
+  "step": 3,
+  "tail": 2
+ },
+ "requires": "growth_v2",
+ "rules": {
+  "init": "grow_init_v1",
+  "score": "grid_score_v1"
+ },
+ "schema": "registry_v1"
+}

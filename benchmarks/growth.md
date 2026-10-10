@@ -8,7 +8,8 @@ CPU and GPU. The setup mirrors plastax-cpp's growth bench
 last section compares the two libraries directly.
 
 The numbers below are steady-state times (20 warm-up calls) after two
-changes:
+changes (a later, smaller one, the packed (src, dst) sort key, has its own
+section, "Packed (src, dst) key: before and after"):
 
 - the GPU total-order sort, the per-level ranking and the slot claim were
   cut down (section "Radix total order and fewer claim kernels: before and
@@ -298,6 +299,58 @@ before the single-sort change).
   callback, about 0.1 ms; see `gpu_gap_analysis.md`). On CPU, global's px
   floor (about 0.5 ms) is the slot claim over every bucket, where cx's host
   loop touches only the few commits.
+
+## Packed (src, dst) key: before and after
+
+**What changed.** When the unit capacity is at most 65536
+(`PACKED_ID_BOUND`, known at trace time), every candidate's source and
+destination fit in 16 bits, so `radix_total_order` merges the dst and src
+passes into one stable radix sort on the uint32 key `(src << 16) | dst`,
+followed by the -score pass: two CUB sorts instead of three, with the same
+permutation. Larger capacities keep the three passes (a 64-bit packed key
+costs about as much as two 32-bit passes). The tables in the sections above
+predate this change.
+
+**Equivalence.** `tests/test_total_order.py` checks the packed form against
+the comparison sort, the three-pass form and the lexsort oracle on the same
+adversarial lists (NaN of either sign, +-inf, +-0.0, subnormals, heavy
+ties), plus lists over the full 16-bit id range that always contain the ids
+at the key's carry boundaries (0, 1, 255, 256, 32767, 32768, 65279, 65280,
+65534, 65535) and every pair of them, on CPU and on the GPU. On the GPU the
+growth goldens, the claim digests and the growth stage tests pass with the
+radix threshold forced to 0. In the interleaved run below, both forms end in
+bit-identical states after about 220 calls at every point.
+
+**Isolated sort** (GPU, locked clocks, ids uniform in [0, 65536), median of
+51 synced calls; pipelined is the mean of 200 back-to-back calls):
+
+| candidates | three passes (ms) | packed (ms) | speedup synced / pipelined |
+|---|---|---|---|
+| 2^17 | 0.188 | 0.146 | 1.29x / 1.39x |
+| 2^18 | 0.204 | 0.162 | 1.26x / 1.35x |
+| 2^20 | 0.345 | 0.275 | 1.26x / 1.30x |
+| 2^22 | 2.07 | 1.73 | 1.20x / 1.23x |
+| 2^24 | 15.1 | 10.9 | 1.38x / 1.41x |
+| 2^25 | 35.8 | 23.8 | 1.51x / 1.60x |
+
+**Growth phase, per_unit** (the points with N <= 65536 and at least 2^17
+candidates; the others do not change). The bench's 7-rep floor points
+jitter by up to 0.1 ms between runs, more than the change, so these come
+from one process that compiles the phase both ways and alternates 8 blocks
+of 25 synced calls each (median, locked clocks):
+
+| point | three passes (ms) | packed (ms) | speedup |
+|---|---|---|---|
+| N=65536, P=2 (131K) | 0.345 | 0.302 | 1.14x |
+| N=65536, P=4 (262K) | 0.364 | 0.319 | 1.14x |
+| N=65536, P=8 (524K) | 0.416 | 0.363 | 1.15x |
+| N=65536, P=16 (1M) | 0.530 | 0.455 | 1.17x |
+| N=65536, P=32 (2M) | 0.834 | 0.719 | 1.16x |
+| N=32768, P=32 (1M) | 0.533 | 0.457 | 1.17x |
+| N=4096, P=32 (131K) | 0.347 | 0.303 | 1.14x |
+
+Every other affected point (N = 8192 to 32768) gains 1.10 to 1.17x, about
+0.04 to 0.08 ms, the cost of one radix sort.
 
 ## Radix total order and fewer claim kernels: before and after
 

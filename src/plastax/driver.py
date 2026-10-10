@@ -9,8 +9,9 @@ jax.test_util.assert_num_jit_and_pmap_compilations .
 
 The overflow flag is connection overflow: a selected growth candidate found
 no slot it may claim -- its TOPOLOGICAL level's bucket is full, or the
-PIPELINE bucket's never-used tail is -- which the driver fixes by growing the
-bucket and re-running the step.
+PIPELINE bucket's never-used tail is -- which the driver fixes inside the same
+step: it grows the full buckets and claims the dropped candidates, re-running
+nothing but the growth phase's claim.
 Unit overflow (`NetworkState.unit_overflow`, an AddUnit spawn that found no
 free unit slot) is not a retrace event: `Network.unit_capacity` is fixed, so
 the dropped spawn stays dropped and the flag is the caller's to read.
@@ -33,13 +34,15 @@ the dropped spawn stays dropped and the flag is the caller's to read.
 
 from __future__ import annotations
 
+from typing import Literal
+
 import jax.numpy as jnp
 
 from plastax import topo
 from plastax._types import Propagation
 from plastax.phases import StepInputs
 from plastax.state import NetworkState, NetworkStatic, grow_bucket, live_conn_count
-from plastax.step import StepFn, make_step
+from plastax.step import StepFn, make_growth_retry, make_step
 from plastax.traits import Network
 
 
@@ -47,8 +50,14 @@ class Driver[GS]:
     """Runs a network's step loop, owning retrace on overflow and resort.
 
     With `check_every=1` (the default) the flags are read after every step:
-    an overflowing step is retried after growing its full buckets, and a
-    resort runs before the next step, so every step is exact.
+    an overflowing step's growth is completed after growing its full buckets
+    (only the growth claim re-runs; see `step`), and a resort runs before the
+    next step, so every step is exact.
+
+    The step is `make_step(net, static, batch_size=..., layout=...,
+    fuse_prune=..., growth=...)`, rebuilt whenever a regrow or resort changes
+    the static configuration; a batched or Scheme-A-sharded step overflows
+    and recovers exactly like the streaming one.
 
     With `check_every=N > 1` the Driver reads the flags back only every N
     steps, keeping the host from blocking on the device in between. The
@@ -74,40 +83,50 @@ class Driver[GS]:
         state: NetworkState[GS],
         *,
         check_every: int = 1,
+        batch_size: int | None = None,
+        layout: Literal["auto", "edge_list", "csr", "triton"] = "auto",
+        fuse_prune: Literal["auto", "triton", "xla", "off"] = "auto",
+        growth: Literal["auto", "xla", "triton"] = "auto",
     ) -> None:
         if check_every < 1:
             raise ValueError(f"Driver: check_every must be >= 1, got {check_every}")
         self._net = net
         self._static = static
         self._state = state
-        self._step: StepFn[GS] = make_step(net, static)
+        self._batch_size = batch_size
+        self._layout: Literal["auto", "edge_list", "csr", "triton"] = layout
+        self._fuse_prune: Literal["auto", "triton", "xla", "off"] = fuse_prune
+        self._growth: Literal["auto", "xla", "triton"] = growth
+        self._step: StepFn[GS] = self._make_step()
         self._check_every = check_every
         self._since_check = 0
         self._overflowed = jnp.bool_(False)
 
     def step(self, inputs: StepInputs) -> None:
-        """Run one step, handling overflow growth-and-retry and resort.
+        """Run one step, completing an overflowing growth, then resort.
 
-        On overflow, grow_bucket and retry the same inputs; on
-        needs_resort, resort and continue -- resort happens between
-        steps, matching native NeedsResort semantics.
+        The step runs once, as one fused jitted call. If its growth overflowed,
+        only the growth is finished, inside the same step: every full bucket
+        grows (`grow_bucket`), then the candidates the claim dropped
+        (`StepResult.growth_remainder`) claim the new room
+        (`make_growth_retry`), in the total order, until none is left. The
+        selection is the step's own, so the result is exactly what the step
+        would have committed had the buckets been that large from the start:
+        forward, backward and the updates run once, the step counter advances
+        once, and `state.overflow` reads False afterwards (`state.grown`
+        counts every edge the step committed). Then, on needs_resort, the
+        network resorts before the next step, matching native NeedsResort
+        semantics.
 
-        The retry replays against the failed attempt's own output
-        (`result.state`), not a pristine `self._state`: the jitted step
-        donates its state argument, so XLA is free to invalidate the
-        pre-attempt buffers as soon as the call returns, successful or
-        not. So forward/backward/update_conn/prune_conn genuinely re-run
-        on a retry -- a real, non-idempotent cost (e.g. a decaying
-        UpdateConn) -- but the alternative, an unconditional per-step
-        defensive copy, would defeat the donation-based in-place update
-        on every step to guard a rare, capacity-mistuned case; growing a
-        bucket already means the network was configured below its live
-        working set, which `capacity_policy`'s headroom is meant to make
-        rare. Every full bucket grows: a TOPOLOGICAL bucket with no dead
-        slot left, or a PIPELINE bucket with no tail left, read off
-        `result.state` against the pre-grow `self._static.level_capacities`
-        -- an overflowing level's claim takes every slot it may use before
-        dropping a candidate, so its bucket is always among them.
+        The completion works on the step's output state: the jitted step
+        donates its input, so the pre-step buffers may be gone. That is why
+        the step hands back its selection rather than being re-run on a
+        regrown copy of its input. Every full bucket grows: a TOPOLOGICAL
+        bucket with no dead slot left, or a PIPELINE bucket with no tail
+        left, read off the output state against the pre-grow
+        `self._static.level_capacities` -- an overflowing level's claim takes
+        every slot it may use before dropping a candidate, so its bucket is
+        always among them.
 
         Args:
             inputs: The external inputs for this step.
@@ -115,25 +134,22 @@ class Driver[GS]:
         if self._check_every > 1:
             self._deferred_step(inputs)
             return
-        while True:
-            result = self._step(self._state, inputs)
-            if bool(result.overflow):
-                state = result.state
-                for level in range(len(self._static.level_capacities)):
-                    if self._free_slots(state, level) == 0:
-                        self._static, state = grow_bucket(self._static, state, level)
-                self._state = state
-                self._step = make_step(self._net, self._static)
-                continue
+        result = self._step(self._state, inputs)
+        state = result.state
+        remainder = result.growth_remainder
+        while bool(state.overflow):
+            assert remainder is not None  # only growth overflows
+            for level in range(len(self._static.level_capacities)):
+                if self._free_slots(state, level) == 0:
+                    self._static, state = grow_bucket(self._static, state, level)
+            self._step = self._make_step()
+            retry = make_growth_retry(self._net, self._static)
+            state, remainder = retry(state, remainder)
 
-            state = result.state
-            if bool(state.needs_resort):
-                self._static, self._state = topo.resort(self._static, state)
-                self._step = make_step(self._net, self._static)
-                return
-
-            self._state = state
-            return
+        if bool(state.needs_resort):
+            self._static, state = topo.resort(self._static, state)
+            self._step = self._make_step()
+        self._state = state
 
     def _deferred_step(self, inputs: StepInputs) -> None:
         """One `check_every > 1` step: no host read-back except every N steps."""
@@ -154,10 +170,21 @@ class Driver[GS]:
                 if self._free_slots(state, level) < want:
                     self._static, state = grow_bucket(self._static, state, level)
             self._state = state
-            self._step = make_step(self._net, self._static)
+            self._step = self._make_step()
         if bool(self._state.needs_resort):
             self._static, self._state = topo.resort(self._static, self._state)
-            self._step = make_step(self._net, self._static)
+            self._step = self._make_step()
+
+    def _make_step(self) -> StepFn[GS]:
+        """The step for the current static configuration."""
+        return make_step(
+            self._net,
+            self._static,
+            batch_size=self._batch_size,
+            layout=self._layout,
+            fuse_prune=self._fuse_prune,
+            growth=self._growth,
+        )
 
     def _free_slots(self, state: NetworkState[GS], level: int) -> int:
         """The slots any level can still claim in bucket `level`.

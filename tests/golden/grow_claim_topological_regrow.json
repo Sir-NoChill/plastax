@@ -1,5 +1,5 @@
 {
- "_comment": "Topological claim: each source level claims only its own bucket's free slots, so level 0 overflows while level 1 keeps spare slots. The host loop then grows every full bucket (regrow_levels) and re-runs the step; the retry block is that step's growth, at step + 1, over the attempt's output edges with the regrown free counts.",
+ "_comment": "Topological claim: each source level claims only its own bucket's free slots, so level 0 overflows while level 1 keeps spare slots. The host loop then grows every full bucket (regrow_levels) and finishes the step's growth in the same step: the retry block is the claim of the winners the attempt dropped, at the same step (no re-selection, no other phase), over the attempt's output edges with the regrown free counts. step_growth is the step's whole growth: one claim over the regrown buckets (attempt free counts plus the regrown slots), which the attempt and the retry together equal.",
  "expect": {
   "committed": [
    {
@@ -176,60 +176,83 @@
      "dst": 1,
      "score": -0.375,
      "src": 0
-    },
-    {
-     "dst": 0,
-     "score": -0.625,
-     "src": 1
-    },
-    {
-     "dst": 1,
-     "score": 0.375,
-     "src": 2
-    },
-    {
-     "dst": 0,
-     "score": 0.125,
-     "src": 3
-    },
-    {
-     "dst": 0,
-     "score": -0.25,
-     "src": 2
-    },
-    {
-     "dst": 2,
-     "score": -0.375,
-     "src": 4
-    },
-    {
-     "dst": 5,
-     "score": -0.625,
-     "src": 4
-    },
-    {
-     "dst": 4,
-     "score": -0.875,
-     "src": 5
     }
    ],
    "conn_overflow": false,
-   "grown": 9,
+   "grown": 2,
    "needs_resort": true,
-   "regrow_levels": [
-    1
-   ]
+   "regrow_levels": []
   },
   "free_per_level": {
    "0": 8,
    "1": 3,
    "2": 8
   },
-  "step": 4
+  "step": 3
  },
  "rules": {
   "init": "grow_init_v1",
   "score": "grid_score_v1"
  },
- "schema": "registry_v1"
+ "schema": "registry_v1",
+ "step_growth": {
+  "expect": {
+   "committed": [
+    {
+     "dst": 3,
+     "score": 0.875,
+     "src": 0
+    },
+    {
+     "dst": 2,
+     "score": 0.625,
+     "src": 1
+    },
+    {
+     "dst": 1,
+     "score": -0.375,
+     "src": 0
+    },
+    {
+     "dst": 5,
+     "score": 0.75,
+     "src": 2
+    },
+    {
+     "dst": 1,
+     "score": 0.75,
+     "src": 3
+    },
+    {
+     "dst": 4,
+     "score": 0.5,
+     "src": 3
+    },
+    {
+     "dst": 3,
+     "score": 0.625,
+     "src": 5
+    },
+    {
+     "dst": 3,
+     "score": 0.25,
+     "src": 4
+    },
+    {
+     "dst": 2,
+     "score": 0.0,
+     "src": 5
+    }
+   ],
+   "conn_overflow": false,
+   "grown": 9,
+   "needs_resort": true,
+   "regrow_levels": []
+  },
+  "free_per_level": {
+   "0": 9,
+   "1": 6,
+   "2": 11
+  }
+ }
 }

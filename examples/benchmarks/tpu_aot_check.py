@@ -112,6 +112,7 @@ def main() -> None:
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
         extra_conn_fields = opt.state_fields
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     static, state = px.NetworkBuilder.from_edges(
         MLP, n, frm, to, weights=weights, globals_=None, capacity_align=256, **io

@@ -1,0 +1,10 @@
+impl,component,us_per_step
+px,forward+prune kernel (Triton fused_forward_prune),221.2
+px,generate: 4-key sort,85.9
+px,"generate: other (scan, scatter, claim)",85.0
+px,D2D copies (memcpy nodes),25.6
+px,"host exposed (dispatch, graph launch, sync)",253.20000000000005
+cx,forward (ForwardConnSweepLevel + apply),78.0
+cx,prune (MarkDeadInplace),39.3
+cx,generate (Fill/Revive/Consume/MarkPruned/Clamp),8.6
+cx,"host exposed (syncs, memcpy)",35.099999999999994

@@ -30,7 +30,11 @@ _SIZES = (2, 3, 1)
 
 
 def _mlp() -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
-    net = mlp_xor.make_net(px.optim.sgd(0.2, mlp_xor.GradPreAct), train=True)
+    base = mlp_xor.make_net(px.optim.sgd(0.2, mlp_xor.GradPreAct), train=True)
+
+    class net(base):  # type: ignore[valid-type, misc]
+        batch_reduction = px.MeanFloatFirstRest()
+
     rng = np.random.default_rng(0)
     blocks = [px.topology.input_units(_SIZES[0])]
     for a, b in zip(_SIZES[:-1], _SIZES[1:], strict=True):

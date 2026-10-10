@@ -21,6 +21,7 @@ from jaxtyping import Array, Bool, Float, Int32
 from plastax import monoid
 from plastax import rng as rng_mod
 from plastax._types import (
+    ACTIVATION,
     DEAD,
     FROM_ID,
     LEVEL,
@@ -45,7 +46,13 @@ from plastax.sweep import (
     identity_accumulator,
     unit_id_mask,
 )
-from plastax.traits import Network, ProposeAddConn, ScoreAddConn
+from plastax.traits import (
+    BatchReduction,
+    Network,
+    ProposeAddConn,
+    Reduction,
+    ScoreAddConn,
+)
 from plastax.views import ConnView, UnitView
 
 # PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
@@ -188,7 +195,8 @@ class BatchedPhases[GS]:
             no update_conn: `(state, batched_units) -> state`, reducing the
             per-sample contributions to one update per connection.
         structural: prune_unit, prune_conn, add_unit, add_conn, and
-            reset_global: run once, on the batch-mean unit state.
+            reset_global: run once, on the unit state reduced by
+            the network's `batch_reduction`.
     """
 
     forward: Phase[GS]
@@ -261,7 +269,9 @@ def build_batched_phases[GS](
         )
     if net.reset_global is not None:
         structural.append(_build_reset_global_phase(net))
-    update = build_batched_update_conn(net) if net.update_conn is not None else None
+    update = (
+        build_batched_update_conn(net, static) if net.update_conn is not None else None
+    )
     return BatchedPhases(
         forward,
         loss,
@@ -274,28 +284,100 @@ def build_batched_phases[GS](
     )
 
 
-def batch_mean_units(units: Columns) -> Columns:
+def reduce_batch_units(
+    policy: BatchReduction,
+    fields: Sequence[FieldSpec[Any]],
+    units_b: Columns,
+    units: Columns,
+) -> Columns:
     """Reduce batched unit columns `(B, num_units)` to one `(num_units,)` view.
 
-    Floating columns take the batch mean; any other column (levels, counters,
-    flags) must agree across the batch and takes sample 0.
+    Each column is reduced by the `Reduction` the policy declares for it:
+    MEAN, SUM, or FIRST (sample 0). A column declared NOT_BATCHED, or not
+    declared at all, is one no per-sample phase writes (the batched step
+    checks this), and keeps its unbatched value from `units`.
 
     Args:
-        units: Unit columns with a leading batch axis.
+        policy: the network's batch-reduction policy.
+        fields: the network's unit columns (`NetworkStatic.unit_fields`).
+        units_b: Unit columns with a leading batch axis.
+        units: The unbatched unit columns the batch started from.
 
     Returns:
         The unbatched unit columns.
     """
-    return {
-        name: col.mean(axis=0).astype(col.dtype)
-        if jnp.issubdtype(col.dtype, jnp.floating)
-        else col[0]
-        for name, col in units.items()
-    }
+    specs = {spec.name: spec for spec in fields}
+    out: Columns = {}
+    for name, col in units_b.items():
+        red = policy.reduction(specs[name])
+        if red is Reduction.MEAN:
+            out[name] = col.mean(axis=0).astype(col.dtype)
+        elif red is Reduction.SUM:
+            out[name] = col.sum(axis=0).astype(col.dtype)
+        elif red is Reduction.FIRST:
+            out[name] = col[0]
+        else:
+            out[name] = units[name]
+    return out
+
+
+def per_sample_written_fields[GS](
+    net: type[Network[GS]],
+    static: NetworkStatic,
+    state: NetworkState[GS],
+    with_targets: bool,
+) -> dict[str, str]:
+    """Find the unit columns a batched step's per-sample phases write.
+
+    Traces one sample of the per-sample phases (forward, loss, backward and
+    unit update) abstractly, with `jax.eval_shape`, and reports every column
+    whose output is not the very array the phases were handed: every phase
+    replaces exactly the columns it writes. `ACTIVATION` is always written
+    (the step's input scatter).
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: the network's trait class.
+        static: static network configuration giving the arena shapes.
+        state: the unbatched state (concrete or traced).
+        with_targets: whether the step carries targets.
+
+    Returns:
+        Each written column's name, mapped to the first phase writing it.
+    """
+    phases: list[tuple[str, Phase[GS]]] = [
+        ("forward_pass", _build_forward_phase(net, static))
+    ]
+    if net.loss is not None:
+        phases.append(("loss", _build_loss_phase(net, static)))
+    if net.backward_pass is not None:
+        phases.append(("backward_pass", _build_backward_phase(net, static)))
+    if net.update_unit is not None:
+        phases.append(("update_unit", build_update_unit_phase(net, static)))
+    written: dict[str, str] = {ACTIVATION.name: "the input scatter"}
+
+    def probe(state: NetworkState[GS], inputs: StepInputs) -> None:
+        for where, phase in phases:
+            before = dict(state.units)
+            state, _ = phase(state, inputs)
+            for name, col in state.units.items():
+                if col is not before[name]:
+                    written.setdefault(name, where)
+
+    inputs = StepInputs(
+        inputs=jnp.zeros((len(static.input_ids),), jnp.float32),
+        targets=jnp.zeros((len(static.output_ids),), jnp.float32)
+        if with_targets
+        else None,
+    )
+    jax.eval_shape(probe, state, inputs)
+    return written
 
 
 def build_batched_update_conn[GS](
-    net: type[Network[GS]],
+    net: type[Network[GS]], static: NetworkStatic
 ) -> Callable[[NetworkState[GS], Columns], NetworkState[GS]]:
     """One connection update per step from a batch of unit states.
 
@@ -304,7 +386,8 @@ def build_batched_update_conn[GS](
     - **Exact** (`per_sample` + `incoming_batched`, e.g. every `optim/`
       bundle): `per_sample` is evaluated per edge for every sample and
       averaged, then `incoming_batched` applies the rule once with that
-      average -- an optimizer step on the batch-mean gradient.
+      average -- an optimizer step on the batch-mean gradient. It reads
+      the unit state reduced by the network's `batch_reduction`.
     - **Mean of writes** (any other UpdateConn): the incoming and outgoing
       passes run once per sample against the unchanged connections and each
       written floating column is averaged over the batch. This equals the
@@ -320,12 +403,15 @@ def build_batched_update_conn[GS](
 
     Args:
         net: the network's trait class, supplying the update_conn policy.
+        static: static network configuration giving the unit columns.
 
     Returns:
         `(state, batched_units) -> state` with updated connections.
     """
     uc = net.update_conn
     assert uc is not None  # only built when set
+    policy = net.batch_reduction
+    assert policy is not None  # make_step requires one for a batched step
     per_sample_fn = getattr(uc, "per_sample", None)
     incoming_batched_fn = getattr(uc, "incoming_batched", None)
     incoming = build_incoming_conn_update(uc.incoming)
@@ -338,7 +424,9 @@ def build_batched_update_conn[GS](
         assert per_sample_fn is not None and incoming_batched_fn is not None
         batch = next(iter(units_b.values())).shape[0]
         g = state.globals_
-        mean_units = batch_mean_units(units_b)
+        mean_units = reduce_batch_units(
+            policy, static.unit_fields, units_b, state.units
+        )
 
         def bucket_update(bucket: Columns) -> Columns:
             c_view = ConnView(bucket)

@@ -150,6 +150,7 @@ def _net(
         extra_unit_fields = (GRAD, LOSS_GRAD, TRACE)
         unit_capacity = capacity
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     return _Net
 

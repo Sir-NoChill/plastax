@@ -7,8 +7,9 @@ Python analogue of the C++ policy concepts; static checking via ty / mypy
 from __future__ import annotations
 
 import dataclasses
+import enum
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax.numpy as jnp
@@ -289,10 +290,10 @@ class UpdateConn[GS](Protocol):
     declare, structurally (read with getattr, not part of this Protocol), the
     exact pair: `per_sample(u, dst, src, c, cid, g) -> pytree`, evaluated per
     sample and averaged over the batch, and `incoming_batched(u, dst, src, c,
-    cid, g, stat) -> ConnWrite`, applied once with that average (and the
-    batch-mean unit view) in place of `incoming`. Every `plastax.optim`
-    bundle declares it, so a batched optimizer step is one step on the
-    batch-mean gradient.
+    cid, g, stat) -> ConnWrite`, applied once with that average (and the unit
+    view reduced by the network's `batch_reduction`) in place of `incoming`.
+    Every `plastax.optim` bundle declares it, so a batched optimizer step is
+    one step on the batch-mean gradient.
 
     Type Args:
         GS: the global state type threaded through the network.
@@ -383,7 +384,7 @@ class PruneUnit[GS](Protocol):
     connection incident to it is tombstoned in the same phase. A slot holding
     no live unit is skipped by every later phase. The phase runs every step,
     after the connection update and before connection pruning, and under a
-    batched step it runs once on the batch-mean unit state. It requires
+    batched step it runs once on the reduced unit state. It requires
     `Network.unit_capacity`.
 
     Type Args:
@@ -424,7 +425,7 @@ class AddUnit[GS](Protocol):
     level is provisional until the next resort recomputes the levels from the
     live edges. The phase runs after connection pruning and before growth,
     gated by `Network.structural_interval`, and under a batched step it runs
-    once on the batch-mean unit state. It requires `Network.unit_capacity`.
+    once on the reduced unit state. It requires `Network.unit_capacity`.
 
     Type Args:
         GS: the global state type threaded through the network.
@@ -694,6 +695,175 @@ class ResetGlobal[GS](Protocol):
         ...
 
 
+class Reduction(enum.Enum):
+    """How a batched step combines one unit column's per-sample values.
+
+    Attributes:
+        MEAN: the batch mean (sum over the samples, then divided by B); a
+            floating column only.
+        SUM: the batch sum; a numeric, non-boolean column only.
+        FIRST: sample 0's value.
+        NOT_BATCHED: the column is shared by every sample and no per-sample
+            phase may write it; the step keeps its pre-step value.
+    """
+
+    MEAN = "mean"
+    SUM = "sum"
+    FIRST = "first"
+    NOT_BATCHED = "not_batched"
+
+
+@runtime_checkable
+class BatchReduction(Protocol):
+    """Batch-reduction policy: how a batched step combines per-sample unit state.
+
+    In a batched step (`make_step(..., batch_size=B)`) the input scatter,
+    forward, loss, backward and unit update run once per sample, so every unit
+    column they write holds B values. Before the once-per-batch phases
+    (connection update, prune, add, growth, reset) those B values become one,
+    by the `Reduction` this policy returns for the column.
+
+    Every column a per-sample phase writes must be declared with MEAN, SUM or
+    FIRST: an undeclared written column, or one declared NOT_BATCHED, is an
+    error (see `make_step`). A column no per-sample phase writes needs no
+    declaration and keeps its pre-step value. `LEVEL` and `PRUNED` belong to
+    the structural phases: a policy may declare them NOT_BATCHED or leave them
+    undeclared. There is no default: a batched step requires the network to
+    set `Network.batch_reduction`. `FieldReductions` declares columns one by
+    one; `MeanFloatFirstRest` is the mean of every floating column and sample
+    0 of every other one.
+    """
+
+    def reduction(self, field: FieldSpec[Any]) -> Reduction | None:
+        """Return how `field` is reduced over the batch.
+
+        Args:
+            field: a unit column of the network.
+
+        Returns:
+            The column's reduction, or None when the policy does not declare
+            it.
+        """
+        ...
+
+
+@dataclasses.dataclass(frozen=True, init=False)
+class FieldReductions:
+    """A batch-reduction policy that declares unit columns one by one.
+
+    ``FieldReductions({ACTIVATION: Reduction.MEAN, COUNT: Reduction.SUM})``
+    declares two columns; every other column is undeclared. Each declared
+    column must be a unit column of the network the policy is set on
+    (checked when the `Network` subclass is defined).
+
+    Args:
+        fields: each declared unit column and its reduction.
+
+    Attributes:
+        fields: the declared columns and their reductions, as (field,
+            reduction) pairs in declaration order.
+
+    Raises:
+        TypeError: if a key is not a FieldSpec or a value is not a Reduction.
+        ValueError: if two declared fields share a name.
+    """
+
+    fields: tuple[tuple[FieldSpec[Any], Reduction], ...]
+
+    def __init__(self, fields: Mapping[FieldSpec[Any], Reduction]) -> None:
+        pairs = tuple(fields.items())
+        names: set[str] = set()
+        for spec, red in pairs:
+            if not isinstance(spec, FieldSpec):
+                raise TypeError(f"FieldReductions: {spec!r} is not a FieldSpec")
+            if not isinstance(red, Reduction):
+                raise TypeError(
+                    f"FieldReductions: {spec.name!r} maps to {red!r}, not a Reduction"
+                )
+            if spec.name in names:
+                raise ValueError(f"FieldReductions: {spec.name!r} declared twice")
+            names.add(spec.name)
+        object.__setattr__(self, "fields", pairs)
+
+    def reduction(self, field: FieldSpec[Any]) -> Reduction | None:
+        """Return the declared reduction of `field`, or None when undeclared.
+
+        Args:
+            field: a unit column of the network.
+
+        Returns:
+            The declared reduction, or None.
+        """
+        for spec, red in self.fields:
+            if spec.name == field.name:
+                return red
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
+class MeanFloatFirstRest:
+    """The batch mean of every floating unit column, sample 0 of every other.
+
+    A convenience `BatchReduction` that declares every column: MEAN for a
+    floating one, FIRST for any other, and NOT_BATCHED for the structural
+    `LEVEL` and `PRUNED` columns. This is the reduction batched steps applied
+    implicitly before the policy became explicit; setting it is the one-line
+    way to keep that behaviour.
+    """
+
+    def reduction(self, field: FieldSpec[Any]) -> Reduction:
+        """Return MEAN for a floating column and FIRST for any other.
+
+        Args:
+            field: a unit column of the network.
+
+        Returns:
+            The column's reduction (NOT_BATCHED for `LEVEL` and `PRUNED`).
+        """
+        if field.name in _STRUCTURAL_UNIT_FIELDS:
+            return Reduction.NOT_BATCHED
+        if np.issubdtype(field.dtype, np.floating):
+            return Reduction.MEAN
+        return Reduction.FIRST
+
+
+# Unit columns only the structural phases write: never reduced over a batch.
+_STRUCTURAL_UNIT_FIELDS = frozenset({LEVEL.name, PRUNED.name})
+
+
+def batch_written_reduction(
+    policy: BatchReduction, field: FieldSpec[Any], *, where: str
+) -> Reduction:
+    """Return the reduction of a column a per-sample phase writes, or raise.
+
+    Args:
+        policy: the network's batch-reduction policy.
+        field: the written unit column.
+        where: what writes it, for the error message.
+
+    Returns:
+        The column's reduction: MEAN, SUM or FIRST.
+
+    Raises:
+        ValueError: if the policy leaves the column undeclared or declares it
+            NOT_BATCHED.
+    """
+    red = policy.reduction(field)
+    if red is None:
+        raise ValueError(
+            f"batch_reduction: unit column {field.name!r} is written per sample "
+            f"({where}) but the batch-reduction policy does not declare it; "
+            "declare it MEAN, SUM or FIRST (or set "
+            "batch_reduction = MeanFloatFirstRest())"
+        )
+    if red is Reduction.NOT_BATCHED:
+        raise ValueError(
+            f"batch_reduction: unit column {field.name!r} is declared "
+            f"NOT_BATCHED but is written per sample ({where})"
+        )
+    return red
+
+
 class Network[GS]:
     """Base configuration surface for a network's traits.
 
@@ -739,6 +909,10 @@ class Network[GS]:
             pruned.
         max_levels: the unit-level bound: a child unit's level is clamped to
             ``[1, max_levels - 1]``. Default 1024, the C++ library's bound.
+        batch_reduction: how a batched step combines the per-sample unit
+            columns before its once-per-batch phases (see `BatchReduction`),
+            or None (the default). A batched step requires one; a streaming
+            step ignores it.
     """
 
     forward_pass: ForwardPass[object, GS]
@@ -761,6 +935,7 @@ class Network[GS]:
     structural_interval: int = 1
     unit_capacity: int | None = None
     max_levels: int = 1024
+    batch_reduction: BatchReduction | None = None
 
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""
@@ -989,6 +1164,87 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         )
 
     _validate_field_names(cls)
+    _validate_batch_reduction(cls)
+
+
+def _validate_batch_reduction(cls: type[Network[Any]]) -> None:
+    """Check the batch-reduction policy against the network's unit columns.
+
+    Every unit column's reduction must suit its dtype (MEAN a floating column,
+    SUM a numeric non-boolean one), `LEVEL` and `PRUNED` may only be
+    NOT_BATCHED or undeclared, a `FieldReductions` may declare only the
+    network's own columns, and the columns every batched step writes per
+    sample -- `ACTIVATION` (the input scatter) and the loss's `seed_field` --
+    must be declared MEAN, SUM or FIRST. The columns the rules write are
+    checked when a batched step is first traced (see `make_step`).
+
+    Args:
+        cls: the Network subclass being validated.
+
+    Raises:
+        TypeError: if `batch_reduction` does not satisfy BatchReduction, or a
+            reduction does not suit its column's dtype.
+        ValueError: if the policy declares a column the network does not have,
+            reduces `LEVEL` or `PRUNED`, or leaves a column every batched step
+            writes undeclared or NOT_BATCHED.
+    """
+    policy: object = getattr(cls, "batch_reduction", None)
+    if policy is None:
+        return
+    if not isinstance(policy, BatchReduction):
+        raise TypeError(
+            f"{cls.__name__}.batch_reduction must satisfy BatchReduction "
+            f"(reduction); got {policy!r}"
+        )
+    unit_fields: tuple[FieldSpec[Any], ...] = (
+        ACTIVATION,
+        LEVEL,
+        *((PRUNED,) if cls.unit_capacity is not None else ()),
+        *cls.extra_unit_fields,
+    )
+    if isinstance(policy, FieldReductions):
+        known = {spec.name for spec in unit_fields}
+        for spec, _ in policy.fields:
+            if spec.name not in known:
+                raise ValueError(
+                    f"{cls.__name__}.batch_reduction declares {spec.name!r}, "
+                    f"which is not a unit column of the network ({sorted(known)})"
+                )
+    for spec in unit_fields:
+        red: object = policy.reduction(spec)
+        if red is None or red is Reduction.NOT_BATCHED:
+            continue
+        if not isinstance(red, Reduction):
+            raise TypeError(
+                f"{cls.__name__}.batch_reduction.reduction({spec.name!r}) must "
+                f"return a Reduction or None; got {red!r}"
+            )
+        if spec.name in _STRUCTURAL_UNIT_FIELDS:
+            raise ValueError(
+                f"{cls.__name__}.batch_reduction: {spec.name!r} is written only "
+                "by the structural phases; declare it NOT_BATCHED or leave it "
+                f"undeclared, not {red.name}"
+            )
+        if red is Reduction.MEAN and not np.issubdtype(spec.dtype, np.floating):
+            raise TypeError(
+                f"{cls.__name__}.batch_reduction: MEAN needs a floating column; "
+                f"{spec.name!r} is {spec.dtype}"
+            )
+        if red is Reduction.SUM and (
+            spec.dtype == np.bool_ or not np.issubdtype(spec.dtype, np.number)
+        ):
+            raise TypeError(
+                f"{cls.__name__}.batch_reduction: SUM needs a numeric, "
+                f"non-boolean column; {spec.name!r} is {spec.dtype}"
+            )
+    try:
+        batch_written_reduction(policy, ACTIVATION, where="the input scatter")
+        if cls.loss is not None:
+            batch_written_reduction(
+                policy, cls.loss.seed_field, where="the loss's seed_field"
+            )
+    except ValueError as err:
+        raise ValueError(f"{cls.__name__}.{err}") from None
 
 
 def _validate_unit_slots(cls: type[Network[Any]]) -> None:

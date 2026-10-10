@@ -716,7 +716,7 @@ def _score_net(
     # Growth reads the batch-mean state under batching: reduce the recorded
     # per-sample activations with px's own batch reduction.
     if "batch_activations" in doc:
-        from plastax.phases import batch_mean_units
+        from plastax.phases import reduce_batch_units
 
         per_sample = jnp.asarray(doc["batch_activations"], jnp.float32)
         batched = {
@@ -724,7 +724,10 @@ def _score_net(
             for name, col in state.units.items()
         }
         batched[px.ACTIVATION.name] = per_sample
-        state = dataclasses.replace(state, units=batch_mean_units(batched))
+        units = reduce_batch_units(
+            px.MeanFloatFirstRest(), static.unit_fields, batched, state.units
+        )
+        state = dataclasses.replace(state, units=units)
     else:
         act = jnp.asarray([u["fields"]["activation"] for u in units], dtype=jnp.float32)
         state = dataclasses.replace(

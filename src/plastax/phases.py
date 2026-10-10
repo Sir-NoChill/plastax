@@ -4029,6 +4029,80 @@ def dedupe_step(
     return jnp.where(repeat, jnp.float32(-jnp.inf), flat_scores)
 
 
+# Candidate count from which `total_order` sorts with stable one-key passes
+# on a GPU backend (`radix_total_order`). XLA lowers a one-key sort there to a
+# CUB radix sort, but sorts with several keys through its own merge network,
+# whose kernel count grows as log^2 of the length. Below this count the merge
+# network's single sort beats three radix launches.
+RADIX_TOTAL_ORDER_MIN = 1 << 17
+
+
+def _sort_key(flat_scores: jax.Array) -> Float[Array, " n"]:
+    """The leading sort key: the negated score, NaN as +inf (sorted last)."""
+    neg_score: Float[Array, " n"] = jnp.where(
+        jnp.isnan(flat_scores), jnp.float32(jnp.inf), -flat_scores
+    ).astype(jnp.float32)
+    return neg_score
+
+
+def comparison_total_order(
+    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
+) -> Int32[Array, " n"]:
+    """`total_order` as one comparison sort on four keys.
+
+    One `lax.sort` on ``(-score, src, dst, candidate_index)``. Its comparator
+    treats -0.0 and +0.0 as equal.
+
+    Args:
+        flat_scores: candidate scores.
+        flat_src: candidate source ids, parallel to `flat_scores`.
+        flat_dst: candidate destination ids, parallel to `flat_scores`.
+
+    Returns:
+        The candidate indices, in the total order.
+    """
+    cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
+    *_, perm = jax.lax.sort(
+        (
+            _sort_key(flat_scores),
+            flat_src.astype(jnp.int32),
+            flat_dst.astype(jnp.int32),
+            cand_idx,
+        ),
+        num_keys=4,
+    )
+    return perm
+
+
+def radix_total_order(
+    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
+) -> Int32[Array, " n"]:
+    """`total_order` as three stable one-key sorts, least significant first.
+
+    Sorts by destination, then by source, then by negated score, each pass
+    stable, so equal keys keep the previous pass's order and the candidate
+    index needs no pass of its own. The result is the permutation
+    `comparison_total_order` returns. A radix sort orders -0.0 before +0.0,
+    which the comparator treats as equal, so -0.0 is folded to +0.0 first;
+    NaN becomes +inf in both.
+
+    Args:
+        flat_scores: candidate scores.
+        flat_src: candidate source ids, parallel to `flat_scores`.
+        flat_dst: candidate destination ids, parallel to `flat_scores`.
+
+    Returns:
+        The candidate indices, in the total order.
+    """
+    neg_score = _sort_key(flat_scores)
+    neg_score = jnp.where(neg_score == 0, jnp.float32(0), neg_score)
+    cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
+    _, perm = jax.lax.sort_key_val(flat_dst.astype(jnp.int32), cand_idx, is_stable=True)
+    for key in (flat_src.astype(jnp.int32), neg_score):
+        _, perm = jax.lax.sort_key_val(key[perm], perm, is_stable=True)
+    return perm
+
+
 def total_order(
     flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
 ) -> jax.Array:
@@ -4042,7 +4116,12 @@ def total_order(
     identically on every backend, and identically in the C++ implementation.
     A NaN score sorts last, like the -inf veto it becomes at commit time
     (`isfinite` gates growability), rather than first as a raw descending
-    float sort would place it.
+    float sort would place it; -0.0 and +0.0 tie.
+
+    How it sorts is fixed at trace time and never changes the result: on a GPU
+    backend with at least `RADIX_TOTAL_ORDER_MIN` candidates it takes three
+    stable radix passes (`radix_total_order`), and otherwise one four-key
+    comparison sort (`comparison_total_order`).
 
     Args:
         flat_scores: candidate scores.
@@ -4052,15 +4131,9 @@ def total_order(
     Returns:
         The candidate indices, in the total order.
     """
-    neg_score = jnp.where(
-        jnp.isnan(flat_scores), jnp.float32(jnp.inf), -flat_scores
-    ).astype(jnp.float32)
-    cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
-    *_, perm = jax.lax.sort(
-        (neg_score, flat_src.astype(jnp.int32), flat_dst.astype(jnp.int32), cand_idx),
-        num_keys=4,
-    )
-    return perm
+    if flat_scores.shape[0] >= RADIX_TOTAL_ORDER_MIN and jax.default_backend() == "gpu":
+        return radix_total_order(flat_scores, flat_src, flat_dst)
+    return comparison_total_order(flat_scores, flat_src, flat_dst)
 
 
 def select(

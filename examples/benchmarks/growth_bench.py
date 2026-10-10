@@ -26,9 +26,14 @@ the window):
 Each point builds the network with `NetworkBuilder.from_edges`, jits the
 add_conn phase from `build_add_conn_phase` alone (state donated, the step
 counter advanced so each call draws fresh proposals), compiles it ahead of
-time (reported as ``compile_s``), runs ``--warmup`` calls, then reports the
-median, min and max of ``--reps`` calls, each timed with ``perf_counter``
-around the call and ``jax.block_until_ready``.
+time (reported as ``compile_s``), warms up, then reports the median, min and
+max of ``--reps`` calls, each timed with ``perf_counter`` around the call and
+``jax.block_until_ready``. A fresh process needs about 15 calls before a GPU
+call reaches its steady-state time (host-side warm-up), so the warm-up runs
+``--warmup`` calls (20), cut short only once ``--warmup-seconds`` (10 s) have
+passed, which only the slowest points (a second or more per call, where the
+warm-up is negligible) reach. The calls warmed up are reported as
+``warmup``.
 
 Sweeps (``--sweep``, comma separated; default all), at fixed P = 4, M = 64,
 N = 65536 and C = 65536 unless varied:
@@ -108,6 +113,7 @@ FIELDS = (
     "pool",
     "conn_capacity",
     "overflow",
+    "warmup",
 )
 
 
@@ -353,14 +359,22 @@ class Point:
 
 
 def measure(
-    pt: Point, *, reps: int, warmup: int, growth: str, backend: str
+    pt: Point,
+    *,
+    reps: int,
+    warmup: int,
+    warmup_seconds: float,
+    growth: str,
+    backend: str,
 ) -> dict[str, Any]:
     """Build one network and time its growth phase.
 
     Args:
         pt: the sweep point.
         reps: timed calls.
-        warmup: untimed calls after compiling.
+        warmup: untimed calls after compiling, at most.
+        warmup_seconds: stop warming up once this long has passed (after at
+            least one call).
         growth: `build_add_conn_phase`'s claim engine.
         backend: the backend label for the row.
 
@@ -396,8 +410,13 @@ def measure(
     )
     compile_s = time.perf_counter() - t0
 
-    for _ in range(warmup):
+    warmed = 0
+    t0 = time.perf_counter()
+    while warmed < warmup and (
+        warmed == 0 or time.perf_counter() - t0 < warmup_seconds
+    ):
         state = jax.block_until_ready(compiled(state))
+        warmed += 1
     ms = []
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -421,6 +440,7 @@ def measure(
         "pool": pool_of(pt, static),
         "conn_capacity": sum(static.level_capacities),
         "overflow": int(bool(state.overflow)),
+        "warmup": warmed,
     }
 
 
@@ -520,7 +540,13 @@ def main() -> None:
     ap.add_argument("--sweep", default="np,n,c,p")
     ap.add_argument("--quick", action="store_true", help="a reduced smoke grid")
     ap.add_argument("--reps", type=int, default=None, help="timed calls (7)")
-    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--warmup", type=int, default=20, help="warm-up calls (20)")
+    ap.add_argument(
+        "--warmup-seconds",
+        type=float,
+        default=10.0,
+        help="cut the warm-up short after this long (10 s)",
+    )
     ap.add_argument(
         "--max-candidates",
         type=int,
@@ -541,7 +567,12 @@ def main() -> None:
         out.writeheader()
         for idx, pt in enumerate(pts, 1):
             row = measure(
-                pt, reps=reps, warmup=args.warmup, growth=args.growth, backend=backend
+                pt,
+                reps=reps,
+                warmup=args.warmup,
+                warmup_seconds=args.warmup_seconds,
+                growth=args.growth,
+                backend=backend,
             )
             out.writerow(row)
             f.flush()

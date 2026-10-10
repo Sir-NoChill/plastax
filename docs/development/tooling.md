@@ -153,10 +153,82 @@ The JAX-specific test infrastructure, beyond plain pytest:
 ## Pre-commit / pre-push
 
 `.pre-commit-config.yaml` defines: ruff check (autofix), ruff format,
-ty check, and hygiene basics on pre-commit; mypy --strict and the fast
-pytest suite (`-m "not slow"`) on pre-push. Install with
-`uv run pre-commit install --hook-type pre-commit --hook-type pre-push`.
+pydoclint, ty check, and hygiene basics on pre-commit; mypy --strict and the
+fast pytest suite on pre-push. Install with
+`uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push`.
 These hooks must run and pass — never commit or push with `--no-verify`.
+
+`default_stages: [pre-commit]` keeps the lint hooks from running again on
+commit-msg and pre-push over files they already checked. mypy is incremental
+through `.mypy_cache/` (a few seconds cold, well under a second warm), so the
+pre-push cost is the test suite.
+
+### Test tiers
+
+| Tier | Selection | Runs in |
+|---|---|---|
+| fast | `-m "not slow"` | pre-push hook (in parallel), and as part of the full suite |
+| slow | `@pytest.mark.slow` | the full suite only: CI and the full local gate |
+| full | everything (`uv run pytest`) | CI (both Python versions) and the full local gate |
+
+The `slow` tier holds the tests whose cost is not compilation but work: the
+optax oracle parity (`test_optim.py`, whose optax dependency is test-only), the
+multi-controller fan-outs that spawn several JAX processes
+(`test_mc_sharding.py`, `test_mc_construct.py`, `test_mc_driver.py`), training
+every showcase optimizer to convergence
+(`test_mlp_xor.py::test_every_showcase_optimizer_learns_xor`), and the CBP
+replacement-rate oracle (`test_cbp.py::test_v1_local_threshold_agrees_with_the_oracle_on_rate`).
+Mark a new test `slow` only for the same reason; a test that is merely slow to
+compile belongs in the fast tier, where the compilation cache absorbs it.
+
+The pre-push hook runs the fast tier as
+
+```
+uv run pytest -m "not slow" -q -n auto --maxprocesses=12
+```
+
+and skips it when the pushed commits touch only prose (`docs/`,
+`benchmarks/`, `.agents/`, `.github/`, `*.md` and similar; the hook's
+`exclude` pattern is the list). On a 20-thread host it takes about 30-40 s
+with a warm cache and 70-90 s cold.
+
+Two things make it fast:
+
+- **pytest-xdist.** Every test runs in a worker process with its own JAX
+  runtime (the conftest environment is set per worker), so tests share no
+  device state. More than about 12 workers oversubscribes a 20-thread host,
+  because each worker's XLA also uses a thread pool.
+- **JAX's persistent compilation cache.** Most of the suite's time is XLA
+  compilation, not execution. `tests/conftest.py` points
+  `JAX_COMPILATION_CACHE_DIR` at `.cache/jax` (git-ignored) and caches every
+  executable, which cuts a run to about a third. The cache key is a hash of
+  the HLO module, the compile options, `XLA_FLAGS`, the backend and the
+  jax/jaxlib versions, so any change to the code being compiled is a miss,
+  never a stale hit; tracing, lowering (including the donation check) and
+  execution still run on every test. The subprocess-based tests inherit the
+  setting. The cache is dropped at session start once it outgrows 1 GiB, and
+  `rm -rf .cache/jax` or `JAX_ENABLE_COMPILATION_CACHE=false` gives a cold run.
+  jax's `jax_compilation_cache_check_contents` cannot be used to audit it on
+  CPU: XLA:CPU compiles kernels in parallel and packs them into object files
+  in a run-dependent order, so two fresh compiles of the same HLO can differ
+  byte-for-byte in their machine-code section while their HLO is identical.
+
+The full local gate, matching CI, runs every tier serially:
+
+```
+uv sync && uv run ruff check src tests examples \
+  && uv run ruff format --check src tests examples \
+  && uv run pydoclint --style=google --arg-type-hints-in-docstring=False \
+       --check-return-types=False --check-class-attributes=True \
+       --skip-checking-private-functions=True src/plastax \
+  && uv run ty check src && uv run mypy --strict src \
+  && uv run pytest \
+  && uv run python scripts/parity/emit.py --check \
+  && uv run --group docs sphinx-build -W --keep-going -b html docs docs/_build
+```
+
+The C++ oracle and golden tests look for a plastix checkout at
+`$PLASTAX_CPP_DIR` (default `../plastax-cpp`) and skip without one.
 
 ## Commit conventions
 

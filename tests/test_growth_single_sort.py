@@ -4,11 +4,14 @@
 once and takes each bucket's winners from its own source level's members.
 `_reference_phase` below is the earlier formulation, kept only as this test's
 oracle: every bucket re-validates and re-scores the whole list with the other
-levels vetoed, sorts all of it, and takes the first k. The two must agree bit
-for bit -- every column of every bucket, the overflow and resort flags, and
-the grown count -- over randomized layered nets covering every candidate
-source, every selection mode, the step cap, both dedupe stages, the window
-knobs, unit capacities, PIPELINE, and buckets tight enough to overflow.
+levels vetoed, sorts all of it, and takes the first k (the PIPELINE bucket
+sorts once per source level; under `level_cap_scope = "step"` the buckets'
+lists are sorted end to end and the first k taken once). The two must agree
+bit for bit -- every column of every bucket, the overflow and resort flags,
+and the grown count -- over randomized layered nets covering every candidate
+source, every selection mode, both cap scopes, the step cap, both dedupe
+stages, the window knobs, unit capacities, PIPELINE, and buckets tight enough
+to overflow.
 """
 
 from __future__ import annotations
@@ -184,6 +187,7 @@ def _config(kind: str, selection: str, seed: int) -> dict[str, Any]:
         unit_capacity=bool(rng.random() < 0.3),
         pipeline=pipeline,
         kill=float(rng.uniform(0.1, 0.5)),
+        level_cap_scope=str(rng.choice(["source_level", "step"])),
     )
 
 
@@ -222,6 +226,7 @@ def _build(
     rule.selection = selection
     rule.max_new_per_level = cfg["k"]
     rule.max_new_per_step = cfg["max_new_per_step"]
+    rule.level_cap_scope = cfg["level_cap_scope"]
     rule.dedupe_live = cfg["dedupe_live"]
     rule.dedupe_step = cfg["dedupe_step"]
     rule.direction = cfg["direction"]
@@ -273,6 +278,7 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
     else:
         pool = pool_side * pool_side
     k = pool if ac.selection == "all" else max(0, min(ac.max_new_per_level, pool))
+    step_scope = ac.level_cap_scope == "step" and ac.selection != "all"
 
     def phase(state: px.NetworkState[Any]) -> px.NetworkState[Any]:
         units, g = state.units, state.globals_
@@ -312,8 +318,38 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
         def init_one(s: jax.Array, d: jax.Array) -> dict[str, jax.Array]:
             return dict(ac.init(u_view, px.UnitIdx(s), px.UnitIdx(d), g).fields)
 
-        claims = []
-        claim_levels = []
+        def claim_of(
+            src: jax.Array,
+            dst: jax.Array,
+            valid: jax.Array,
+            scores: jax.Array,
+            top: jax.Array,
+            member: jax.Array,
+        ) -> tuple[phases.GrowthClaim, jax.Array]:
+            growable = member & valid[top] & jnp.isfinite(scores[top])
+            if ac.selection == "threshold":
+                growable = growable & (scores[top] >= ac.threshold(g))
+            init = jax.vmap(init_one)(src[top], dst[top])
+            values = {}
+            for spec in static.conn_fields:
+                if spec.name == FROM_ID.name:
+                    values[spec.name] = src[top].astype(spec.dtype)
+                elif spec.name == TO_ID.name:
+                    values[spec.name] = dst[top].astype(spec.dtype)
+                elif spec.name in init:
+                    values[spec.name] = init[spec.name].astype(spec.dtype)
+                elif spec.name != DEAD.name:
+                    values[spec.name] = jnp.full(top.shape, spec.default, spec.dtype)
+            claim = phases.GrowthClaim(
+                growable=growable,
+                violating=~(level[dst[top]] > level[src[top]]),
+                values=values,
+            )
+            return claim, level[src[top]]
+
+        # Every bucket's whole list, re-validated and re-scored with the
+        # other levels vetoed.
+        lists = []
         for b in range(num_buckets):
             if use_per_level:
                 src, dst = phases.candidates_per_level(
@@ -348,38 +384,67 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
                 scores = jnp.where(valid, raw.astype(jnp.float32), -jnp.inf)
             if ac.dedupe_step:
                 scores = phases.dedupe_step(scores, src, dst)
-            top = phases.select(scores, src, dst, k)
-            growable = valid[top] & jnp.isfinite(scores[top])
-            if ac.selection == "threshold":
-                growable = growable & (scores[top] >= ac.threshold(g))
-            init = jax.vmap(init_one)(src[top], dst[top])
-            values = {}
-            for spec in static.conn_fields:
-                if spec.name == FROM_ID.name:
-                    values[spec.name] = src[top].astype(spec.dtype)
-                elif spec.name == TO_ID.name:
-                    values[spec.name] = dst[top].astype(spec.dtype)
-                elif spec.name in init:
-                    values[spec.name] = init[spec.name].astype(spec.dtype)
-                elif spec.name != DEAD.name:
-                    values[spec.name] = jnp.full((k,), spec.default, spec.dtype)
+            lists.append((src, dst, valid, scores))
+
+        claims, claim_levels = [], []
+        if step_scope:
+            # The buckets' lists end to end, each candidate valid in one copy
+            # only; ties between copies resolve as in one list (equal
+            # (score, src, dst) share a source, hence a bucket).
+            src, dst, valid, scores = (
+                jnp.concatenate(c) for c in zip(*lists, strict=True)
+            )
+            owner = jnp.asarray(
+                np.repeat(np.arange(num_buckets), [x[0].shape[0] for x in lists])
+            )
+            top = phases.select(
+                scores, src, dst, min(ac.max_new_per_level, src.shape[0])
+            )
+            for b in range(num_buckets):
+                claim, lvl = claim_of(src, dst, valid, scores, top, owner[top] == b)
+                claims.append(claim)
+                claim_levels.append(lvl)
+        elif is_pipeline:
+            # One sort per source level, every other level vetoed; the
+            # level's claims concatenated levels ascending.
+            src, dst, valid, scores = lists[0]
+            parts = []
+            for lvl in range(num_units):
+                mine = level[src] == lvl
+                top = phases.select(jnp.where(mine, scores, -jnp.inf), src, dst, k)
+                parts.append(claim_of(src, dst, valid, scores, top, mine[top]))
             claims.append(
                 phases.GrowthClaim(
-                    growable=growable,
-                    violating=~(level[dst[top]] > level[src[top]]),
-                    values=values,
+                    growable=jnp.concatenate([c.growable for c, _ in parts]),
+                    violating=jnp.concatenate([c.violating for c, _ in parts]),
+                    values={
+                        name: jnp.concatenate([c.values[name] for c, _ in parts])
+                        for name in parts[0][0].values
+                    },
                 )
             )
-            claim_levels.append(level[src[top]])
-        if ac.max_new_per_step is not None:
-            prior = jnp.int32(0)
-            for i, claim in enumerate(claims):
-                grow32 = claim.growable.astype(jnp.int32)
-                rank = jnp.cumsum(grow32) - 1 + prior
-                claims[i] = dataclasses.replace(
-                    claim, growable=claim.growable & (rank < ac.max_new_per_step)
+            claim_levels.append(jnp.concatenate([lv for _, lv in parts]))
+        else:
+            for src, dst, valid, scores in lists:
+                top = phases.select(scores, src, dst, k)
+                claim, lvl = claim_of(
+                    src, dst, valid, scores, top, jnp.ones(top.shape, jnp.bool_)
                 )
-                prior = prior + grow32.sum()
+                claims.append(claim)
+                claim_levels.append(lvl)
+        if ac.max_new_per_step is not None:
+            # Levels ascending, then claim order.
+            grow32 = jnp.concatenate([c.growable for c in claims]).astype(jnp.int32)
+            order = jnp.argsort(jnp.concatenate(claim_levels), stable=True)
+            rank = jnp.zeros_like(grow32).at[order].set(jnp.cumsum(grow32[order]) - 1)
+            keep = rank < ac.max_new_per_step
+            at = 0
+            for i, claim in enumerate(claims):
+                n = claim.growable.shape[0]
+                claims[i] = dataclasses.replace(
+                    claim, growable=claim.growable & keep[at : at + n]
+                )
+                at += n
         new_conns, overflow, resort = [], jnp.bool_(False), jnp.bool_(False)
         tail_start = state.tail_start
         for bucket, claim, claim_level in zip(
@@ -478,3 +543,7 @@ def test_the_configs_exercise_overflow_and_several_levels() -> None:
     assert sum(s["buckets_grown"] >= 2 for s in stats) >= 10
     assert sum(s["grown"] for s in stats) > 0
     assert sum(s["resort"] > 0 for s in stats) >= 3
+    # Both cap scopes, capped (not "all"), in both propagation models.
+    configs = [_config(*case) for case in _CASES if case[1] != "all"]
+    scoped = {(cfg["pipeline"], cfg["level_cap_scope"]) for cfg in configs}
+    assert scoped == {(p, s) for p in (False, True) for s in ("source_level", "step")}

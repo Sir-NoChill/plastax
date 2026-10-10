@@ -4149,6 +4149,9 @@ def dedupe_step(
 # whose kernel count grows as log^2 of the length. Below this count the merge
 # network's single sort beats three radix launches.
 RADIX_TOTAL_ORDER_MIN = 1 << 17
+# The largest unit-id bound for which `radix_total_order` packs (src, dst)
+# into one uint32 key: every id then fits in 16 bits.
+PACKED_ID_BOUND = 1 << 16
 # The most elements of the one-hot running count `select_per_segment` ranks a
 # chunk of segments with (16 MB of int32).
 _SEGMENT_RANK_ELEMENTS = 1 << 22
@@ -4192,13 +4195,21 @@ def comparison_total_order(
 
 
 def radix_total_order(
-    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
+    flat_scores: jax.Array,
+    flat_src: jax.Array,
+    flat_dst: jax.Array,
+    *,
+    id_bound: int | None = None,
 ) -> Int32[Array, " n"]:
-    """`total_order` as three stable one-key sorts, least significant first.
+    """`total_order` as stable one-key sorts, least significant first.
 
     Sorts by destination, then by source, then by negated score, each pass
     stable, so equal keys keep the previous pass's order and the candidate
-    index needs no pass of its own. The result is the permutation
+    index needs no pass of its own. When every id is known to lie in
+    ``[0, id_bound)`` with `id_bound` at most `PACKED_ID_BOUND`, the
+    destination and source passes merge into one on the uint32 key
+    ``(src << 16) | dst``, which orders exactly as (src, dst) does; that
+    saves one radix sort. The result is the permutation
     `comparison_total_order` returns. A radix sort orders -0.0 before +0.0,
     which the comparator treats as equal, so -0.0 is folded to +0.0 first;
     NaN becomes +inf in both.
@@ -4207,6 +4218,9 @@ def radix_total_order(
         flat_scores: candidate scores.
         flat_src: candidate source ids, parallel to `flat_scores`.
         flat_dst: candidate destination ids, parallel to `flat_scores`.
+        id_bound: a static bound every source and destination id is below
+            (the unit capacity), or None if unknown. Ids at or above it give
+            an unspecified order.
 
     Returns:
         The candidate indices, in the total order.
@@ -4214,14 +4228,25 @@ def radix_total_order(
     neg_score = _sort_key(flat_scores)
     neg_score = jnp.where(neg_score == 0, jnp.float32(0), neg_score)
     cand_idx = jnp.arange(flat_scores.shape[0], dtype=jnp.int32)
-    _, perm = jax.lax.sort_key_val(flat_dst.astype(jnp.int32), cand_idx, is_stable=True)
-    for key in (flat_src.astype(jnp.int32), neg_score):
+    if id_bound is not None and id_bound <= PACKED_ID_BOUND:
+        pair = (flat_src.astype(jnp.uint32) << jnp.uint32(16)) | flat_dst.astype(
+            jnp.uint32
+        )
+        keys = [pair, neg_score]
+    else:
+        keys = [flat_dst.astype(jnp.int32), flat_src.astype(jnp.int32), neg_score]
+    _, perm = jax.lax.sort_key_val(keys[0], cand_idx, is_stable=True)
+    for key in keys[1:]:
         _, perm = jax.lax.sort_key_val(key[perm], perm, is_stable=True)
     return perm
 
 
 def total_order(
-    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array
+    flat_scores: jax.Array,
+    flat_src: jax.Array,
+    flat_dst: jax.Array,
+    *,
+    id_bound: int | None = None,
 ) -> jax.Array:
     """The permutation sorting candidates into the total candidate order.
 
@@ -4236,25 +4261,33 @@ def total_order(
     float sort would place it; -0.0 and +0.0 tie.
 
     How it sorts is fixed at trace time and never changes the result: on a GPU
-    backend with at least `RADIX_TOTAL_ORDER_MIN` candidates it takes three
-    stable radix passes (`radix_total_order`), and otherwise one four-key
-    comparison sort (`comparison_total_order`).
+    backend with at least `RADIX_TOTAL_ORDER_MIN` candidates it takes stable
+    radix passes (`radix_total_order`: two when `id_bound` is at most
+    `PACKED_ID_BOUND`, else three), and otherwise one four-key comparison
+    sort (`comparison_total_order`).
 
     Args:
         flat_scores: candidate scores.
         flat_src: candidate source ids, parallel to `flat_scores`.
         flat_dst: candidate destination ids, parallel to `flat_scores`.
+        id_bound: a static bound every id is below (the unit capacity), or
+            None if unknown.
 
     Returns:
         The candidate indices, in the total order.
     """
     if flat_scores.shape[0] >= RADIX_TOTAL_ORDER_MIN and jax.default_backend() == "gpu":
-        return radix_total_order(flat_scores, flat_src, flat_dst)
+        return radix_total_order(flat_scores, flat_src, flat_dst, id_bound=id_bound)
     return comparison_total_order(flat_scores, flat_src, flat_dst)
 
 
 def select(
-    flat_scores: jax.Array, flat_src: jax.Array, flat_dst: jax.Array, k: int
+    flat_scores: jax.Array,
+    flat_src: jax.Array,
+    flat_dst: jax.Array,
+    k: int,
+    *,
+    id_bound: int | None = None,
 ) -> jax.Array:
     """Indices of the bucket's k selection winners, in selection order.
 
@@ -4266,6 +4299,8 @@ def select(
         flat_src: candidate source ids, parallel to `flat_scores`.
         flat_dst: candidate destination ids, parallel to `flat_scores`.
         k: the static per-bucket budget.
+        id_bound: a static bound every id is below (the unit capacity), or
+            None if unknown.
 
     Returns:
         Indices of the k selected candidates, in the total order -- also
@@ -4273,7 +4308,8 @@ def select(
         winners in this order, so an unsorted full pool would commit in
         candidate order instead.
     """
-    top_idx: jax.Array = total_order(flat_scores, flat_src, flat_dst)[:k]
+    perm = total_order(flat_scores, flat_src, flat_dst, id_bound=id_bound)
+    top_idx: jax.Array = perm[:k]
     return top_idx
 
 
@@ -4284,6 +4320,8 @@ def select_per_segment(
     segment: jax.Array,
     num_segments: int,
     k: int,
+    *,
+    id_bound: int | None = None,
 ) -> list[tuple[jax.Array, jax.Array]]:
     """Each segment's first k candidates in the total order, from one sort.
 
@@ -4300,13 +4338,15 @@ def select_per_segment(
         segment: each candidate's segment id.
         num_segments: the static segment count.
         k: the static per-segment budget.
+        id_bound: a static bound every id is below (the unit capacity), or
+            None if unknown.
 
     Returns:
         Per segment, the `(k,)` indices of its winners in the total order, and
         a `(k,)` mask that is False past the segment's member count (those
         indices are placeholders).
     """
-    perm = total_order(flat_scores, flat_src, flat_dst)
+    perm = total_order(flat_scores, flat_src, flat_dst, id_bound=id_bound)
     sorted_segment = segment[perm].astype(jnp.int32)
     n = perm.shape[0]
     # Every segment of a chunk is ranked by one running count over a
@@ -4671,7 +4711,7 @@ def build_add_conn_phase[GS](
                 )
                 valid = bucket_valid(bucket_idx, flat_src, flat_dst)
                 flat_scores = scores_of(flat_src, flat_dst, valid)
-                top_idx = select(flat_scores, flat_src, flat_dst, k)
+                top_idx = select(flat_scores, flat_src, flat_dst, k, id_bound=num_units)
                 filled = jnp.ones((k,), jnp.bool_)
                 selections.append(
                     (flat_src, flat_dst, valid, flat_scores, top_idx, filled)
@@ -4698,7 +4738,13 @@ def build_add_conn_phase[GS](
             else:
                 segment = unit_level[global_src].astype(jnp.int32)
             for top_idx, filled in select_per_segment(
-                flat_scores, global_src, global_dst, segment, num_buckets, k
+                flat_scores,
+                global_src,
+                global_dst,
+                segment,
+                num_buckets,
+                k,
+                id_bound=num_units,
             ):
                 selections.append(
                     (global_src, global_dst, valid, flat_scores, top_idx, filled)

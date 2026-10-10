@@ -1,12 +1,14 @@
 """The two formulations of the total candidate order agree exactly.
 
 `total_order` sorts with one four-key comparison sort, or, on a GPU backend
-above `RADIX_TOTAL_ORDER_MIN` candidates, with three stable one-key passes
-that XLA lowers to radix sorts. The choice must never change the order, so
-both formulations are called directly here (on whatever backend runs the
-tests) and compared, permutation for permutation, with each other and with a
-numpy lexsort oracle. The scores mix heavy ties with NaN (either sign),
-+-inf, +-0.0 and subnormals; the ids repeat heavily.
+above `RADIX_TOTAL_ORDER_MIN` candidates, with stable one-key passes that XLA
+lowers to radix sorts: three (dst, src, -score), or two when the ids fit in
+16 bits (the packed (src << 16) | dst, then -score). The choice must never
+change the order, so every formulation is called directly here (on whatever
+backend runs the tests) and compared, permutation for permutation, with the
+others and with a numpy lexsort oracle. The scores mix heavy ties with NaN
+(either sign), +-inf, +-0.0 and subnormals; the ids repeat heavily, and the
+16-bit lists reach the top id 65535 and the byte and half-word boundaries.
 """
 
 from __future__ import annotations
@@ -20,6 +22,10 @@ import pytest
 
 from plastax import phases
 from plastax.phases import comparison_total_order, radix_total_order, total_order
+
+_BOUND = phases.PACKED_ID_BOUND
+# Ids at the packed key's carry boundaries, always mixed into a 16-bit list.
+_EDGE_IDS = np.array([0, 1, 255, 256, 32767, 32768, 65279, 65280, 65534, 65535])
 
 _SPECIAL = np.array(
     [
@@ -65,7 +71,17 @@ def _candidates(
     scores = pool[rng.integers(0, pool.shape[0], n)]
     src = rng.integers(0, id_range, n).astype(np.int32)
     dst = rng.integers(0, id_range, n).astype(np.int32)
+    if id_range == _BOUND:
+        # Every edge id as a source and as a destination, in place of a
+        # random spread of draws, so the packed key's extremes are compared.
+        for ids in (src, dst):
+            at = rng.choice(n, min(n, 4 * _EDGE_IDS.shape[0]), replace=False)
+            ids[at] = np.resize(_EDGE_IDS, at.shape[0])
     return scores, src, dst
+
+
+def _packed(*args: Any) -> np.ndarray:
+    return np.asarray(jax.jit(lambda *a: radix_total_order(*a, id_bound=_BOUND))(*args))
 
 
 @pytest.mark.parametrize(
@@ -82,6 +98,12 @@ def _candidates(
         (8, 65537, 1000, 1 << 16),
         (9, 131072, 3, 300),
         (10, 140001, 100000, 1 << 30),
+        # The full 16-bit id range, with heavy score ties so (src, dst)
+        # decides most of the order.
+        (11, 40, 0, 1 << 16),
+        (12, 5000, 0, 1 << 16),
+        (13, 131072, 2, 1 << 16),
+        (14, 200003, 50000, 1 << 16),
     ],
 )
 def test_both_formulations_give_the_same_permutation(
@@ -95,6 +117,25 @@ def test_both_formulations_give_the_same_permutation(
     np.testing.assert_array_equal(comparison, want)
     np.testing.assert_array_equal(radix, want)
     np.testing.assert_array_equal(np.asarray(total_order(*args)), want)
+    if id_range <= _BOUND:
+        np.testing.assert_array_equal(_packed(*args), want)
+        bounded = total_order(*args, id_bound=_BOUND)
+        np.testing.assert_array_equal(np.asarray(bounded), want)
+
+
+def test_the_packed_key_orders_by_src_then_dst_across_the_halfword() -> None:
+    # Every (src, dst) over the edge ids, shuffled, with one tied score: the
+    # order is (src, dst) alone, so a carry from dst into src (or a signed
+    # compare of the packed key) would show.
+    src, dst = (g.ravel() for g in np.meshgrid(_EDGE_IDS, _EDGE_IDS, indexing="ij"))
+    shuffle = np.random.default_rng(0).permutation(src.shape[0])
+    src, dst = src[shuffle].astype(np.int32), dst[shuffle].astype(np.int32)
+    scores = np.zeros(src.shape, np.float32)
+    want = _oracle(scores, src, dst)
+    np.testing.assert_array_equal(want, np.lexsort((dst, src)))
+    args = (jnp.asarray(scores), jnp.asarray(src), jnp.asarray(dst))
+    np.testing.assert_array_equal(_packed(*args), want)
+    np.testing.assert_array_equal(np.asarray(comparison_total_order(*args)), want)
 
 
 def test_the_zeros_and_nans_tie_and_fall_back_to_src_dst_index() -> None:
@@ -109,14 +150,15 @@ def test_the_zeros_and_nans_tie_and_fall_back_to_src_dst_index() -> None:
     want = [5, 6, 0, 1, 4, 3, 7, 2]
     assert np.asarray(comparison_total_order(*args)).tolist() == want
     assert np.asarray(radix_total_order(*args)).tolist() == want
+    assert _packed(*args).tolist() == want
 
 
-def _sorts(fn: Any, n: int) -> list[int]:
+def _sorts(fn: Any, n: int, **kw: Any) -> list[int]:
     """The `num_keys` of every sort in `fn`'s jaxpr over n candidates."""
     scores = jax.ShapeDtypeStruct((n,), jnp.float32)
     ids = jax.ShapeDtypeStruct((n,), jnp.int32)
     # A fresh wrapper per call: make_jaxpr caches traces by function.
-    jaxpr = jax.make_jaxpr(lambda *a: fn(*a))(scores, ids, ids)
+    jaxpr = jax.make_jaxpr(lambda *a: fn(*a, **kw))(scores, ids, ids)
     return [e.params["num_keys"] for e in jaxpr.eqns if e.primitive.name == "sort"]
 
 
@@ -130,3 +172,8 @@ def test_total_order_takes_the_radix_passes_only_on_a_gpu_above_the_threshold(
         monkeypatch.setattr(phases.jax, "default_backend", lambda: "gpu")
     assert _sorts(total_order, small) == [4]
     assert _sorts(total_order, big) == [1, 1, 1]
+    # Ids that fit in 16 bits merge the src and dst passes; one more id
+    # does not.
+    assert _sorts(total_order, small, id_bound=_BOUND) == [4]
+    assert _sorts(total_order, big, id_bound=_BOUND) == [1, 1]
+    assert _sorts(total_order, big, id_bound=_BOUND + 1) == [1, 1, 1]

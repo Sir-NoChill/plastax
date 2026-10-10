@@ -50,6 +50,10 @@ mlp_xor = _load_example("mlp_xor")
 mnist_sgd = _load_example("mnist_sgd")  # data loader reuse; needs mlp_xor loaded first
 
 LR, MU, ADAM_LR, RMS_LR = 0.1, 0.9, 0.01, 0.001
+# Far above the 1e-4 default: at the default, the decay's total effect over
+# STEPS steps (~lr * wd * |w| * STEPS ~ 3e-5) sits inside the tolerance, so an
+# adamw that dropped its decay (plain adam) still matched optax.adamw.
+ADAMW_WD = 0.1
 STEPS = 60
 # max |Δ| observed ~1e-7 (float32 rounding); bounds fail on any real divergence
 # while tolerating the differing reduction order of the two backends.
@@ -62,7 +66,11 @@ _CASES: list[tuple[str, OptFactory, object]] = [
     ("sgd", lambda gf: px.optim.sgd(LR, gf), optax.sgd(LR)),
     ("momentum", lambda gf: px.optim.momentum(LR, MU, gf), optax.sgd(LR, momentum=MU)),
     ("adam", lambda gf: px.optim.adam(ADAM_LR, gf), optax.adam(ADAM_LR)),
-    ("adamw", lambda gf: px.optim.adamw(ADAM_LR, gf), optax.adamw(ADAM_LR)),
+    (
+        "adamw",
+        lambda gf: px.optim.adamw(ADAM_LR, gf, weight_decay=ADAMW_WD),
+        optax.adamw(ADAM_LR, weight_decay=ADAMW_WD),
+    ),
     ("rmsprop", lambda gf: px.optim.rmsprop(RMS_LR, gf), optax.rmsprop(RMS_LR)),
 ]
 _IDS = [case[0] for case in _CASES]

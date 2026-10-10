@@ -532,15 +532,29 @@ def test_pure_add_prune_level_preserving_workload_compiles_exactly_once() -> Non
     # static never changes, so nothing ever
     # recompiles (module docstring: construction's eager prelude is
     # deliberately outside this window).
+    # Host reads only (np.asarray is a transfer, not a lowering), so the
+    # per-step churn record does not perturb the compile count.
+    grown, live = [], []
     with jtu.assert_num_jit_and_pmap_compilations(1):
         for _ in range(20):
             driver.step(inputs)
+            grown.append(int(np.asarray(driver.state.grown)))
+            live.append(
+                sum(
+                    int((~np.asarray(b[px.DEAD.name])).sum())
+                    for b in driver.state.conns
+                )
+            )
 
     assert driver.static == static
     assert bool(driver.state.needs_resort) is False
-    # Genuine churn happened, not a no-op: ANCHOR's 3 original edges plus
-    # whatever SRC-sourced pairs survived this run's last add-then-prune.
-    assert int(live_conn_count(driver.state)) >= len(_R_DST)
+    # Genuine churn every step, not a no-op: the prune removed the prior
+    # step's two _R_MARK edges and the add committed two fresh ones, so the
+    # live count holds at ANCHOR's 3 edges plus 2. Without the prune, dedupe
+    # would exhaust SRC's 3 candidates and growth would stop.
+    assert grown == [2] * 20, grown
+    assert live == [len(_R_DST) + 2] * 20, live
+    assert int(live_conn_count(driver.state)) == len(_R_DST) + 2
 
 
 # ---------------------------------------------------------------------------

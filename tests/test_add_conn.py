@@ -212,6 +212,9 @@ def test_level_preserving_add_does_not_set_needs_resort() -> None:
     # exactly the level-preserving (SRC, 2/3/4) edges and needs_resort
     # stays False.
     assert bool(new_state.needs_resort) is False
+    # ...and the add really happened: a phase that grew nothing would leave
+    # needs_resort False too.
+    assert int(new_state.grown) == 3
 
 
 def test_overflow_flag_set_and_excess_candidates_dropped_not_miswritten() -> None:

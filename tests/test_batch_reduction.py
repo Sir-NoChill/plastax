@@ -29,7 +29,7 @@ _N = 4
 _SRC = np.asarray([0, 1, 2, 1], np.int32)
 _DST = np.asarray([2, 2, 3, 3], np.int32)
 _W = np.asarray([0.5, -0.25, 0.75, 0.375], np.float32)
-_X = np.asarray([[1.0, 0.5], [-0.75, 2.0], [0.25, -1.5]], np.float32)
+_X = np.asarray([[1.0, 0.5], [-0.75, 2.0], [-1.0, 0.5]], np.float32)
 
 
 class Forward(px.ForwardPass):
@@ -127,6 +127,7 @@ def test_sum_mean_and_first_reduce_as_declared() -> None:
     values = np.stack([s[VALUE.name] for s in samples])
     counts = np.stack([s[COUNT.name] for s in samples])
     assert len({tuple(v) for v in values}) == len(_X), "samples must disagree"
+    assert len({tuple(c) for c in counts}) == len(_X), "counts must disagree"
 
     summed = _batched(_policy(px.Reduction.SUM, px.Reduction.SUM))
     np.testing.assert_array_equal(summed[VALUE.name], values.sum(axis=0))
@@ -152,6 +153,9 @@ def test_an_unwritten_undeclared_column_keeps_its_value() -> None:
 
 def test_mean_float_first_rest_is_mean_of_floats_and_first_of_the_rest() -> None:
     samples = _per_sample()
+    # FIRST is only observable if sample 0's int column differs from the rest.
+    for other in samples[1:]:
+        assert not np.array_equal(other[COUNT.name], samples[0][COUNT.name])
     got = _batched(px.MeanFloatFirstRest())
     for name in (px.ACTIVATION.name, VALUE.name):
         stacked = np.stack([s[name] for s in samples])

@@ -44,6 +44,7 @@ from jax.sharding import PartitionSpec
 
 import plastax as px
 from plastax import phases
+from sharding_equiv import assert_conns_sharded
 
 SHARD_COUNTS = (2, 4)
 STEPS = 6
@@ -331,6 +332,7 @@ def main() -> None:
             pre = _copy(single)
             single = single_step(single, sp).state
             sharded = sharded_step(sharded, sp).state
+            assert_conns_sharded(sharded, num_shards, what)
             _assert_states_equal(single, sharded, what)
             total_grown += int(single.grown)
             overflowed += int(single.overflow)

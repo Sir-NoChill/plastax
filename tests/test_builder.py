@@ -359,6 +359,13 @@ def test_from_edges_multi_bucket_matches_manual_at_scale() -> None:
         manual.add_conn(s, d, weight=w)
 
     _assert_arenas_equal(vectorized, manual.finalize())
+    # Both paths share `_assemble`, so the equality above cannot see a wrong
+    # bucket order; the random (unsorted) insertion order here can.
+    _, state = vectorized
+    assert len(state.conns) == 2
+    for bucket in state.conns:
+        _assert_bucket_sorted_by_dead_then_src(bucket)
+    assert int(px.state.live_conn_count(state)) == from_ids.size
 
 
 def test_from_edges_empty_edge_set_matches_manual() -> None:

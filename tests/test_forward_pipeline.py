@@ -6,6 +6,7 @@ Flat sweep vs numpy reference; one-hop latency semantics
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 
 import jax.numpy as jnp
@@ -154,6 +155,17 @@ def test_forward_pipeline_dead_slot_null_scatter_matches_exactly_live() -> None:
     grown_static, grown_state = state_mod.grow_bucket(static_b, state_b, level=0)
     assert grown_static.level_capacities[0] > static_a.level_capacities[0]
     del state_b  # grow_bucket's new_state aliases state_b.units; don't reuse
+    # Poison every dead slot with a heavy edge into the output: a sweep that
+    # let a dead slot through would move unit 3. Default-filled dead slots
+    # (weight 0) would contribute nothing either way, so without this the
+    # comparison below could not see a broken null scatter.
+    bucket = dict(grown_state.conns[0])
+    dead = bucket[px.DEAD.name]
+    assert int(dead.sum()) > 0
+    bucket[px.FROM_ID.name] = jnp.where(dead, 2, bucket[px.FROM_ID.name])
+    bucket[px.TO_ID.name] = jnp.where(dead, 3, bucket[px.TO_ID.name])
+    bucket[px.WEIGHT.name] = jnp.where(dead, 1000.0, bucket[px.WEIGHT.name])
+    grown_state = dataclasses.replace(grown_state, conns=(bucket,))
 
     inputs_a = px.StepInputs(
         inputs=jnp.asarray([1.0, 2.0], dtype=jnp.float32), targets=None

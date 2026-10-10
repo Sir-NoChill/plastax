@@ -11,8 +11,9 @@ emitted by `tests/tools/emit_rng_golden.cpp`) and plastax-cpp's own
 `test_parity_rng.cpp` asserts against the same file, so neither implementation
 can drift alone.
 
-Skipped when the plastax-cpp checkout is absent (see `_plastax_cpp`) -- the
-port is still importable and usable, it just cannot be verified from here.
+The golden-reading tests skip when the plastax-cpp checkout is absent (see
+`_plastax_cpp`) -- the port is still importable and usable, it just cannot be
+verified against the C++ from here; the golden-independent tests always run.
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ from _plastax_cpp_rng import fully_connected_weights, mix_seed, uniform_real
 
 _GOLDEN = plastax_cpp_dir() / "tests" / "golden" / "rng_uniform.json"
 
-pytestmark = pytest.mark.skipif(
+# Only the golden-reading tests need the checkout; the rest pin the port on its
+# own and must run where it is absent too (CI has no plastax-cpp checkout).
+needs_golden = pytest.mark.skipif(
     not _GOLDEN.is_file(),
     reason=(
         f"no plastax-cpp RNG golden at {_GOLDEN}; point PLASTAX_CPP_DIR at a "
@@ -46,6 +49,7 @@ def _golden() -> dict:
     return json.loads(_GOLDEN.read_text())
 
 
+@needs_golden
 def test_uniform_real_is_bit_exact() -> None:
     """Every (seed, counter, range) in the golden reproduces exactly."""
     golden = _golden()
@@ -68,6 +72,7 @@ def test_uniform_real_is_bit_exact() -> None:
     )
 
 
+@needs_golden
 def test_both_lerp_branches_are_covered() -> None:
     """The golden must exercise a zero-straddling and a same-sign range.
 

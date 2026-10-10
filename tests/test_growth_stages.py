@@ -409,8 +409,12 @@ def test_select_per_segment_matches_one_pass_per_segment(
     dst = jnp.asarray(rng.integers(0, 9, n).astype(np.int32))
     # a few candidates belong to no segment (below 0 or past the last)
     segment = jnp.asarray(rng.integers(-1, num_segments + 1, n).astype(np.int32))
-    got = jax.jit(select_per_segment, static_argnums=(4, 5))(
-        scores, src, dst, segment, num_segments, k
+    # A fresh callable per case: jit's trace cache is keyed on the function,
+    # not on the module global the monkeypatch sets, so jitting
+    # select_per_segment itself would replay the unchunked trace of an earlier
+    # case with the same shapes and never run the chunked path.
+    got = jax.jit(lambda *a: select_per_segment(*a, num_segments, k))(
+        scores, src, dst, segment
     )
     want = _select_per_segment_reference(scores, src, dst, segment, num_segments, k)
     assert len(got) == len(want) == num_segments

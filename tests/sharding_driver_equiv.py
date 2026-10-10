@@ -50,6 +50,7 @@ from mlp_xor import GradPreAct
 
 import plastax as px
 from plastax import topo
+from sharding_equiv import assert_conns_sharded
 
 N_SHARDS = 4
 _OPT = px.optim.adam(0.05, GradPreAct)
@@ -107,6 +108,8 @@ def _run_growth_driver(
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
     for _ in range(3):
         driver.step(sp)
+    if static.sharding is not None:
+        assert_conns_sharded(driver.state, N_SHARDS, "overflow")
     return (
         int(px.state.live_conn_count(driver.state)),
         tuple(driver.static.level_capacities),
@@ -150,6 +153,8 @@ def _check_resort_shards() -> None:
         state = step(
             state, px.StepInputs(inputs=inp, targets=_one_hot(label, _LAYERS[-1]))
         ).state
+        if sharded:
+            assert_conns_sharded(state, N_SHARDS, "resort input")
         new_static, new_state = topo.resort(static, state)
         conns = [{n: np.asarray(c) for n, c in b.items()} for b in new_state.conns]
         return (

@@ -193,6 +193,7 @@ def test_removed_attribute_names_its_replacement(
         ({"trigger": "when"}, "requires a `when"),
         ({"on_overflow": "warn"}, "on_overflow must be"),
         ({"max_new_per_step": 0}, "max_new_per_step must be"),
+        ({"level_cap_scope": "level"}, "level_cap_scope must be one of"),
         ({"allow_self_loops": 1}, "allow_self_loops must be a bool"),
         ({"candidates": "grid"}, "candidates must be one of"),
         ({"candidates": "shortlist"}, "shortlist_size must be an int"),

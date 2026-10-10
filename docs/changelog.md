@@ -11,6 +11,13 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Added
 
+- Growth-rule knob `level_cap_scope` ("source_level" default, or "step"):
+  whether `max_new_per_level` caps each source level's winners or the whole
+  step's, in the total order across levels. The winners are listed levels
+  ascending either way, and `max_new_per_step` caps that list. plastax-cpp
+  (`LevelCapScope`) and the parity reference implement both, pinned by new
+  pipeline, single-domain and per-level-shortlist goldens.
+
 - `make_step(fuse_prune=...)` ("auto", "triton", "xla", "off"): a streaming
   step can evaluate the prune_conn predicate inside the forward's edge sweep,
   so each bucket's edge columns are read once instead of twice. On an NVIDIA
@@ -109,6 +116,15 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   Previously this combination raised `NotImplementedError`.
 
 ### Changed
+
+- **Behaviour change.** PIPELINE growth now applies `max_new_per_level` per
+  source level, as TOPOLOGICAL growth, plastax-cpp and the parity reference
+  do, instead of once over the single bucket's candidates. A pipeline net
+  with several source levels can therefore grow up to `max_new_per_level`
+  edges per level per step; set `level_cap_scope = "step"` for the previous
+  whole-step cap. `max_new_per_step` on a PIPELINE net now keeps the winners
+  levels ascending (as the reference specifies) rather than in the total
+  order.
 
 - **Breaking:** an overflowing growth is finished inside the same step. When
   a step's growth claim drops selected candidates for lack of room, the

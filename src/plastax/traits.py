@@ -491,8 +491,14 @@ class ScoreAddConn[GS](Protocol):
       per step), at most ``max_new_per_level``.
     - ``"all"``: every finite candidate.
 
-    ``max_new_per_step`` (int, default None) then caps the step's total
-    across levels, level-ascending. The validity window is the rule's
+    ``level_cap_scope`` (read structurally) scopes ``max_new_per_level``:
+    ``"source_level"`` (default) applies it to each source level in turn, in
+    both propagation models; ``"step"`` applies it once to the whole step --
+    the first ``max_new_per_level`` qualifying candidates of the total order,
+    whatever their source levels. Either way the winners are listed levels
+    ascending, the total order within a level, and each claims a slot for its
+    own source level. ``max_new_per_step`` (int, default None) then caps that
+    list, level-ascending. The validity window is the rule's
     ``max_level_gap`` (default 1), ``direction`` (``"any"`` default,
     ``"deeper"``, ``"same_or_deeper"``) and ``allow_self_loops`` (default
     False). A score of -inf (or NaN, or any non-finite) vetoes a candidate.
@@ -622,7 +628,8 @@ class ProposeAddConn[GS](Protocol):
         GS: the global state type threaded through the network.
 
     Selection, the validity window (``max_level_gap``, ``direction``,
-    ``allow_self_loops``), ``max_new_per_level`` / ``max_new_per_step``,
+    ``allow_self_loops``), ``max_new_per_level`` / ``level_cap_scope`` /
+    ``max_new_per_step``,
     ``trigger`` and ``on_overflow`` are the same rule attributes
     `ScoreAddConn` documents; proposals feed the same pipeline.
 
@@ -1377,6 +1384,7 @@ def _validate_propose_rule(cls: type[Network[Any]], ac: ProposeAddConn[Any]) -> 
 _SELECTIONS = ("top_k", "threshold", "all")
 _DIRECTIONS = ("any", "deeper", "same_or_deeper")
 _CANDIDATES = ("exhaustive", "shortlist", "shortlist_per_level")
+_LEVEL_CAP_SCOPES = ("source_level", "step")
 
 
 def _validate_growth_knobs(cls: type[Network[Any]], ac: object) -> None:
@@ -1422,6 +1430,12 @@ def _validate_growth_knobs(cls: type[Network[Any]], ac: object) -> None:
         raise TypeError(
             f'{cls.__name__}.add_conn: selection = "threshold" requires a '
             "`threshold(g)` method on the rule."
+        )
+    scope = getattr(ac, "level_cap_scope", "source_level")
+    if scope not in _LEVEL_CAP_SCOPES:
+        raise TypeError(
+            f"{cls.__name__}.add_conn.level_cap_scope must be one of "
+            f"{_LEVEL_CAP_SCOPES}; got {scope!r}"
         )
     mnps: object = getattr(ac, "max_new_per_step", None)
     if mnps is not None and (

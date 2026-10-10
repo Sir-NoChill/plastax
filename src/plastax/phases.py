@@ -4419,6 +4419,70 @@ def select_per_segment(
     return winners
 
 
+def select_level_major(
+    flat_scores: jax.Array,
+    flat_src: jax.Array,
+    flat_dst: jax.Array,
+    level: jax.Array,
+    k: int,
+    num_levels: int,
+    *,
+    id_bound: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """Each source level's first k candidates, listed level-major, in one list.
+
+    The single-list counterpart of `select_per_segment` for a level count too
+    large to give every level its own `(k,)` winner array (PIPELINE levels
+    run up to `num_units`): the candidates are sorted into the total order
+    (see `total_order`), then stably by source level, and the first k of each
+    level's run win. The winners are returned levels ascending, the total
+    order within a level.
+
+    Args:
+        flat_scores: candidate scores.
+        flat_src: candidate source ids, parallel to `flat_scores`.
+        flat_dst: candidate destination ids, parallel to `flat_scores`.
+        level: each candidate's source level, in ``[0, num_levels)``.
+        k: the static per-level budget.
+        num_levels: a static bound on the level count.
+        id_bound: a static bound every id is below (the unit capacity), or
+            None if unknown.
+
+    Returns:
+        The `(K,)` winner indices, K = min(candidates, k * num_levels), and a
+        `(K,)` mask that is False past the winner count (those indices are
+        placeholders).
+    """
+    n = flat_scores.shape[0]
+    width = min(n, k * num_levels)
+    perm = total_order(flat_scores, flat_src, flat_dst, id_bound=id_bound)
+    by_level = jnp.argsort(level[perm].astype(jnp.int32), stable=True)
+    sorted_level = level[perm][by_level].astype(jnp.int32)
+    first = jnp.searchsorted(sorted_level, sorted_level, side="left").astype(jnp.int32)
+    wins = jnp.arange(n, dtype=jnp.int32) - first < jnp.int32(k)
+    # Winners first, still level-major: a stable sort on the losing bit.
+    keep = jnp.argsort(~wins, stable=True)[:width]
+    return perm[by_level][keep], wins[keep]
+
+
+def level_major(
+    top_idx: jax.Array, filled: jax.Array, level: jax.Array
+) -> tuple[jax.Array, jax.Array]:
+    """Reorder a winner list levels ascending, keeping its order within a level.
+
+    Args:
+        top_idx: winner indices, in the total order.
+        filled: which entries of `top_idx` hold a winner.
+        level: each winner's source level, parallel to `top_idx`.
+
+    Returns:
+        `top_idx` and `filled`, placeholders last.
+    """
+    key = jnp.where(filled, level.astype(jnp.int32), np.iinfo(np.int32).max)
+    order = jnp.argsort(key, stable=True)
+    return top_idx[order], filled[order]
+
+
 def build_add_conn_phase[GS](
     net: type[Network[GS]],
     static: NetworkStatic,
@@ -4455,10 +4519,14 @@ def build_add_conn_phase[GS](
     pair id binary-searched against the sorted live pair ids -- no
     num_units**2 occupancy grid); with `dedupe_step`, equal candidates
     within the step keep only their first copy in the total order. Each
-    bucket then selects independently (`selection`: top_k of
+    source level then selects independently (`selection`: top_k of
     `max_new_per_level`, threshold or all) in the total candidate order
-    `(-score, src, dst, candidate index)`, and `max_new_per_step` caps the
-    step across levels, level-ascending. When every bucket draws from one
+    `(-score, src, dst, candidate index)` -- in both propagation models, the
+    PIPELINE bucket's winners grouped by source level -- unless the rule sets
+    `level_cap_scope = "step"`, under which `max_new_per_level` caps the
+    whole step's winners in the total order, whatever their source levels.
+    The winners are listed levels ascending, the total order within a level,
+    and `max_new_per_step` caps that list. When every bucket draws from one
     shared candidate list (everything but `"shortlist_per_level"`), the list
     is scored and sorted into that order once, and each bucket takes its own
     source level's members (`select_per_segment`). A candidate with a non-finite score
@@ -4563,6 +4631,12 @@ def build_add_conn_phase[GS](
     selection = str(getattr(ac, "selection", "top_k"))
     max_new_per_level = getattr(ac, "max_new_per_level", None)
     max_new_per_step = getattr(ac, "max_new_per_step", None)
+    # Under "step", max_new_per_level caps the whole step's winners in the
+    # total order instead of each source level's; `all` has no cap to scope.
+    step_scope = (
+        str(getattr(ac, "level_cap_scope", "source_level")) == "step"
+        and selection != "all"
+    )
     threshold_fn = getattr(ac, "threshold", None)
     direction = str(getattr(ac, "direction", "any"))
     allow_self_loops = bool(getattr(ac, "allow_self_loops", False))
@@ -4747,17 +4821,47 @@ def build_add_conn_phase[GS](
         selections: list[tuple[jax.Array, ...]] = []
         if use_per_level:
             assert imp is not None  # use_per_level implies importance is set
+            grids = []
             for bucket_idx in range(num_buckets):
                 flat_src, flat_dst = candidates_per_level(
                     imp, unit_level, bucket_idx, pool_side, max_level_gap, direction
                 )
                 valid = bucket_valid(bucket_idx, flat_src, flat_dst)
-                flat_scores = scores_of(flat_src, flat_dst, valid)
-                top_idx = select(flat_scores, flat_src, flat_dst, k, id_bound=num_units)
-                filled = jnp.ones((k,), jnp.bool_)
-                selections.append(
-                    (flat_src, flat_dst, valid, flat_scores, top_idx, filled)
+                grids.append(
+                    (flat_src, flat_dst, valid, scores_of(flat_src, flat_dst, valid))
                 )
+            if step_scope:
+                # One cap over every level's grid. Concatenated levels
+                # ascending, the grids keep the candidate index order, so the
+                # total order over them is the reference's.
+                cat_src, cat_dst, cat_valid, cat_scores = (
+                    jnp.concatenate(cols) for cols in zip(*grids, strict=True)
+                )
+                k_step = min(int(max_new_per_level or 0), int(cat_src.shape[0]))
+                top_idx = select(
+                    cat_scores, cat_src, cat_dst, k_step, id_bound=num_units
+                )
+                top_level = unit_level[cat_src[top_idx]]
+                for bucket_idx in range(num_buckets):
+                    selections.append(
+                        (
+                            cat_src,
+                            cat_dst,
+                            cat_valid,
+                            cat_scores,
+                            top_idx,
+                            top_level == bucket_idx,
+                        )
+                    )
+            else:
+                for flat_src, flat_dst, valid, flat_scores in grids:
+                    top_idx = select(
+                        flat_scores, flat_src, flat_dst, k, id_bound=num_units
+                    )
+                    filled = jnp.ones((k,), jnp.bool_)
+                    selections.append(
+                        (flat_src, flat_dst, valid, flat_scores, top_idx, filled)
+                    )
         else:
             # Every bucket draws from the one shared candidate list. A
             # topological bucket admits only candidates sourced at its own
@@ -4774,23 +4878,73 @@ def build_add_conn_phase[GS](
             for bucket_idx in range(1, num_buckets):
                 valid = valid | bucket_valid(bucket_idx, global_src, global_dst)
             flat_scores = scores_of(global_src, global_dst, valid)
+            src_level = unit_level[global_src].astype(jnp.int32)
             if is_pipeline:
                 assert num_buckets == 1  # PIPELINE keeps one bucket
-                segment = jnp.zeros(global_src.shape, jnp.int32)
-            else:
-                segment = unit_level[global_src].astype(jnp.int32)
-            for top_idx, filled in select_per_segment(
-                flat_scores,
-                global_src,
-                global_dst,
-                segment,
-                num_buckets,
-                k,
-                id_bound=num_units,
-            ):
+                # The single bucket's winners, level-major: the step cap
+                # below and the claim consume them levels ascending.
+                if step_scope:
+                    top_idx, filled = select_per_segment(
+                        flat_scores,
+                        global_src,
+                        global_dst,
+                        jnp.zeros(global_src.shape, jnp.int32),
+                        1,
+                        k,
+                        id_bound=num_units,
+                    )[0]
+                    top_idx, filled = level_major(top_idx, filled, src_level[top_idx])
+                else:
+                    # Levels are below num_units (cosmetic, but bounded).
+                    top_idx, filled = select_level_major(
+                        flat_scores,
+                        global_src,
+                        global_dst,
+                        src_level,
+                        k,
+                        num_units,
+                        id_bound=num_units,
+                    )
                 selections.append(
                     (global_src, global_dst, valid, flat_scores, top_idx, filled)
                 )
+            elif step_scope:
+                # One cap over all levels: the step's first k in the total
+                # order, each claimed by its own source level's bucket.
+                top_idx, filled = select_per_segment(
+                    flat_scores,
+                    global_src,
+                    global_dst,
+                    jnp.zeros(global_src.shape, jnp.int32),
+                    1,
+                    k,
+                    id_bound=num_units,
+                )[0]
+                top_level = src_level[top_idx]
+                for bucket_idx in range(num_buckets):
+                    selections.append(
+                        (
+                            global_src,
+                            global_dst,
+                            valid,
+                            flat_scores,
+                            top_idx,
+                            filled & (top_level == bucket_idx),
+                        )
+                    )
+            else:
+                for top_idx, filled in select_per_segment(
+                    flat_scores,
+                    global_src,
+                    global_dst,
+                    src_level,
+                    num_buckets,
+                    k,
+                    id_bound=num_units,
+                ):
+                    selections.append(
+                        (global_src, global_dst, valid, flat_scores, top_idx, filled)
+                    )
 
         claims: list[GrowthClaim] = []
         claim_levels: list[jax.Array] = []
@@ -4836,7 +4990,7 @@ def build_add_conn_phase[GS](
                     # prune_conn pass, or the builder's initial padding)
                     # left behind.
                     values[spec.name] = jnp.full(
-                        (k,), np.asarray(spec.default), dtype=spec.dtype
+                        top_idx.shape, np.asarray(spec.default), dtype=spec.dtype
                     )
             claims.append(
                 GrowthClaim(

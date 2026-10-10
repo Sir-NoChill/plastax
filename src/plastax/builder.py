@@ -565,6 +565,7 @@ class NetworkBuilder[GS]:
 
         conns: list[Columns] = []
         level_capacities: list[int] = []
+        live_total = 0
         for level_idx in range(num_buckets):
             idx = np.flatnonzero(bucket_of_conn == level_idx)
             # Source-major order (ties by destination). Consecutive edges then
@@ -578,6 +579,7 @@ class NetworkBuilder[GS]:
             order = idx[np.argsort(key, kind="stable")]
             del key
             live = int(order.size)
+            live_total += live
             capacity = topo.capacity_policy(
                 live, headroom=capacity_headroom, align=capacity_align
             )
@@ -615,10 +617,14 @@ class NetworkBuilder[GS]:
             conns.append(cols)
             level_capacities.append(capacity)
 
+        # PIPELINE's single bucket holds every live edge first, so its
+        # never-used tail starts right after them.
+        tail = live_total if self.net.propagation is Propagation.PIPELINE else 0
         if repl_sharding is None:
             globals_out: GS = self.globals_
             needs_resort = jnp.bool_(False)
             step = jnp.int32(0)
+            tail_start = jnp.int32(tail)
         else:
             repl = repl_sharding  # narrowed non-None for the placement closures
             globals_out = jax.tree_util.tree_map(
@@ -627,6 +633,7 @@ class NetworkBuilder[GS]:
             )
             needs_resort = _place(np.asarray(False), repl, ())
             step = _place(np.asarray(0, dtype=np.int32), repl, ())
+            tail_start = _place(np.asarray(tail, dtype=np.int32), repl, ())
 
         static = NetworkStatic(
             num_units=num_slots,
@@ -649,5 +656,6 @@ class NetworkBuilder[GS]:
             globals_=globals_out,
             needs_resort=needs_resort,
             step=step,
+            tail_start=tail_start,
         )
         return static, state

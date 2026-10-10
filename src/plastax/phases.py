@@ -91,6 +91,7 @@ def build_phases[GS](
     overflow_sink: list[Bool[Array, ""]] | None = None,
     prune_fusion: PruneFusionPlan | None = None,
     growth: str = "auto",
+    remainder_sink: list[Any] | None = None,
 ) -> tuple[Phase[GS], ...]:
     """Assemble the phases present for this net; absent slots trace nothing.
 
@@ -113,6 +114,9 @@ def build_phases[GS](
             commits the tombstones), or None for the separate prune sweep.
         growth: the add_conn free-slot claim engine (see
             `build_add_conn_phase`).
+        remainder_sink: optional length-1 out-parameter that
+            build_add_conn_phase overwrites with the candidates its claim
+            dropped (a `GrowthRemainder`).
 
     Returns:
         The tuple of phase functions to run in order, one per present
@@ -170,6 +174,7 @@ def build_phases[GS](
                 overflow_sink=overflow_sink,
                 free_sink=free_sink if fused else None,
                 growth=growth,
+                remainder_sink=remainder_sink,
             )
         )
     if net.reset_global is not None:
@@ -216,6 +221,7 @@ def build_batched_phases[GS](
     overflow_sink: list[Bool[Array, ""]] | None = None,
     engine: str | None = None,
     growth: str = "auto",
+    remainder_sink: list[Any] | None = None,
 ) -> BatchedPhases[GS]:
     """Assemble a batched step's phases (see `BatchedPhases`).
 
@@ -230,6 +236,7 @@ def build_batched_phases[GS](
             bucket product (`bucket_product`), or None for the per-sample edge
             list; non-linear passes always keep the edge list.
         growth: as for `build_phases`.
+        remainder_sink: as for `build_phases`.
 
     Returns:
         The per-sample, update, and structural phases.
@@ -264,7 +271,11 @@ def build_batched_phases[GS](
     if net.add_conn is not None:
         structural.append(
             build_add_conn_phase(
-                net, static, overflow_sink=overflow_sink, growth=growth
+                net,
+                static,
+                overflow_sink=overflow_sink,
+                growth=growth,
+                remainder_sink=remainder_sink,
             )
         )
     if net.reset_global is not None:
@@ -2783,6 +2794,28 @@ class GrowthClaim:
     values: dict[str, jax.Array]
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class GrowthRemainder:
+    """The selected growth candidates a step's claim dropped for lack of room.
+
+    A growth step that overflows returns this alongside its state, so the
+    `Driver` can grow the full buckets and claim exactly these candidates
+    (`build_growth_retry`) without re-running the step: the selection is kept,
+    only the claim gets more room.
+
+    Attributes:
+        claims: Per bucket, the step's claim with `growable` narrowed to the
+            dropped candidates, still in the total order (all False when
+            nothing was dropped).
+        levels: Per bucket, each candidate's source level (read by the
+            PIPELINE claim).
+    """
+
+    claims: tuple[GrowthClaim, ...]
+    levels: tuple[Int32[Array, " k"], ...]
+
+
 def xla_claim(
     bucket: Columns,
     claim: GrowthClaim,
@@ -3363,7 +3396,7 @@ def triton_claim(
     claims: list[GrowthClaim],
     *,
     block_counts: list[Int32[Array, " _"]] | None = None,
-) -> tuple[list[Columns], Bool[Array, ""], Bool[Array, ""]]:
+) -> tuple[list[Columns], Bool[Array, ""], Bool[Array, ""], Bool[Array, "buckets k"]]:
     """Claim free slots and write every column for all buckets in three launches.
 
     The fused counterpart of `xla_claim` on one device (NVIDIA GPUs, through
@@ -3386,8 +3419,9 @@ def triton_claim(
             example from a fused prune sweep), or None to compute them here.
 
     Returns:
-        The updated buckets, whether any growable candidate overflowed, and
-        whether any committed edge breaks the leveling invariant.
+        The updated buckets, whether any growable candidate overflowed,
+        whether any committed edge breaks the leveling invariant, and per
+        bucket and candidate whether it overflowed.
 
     Raises:
         ValueError: If a bucket capacity is not a multiple of 4 (the kernel
@@ -3494,7 +3528,9 @@ def triton_claim(
             }
         )
     flags_out = status_ref[...] > 0
-    return new_buckets, flags_out[0], flags_out[1]
+    growable = jnp.stack([c.growable for c in claims])
+    unplaced = slots.reshape(num_buckets, k) == jnp.asarray(caps, jnp.int32)[:, None]
+    return new_buckets, flags_out[0], flags_out[1], growable & unplaced
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4350,6 +4386,7 @@ def build_add_conn_phase[GS](
     overflow_sink: list[Bool[Array, ""]] | None = None,
     free_sink: list[Any] | None = None,
     growth: str = "auto",
+    remainder_sink: list[Any] | None = None,
 ) -> Phase[GS]:
     """Select each source level's growth candidates and claim free slots.
 
@@ -4413,11 +4450,13 @@ def build_add_conn_phase[GS](
     Overflow is a real (growable, top-k-selected) candidate left without a
     slot: its own bucket ran out of dead slots (TOPOLOGICAL), or its level's
     dead slots and the tail both ran out (PIPELINE). It is dropped and the
-    flag is raised via `overflow_sink` rather than committed. A committed
-    candidate whose destination is not strictly deeper than its source
-    (the window admits same-level and behind-src pairs) sets
-    `needs_resort`, since it breaks the leveling invariant that every
-    edge sources from a level strictly below its destination.
+    flag is raised via `overflow_sink` rather than committed; the dropped
+    candidates go to `remainder_sink`, for the Driver's growth-only retry
+    (`build_growth_retry`). A committed candidate whose destination is not
+    strictly deeper than its source (the window admits same-level and
+    behind-src pairs) sets `needs_resort`, since it breaks the leveling
+    invariant that every edge sources from a level strictly below its
+    destination.
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -4433,6 +4472,9 @@ def build_add_conn_phase[GS](
             its 256-slot blocks, and regrouped for the XLA claim in place of
             `count_free_blocks`.
         growth: The free-slot claim engine: "auto", "xla", or "triton".
+        remainder_sink: optional length-1 out-parameter overwritten with
+            this call's `GrowthRemainder`: the candidates it dropped, for
+            `build_growth_retry` to claim after a regrow.
 
     Returns:
         The add_conn phase function.
@@ -4539,7 +4581,7 @@ def build_add_conn_phase[GS](
 
     def add_conn_phase(
         state: NetworkState[GS], inputs: StepInputs
-    ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+    ) -> tuple[NetworkState[GS], GrowthRemainder]:
         del inputs
         units = state.units
         g = state.globals_
@@ -4809,6 +4851,7 @@ def build_add_conn_phase[GS](
             new_conns = [new_bucket]
             overflow, reassigning = jnp.any(overflowed_p), jnp.any(resort_p)
             grown_count = live_growth(new_conns)
+            dropped = overflowed_p[None]
         elif use_triton:
             # A fused prune sweep's counts, when it made them in this claim's
             # blocks (see build_phases); otherwise triton_claim counts.
@@ -4819,7 +4862,7 @@ def build_add_conn_phase[GS](
                 for entry, cap in zip(free_sink, static.level_capacities, strict=True)
             ):
                 fused_counts = [entry[0] for entry in free_sink]
-            new_conns, overflow, reassigning = triton_claim(
+            new_conns, overflow, reassigning, dropped = triton_claim(
                 list(state.conns), claims, block_counts=fused_counts
             )
             grown_count = live_growth(new_conns)
@@ -4861,6 +4904,7 @@ def build_add_conn_phase[GS](
             # needs no second pass over the dead masks, nor a collective.
             committed = jnp.stack([claim.growable for claim in claims]) & ~overflowed_x
             grown_count = jnp.sum(committed, dtype=jnp.int32)
+            dropped = overflowed_x
         if on_overflow == "error":
             # Raises inline when the phase runs eagerly; under jit the
             # callback raises on the host when the step is consumed
@@ -4874,16 +4918,44 @@ def build_add_conn_phase[GS](
             overflow=overflow,
             tail_start=tail_start,
         )
-        return new_state, jnp.float32(0.0)
+        remainder = GrowthRemainder(
+            claims=tuple(
+                dataclasses.replace(claim, growable=dropped[b])
+                for b, claim in enumerate(claims)
+            ),
+            levels=tuple(lvl.astype(jnp.int32) for lvl in claim_levels),
+        )
+        return new_state, remainder
+
+    def nothing_dropped() -> GrowthRemainder:
+        # The remainder of a growth phase its trigger skipped: same shapes as
+        # add_conn_phase's, nothing to claim.
+        values = {
+            spec.name: jnp.zeros((k,), spec.dtype)
+            for spec in static.conn_fields
+            if spec.name != DEAD.name
+        }
+        claim = GrowthClaim(
+            growable=jnp.zeros((k,), jnp.bool_),
+            violating=jnp.zeros((k,), jnp.bool_),
+            values=values,
+        )
+        return GrowthRemainder(
+            claims=(claim,) * num_buckets,
+            levels=(jnp.zeros((k,), jnp.int32),) * num_buckets,
+        )
 
     interval = int(getattr(net, "structural_interval", 1))
+    gated: Callable[
+        [NetworkState[GS], StepInputs], tuple[NetworkState[GS], GrowthRemainder]
+    ]
     if trigger == "every_step" and interval == 1:
         gated = add_conn_phase
     else:
 
         def gated(
             state: NetworkState[GS], inputs: StepInputs
-        ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+        ) -> tuple[NetworkState[GS], GrowthRemainder]:
             fire = jnp.bool_(True)
             if interval > 1:
                 fire = fire & ((state.step % jnp.int32(interval)) == jnp.int32(0))
@@ -4897,29 +4969,109 @@ def build_add_conn_phase[GS](
 
             def skip(
                 st: NetworkState[GS], _: StepInputs
-            ) -> tuple[NetworkState[GS], Float[Array, ""]]:
+            ) -> tuple[NetworkState[GS], GrowthRemainder]:
                 return (
                     dataclasses.replace(
                         st, grown=jnp.int32(0), overflow=jnp.bool_(False)
                     ),
-                    jnp.float32(0.0),
+                    nothing_dropped(),
                 )
 
-            out: tuple[NetworkState[GS], Float[Array, ""]] = jax.lax.cond(
+            out: tuple[NetworkState[GS], GrowthRemainder] = jax.lax.cond(
                 fire, add_conn_phase, skip, state, inputs
             )
             return out
 
-    if overflow_sink is None:
-        return gated
-
+    # Named like the phase it wraps (add_conn_phase, or gated for a trigger).
+    @functools.wraps(gated, assigned=("__name__", "__qualname__"))
     def sinked(
         state: NetworkState[GS], inputs: StepInputs
     ) -> tuple[NetworkState[GS], Float[Array, ""]]:
         # Written OUTSIDE any trigger/interval cond: a sink write inside a
         # traced branch would leak the branch-local tracer.
-        new_state, aux = gated(state, inputs)
-        overflow_sink[0] = new_state.overflow
-        return new_state, aux
+        new_state, remainder = gated(state, inputs)
+        if overflow_sink is not None:
+            overflow_sink[0] = new_state.overflow
+        if remainder_sink is not None:
+            remainder_sink[0] = remainder
+        return new_state, jnp.float32(0.0)
 
     return sinked
+
+
+def build_growth_retry[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> Callable[
+    [NetworkState[GS], GrowthRemainder], tuple[NetworkState[GS], GrowthRemainder]
+]:
+    """Claim an overflowing growth phase's dropped candidates, after a regrow.
+
+    The second half of growth's overflow recovery: the step ran once, its
+    growth phase dropped the candidates in `remainder` (`build_add_conn_phase`'s
+    `remainder_sink`), and the `Driver` grew the full buckets. This claims those
+    candidates, in the total order, into the state's free slots -- the same
+    claim rule as the step (`xla_claim_buckets` per TOPOLOGICAL bucket,
+    `pipeline_claim` for PIPELINE) with the values the step already computed.
+    An overflowing level claimed every free slot it may use before dropping a
+    candidate, and a regrow appends never-used slots at the end of a bucket,
+    so its remainder lands in exactly the slots growth would have filled had
+    the bucket been that large from the start. No other phase runs and the
+    step counter is untouched.
+
+    The returned state's `grown` adds the newly committed edges to the step's,
+    its `overflow` is whether candidates are still left (the bucket must grow
+    again), and `needs_resort` also counts the new edges.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network's trait class.
+        static: The regrown static configuration.
+
+    Returns:
+        `(state, remainder) -> (state, still dropped)`.
+    """
+    shard_axis = _shard_axis(static)
+    num_shards = static.sharding.num_shards if static.sharding is not None else 1
+    is_pipeline = net.propagation is Propagation.PIPELINE
+
+    def retry(
+        state: NetworkState[GS], remainder: GrowthRemainder
+    ) -> tuple[NetworkState[GS], GrowthRemainder]:
+        claims = remainder.claims
+        tail_start = state.tail_start
+        if is_pipeline:
+            new_bucket, dropped_p, resort_p, tail_start = pipeline_claim(
+                state.conns[0],
+                claims[0],
+                remainder.levels[0],
+                state.units[LEVEL.name],
+                state.tail_start,
+                shard_axis=shard_axis,
+                num_shards=num_shards,
+            )
+            new_conns, dropped, resort = [new_bucket], dropped_p[None], resort_p[None]
+        else:
+            new_conns, dropped, resort = xla_claim_buckets(
+                state.conns, claims, shard_axis=shard_axis, num_shards=num_shards
+            )
+        committed = jnp.stack([claim.growable for claim in claims]) & ~dropped
+        new_state = dataclasses.replace(
+            state,
+            conns=tuple(new_conns),
+            needs_resort=state.needs_resort | jnp.any(resort),
+            grown=state.grown + jnp.sum(committed, dtype=jnp.int32),
+            overflow=jnp.any(dropped),
+            tail_start=tail_start,
+        )
+        left = GrowthRemainder(
+            claims=tuple(
+                dataclasses.replace(claim, growable=dropped[b])
+                for b, claim in enumerate(claims)
+            ),
+            levels=remainder.levels,
+        )
+        return new_state, left
+
+    return retry

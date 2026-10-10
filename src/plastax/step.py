@@ -21,11 +21,13 @@ from jaxtyping import Array, Bool, Float
 from plastax._types import ACTIVATION, Propagation
 from plastax.distributed import scheme_a_mesh
 from plastax.phases import (
+    GrowthRemainder,
     Phase,
     PruneFusionPlan,
     PruneFusionRecord,
     StepInputs,
     build_batched_phases,
+    build_growth_retry,
     build_phases,
     nvidia_triton_available,
     per_sample_written_fields,
@@ -53,14 +55,22 @@ class StepResult[GS]:
         overflow: growth overflow flag for the step (also on the state).
         loss: The scalar the loss policy returned for the step; 0.0 when the
             net has no loss phase.
+        growth_remainder: The selected growth candidates the step's claim
+            dropped for lack of room (`overflow`), which `make_growth_retry`
+            claims after a regrow; None when the net does not grow
+            connections.
     """
 
     state: NetworkState[GS]
     overflow: Bool[Array, ""]
     loss: Float[Array, ""]
+    growth_remainder: GrowthRemainder | None = None
 
 
 StepFn = Callable[[NetworkState[GS], StepInputs], StepResult[GS]]
+GrowthRetryFn = Callable[
+    [NetworkState[GS], GrowthRemainder], tuple[NetworkState[GS], GrowthRemainder]
+]
 
 
 def make_step[GS](
@@ -257,12 +267,33 @@ def _shard_map_step(
     replicated PartitionSpec at `globals_` is a prefix over the whole opaque
     globals subtree.
     """
+    repl, state_spec = _scheme_a_specs(static)
+    in_specs: Any = (state_spec, _spec(StepInputs, inputs=repl, targets=repl))
+    # A bare replicated spec is a prefix over the whole remainder subtree
+    # (replicated: the claim's masks and values are computed from replicated
+    # units and collectives), and over None when the net does not grow.
+    out_specs: Any = _spec(
+        StepResult,
+        state=state_spec,
+        overflow=repl,
+        loss=repl,
+        growth_remainder=repl,
+    )
+    sharded: Any = jax.shard_map(
+        step, mesh=scheme_a_mesh(static), in_specs=in_specs, out_specs=out_specs
+    )
+    return cast(Callable[[NetworkState[Any], StepInputs], StepResult[Any]], sharded)
+
+
+def _scheme_a_specs(static: NetworkStatic) -> tuple[Any, Any]:
+    """The replicated spec and the state's spec pytree under Scheme-A.
+
+    PartitionSpec is untyped in jax's stubs; the spec pytrees deliberately
+    hold PartitionSpec leaves in the array-typed state shapes, so they are
+    built and threaded as Any.
+    """
     sharding = static.sharding
     assert sharding is not None  # only called on the sharded branch
-    mesh = scheme_a_mesh(static)
-    # PartitionSpec is untyped in jax's stubs; the spec pytrees deliberately
-    # hold PartitionSpec leaves in the array-typed state/input/result shapes,
-    # so they are built and threaded as Any.
     repl: Any = PartitionSpec()  # type: ignore[no-untyped-call]
     conn: Any = PartitionSpec(sharding.axis_name)  # type: ignore[no-untyped-call]
     units_spec: Any = {spec.name: repl for spec in static.unit_fields}
@@ -283,18 +314,53 @@ def _shard_map_step(
         unit_overflow=repl,
         tail_start=repl,
     )
-    in_specs: Any = (state_spec, _spec(StepInputs, inputs=repl, targets=repl))
-    out_specs: Any = _spec(StepResult, state=state_spec, overflow=repl, loss=repl)
-    sharded: Any = jax.shard_map(
-        step, mesh=mesh, in_specs=in_specs, out_specs=out_specs
-    )
-    return cast(Callable[[NetworkState[Any], StepInputs], StepResult[Any]], sharded)
+    return repl, state_spec
+
+
+def make_growth_retry[GS](
+    net: type[Network[GS]], static: NetworkStatic
+) -> GrowthRetryFn[GS]:
+    """The jitted growth-only retry for a regrown static (see `Driver.step`).
+
+    `phases.build_growth_retry`, jitted with the state donated and, under
+    Scheme-A sharding, wrapped in the same shard_map as the step. Cached on
+    `(net, static)` like `make_step`.
+
+    Type Args:
+        GS: the user's global-state pytree, opaque to the framework.
+
+    Args:
+        net: The network subclass.
+        static: The regrown static configuration.
+
+    Returns:
+        `(state, remainder) -> (state, still dropped)`.
+    """
+    return cast(GrowthRetryFn[GS], _cached_growth_retry(net, static))  # type: ignore[arg-type]
+
+
+@functools.cache
+def _cached_growth_retry(
+    net: type[Network[Any]], static: NetworkStatic
+) -> GrowthRetryFn[Any]:
+    retry: Any = build_growth_retry(net, static)
+    if static.sharding is not None:
+        repl, state_spec = _scheme_a_specs(static)
+        retry = jax.shard_map(
+            retry,
+            mesh=scheme_a_mesh(static),
+            in_specs=(state_spec, repl),
+            out_specs=(state_spec, repl),
+        )
+    jitted: Any = jax.jit(retry, donate_argnums=0)
+    return cast(GrowthRetryFn[Any], jitted)
 
 
 def _batched_step(
     net: type[Network[Any]],
     static: NetworkStatic,
     overflow_sink: list[Bool[Array, ""]],
+    remainder_sink: list[Any],
     input_ids: jax.Array,
     batch_size: int,
     engine: str | None,
@@ -302,7 +368,12 @@ def _batched_step(
 ) -> StepFn[Any]:
     """The jitted batched step (see `make_step`'s `batch_size` and `layout`)."""
     phases = build_batched_phases(
-        net, static, overflow_sink=overflow_sink, engine=engine, growth=growth
+        net,
+        static,
+        overflow_sink=overflow_sink,
+        engine=engine,
+        growth=growth,
+        remainder_sink=remainder_sink,
     )
     policy = net.batch_reduction
     assert policy is not None  # make_step checked
@@ -371,7 +442,12 @@ def _batched_step(
             state, _ = phase(state, inputs)
         # One batched step = one framework step (phases saw the old value).
         state = dataclasses.replace(state, step=state.step + 1)
-        return StepResult(state=state, overflow=overflow_sink[0], loss=losses.mean())
+        return StepResult(
+            state=state,
+            overflow=overflow_sink[0],
+            loss=losses.mean(),
+            growth_remainder=remainder_sink[0],
+        )
 
     traced = step if static.sharding is None else _shard_map_step(step, static)
     # The write check traces the per-sample phases on the whole (unsharded)
@@ -482,10 +558,20 @@ def _cached_make_step(
     # jax.jit traces step's body exactly once, so this is an ordinary data
     # dependency in the resulting jaxpr, not a stale Python-side read.
     overflow_sink: list[Bool[Array, ""]] = [jnp.bool_(False)]
+    # Likewise the growth phase's dropped candidates (a GrowthRemainder);
+    # stays [None] when the net does not grow connections.
+    remainder_sink: list[Any] = [None]
     input_ids = jnp.asarray(static.input_ids, dtype=jnp.int32)
     if batch_size is not None:
         return _batched_step(
-            net, static, overflow_sink, input_ids, batch_size, engine, growth
+            net,
+            static,
+            overflow_sink,
+            remainder_sink,
+            input_ids,
+            batch_size,
+            engine,
+            growth,
         )
     record = PruneFusionRecord()
 
@@ -504,6 +590,7 @@ def _cached_make_step(
             overflow_sink=overflow_sink,
             prune_fusion=plan,
             growth=growth,
+            remainder_sink=remainder_sink,
         )
 
         # Step input scatter, before any phase: StepInputs.inputs onto
@@ -520,7 +607,12 @@ def _cached_make_step(
 
         # Completed-steps counter: phases above saw the pre-increment value.
         state = dataclasses.replace(state, step=state.step + 1)
-        return StepResult(state=state, overflow=overflow_sink[0], loss=total_loss)
+        return StepResult(
+            state=state,
+            overflow=overflow_sink[0],
+            loss=total_loss,
+            growth_remainder=remainder_sink[0],
+        )
 
     # Under Scheme-A sharding, wrap the step in a shard_map (connections
     # sharded, rest replicated) before jitting; single-device is unchanged.

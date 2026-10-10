@@ -157,7 +157,8 @@ semi-internal but tests reach into them — renaming still has blast radius.
     ruff-format, pydoclint, `ty check`.
   - **commit-msg:** `scripts/check-commit-msg.sh` enforces the type(scope)
     grammar against `docs/development/tags.md`/`scopes.md` (single source of truth).
-  - **pre-push:** `mypy --strict src`, then `pytest -m "not slow"`.
+  - **pre-push:** `mypy --strict src`, then the fast tier `pytest -m "not slow"`
+    in parallel over a JAX compilation cache (tiers: `docs/development/tooling.md`).
 - Install (once): `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push`.
 
 ---

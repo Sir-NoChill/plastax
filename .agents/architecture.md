@@ -457,8 +457,10 @@ The contract:
   - cross-mode equivalence (pipeline vs topological): `rtol=1e-5, atol=1e-5`
   - exact invariants (regrown state zeroed): `atol=0.0`
   Document *why* a tolerance was chosen, in the existing files' style.
-- **Slow marker:** `@pytest.mark.slow` for optax/heavy oracles (excluded from
-  the pre-push fast suite). Use `pytest.importorskip` for optional deps.
+- **Slow marker:** `@pytest.mark.slow` for optax/heavy oracles and
+  multi-process fan-outs (excluded from the pre-push fast suite; CI runs it).
+  Slow to *compile* is not a reason: the fast tier runs over a JAX compilation
+  cache (`docs/development/tooling.md`, Test tiers). Use `pytest.importorskip` for optional deps.
 - **Example-backed acceptance:** `examples/` is not on `sys.path`; tests load an
   example by file path (`importlib.util.spec_from_file_location`; see the
   `_load_example` helper). A good example's `main()` asserts its own success

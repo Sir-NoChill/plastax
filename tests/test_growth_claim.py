@@ -502,6 +502,39 @@ def test_xla_claim_takes_precomputed_triton_block_counts(seed: int) -> None:
             np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want[2]))
 
 
+@pytest.mark.parametrize("seed", range(3))
+def test_xla_claim_buckets_claims_each_bucket_as_if_alone(seed: int) -> None:
+    # Claiming every bucket in one call shares kernels between them; each
+    # bucket must come out exactly as its own single-bucket claim does. The
+    # last case mixes both claim regimes and two block lengths.
+    rng = np.random.default_rng(seed)
+    cases = [*_CLAIM_CASES, ((4096, 256 * 1001, 3 << 14, 72, 1 << 16), 10, 0.05)]
+    for caps, k, density in cases:
+        buckets, claims = _claim_case(rng, caps, k, density)
+        counts = [
+            (
+                phases.free_block_counts(b[px.DEAD.name], phases.TRITON_CLAIM_BLOCK),
+                phases.free_block_length(cap, phases.TRITON_CLAIM_BLOCK),
+            )
+            if i % 2
+            else None
+            for i, (b, cap) in enumerate(zip(buckets, caps, strict=True))
+        ]
+        got, overflowed, resort = phases.xla_claim_buckets(
+            buckets, claims, free_counts=counts
+        )
+        for i, (bucket, claim) in enumerate(zip(buckets, claims, strict=True)):
+            want = phases.xla_claim(bucket, claim)
+            for name in want[0]:
+                np.testing.assert_array_equal(
+                    np.asarray(got[i][name]), np.asarray(want[0][name])
+                )
+            np.testing.assert_array_equal(
+                np.asarray(overflowed[i]), np.asarray(want[1])
+            )
+            np.testing.assert_array_equal(np.asarray(resort[i]), np.asarray(want[2]))
+
+
 def _pipeline_case(
     rng: np.random.Generator, cap: int, k: int, num_units: int
 ) -> tuple[dict[str, jax.Array], phases.GrowthClaim, jax.Array, jax.Array, int]:

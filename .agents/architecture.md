@@ -239,8 +239,11 @@ per-bucket level walk for TOPOLOGICAL). `build_add_conn_phase` is the most
 complex: trigger → candidates (a `ProposeAddConn`'s proposals, or a
 `ScoreAddConn`'s scored pairs from the exhaustive or shortlisted grid) →
 validity window → the opt-in dedupe stages (`dedupe_live`, `dedupe_step`) →
-per-source-level selection in the total candidate order → prefix-sum free-slot
-claim (`xla_claim`, or `triton_claim`'s three jax_triton kernels on NVIDIA,
+per-source-level selection in the total candidate order (`total_order`: one
+four-key comparison sort, or on a GPU above `RADIX_TOTAL_ORDER_MIN` candidates
+three stable one-key passes that XLA lowers to CUB radix sorts; the order is
+the same either way) → prefix-sum free-slot claim (`xla_claim_buckets`, every
+bucket at once on a GPU and per bucket on CPU, or `triton_claim`'s three jax_triton kernels on NVIDIA,
 picked by `make_step(growth=...)`) → commit → set `needs_resort` if a committed
 edge isn't level-preserving (§10 has the full pipeline). A non-finite score
 (`-inf`) is a **hard veto**. Under Scheme-A it is device-resident and shards
@@ -341,7 +344,7 @@ relaxed atomic scatter-add, the predicate translated from its jaxpr by
 tombstones written in place, and the free-slot block counts that add_conn's
 claim then reuses (`free_sink`): in `TRITON_CLAIM_BLOCK` (256-slot) blocks
 straight into `triton_claim(block_counts=)` when the Triton claim runs
-(`triton_claim_applies`), else in 1024-slot blocks for `xla_claim`. XLA cannot do this in one pass (a scatter is
+(`triton_claim_applies`), else in 1024-slot blocks for `xla_claim_buckets`. XLA cannot do this in one pass (a scatter is
 never a multi-output fusion root), so `fuse_prune="auto"` keeps the two-pass
 step everywhere else; `"xla"` forces the XLA-lowered fused step (the CPU
 correctness reference, also valid under Scheme-A). Batched steps never fuse.

@@ -214,6 +214,20 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   level 0 when an acyclic edge feeds them, as `recompute_levels` does; a
   cycle through an input still raises.
 
+### Performance
+
+- Growth on the GPU sorts the total candidate order with three stable
+  one-key radix passes from 2^17 candidates (CUB, where the four-key sort
+  ran as XLA's merge network), ranks the source levels in one pass, and
+  claims every bucket's slots in one batched XLA claim. The committed edges
+  are unchanged. Steady-state growth-call times on an RTX 5000 Ada: per-unit
+  0.56 -> 0.36 ms at 262K candidates and 197 -> 24 ms at 32M, exhaustive
+  N = 4096 98 -> 16 ms; the per-unit phase runs 72 kernels instead of 123.
+- The XLA claim counts `grown` from its commits instead of reducing every
+  dead mask twice: a global proposer's growth call takes 2.3x less on CPU.
+- `growth_bench.py` warms up for 20 calls before timing (the GPU floor was
+  overstated by up to 0.3 ms) and records the calls warmed up.
+
 ## [0.1.0rc2] - 2026-10-01
 
 Scale work: in-place structural churn at a cost that follows the churn, a

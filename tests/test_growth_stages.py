@@ -365,3 +365,55 @@ def test_per_conn_occurrence_distinguishes_parallel_edge_sites() -> None:
     ]
     assert [int(d) for d in dst[:2]] == want
     assert want[0] != want[1]  # occurrence actually separates the streams
+
+
+def _select_per_segment_reference(
+    scores: jax.Array,
+    src: jax.Array,
+    dst: jax.Array,
+    segment: jax.Array,
+    num_segments: int,
+    k: int,
+) -> list[tuple[jax.Array, jax.Array]]:
+    """One running count and one scatter per segment (the earlier form)."""
+    perm = phases.total_order(scores, src, dst)
+    sorted_segment = segment[perm]
+    winners = []
+    for s in range(num_segments):
+        member = sorted_segment == s
+        rank = jnp.cumsum(member.astype(jnp.int32)) - 1
+        slot = jnp.where(member & (rank < k), rank, jnp.int32(k))
+        top = jnp.zeros((k,), jnp.int32).at[slot].set(perm, mode="drop")
+        winners.append((top, jnp.arange(k, dtype=jnp.int32) < member.sum()))
+    return winners
+
+
+@pytest.mark.parametrize("chunk_elements", [None, 1])
+@pytest.mark.parametrize(
+    ("seed", "n", "num_segments", "k"),
+    [(0, 1, 1, 1), (1, 50, 3, 4), (2, 1000, 7, 16), (3, 4096, 33, 5), (4, 999, 2, 999)],
+)
+def test_select_per_segment_matches_one_pass_per_segment(
+    monkeypatch: pytest.MonkeyPatch,
+    chunk_elements: int | None,
+    seed: int,
+    n: int,
+    num_segments: int,
+    k: int,
+) -> None:
+    if chunk_elements is not None:  # one segment per chunk
+        monkeypatch.setattr(phases, "_SEGMENT_RANK_ELEMENTS", chunk_elements)
+    rng = np.random.default_rng(seed)
+    scores = jnp.asarray(rng.integers(0, 4, n).astype(np.float32))
+    src = jnp.asarray(rng.integers(0, 9, n).astype(np.int32))
+    dst = jnp.asarray(rng.integers(0, 9, n).astype(np.int32))
+    # a few candidates belong to no segment (below 0 or past the last)
+    segment = jnp.asarray(rng.integers(-1, num_segments + 1, n).astype(np.int32))
+    got = jax.jit(select_per_segment, static_argnums=(4, 5))(
+        scores, src, dst, segment, num_segments, k
+    )
+    want = _select_per_segment_reference(scores, src, dst, segment, num_segments, k)
+    assert len(got) == len(want) == num_segments
+    for (top, filled), (want_top, want_filled) in zip(got, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(top), np.asarray(want_top))
+        np.testing.assert_array_equal(np.asarray(filled), np.asarray(want_filled))

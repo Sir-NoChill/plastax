@@ -3,9 +3,13 @@
 This note explains where plastax (px, JAX) loses time against plastax-cpp
 (cx, C++/CUDA) on the GPU. It covers the growth call (`growth.md`) and the
 one full-step comparison that exists, the plastix-synth-bench churn step. The
-work is analysis: every fix below is a suggestion, and nothing in `src/` was
-changed. The one code change measured, a different sort in `total_order`, was
-monkeypatched into a probe script.
+analysis below was done on unchanged code: the one code change measured, a
+different sort in `total_order`, was monkeypatched into a probe script.
+
+Since then, px fixes 1, 2, 4 and 5 below have landed (the radix total order on
+the GPU, steady-state growth-bench timing, the one-pass per-level ranking and
+a batched claim). The section "After the fixes" measures the growth points
+again; the rest of the note describes the code it analysed.
 
 ## Headline
 
@@ -30,8 +34,9 @@ monkeypatched into a probe script.
     0.02 to 0.04 ms more than cx's.
 - **The published px GPU floor is inflated by warm-up.** px needs about 15
   calls in a fresh process to reach steady state; cx needs one. The growth
-  bench times calls 3 to 9, so px per_unit at 262K candidates reads
-  0.83 to 0.91 ms there, against a steady state of 0.53 ms.
+  bench timed calls 3 to 9, so px per_unit at 262K candidates read
+  0.83 to 0.91 ms there, against a steady state of 0.53 ms. (The bench now
+  warms up for 20 calls.)
 - **The full step (synth-bench E5M, s = 0.99)** takes 0.672 ms in px against
   0.161 ms in cx (4.2x). The gap of 0.51 ms splits as follows:
   - 43 % host exposure (graph launch and sync);
@@ -73,7 +78,8 @@ negative share means px is ahead on that part.
   as `growth_bench.py` and runs 30 warm-up calls. It then reports three
   times: synced (the bench's method), dispatch-only, and pipelined (50 calls
   back to back with one sync, which is the device time with dispatch
-  overlapped). `GAP_SORT=lsd3` swaps in the 3-pass sort.
+  overlapped). `GAP_SORT=lsd3` swapped in the 3-pass sort (now
+  `GAP_SORT=radix`, see "Reproducing").
 - **Profiles.**
   - `nsys profile -t cuda,nvtx,osrt`, with `--cuda-graph-trace=node` for
     px, because XLA runs the phase as one CUDA graph.
@@ -265,15 +271,66 @@ Per step, from nsys over 40 steps (px) and kernel totals over 55 steps (cx):
   Triton calls, which suggests a custom-call operand that does not alias its
   output.
 
+## After the fixes
+
+Fixes 1, 2, 4 and 5 below are in px (`origin/main` 51d1046 plus the
+`perf/gpu-radix-total-order` branch):
+
+- `total_order` takes the three stable radix passes on a GPU from
+  `RADIX_TOTAL_ORDER_MIN` = 2^17 candidates (the isolated crossover: 0.145
+  against 0.148 ms at 2^17, 0.175 against 0.151 ms at 147456, where the
+  merge network pads to 2^18);
+- `select_per_segment` ranks up to 2^22 one-hot elements of levels in one
+  pass;
+- the XLA claim shares its ranking, cross-shard counts and free-slot search
+  across buckets on a GPU, and `grown` counts the commits instead of
+  reducing every dead mask twice;
+- `growth_bench.py` warms up for 20 calls.
+
+The committed edges are identical to before at every point (probe digests
+over every connection column; growth goldens and claim digests on CPU and
+GPU). The per-column scatters remain (16 at the per-unit point): XLA's
+scatter writes one array, and a variadic scatter lowers to a loop on the GPU.
+
+Kernels per call (nsys): per_unit 262K 123 -> 72 (108 with the sort alone,
+101 with the ranking), per_unit 1M 145 -> 77, global P=4 65 -> 44; memcpys
+14 -> 7 and 12 -> 8.
+
+The growth points again, with the probe (30 warm-up calls, locked clocks;
+ms; "before" is the same probe on 51d1046, except where marked):
+
+| point | px before, synced | px now, synced | px now, pipelined | cx event | now / cx |
+|---|---|---|---|---|---|
+| per_unit N=65536, P=4 (262K) | 0.557 | 0.356 | 0.250 | 0.331 | 1.08 |
+| per_unit N=2^18, P=4 (1M) | 2.14 | 0.545 | 0.434 | 0.569 | 0.96 |
+| per_unit N=2^20, P=4 (4M) | 8.14 | 2.80 | 2.03 | 2.10 | 1.34 |
+| per_unit N=2^20, P=8 (8M) | 37.8 (analysis) | 6.21 | 5.43 | 6.31 | 0.98 |
+| per_unit N=2^20, P=32 (32M) | 197 | 23.5 | 22.5 | 34.6 | 0.68 |
+| global P=4 | 0.240 | 0.198 | 0.085 | 0.153 | 1.29 |
+| exhaustive N=2048 (4M) | 9.38 (analysis) | 3.18 | 2.54 | 2.13 | 1.50 |
+| exhaustive N=4096 (16M) | 97.6 | 15.9 | 15.0 | 16.0 | 0.99 |
+| per_connection C=65536, P=4 (262K) | 1.45 | 0.667 | 0.528 | 2.46 | 0.27 |
+
+- At the per-unit floor px is now within 8 % of cx, and from 8M
+  candidates level with or faster than it (0.68x at 32M).
+- The 4M points sit on the L2 cliff, where a synced call varies by about
+  20 % from run to run around 2.0 to 2.5 ms of device time.
+- global P=4 is the floor that is left: 0.085 ms of device time against
+  cx's 0.092 ms busy time, plus about 0.11 ms of host exposure (the graph
+  launch and completion callback; Cause 2 and fix 8).
+- The cx times are from the analysis runs above; cx's own results have
+  since moved for some points (`growth.md` uses its current ones).
+
 ## Candidate fixes, ranked
 
-All of these are suggestions. The gains are measured where marked, and
-estimated otherwise.
+The gains are measured where marked, and estimated otherwise. Fixes 1, 2, 4
+and 5 have landed (see "After the fixes").
 
 ### px
 
-1. **Sort the total order with stable one-key radix passes on the GPU**
-   (`phases.total_order`), above a static size of about 128K candidates.
+1. *(Done.)* **Sort the total order with stable one-key radix passes on the
+   GPU** (`phases.total_order`), above a static size of about 128K
+   candidates.
    Keep the 4-key sort below that size and on CPU. *Measured, identical
    results:*
    - per_unit 4M: 8.1 -> 2.8 ms;
@@ -287,7 +344,8 @@ estimated otherwise.
    - pack (src, dst) into one key when the unit count fits 16 bits, saving a
      pass;
    - use a 64-bit packed key under x64, giving 2 passes.
-2. **Report steady-state times in `growth_bench.py`** (20 or more warm-up
+2. *(Done.)* **Report steady-state times in `growth_bench.py`** (20 or more
+   warm-up
    calls). This is not a library fix, but the published GPU floor overstates
    px by about 0.3 ms: per_unit at 262K is 0.83 to 0.91 -> 0.53 ms, and
    global is 0.50 -> 0.24 ms. The floor ratio drops from 2.8x to 1.6x.
@@ -301,13 +359,17 @@ estimated otherwise.
    error at 4M, so this needs a custom kernel. On CPU this is the fix that
    matters: the sort is 94 % of the call there, and XLA:CPU has no radix
    path.
-4. **Rank every segment in one pass** in `select_per_segment`, instead of
-   one cumsum and one scatter per level. *Estimate:* -20 to -25 us at 262K
-   candidates, growing with n.
-5. **Shrink the claim's per-bucket kernel count.** Use the Triton claim
-   where its dispatch cost is lower (it is already device-parity), or batch
-   the per-column scatters into one scatter over a stacked array.
-   *Estimate:* -40 us of device time at the floor.
+4. *(Done, up to 2^22 one-hot elements.)* **Rank every segment in one
+   pass** in `select_per_segment`, instead of one cumsum and one scatter per
+   level. *Estimate:* -20 to -25 us at 262K candidates, growing with n.
+   Past 4M candidates a pass per level turned out faster, and stays.
+5. *(Done, without the scatters.)* **Shrink the claim's per-bucket kernel
+   count.** Use the Triton claim where its dispatch cost is lower (it is
+   already device-parity), or batch the per-column scatters into one scatter
+   over a stacked array. *Estimate:* -40 us of device time at the floor.
+   The landed claim batches everything but the scatters across buckets (a
+   stacked array would copy whole columns, and XLA lowers a variadic
+   scatter to a loop on the GPU).
 6. **Full step: improve the Triton forward + prune kernel.** Warp-level
    pre-aggregation of the atomics (as in cx) and fewer registers to reach
    full occupancy. *Estimate:* -50 to -100 us at E5M.
@@ -357,8 +419,8 @@ locked:
 
 ```bash
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_FLAGS=--xla_disable_hlo_passes=constant_folding
-python examples/benchmarks/gpu_gap_probe.py per_unit 65536 65536 4 31            # 4-key sort
-GAP_SORT=lsd3 python examples/benchmarks/gpu_gap_probe.py per_unit 65536 65536 4 31
+GAP_SORT=comparison python examples/benchmarks/gpu_gap_probe.py per_unit 65536 65536 4 31  # 4-key sort
+GAP_SORT=radix python examples/benchmarks/gpu_gap_probe.py per_unit 65536 65536 4 31       # radix passes
 GAP_NVTX=1 nsys profile -t cuda,nvtx,osrt --cuda-graph-trace=node -o px \
     python examples/benchmarks/gpu_gap_probe.py per_unit 65536 65536 4 7
 nsys export --type sqlite -o px.sqlite px.nsys-rep
@@ -373,7 +435,7 @@ roughly 15-line patch to `bench_growth.cpp`'s `TimeOnce` and `BuildPoints`.
 The raw data in `results/gpu_gap/`:
 
 - `growth_points.csv`: per point, the synced, pipelined and dispatch times
-  for both sorts, the cx event time, nsys busy and sort time, and op counts.
+  for both sorts (`lsd3` is the radix formulation), the cx event time, nsys busy and sort time, and op counts.
 - `kernel_classes.csv`: device time per kernel class.
 - `sort_micro.csv`: the sort microbenchmark.
 - `warmup_calls.csv`: the warm-up sequences.

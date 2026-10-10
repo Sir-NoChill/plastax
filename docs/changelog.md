@@ -110,6 +110,20 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** an overflowing growth is finished inside the same step. When
+  a step's growth claim drops selected candidates for lack of room, the
+  `Driver` grows the full buckets and claims exactly those candidates, in the
+  total order, at the same step; forward, backward and the updates are not
+  re-run, the step counter advances once, and the result equals a step whose
+  buckets were large enough from the start. Previously the whole step re-ran
+  as a new step, so an overflowing step applied its learning update twice.
+  `StepResult.growth_remainder` carries the dropped candidates
+  (`phases.GrowthRemainder`) and `make_growth_retry(net, static)` is the
+  jitted claim; `state.overflow` reads False after a `Driver.step`. The
+  `Driver` now takes `batch_size`, `layout`, `fuse_prune` and `growth` and
+  passes them to `make_step`, so batched steps recover the same way. The
+  `grow_claim_topological_regrow` golden's `retry` block is now that claim at
+  the same step, plus a `step_growth` block for the whole step's growth.
 - **Breaking:** a batched step no longer averages the unit state implicitly.
   How the per-sample unit columns combine before the once-per-batch phases is
   a new policy slot, `Network.batch_reduction` (`BatchReduction`), mapping

@@ -54,6 +54,7 @@ from dst_sparse import (
 from mlp_xor import GradPreAct
 
 import plastax as px
+from sharding_equiv import assert_conns_sharded
 
 N_SHARDS = 4
 _LAYERS = (17, 64, 4)
@@ -90,6 +91,7 @@ def _check_train_step_shards(
 
     single = px.make_step(train_net, static)(_copy(state), si)
     sharded = px.make_step(train_net, static_s)(_copy(state), si)
+    assert_conns_sharded(sharded.state, N_SHARDS, "train")
 
     if not bool(
         jnp.allclose(
@@ -120,7 +122,10 @@ def _check_prune_step_shards(
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
     single = px.make_step(_PruneNet, static)(_copy(state), sp).state
     sharded = px.make_step(_PruneNet, static_s)(_copy(state), sp).state
+    assert_conns_sharded(sharded, N_SHARDS, "prune")
 
+    if int(px.state.live_conn_count(single)) >= int(px.state.live_conn_count(state)):
+        raise AssertionError("prune: nothing was pruned; the check is vacuous")
     if int(px.state.live_conn_count(single)) != int(px.state.live_conn_count(sharded)):
         raise AssertionError("prune: live-edge count differs sharded vs single")
     if not _conns_allclose(single, sharded):
@@ -143,7 +148,10 @@ def _check_churn_step_shards(
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
     single = px.make_step(churn_net, static)(_copy(state), sp).state
     sharded = px.make_step(churn_net, static_s)(_copy(state), sp).state
+    assert_conns_sharded(sharded, N_SHARDS, "churn")
 
+    if int(single.grown) == 0:
+        raise AssertionError("churn: nothing grew; the check is vacuous")
     if int(px.state.live_conn_count(single)) != int(px.state.live_conn_count(sharded)):
         raise AssertionError("churn: live-edge count differs sharded vs single")
     if not _conns_allclose(single, sharded):
@@ -202,6 +210,7 @@ def _check_propose_churn_shards(
         sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
         single = px.make_step(_ProposeNet, static)(_copy(state), sp).state
         sharded = px.make_step(_ProposeNet, static_s)(_copy(state), sp).state
+        assert_conns_sharded(sharded, N_SHARDS, f"propose(dedupe={dedupe})")
         if int(px.state.live_conn_count(single)) != int(
             px.state.live_conn_count(sharded)
         ):
@@ -250,6 +259,7 @@ def _check_fused_prune_shards(
     single = px.make_step(_FusedNet, static, fuse_prune="off")(_copy(state), sp).state
     step_s = px.make_step(_FusedNet, static_s, fuse_prune="xla")
     sharded = step_s(_copy(state), sp).state
+    assert_conns_sharded(sharded, N_SHARDS, "fused prune")
     plan = step_s.prune_fusion.plan  # type: ignore[attr-defined]
     if plan is None or not plan.fused:
         raise AssertionError(f"fused prune: not fused under Scheme-A ({plan})")
@@ -278,6 +288,7 @@ def _check_batched_train_step_shards(
         sharded = px.make_step(train_net, static_s, batch_size=5, layout=layout)(
             _copy(state), sp
         )
+        assert_conns_sharded(sharded.state, N_SHARDS, f"batched {layout}")
         if not _conns_allclose(single.state, sharded.state):
             raise AssertionError(f"batched {layout}: conns differ sharded vs single")
 

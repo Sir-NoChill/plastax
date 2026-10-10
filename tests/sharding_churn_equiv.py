@@ -263,7 +263,10 @@ def _check_batched_train_step_shards(
     static: px.NetworkStatic, static_s: px.NetworkStatic, state: px.NetworkState[None]
 ) -> None:
     """A batched (B = 5) train step shards like the streaming one."""
-    train_net = make_net(_OPT, method="set", mode="train")
+
+    class train_net(make_net(_OPT, method="set", mode="train")):  # type: ignore[misc]
+        batch_reduction = px.MeanFloatFirstRest()
+
     rng = np.random.default_rng(0)
     xs = jnp.asarray(rng.standard_normal((5, _LAYERS[0])).astype(np.float32))
     ys = jax.nn.one_hot(jnp.asarray(rng.integers(0, _LAYERS[-1], 5)), _LAYERS[-1])

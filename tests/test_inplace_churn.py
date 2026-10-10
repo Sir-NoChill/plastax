@@ -219,6 +219,7 @@ class _GrowingNet(px.Network[dict[str, jax.Array]]):
     add_conn = _FanoutGrow()
     reset_global = _Tick()
     propagation = px.Propagation.TOPOLOGICAL
+    batch_reduction = px.MeanFloatFirstRest()
 
 
 class _ForwardOnly(px.Network[dict[str, jax.Array]]):

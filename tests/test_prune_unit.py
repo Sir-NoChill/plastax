@@ -106,6 +106,7 @@ def _net(
         unit_capacity = _CAPACITY
         structural_interval = interval
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     _Net.prune_conn = prune_conn
     return _Net

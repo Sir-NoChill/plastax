@@ -25,14 +25,15 @@ from plastax.phases import (
     PruneFusionPlan,
     PruneFusionRecord,
     StepInputs,
-    batch_mean_units,
     build_batched_phases,
     build_phases,
     nvidia_triton_available,
+    per_sample_written_fields,
     plan_prune_fusion,
+    reduce_batch_units,
 )
 from plastax.state import NetworkState, NetworkStatic
-from plastax.traits import Network
+from plastax.traits import Network, batch_written_reduction
 
 # Module-scoped (not PEP 695) so it stays free inside the StepFn alias below;
 # StepResult/make_step below shadow it with their own PEP 695 [GS] locally.
@@ -83,8 +84,18 @@ def make_step[GS](
     run per sample against the shared connections; the connection update is
     reduced over the batch (see `phases.build_batched_update_conn`: exact for
     the `optim/` bundles, mean-of-writes otherwise); prune, add, and reset run
-    once on the batch-mean unit state, which is also what the returned state holds; and
-    `StepResult.loss` is the batch mean.
+    once on the reduced unit state, which is also what the returned state
+    holds; and `StepResult.loss` is the batch mean.
+
+    How the per-sample unit columns reduce to one state is the network's
+    `batch_reduction` policy (`traits.BatchReduction`), which a batched step
+    requires: there is no implicit average. When the step is first traced it
+    finds the columns its per-sample phases write (the input scatter's
+    `ACTIVATION`, the loss's seed field and every column a forward, backward or
+    unit-update rule returns in its `UnitWrite`) and raises if the policy
+    leaves one undeclared or declares it NOT_BATCHED. Set
+    `batch_reduction = MeanFloatFirstRest()` for the batch mean of every
+    floating column and sample 0 of every other one.
 
     `layout` picks how a batched step runs a *linear* forward or backward pass
     (one declaring `linear_input`, see `phases.linear_input_field`):
@@ -131,9 +142,8 @@ def make_step[GS](
     where it can run; a "triton" request that cannot (another backend, or
     Scheme-A sharding, where jax_triton is not validated) uses "xla".
 
-    In a batched step a non-floating unit column (a flag, a count) is stored
-    from sample 0 rather than averaged, and so is a non-floating connection
-    column written by an UpdateConn without the exact pair: such columns
+    In a batched step a non-floating connection column written by an
+    UpdateConn without the exact pair is stored from sample 0: such columns
     should agree across the batch. With layout "csr", call the step
     directly: the cuSPARSE lowering is scoped to its own calls, so wrapping
     it in an outer jit or scan lowers it outside that scope, onto the
@@ -157,8 +167,11 @@ def make_step[GS](
 
     Raises:
         ValueError: If `batch_size` is below 1, or set for a PIPELINE net
-            (whose carried unit state is per-sample recurrent state), or if
-            `layout`, `fuse_prune` or `growth` is not one of its values.
+            (whose carried unit state is per-sample recurrent state) or for a
+            net without a `batch_reduction`, or if `layout`, `fuse_prune` or
+            `growth` is not one of its values. The batched step raises it when
+            first traced if a per-sample phase writes a unit column its
+            `batch_reduction` leaves undeclared or declares NOT_BATCHED.
     """
     if batch_size is not None:
         if batch_size < 1:
@@ -167,6 +180,14 @@ def make_step[GS](
             raise ValueError(
                 "make_step: batch_size is for TOPOLOGICAL (feed-forward) nets; a "
                 "PIPELINE net carries per-sample recurrent state between steps"
+            )
+        if net.batch_reduction is None:
+            raise ValueError(
+                f"make_step: a batched step needs {net.__name__}.batch_reduction, "
+                "the policy combining the per-sample unit columns (see "
+                "plastax.BatchReduction); set batch_reduction = "
+                "MeanFloatFirstRest() for the batch mean of every floating "
+                "column and sample 0 of every other one"
             )
     if layout not in ("auto", "edge_list", "csr", "triton"):
         raise ValueError(f"make_step: unknown layout {layout!r}")
@@ -282,6 +303,9 @@ def _batched_step(
     phases = build_batched_phases(
         net, static, overflow_sink=overflow_sink, engine=engine, growth=growth
     )
+    policy = net.batch_reduction
+    assert policy is not None  # make_step checked
+    specs = {spec.name: spec for spec in static.unit_fields}
 
     def per_sample(
         phase: Phase[Any],
@@ -340,7 +364,8 @@ def _batched_step(
             units_b, _ = per_sample(phases.update_unit, state, units_b, inputs)
         if phases.update_conn is not None:
             state = phases.update_conn(state, units_b)
-        state = dataclasses.replace(state, units=batch_mean_units(units_b))
+        units = reduce_batch_units(policy, static.unit_fields, units_b, state.units)
+        state = dataclasses.replace(state, units=units)
         for phase in phases.structural:
             state, _ = phase(state, inputs)
         # One batched step = one framework step (phases saw the old value).
@@ -348,7 +373,24 @@ def _batched_step(
         return StepResult(state=state, overflow=overflow_sink[0], loss=losses.mean())
 
     traced = step if static.sharding is None else _shard_map_step(step, static)
-    jitted = cast(StepFn[Any], jax.jit(traced, donate_argnums=0))
+    # The write check traces the per-sample phases on the whole (unsharded)
+    # state, so it runs outside any shard_map.
+    unsharded = dataclasses.replace(static, sharding=None)
+
+    def checked(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        # Once per trace: every column a per-sample phase writes must have a
+        # declared reduction.
+        written = per_sample_written_fields(
+            net, unsharded, state, inputs.targets is not None
+        )
+        for name, where in written.items():
+            try:
+                batch_written_reduction(policy, specs[name], where=where)
+            except ValueError as err:
+                raise ValueError(f"{net.__name__}.{err}") from None
+        return traced(state, inputs)
+
+    jitted = cast(StepFn[Any], jax.jit(checked, donate_argnums=0))
     if engine != "csr" or not _nvidia_gpu():
         # cuSPARSE exists only on NVIDIA GPUs; elsewhere BCSR uses XLA's
         # generic lowering and the flag would do nothing.

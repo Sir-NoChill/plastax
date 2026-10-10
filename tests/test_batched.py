@@ -81,6 +81,7 @@ def _mlp(
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
         extra_conn_fields = extra_conn
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     rng = np.random.default_rng(0)
     blocks = [px.topology.input_units(_SIZES[0])]
@@ -270,6 +271,7 @@ def test_linear_forward_is_exact_on_a_churned_arena(layout: str) -> None:
     class _Fwd(px.Network[dict[str, jax.Array]]):
         forward_pass = _LinearSum()
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     static, state = churn._build()
     churn_step = px.make_step(churn._ChurnNet, static)

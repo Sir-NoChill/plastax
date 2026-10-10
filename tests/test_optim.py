@@ -90,6 +90,7 @@ def _build_plastax(
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
         extra_conn_fields = optimizer.state_fields
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     blocks = [px.topology.input_units(sizes[0])]
     for i, w in enumerate(weights):

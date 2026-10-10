@@ -223,6 +223,7 @@ def _net(
         add_conn = _GROWTH[growth] if growth is not None else None
         extra_unit_fields = (GRAD, LOSS_GRAD, APPLIED)
         unit_capacity = capacity
+        batch_reduction = px.MeanFloatFirstRest()
 
     _Net.propagation = propagation
     return _Net

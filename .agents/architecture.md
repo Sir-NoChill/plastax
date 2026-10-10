@@ -273,8 +273,16 @@ with conns/globals broadcast; the **update** reduced over the batch
 (`build_batched_update_conn`: the exact `per_sample` + `incoming_batched` pair
 if the UpdateConn declares it -- every `optim/` bundle does -- else the mean of
 the per-sample writes; both accumulate in a `fori_loop`, O(capacity) memory);
-and **structural** (prune_unit, prune_conn, add_unit, add_conn, reset) run once on `batch_mean_units`. Unit
-columns in the state stay `(num_units,)` and hold the batch mean. PIPELINE nets
+and **structural** (prune_unit, prune_conn, add_unit, add_conn, reset) run once on
+`reduce_batch_units`'s result. How each unit column reduces is the net's
+`batch_reduction` policy (`traits.BatchReduction`: MEAN, SUM, FIRST or
+NOT_BATCHED per column; `FieldReductions`, or `MeanFloatFirstRest` for the mean
+of floats and sample 0 of the rest). It is mandatory for a batched step (no
+implicit average): `make_step` rejects a net without one, and the first trace
+finds the columns the per-sample phases write (`phases.per_sample_written_fields`,
+an `eval_shape` probe comparing column identity) and rejects any the policy
+leaves undeclared or NOT_BATCHED. Unwritten undeclared columns keep their
+pre-step value. Unit columns in the state stay `(num_units,)`. PIPELINE nets
 are rejected. Measured on GPU the per-sample cost falls only ~2x from B = 1 to
 128 on the edge-list layout (each pass touches every edge once per sample);
 the CSR layout addresses that for linear passes:

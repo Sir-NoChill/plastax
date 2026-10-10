@@ -8,10 +8,10 @@ files. Each golden names the feature set it `requires`:
   those goldens is a dyadic fraction, so float32 arithmetic on them is exact).
 - ``loss_v1`` runs the shipped `SoftmaxCrossEntropyLoss` through a real step:
   the gradient seed on every output and the returned loss, exactly.
-- ``growth_v2`` is enforced in full: the propose cases and the score cases
+- ``growth_v2`` is enforced in full: the propose cases, the score cases
   (exhaustive/shortlist/per-level shortlist/predicate scoring, every
   selection mode, the validity window, the triggers, and growth on the
-  batch-mean state).
+  batch-mean state), and the slot-claim cases of each propagation model.
 - ``unit_lifecycle_v1`` is enforced in full: unit update, permanent pruning
   with the input/output exemption, and unit addition (lowest-free-id
   placement, reuse of an id pruned in the same step, overflow and the level
@@ -59,6 +59,17 @@ _ENFORCED_SCORE = {
     for path in sorted(_GOLDEN_DIR.glob("grow_*.json"))
     if json.loads(path.read_text()).get("requires") == "growth_v2"
     and "score" in json.loads(path.read_text())["rules"]
+    and "model" not in json.loads(path.read_text())["params"]
+}
+# growth_v2 slot-claim cases (enforced by test_grow_claim_*_golden): the score
+# cases that pin a claim model's per-level free accounting.
+_ENFORCED_CLAIM = {
+    model: {
+        path.stem
+        for path in sorted(_GOLDEN_DIR.glob("grow_*.json"))
+        if json.loads(path.read_text())["params"].get("model") == model
+    }
+    for model in ("topological", "pipeline")
 }
 
 # unit_lifecycle_v1 cases (enforced by test_unit_lifecycle_golden), discovered
@@ -352,7 +363,8 @@ def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) ->
         ), f"{doc['name']} claims {requires} but no consumer covers it"
         return
     assert requires in _SPEC_ONLY, f"unknown requires tag {requires!r} in {path.name}"
-    if doc["name"] in _ENFORCED_GROWTH | _ENFORCED_SCORE:
+    claim_cases = _ENFORCED_CLAIM["topological"] | _ENFORCED_CLAIM["pipeline"]
+    if doc["name"] in _ENFORCED_GROWTH | _ENFORCED_SCORE | claim_cases:
         return  # consumed by the test_grow_* tests
     pytest.skip(f"{doc['name']}: {_SPEC_ONLY[requires]} ({requires})")
 
@@ -623,16 +635,48 @@ def _make_score_rule(
     return _Rule()
 
 
+def _pin_free(state: Any, units: list[dict[str, Any]], free_at: dict[int, int]) -> Any:
+    """Leave exactly `free_at[L]` free slots in bucket L.
+
+    Every bucket L's surplus dead slots (all but the first `free_at[L]`) are
+    plugged with a live, zero-weight self-loop on a level-L unit. The plug is
+    inert to these goldens (a self-loop is never a valid candidate, so even
+    `dedupe_live` cannot veto a real one, and scores read only ids and
+    activations) and is diffed out of the commits.
+    """
+    import dataclasses
+
+    conns = list(state.conns)
+    for lvl, free in free_at.items():
+        bucket = dict(conns[lvl])
+        dead = np.flatnonzero(np.asarray(bucket[px.DEAD.name]))
+        assert dead.size >= free, "bucket built too small to pin"
+        surplus = dead[free:]
+        plug = next(u["id"] for u in units if u["level"] == lvl)
+        plug_value = {
+            px.DEAD.name: False,
+            px.FROM_ID.name: plug,
+            px.TO_ID.name: plug,
+            px.WEIGHT.name: 0.0,
+        }
+        for name, value in plug_value.items():
+            col = np.asarray(bucket[name]).copy()
+            col[surplus] = value
+            bucket[name] = jnp.asarray(col)
+        conns[lvl] = bucket
+    return dataclasses.replace(state, conns=tuple(conns))
+
+
 def _score_net(
-    doc: dict[str, Any], *, step_cap: int | None, free_at: dict[int, int]
+    doc: dict[str, Any],
+    *,
+    step_cap: int | None,
+    free_at: dict[int, int],
+    mode: px.Propagation = px.Propagation.TOPOLOGICAL,
 ) -> tuple[Any, Any, Any]:
     """Build the golden's network; `free_at` pins exact free-slot counts.
 
-    Every bucket is built with ample capacity. For each `free_at[L] = f`,
-    bucket L's surplus dead slots (all but the first f) are plugged with a
-    live, zero-weight self-loop on a level-L unit, leaving exactly f free
-    slots. The plug is inert to these goldens (none sets `dedupe_live`, and
-    scores read only ids and activations) and is diffed out of the commits.
+    Every bucket is built with ample capacity, then pinned by `_pin_free`.
     """
     import dataclasses
 
@@ -645,7 +689,7 @@ def _score_net(
         forward_pass = ReluForward()
         add_conn = rule
         seed = int(params["network_seed"])
-        propagation = px.Propagation.TOPOLOGICAL
+        propagation = mode
 
     edges = doc["initial_edges"]
     trigger = doc.get("trigger") or {}
@@ -668,25 +712,7 @@ def _score_net(
     for u in units:
         assert got_levels[u["id"]] == u["level"], f"unit {u['id']} level"
     if free_at:
-        conns = list(state.conns)
-        for lvl, free in free_at.items():
-            bucket = dict(conns[lvl])
-            dead = np.flatnonzero(np.asarray(bucket[px.DEAD.name]))
-            assert dead.size >= free, "bucket built too small to pin"
-            surplus = dead[free:]
-            plug = next(u["id"] for u in units if u["level"] == lvl)
-            plug_value = {
-                px.DEAD.name: False,
-                px.FROM_ID.name: plug,
-                px.TO_ID.name: plug,
-                px.WEIGHT.name: 0.0,
-            }
-            for name, value in plug_value.items():
-                col = np.asarray(bucket[name]).copy()
-                col[surplus] = value
-                bucket[name] = jnp.asarray(col)
-            conns[lvl] = bucket
-        state = dataclasses.replace(state, conns=tuple(conns))
+        state = _pin_free(state, units, free_at)
     # Growth reads the batch-mean state under batching: reduce the recorded
     # per-sample activations with px's own batch reduction.
     if "batch_activations" in doc:
@@ -773,6 +799,115 @@ def test_grow_score_golden(name: str) -> None:
     assert grown_c == want, f"{name}: the real claim diverges"
     assert bool(state_c.overflow) == expect["conn_overflow"]
     assert bool(state_c.needs_resort) == expect["needs_resort"]
+
+
+def _want_commits(expect: dict[str, Any]) -> list[tuple[int, int, float]]:
+    return sorted(
+        (
+            int(c["src"]),
+            int(c["dst"]),
+            float(np.float32((((3 * c["src"] + 5 * c["dst"]) % 16) - 8) / 8.0)),
+        )
+        for c in expect["committed"]
+    )
+
+
+def _grow_diff(net: Any, static: Any, state: Any) -> tuple[list[Any], Any]:
+    """Run the real growth phase; return the committed edges and new state."""
+    from plastax.phases import build_add_conn_phase
+
+    before = _live_pairs(state)
+    phase = build_add_conn_phase(net, static)
+    new_state, _ = phase(state, px.StepInputs(inputs=jnp.zeros((0,)), targets=None))
+    grown = sorted(_live_pairs(new_state))
+    for pair in before:
+        grown.remove(pair)
+    assert int(new_state.grown) == len(grown), "state.grown miscounts the commits"
+    return grown, new_state
+
+
+@pytest.mark.parametrize("name", sorted(_ENFORCED_CLAIM["topological"]))
+def test_grow_claim_topological_golden(name: str) -> None:
+    """Strict per-level buckets, the Driver's regrow, then the retry's growth."""
+    import dataclasses
+
+    from plastax.state import grow_bucket, live_conn_count
+
+    doc = _load(f"{name}.json")
+    units = doc["initial_units"]
+    free = {int(k): v for k, v in doc["params"]["free_per_level"].items()}
+    net, static, state = _score_net(doc, step_cap=None, free_at=free)
+    assert len(static.level_capacities) == len(free), "one bucket per level"
+
+    grown, state = _grow_diff(net, static, state)
+    expect = doc["expect"]
+    assert grown == _want_commits(expect), f"{name}: the attempt's commits"
+    assert bool(state.overflow) == expect["conn_overflow"]
+    assert bool(state.needs_resort) == expect["needs_resort"]
+    # The Driver's regrow set: every bucket the attempt left full.
+    full = [
+        lvl
+        for lvl, cap in enumerate(static.level_capacities)
+        if int(live_conn_count(state, lvl)) == cap
+    ]
+    assert full == expect["regrow_levels"]
+
+    # The retry: grow those buckets as the Driver does, pin the golden's
+    # regrown free counts, and run the next step's growth.
+    for lvl in full:
+        static, state = grow_bucket(static, state, lvl)
+    retry = doc["retry"]
+    state = _pin_free(
+        state, units, {int(k): v for k, v in retry["free_per_level"].items()}
+    )
+    state = dataclasses.replace(state, step=jnp.int32(retry["step"]))
+    grown, state = _grow_diff(net, static, state)
+    assert grown == _want_commits(retry["expect"]), f"{name}: the retry's commits"
+    assert bool(state.overflow) == retry["expect"]["conn_overflow"]
+
+
+@pytest.mark.parametrize("name", sorted(_ENFORCED_CLAIM["pipeline"]))
+def test_grow_claim_pipeline_golden(name: str) -> None:
+    """Each level's own dead slots first, then the shared never-used tail."""
+    import dataclasses
+
+    doc = _load(f"{name}.json")
+    params = doc["params"]
+    net, static, state = _score_net(
+        doc, step_cap=None, free_at={}, mode=px.Propagation.PIPELINE
+    )
+    # Rebuild the single bucket exactly: the live edges, the golden's dead
+    # edges, then `tail` never-used slots.
+    live = len(doc["initial_edges"])
+    dead_edges = doc["initial_dead_edges"]
+    capacity = live + len(dead_edges) + int(params["tail"])
+    bucket = {}
+    for spec in static.conn_fields:
+        col = np.full((capacity,), np.asarray(spec.default), dtype=spec.dtype)
+        col[:live] = np.asarray(state.conns[0][spec.name])[:live]
+        bucket[spec.name] = col
+    for i, e in enumerate(dead_edges, start=live):
+        bucket[px.FROM_ID.name][i] = e["src"]
+        bucket[px.TO_ID.name][i] = e["dst"]
+        bucket[px.DEAD.name][i] = True
+    assert int(state.tail_start) == live
+    static = dataclasses.replace(static, level_capacities=(capacity,))
+    state = dataclasses.replace(
+        state,
+        conns=({k: jnp.asarray(v) for k, v in bucket.items()},),
+        tail_start=jnp.int32(live + len(dead_edges)),
+    )
+
+    grown, new_state = _grow_diff(net, static, state)
+    expect = doc["expect"]
+    assert grown == _want_commits(expect), f"{name}: committed edges diverge"
+    assert bool(new_state.overflow) == expect["conn_overflow"]
+    assert bool(new_state.needs_resort) == expect["needs_resort"]
+    assert int(new_state.tail_start) - int(state.tail_start) == expect["tail_used"]
+    # Own claims reuse dead slots only: the slots past the claimed tail stay
+    # never used.
+    dead_after = np.asarray(new_state.conns[0][px.DEAD.name])
+    assert dead_after[int(new_state.tail_start) :].all()
 
 
 # ---------------------------------------------------------------------------

@@ -126,7 +126,15 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   gives bit-identical results. To migrate, add
   `batch_reduction = px.MeanFloatFirstRest()` to every batched net.
   `phases.batch_mean_units` is replaced by `phases.reduce_batch_units`.
-
+- PIPELINE growth claims per source level: each level's candidates first take
+  the dead slots its own former connections left, then spill to the bucket's
+  never-used tail (levels ascending); a level never takes another level's
+  dead slot, and `overflow` now means the tail ran out. The new
+  `NetworkState.tail_start` is the bucket's high-water mark; resort compacts
+  and resets it. The `Driver` grows a PIPELINE bucket whose tail ran out (it
+  previously regrew only full buckets, and looped forever when other levels'
+  dead slots remained). TOPOLOGICAL growth keeps its strict per-bucket claim.
+  plastax-cpp claims identically (ADR-010).
 - **Breaking:** the loss is whole-output. A `Loss` declares `seed_field` (the
   float unit column its gradient seed goes to) and implements
   `calculate_loss(u, outputs, targets, g) -> (loss, seed)`, called once over

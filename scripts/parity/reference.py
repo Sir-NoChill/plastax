@@ -95,8 +95,20 @@ Growth selection pipeline
    ``threshold`` those with score >= threshold(g) up to ``max_new_per_level``,
    ``all`` every finite candidate -- then ``max_new_per_step`` applies across
    levels, level ascending.
-8. Selected candidates claim free connection slots in order; candidates beyond
-   free capacity are dropped and raise ``conn_overflow``.
+8. Selected candidates claim free connection slots per source level, each
+   level's in the total order; a candidate left without a slot is dropped and
+   raises ``conn_overflow``. The free slots depend on the propagation model:
+
+   - topological: each level owns one bucket and claims only that bucket's
+     free slots. A level whose bucket is full after the claim (no free slot
+     left) is grown by the host loop, which then re-runs the step: the
+     goldens' ``retry`` block re-runs this phase at ``step + 1`` over the
+     attempt's output edges with the regrown free counts.
+   - pipeline: each level first claims the dead slots whose former occupant
+     was sourced at that level; the rest spill to the shared never-used tail,
+     levels ascending and in the total order within a level. Overflow means
+     the tail ran out. The single-domain goldens (``free_slots``) are this
+     model with no dead slots.
 9. ``init`` writes the new edge's fields; unwritten fields take declared
    defaults.
 10. Flags: ``needs_resort`` iff a committed edge has
@@ -791,17 +803,57 @@ def commit_growth(
     edges: list[dict[str, Any]],
     selected: list[dict[str, Any]],
     *,
-    free_slots: int,
     init: Callable[[int, int], dict[str, float]],
     field_defaults: dict[str, float],
+    free_slots: int | None = None,
+    dead_per_level: dict[int, int] | None = None,
+    tail: int | None = None,
+    free_per_level: dict[int, int] | None = None,
 ) -> dict[str, Any]:
     """Stages 8-10: claim slots, init fields, compute flags.
 
-    ``free_slots`` is the claim capacity of the single claim domain these
-    goldens use (one source level, so the per-level and global claim
-    disciplines coincide).
+    Exactly one claim model is given:
+
+    - ``free_slots``: one domain of that many never-used slots (the pipeline
+      model with no dead slots), committed as a prefix of the selection;
+    - ``dead_per_level`` and ``tail``: the pipeline model -- each level's own
+      dead slots first, then the tail, levels ascending;
+    - ``free_per_level``: the topological model -- each level only its own
+      bucket's free slots. The result also lists ``regrow_levels``, the
+      levels whose bucket the claim left full, ascending.
+
+    ``committed`` keeps the selection order (levels ascending, the total order
+    within a level).
     """
-    committed = selected[:free_slots]
+    level_of = {u["id"]: u["level"] for u in units}
+    by_level: dict[int, list[dict[str, Any]]] = {}
+    for c in selected:
+        by_level.setdefault(level_of[c["src"]], []).append(c)
+    extra: dict[str, Any] = {}
+    if free_slots is not None:
+        assert dead_per_level is None and tail is None and free_per_level is None
+        keep = {id(c) for c in selected[:free_slots]}
+    elif free_per_level is not None:
+        assert dead_per_level is None and tail is None
+        keep = set()
+        left = dict(free_per_level)
+        for level in sorted(by_level):
+            assert level in left, f"no bucket for source level {level}"
+            take = by_level[level][: left[level]]
+            keep |= {id(c) for c in take}
+            left[level] -= len(take)
+        extra["regrow_levels"] = sorted(lvl for lvl, f in left.items() if f == 0)
+    else:
+        assert dead_per_level is not None and tail is not None
+        keep = set()
+        spill: list[dict[str, Any]] = []
+        for level in sorted(by_level):
+            own = dead_per_level.get(level, 0)
+            keep |= {id(c) for c in by_level[level][:own]}
+            spill.extend(by_level[level][own:])
+        keep |= {id(c) for c in spill[:tail]}
+        extra["tail_used"] = min(len(spill), tail)
+    committed = [c for c in selected if id(c) in keep]
     overflow = len(selected) > len(committed)
     for c in committed:
         fields = dict(field_defaults)
@@ -817,4 +869,5 @@ def commit_growth(
         "grown": len(committed),
         "conn_overflow": overflow,
         "needs_resort": needs_resort,
+        **extra,
     }

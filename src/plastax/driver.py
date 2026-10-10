@@ -8,7 +8,9 @@ retraces performed via
 jax.test_util.assert_num_jit_and_pmap_compilations .
 
 The overflow flag is connection overflow: a selected growth candidate found
-no free slot in its bucket, which the driver fixes by growing the bucket.
+no slot it may claim -- its TOPOLOGICAL level's bucket is full, or the
+PIPELINE bucket's never-used tail is -- which the driver fixes by growing the
+bucket and re-running the step.
 Unit overflow (`NetworkState.unit_overflow`, an AddUnit spawn that found no
 free unit slot) is not a retrace event: `Network.unit_capacity` is fixed, so
 the dropped spawn stays dropped and the flag is the caller's to read.
@@ -16,9 +18,8 @@ the dropped spawn stays dropped and the flag is the caller's to read.
 ## Recommendations for Poor Performance
 
 1. If your algorithm exhibits many overflow events then
-   you should pre-allocate more VRAM. Note that in plastax-cpp
-   this should not be an issue as VRAM is
-   reallocated on demand
+   you should pre-allocate more VRAM. plastax-cpp regrows its
+   buckets inside a fixed arena instead, so it retraces nothing
 2. If your algorithm exhibits many retrace events, then you
    may want to consider implementing a pipelined version
    of your algorithm. Pipelined versions do not have to be
@@ -35,6 +36,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from plastax import topo
+from plastax._types import Propagation
 from plastax.phases import StepInputs
 from plastax.state import NetworkState, NetworkStatic, grow_bucket, live_conn_count
 from plastax.step import StepFn, make_step
@@ -101,10 +103,11 @@ class Driver[GS]:
         on every step to guard a rare, capacity-mistuned case; growing a
         bucket already means the network was configured below its live
         working set, which `capacity_policy`'s headroom is meant to make
-        rare. Fullness is checked against `result.state`'s own live
-        counts against the pre-grow `self._static.level_capacities`,
-        since `build_add_conn_phase`'s `committed` claims every free
-        slot before any candidate is dropped.
+        rare. Every full bucket grows: a TOPOLOGICAL bucket with no dead
+        slot left, or a PIPELINE bucket with no tail left, read off
+        `result.state` against the pre-grow `self._static.level_capacities`
+        -- an overflowing level's claim takes every slot it may use before
+        dropping a candidate, so its bucket is always among them.
 
         Args:
             inputs: The external inputs for this step.
@@ -117,8 +120,7 @@ class Driver[GS]:
             if bool(result.overflow):
                 state = result.state
                 for level in range(len(self._static.level_capacities)):
-                    live = int(live_conn_count(state, level))
-                    if live == self._static.level_capacities[level]:
+                    if self._free_slots(state, level) == 0:
                         self._static, state = grow_bucket(self._static, state, level)
                 self._state = state
                 self._step = make_step(self._net, self._static)
@@ -149,14 +151,24 @@ class Driver[GS]:
             want = getattr(ac, "max_new_per_level", None) or 1 if ac is not None else 1
             state = self._state
             for level in range(len(self._static.level_capacities)):
-                capacity = self._static.level_capacities[level]
-                if capacity - int(live_conn_count(state, level)) < want:
+                if self._free_slots(state, level) < want:
                     self._static, state = grow_bucket(self._static, state, level)
             self._state = state
             self._step = make_step(self._net, self._static)
         if bool(self._state.needs_resort):
             self._static, self._state = topo.resort(self._static, self._state)
             self._step = make_step(self._net, self._static)
+
+    def _free_slots(self, state: NetworkState[GS], level: int) -> int:
+        """The slots any level can still claim in bucket `level`.
+
+        Every dead slot of a TOPOLOGICAL bucket; only the never-used tail of
+        the PIPELINE bucket, whose dead slots serve the levels that left them.
+        """
+        capacity = self._static.level_capacities[level]
+        if self._static.propagation is Propagation.PIPELINE:
+            return capacity - int(state.tail_start)
+        return capacity - int(live_conn_count(state, level))
 
     @property
     def state(self) -> NetworkState[GS]:

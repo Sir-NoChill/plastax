@@ -500,3 +500,129 @@ def test_xla_claim_takes_precomputed_triton_block_counts(seed: int) -> None:
                 )
             np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
             np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want[2]))
+
+
+def _pipeline_case(
+    rng: np.random.Generator, cap: int, k: int, num_units: int
+) -> tuple[dict[str, jax.Array], phases.GrowthClaim, jax.Array, jax.Array, int]:
+    """A PIPELINE bucket with used dead slots below its mark and a tail."""
+    tail_start = int(rng.integers(0, cap + 1))
+    dead = np.ones(cap, bool)
+    dead[:tail_start] = rng.random(tail_start) < rng.uniform(0.05, 0.6)
+    bucket = {
+        px.DEAD.name: jnp.asarray(dead),
+        px.FROM_ID.name: jnp.asarray(rng.integers(0, num_units, cap, dtype=np.int32)),
+        px.TO_ID.name: jnp.asarray(rng.integers(0, num_units, cap, dtype=np.int32)),
+        px.WEIGHT.name: jnp.asarray(rng.standard_normal(cap), jnp.float32),
+    }
+    unit_level = jnp.asarray(rng.integers(0, 5, num_units, dtype=np.int32))
+    src = jnp.asarray(rng.integers(0, num_units, k, dtype=np.int32))
+    claim = phases.GrowthClaim(
+        growable=jnp.asarray(rng.random(k) < rng.uniform(0.2, 1.0)),
+        violating=jnp.asarray(rng.random(k) < 0.1),
+        values={
+            px.FROM_ID.name: src,
+            px.TO_ID.name: jnp.asarray(rng.integers(0, num_units, k, dtype=np.int32)),
+            px.WEIGHT.name: jnp.asarray(rng.standard_normal(k).astype(np.float32)),
+        },
+    )
+    return bucket, claim, unit_level[src], unit_level, tail_start
+
+
+def _pipeline_oracle(
+    bucket: dict[str, jax.Array],
+    claim: phases.GrowthClaim,
+    cand_level: jax.Array,
+    unit_level: jax.Array,
+    tail_start: int,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, int]:
+    """The spec, slot by slot: own dead slots in slot order, then the tail."""
+    dead = np.asarray(bucket[px.DEAD.name])
+    owner = np.asarray(unit_level)[np.asarray(bucket[px.FROM_ID.name])]
+    grow = np.asarray(claim.growable)
+    level = np.asarray(cand_level)
+    own_slots = {
+        lvl: [s for s in range(tail_start) if dead[s] and owner[s] == lvl]
+        for lvl in set(level.tolist())
+    }
+    target = np.full(grow.size, -1)
+    spill = []
+    for lvl in sorted(own_slots):
+        for i in np.flatnonzero(grow & (level == lvl)):
+            if own_slots[lvl]:
+                target[i] = own_slots[lvl].pop(0)
+            else:
+                spill.append(i)
+    tail = tail_start
+    overflowed = np.zeros(grow.size, bool)
+    for i in spill:
+        if tail < dead.size:
+            target[i] = tail
+            tail += 1
+        else:
+            overflowed[i] = True
+    committed = target >= 0
+    new = {name: np.asarray(col).copy() for name, col in bucket.items()}
+    new[px.DEAD.name][target[committed]] = False
+    for name, value in claim.values.items():
+        new[name][target[committed]] = np.asarray(value)[committed]
+    return new, overflowed, committed & np.asarray(claim.violating), tail
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_pipeline_claim_takes_own_dead_slots_then_the_tail(seed: int) -> None:
+    rng = np.random.default_rng(seed)
+    for cap, k in ((64, 40), (1024, 300), (4096, 2000), (256, 5)):
+        bucket, claim, cand_level, unit_level, tail_start = _pipeline_case(
+            rng, cap, k, num_units=40
+        )
+        new, overflowed, resort, tail = phases.pipeline_claim(
+            bucket, claim, cand_level, unit_level, jnp.int32(tail_start)
+        )
+        want, want_over, want_resort, want_tail = _pipeline_oracle(
+            bucket, claim, cand_level, unit_level, tail_start
+        )
+        for name, col in want.items():
+            np.testing.assert_array_equal(np.asarray(new[name]), col, err_msg=name)
+        np.testing.assert_array_equal(np.asarray(overflowed), want_over)
+        np.testing.assert_array_equal(np.asarray(resort), want_resort)
+        assert int(tail) == want_tail
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 devices")
+@pytest.mark.parametrize("seed", range(3))
+def test_pipeline_claim_under_scheme_a_matches_one_device(seed: int) -> None:
+    from jax.sharding import Mesh, PartitionSpec
+
+    rng = np.random.default_rng(100 + seed)
+    bucket, claim, cand_level, unit_level, tail_start = _pipeline_case(
+        rng, 512, 200, num_units=30
+    )
+    mesh = Mesh(np.asarray(jax.devices()[:4]), ("c",))
+    conn = PartitionSpec("c")
+    repl = PartitionSpec()
+
+    def sharded(b: Any, grow: Any, viol: Any, vals: Any, lvl: Any, ul: Any) -> Any:
+        c = phases.GrowthClaim(growable=grow, violating=viol, values=vals)
+        return phases.pipeline_claim(
+            b, c, lvl, ul, jnp.int32(tail_start), shard_axis="c", num_shards=4
+        )
+
+    run = jax.shard_map(
+        sharded,
+        mesh=mesh,
+        in_specs=({name: conn for name in bucket}, repl, repl, repl, repl, repl),
+        out_specs=({name: conn for name in bucket}, repl, repl, repl),
+    )
+    got = run(
+        bucket, claim.growable, claim.violating, claim.values, cand_level, unit_level
+    )
+    want = phases.pipeline_claim(
+        bucket, claim, cand_level, unit_level, jnp.int32(tail_start)
+    )
+    for name in bucket:
+        np.testing.assert_array_equal(
+            np.asarray(got[0][name]), np.asarray(want[0][name])
+        )
+    for g, w in zip(got[1:], want[1:], strict=True):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))

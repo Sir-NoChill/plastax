@@ -106,6 +106,10 @@ class NetworkState[GS]:
             growth trigger "on_units_added" reads it.
         unit_overflow: whether this step's unit-addition phase dropped a
             spawn for lack of a free unit slot.
+        tail_start: PIPELINE only (0 under TOPOLOGICAL): the single bucket's
+            high-water mark. Slots below it have held a connection; slots
+            from it up are the never-used tail that growth spills into once
+            a source level's own dead slots run out.
     """
 
     units: Columns
@@ -122,6 +126,9 @@ class NetworkState[GS]:
     )
     unit_overflow: Bool[Array, ""] = dataclasses.field(
         default_factory=lambda: jnp.bool_(False)
+    )
+    tail_start: Int32[Array, ""] = dataclasses.field(
+        default_factory=lambda: jnp.int32(0)
     )
 
 
@@ -163,6 +170,7 @@ def make_empty_state[GS](static: NetworkStatic, globals_: GS) -> NetworkState[GS
         overflow=jnp.bool_(False),
         units_added=jnp.int32(0),
         unit_overflow=jnp.bool_(False),
+        tail_start=jnp.int32(0),
     )
 
 
@@ -230,7 +238,8 @@ def grow_bucket[GS](
     """Pad one bucket's columns, host-side, and produce a new static/state.
 
     Pure old-state -> new-state; the caller retraces once against the new
-    static config and host-side reallocation.
+    static config and host-side reallocation. The padding is never-used, so
+    in PIPELINE mode it extends the bucket's tail (`tail_start` stays put).
 
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
@@ -296,5 +305,6 @@ def grow_bucket[GS](
         overflow=state.overflow,
         units_added=state.units_added,
         unit_overflow=state.unit_overflow,
+        tail_start=state.tail_start,
     )
     return new_static, new_state

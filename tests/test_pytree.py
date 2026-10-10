@@ -78,8 +78,9 @@ def test_network_state_flatten_leaves_are_arena_arrays_and_globals() -> None:
     num_unit_leaves = len(static.unit_fields)
     num_conn_leaves = len(static.conn_fields) * len(static.level_capacities)
     num_globals_leaves = 1  # {"tau": jnp.array(1.0)}
-    # needs_resort, step, grown, overflow, units_added, unit_overflow
-    num_scalar_leaves = 6
+    # needs_resort, step, grown, overflow, units_added, unit_overflow,
+    # tail_start
+    num_scalar_leaves = 7
     expected = (
         num_unit_leaves + num_conn_leaves + num_globals_leaves + num_scalar_leaves
     )

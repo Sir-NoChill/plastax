@@ -313,7 +313,8 @@ def resort[GS](
     schedule and raises. Returns new (static, state); caller retraces.
 
     PIPELINE mode keeps exactly one bucket, mirrored from
-    NetworkBuilder.finalize's own PIPELINE branch; TOPOLOGICAL's new
+    NetworkBuilder.finalize's own PIPELINE branch, and its compaction resets
+    the never-used tail (`NetworkState.tail_start`) to the live count; TOPOLOGICAL's new
     bucket count is `max(new_level.max(), 1)`, exactly finalize's "the
     highest level ever used as a source is max(levels) - 1" derivation --
     unlike construction, a resort's bucket count can move in EITHER
@@ -444,6 +445,8 @@ def resort[GS](
         units={**state.units, LEVEL.name: new_level},
         conns=tuple(new_conns),
         needs_resort=jnp.bool_(False),
+        # The compaction above returns every dead slot to the pipeline tail.
+        tail_start=jnp.int32(live_counts[0] if is_pipeline else 0),
     )
     return new_static, new_state
 

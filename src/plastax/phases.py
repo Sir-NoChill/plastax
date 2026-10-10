@@ -2667,7 +2667,8 @@ def nth_free_slot(
     The second level: a binary search over the block counts finds each rank's
     block, then a cumsum over just that block finds the slot -- O(k * block)
     work, independent of the capacity. Ranks at or beyond the free count return
-    an arbitrary in-bounds position; callers mask them.
+    an arbitrary in-bounds position; callers mask them. `nth_free_slots` for
+    one bucket.
 
     Args:
         dead: The bucket's tombstone mask.
@@ -2678,20 +2679,67 @@ def nth_free_slot(
     Returns:
         One slot position per rank.
     """
-    cap = dead.shape[0]
+    slots = nth_free_slots([dead], [free_blocks], block, rank[None])
+    slot: Int32[Array, " k"] = slots[0]
+    return slot
+
+
+def nth_free_slots(
+    deads: Sequence[Bool[Array, " _cap"]],
+    free_blocks: Sequence[Int32[Array, " _blocks"]],
+    block: int,
+    rank: Int32[Array, "buckets k"],
+) -> Int32[Array, "buckets k"]:
+    """`nth_free_slot` for several buckets of one block length, in one pass.
+
+    The buckets' running block counts are laid end to end, each lifted by the
+    free slots of the buckets before it, so one search over that monotone list
+    finds every bucket's blocks, and one cumsum over the gathered blocks finds
+    the slots. Each bucket's result equals `nth_free_slot` on that bucket
+    alone, placeholders included.
+
+    Args:
+        deads: Each bucket's tombstone mask.
+        free_blocks: Each bucket's `count_free_blocks` running counts.
+        block: The buckets' (shared) block length.
+        rank: Per bucket, the free-slot ranks to locate.
+
+    Returns:
+        Per bucket, one slot position per rank.
+    """
+    caps = np.array([d.shape[0] for d in deads], np.int32)
+    num_blocks = np.array([r.shape[0] for r in free_blocks], np.int32)
+    first_block = np.concatenate([[0], np.cumsum(num_blocks)[:-1]]).astype(np.int32)
+    # Bucket i's free slots come after base[i] in the joint count.
+    totals = jnp.stack([r[-1] for r in free_blocks])
+    base = jnp.cumsum(totals) - totals
+    joint = jnp.concatenate([r + base[i] for i, r in enumerate(free_blocks)])
     target = rank + jnp.int32(1)
-    b = jnp.minimum(
-        jnp.searchsorted(free_blocks, target, method=_SEARCH).astype(jnp.int32),
-        jnp.int32(free_blocks.shape[0] - 1),
-    )
-    before = jnp.where(b > 0, free_blocks[jnp.maximum(b - 1, 0)], jnp.int32(0))
-    idx = b[:, None] * jnp.int32(block) + jnp.arange(block, dtype=jnp.int32)[None, :]
-    in_block = jnp.where(idx < cap, dead[jnp.minimum(idx, cap - 1)], False)
-    running = jnp.cumsum(in_block.astype(jnp.int32), axis=1)
-    offset = jax.vmap(functools.partial(jnp.searchsorted, method=_SEARCH))(
-        running, target - before
+    found = jnp.searchsorted(
+        joint, (target + base[:, None]).ravel(), method=_SEARCH
     ).astype(jnp.int32)
-    slot: Int32[Array, " k"] = jnp.minimum(b * jnp.int32(block) + offset, cap - 1)
+    b = jnp.minimum(
+        found.reshape(rank.shape) - first_block[:, None], num_blocks[:, None] - 1
+    )
+    before = jnp.where(
+        b > 0,
+        joint[jnp.maximum(first_block[:, None] + b - 1, 0)] - base[:, None],
+        jnp.int32(0),
+    )
+    lane = jnp.arange(block, dtype=jnp.int32)
+    blocks: list[jax.Array] = []
+    for i, dead in enumerate(deads):
+        idx = b[i][:, None] * jnp.int32(block) + lane[None, :]
+        cap = dead.shape[0]
+        blocks.append(jnp.where(idx < cap, dead[jnp.minimum(idx, cap - 1)], False))
+    in_block = jnp.stack(blocks)
+    running = jnp.cumsum(in_block.astype(jnp.int32), axis=2)
+    offset = jax.vmap(functools.partial(jnp.searchsorted, method=_SEARCH))(
+        running.reshape(-1, block), (target - before).ravel()
+    ).astype(jnp.int32)
+    slot: Int32[Array, "buckets k"] = jnp.minimum(
+        b * jnp.int32(block) + offset.reshape(rank.shape), caps[:, None] - 1
+    )
     return slot
 
 
@@ -2745,94 +2793,160 @@ def xla_claim(
 ) -> tuple[Columns, Bool[Array, " k"], Bool[Array, " k"]]:
     """Claim free slots for one bucket's candidates and write them, in plain XLA.
 
-    The portable claim, sharding-aware. Under Scheme-A the dead mask is this
-    shard's capacity slice, so the claim runs over the LOCAL slice and is
-    coordinated across shards: each growable candidate takes a GLOBAL
-    free-slot rank and lands on the one shard that owns it. Because shard g
-    holds arena positions [g*local_capacity, (g+1)*local_capacity), the global
-    free-slot order (shard 0's free slots, then shard 1's, ...) is exactly the
-    single-device position order -- so a candidate lands where the
-    single-device claim would put it.
+    `xla_claim_buckets` for one bucket.
 
     Args:
         bucket: The bucket's (local) columns.
         claim: The bucket's candidates.
         shard_axis: The Scheme-A mesh axis, or None when unsharded.
         num_shards: The Scheme-A shard count (1 when unsharded).
-        free_counts: Precomputed `(free_block_counts(dead, max_block),
-            free_block_length(cap, max_block))` of the bucket's current
-            (local) dead mask for any `max_block` (for example from a fused
-            prune sweep), or None to compute them here.
+        free_counts: As for `xla_claim_buckets`, for this bucket.
 
     Returns:
         The updated columns, and per candidate whether it overflowed and
         whether it was committed with a leveling-breaking edge. Both masks are
         replicated across shards.
     """
-    growable = claim.growable
-    k = growable.shape[0]
-    dead_b = bucket[DEAD.name]
-    local_capacity = dead_b.shape[0]
+    (new_bucket,), overflowed, resort = xla_claim_buckets(
+        [bucket],
+        [claim],
+        shard_axis=shard_axis,
+        num_shards=num_shards,
+        free_counts=[free_counts],
+    )
+    return new_bucket, overflowed[0], resort[0]
+
+
+def xla_claim_buckets(
+    buckets: Sequence[Columns],
+    claims: Sequence[GrowthClaim],
+    *,
+    shard_axis: str | None = None,
+    num_shards: int = 1,
+    free_counts: Sequence[tuple[Int32[Array, " _blocks"], int] | None] | None = None,
+) -> tuple[list[Columns], Bool[Array, "buckets k"], Bool[Array, "buckets k"]]:
+    """Claim free slots for each bucket's candidates and write them, in plain XLA.
+
+    The portable claim, sharding-aware. Each bucket's claim is independent
+    of the others; they share kernels (the ranking, the cross-shard counts
+    and the free-slot search) where their shapes allow, which changes no
+    result. Every candidate list has the same length.
+
+    Under Scheme-A the dead mask is this shard's capacity slice, so the claim
+    runs over the LOCAL slice and is coordinated across shards: each growable
+    candidate takes a GLOBAL free-slot rank and lands on the one shard that
+    owns it. Because shard g holds arena positions [g*local_capacity,
+    (g+1)*local_capacity), the global free-slot order (shard 0's free slots,
+    then shard 1's, ...) is exactly the single-device position order -- so a
+    candidate lands where the single-device claim would put it.
+
+    Args:
+        buckets: Each bucket's (local) columns.
+        claims: Each bucket's candidates.
+        shard_axis: The Scheme-A mesh axis, or None when unsharded.
+        num_shards: The Scheme-A shard count (1 when unsharded).
+        free_counts: Per bucket, precomputed `(free_block_counts(dead,
+            max_block), free_block_length(cap, max_block))` of the bucket's
+            current (local) dead mask for any `max_block` (for example from a
+            fused prune sweep), or None to compute them here.
+
+    Returns:
+        The updated columns per bucket, and per bucket and candidate whether
+        it overflowed and whether it was committed with a leveling-breaking
+        edge. Both masks are replicated across shards.
+    """
+    num = len(buckets)
+    counts: list[tuple[Int32[Array, " _blocks"], int] | None] = (
+        list(free_counts) if free_counts is not None else [None] * num
+    )
+    growable = jnp.stack([claim.growable for claim in claims])
+    k = growable.shape[1]
+    deads = [bucket[DEAD.name] for bucket in buckets]
     # Per-block free counts over this shard's slice: one reduction reading the
     # dead mask, instead of a capacity-sized cumsum. Two-level search for a
     # small claim (O(k * block) past one reduction); for a claim large next to
     # the bucket that gather outgrows one capacity-sized cumsum, which is then
     # used instead.
-    small_claim = k * _FREE_BLOCK <= local_capacity
-    if small_claim:
-        if free_counts is None:
-            running, block_len = count_free_blocks(dead_b)
+    running: dict[int, jax.Array] = {}
+    block_len: dict[int, int] = {}
+    free_through: dict[int, jax.Array] = {}
+    local_free_of: list[jax.Array] = []
+    for b, dead_b in enumerate(deads):
+        local_capacity = dead_b.shape[0]
+        if k * _FREE_BLOCK <= local_capacity:
+            given = counts[b]
+            if given is None:
+                running[b], block_len[b] = count_free_blocks(dead_b)
+            else:
+                fine, fine_block = given
+                running[b] = jnp.cumsum(
+                    regroup_free_counts(fine, fine_block, local_capacity)
+                )
+                block_len[b] = free_block_length(local_capacity)
+            local_free_of.append(running[b][-1])
         else:
-            running = jnp.cumsum(regroup_free_counts(*free_counts, local_capacity))
-            block_len = free_block_length(local_capacity)
-        local_free = running[-1]
-    else:
-        free_through = jnp.cumsum(dead_b.astype(jnp.int32))
-        local_free = free_through[-1]
-    # This shard's offset into the global free-slot space, and the total free
-    # count. The offset is an exclusive prefix of the per-shard free counts (an
-    # all-gather -- a prefix is not a plain all-reduce) and feeds only the
-    # per-shard placement below. total_free is a psum, not sum(all_gather): it
-    # flows into `overflow` and `needs_resort`, which shard_map requires be
-    # provably replicated, and psum is the all-reduce it recognizes as
-    # replicating. Both are device-resident collectives.
+            free_through[b] = jnp.cumsum(dead_b.astype(jnp.int32))
+            local_free_of.append(free_through[b][-1])
+    local_free = jnp.stack(local_free_of)
+    # This shard's offset into each bucket's global free-slot space, and the
+    # total free counts. The offset is an exclusive prefix of the per-shard
+    # free counts (an all-gather -- a prefix is not a plain all-reduce) and
+    # feeds only the per-shard placement below. total_free is a psum, not
+    # sum(all_gather): it flows into `overflow` and `needs_resort`, which
+    # shard_map requires be provably replicated, and psum is the all-reduce it
+    # recognizes as replicating. Both are device-resident collectives.
     if shard_axis is not None:
         all_free = jax.lax.all_gather(local_free, shard_axis)
         my_index = jax.lax.axis_index(shard_axis)
-        offset = jnp.sum(jnp.where(jnp.arange(num_shards) < my_index, all_free, 0))
+        offset = jnp.sum(
+            jnp.where(jnp.arange(num_shards)[:, None] < my_index, all_free, 0), axis=0
+        )
         total_free = monoid.sum_.collective(local_free, shard_axis)
     else:
-        offset = jnp.int32(0)
+        offset = jnp.zeros((num,), jnp.int32)
         total_free = local_free
-    # growth_rank[i] = candidate i's rank among the growable candidates -- its
-    # global free-slot index. A candidate whose rank exceeds the total free
-    # slots is overflow: dropped, flag raised.
-    growth_rank = jnp.cumsum(growable.astype(jnp.int32)) - 1
-    committed = growable & (growth_rank < total_free)
-    overflowed = growable & (growth_rank >= total_free)
+    # growth_rank[b, i] = candidate i's rank among bucket b's growable
+    # candidates -- its global free-slot index. A candidate whose rank exceeds
+    # the total free slots is overflow: dropped, flag raised.
+    growth_rank = jnp.cumsum(growable.astype(jnp.int32), axis=1) - 1
+    committed = growable & (growth_rank < total_free[:, None])
+    overflowed = growable & (growth_rank >= total_free[:, None])
     # A committed candidate belongs to THIS shard iff its global rank falls in
     # [offset, offset + local_free); place it at that shard-local free slot,
     # else scatter to `local_capacity` (out of this slice's range), dropped by
     # the scatter's drop mode.
-    local_rank = growth_rank - offset
-    mine = committed & (local_rank >= jnp.int32(0)) & (local_rank < local_free)
+    local_rank = growth_rank - offset[:, None]
+    mine = committed & (local_rank >= 0) & (local_rank < local_free[:, None])
     safe_rank = jnp.where(mine, local_rank, jnp.int32(0))
-    if small_claim:
-        free_slot = nth_free_slot(dead_b, running, block_len, safe_rank)
-    else:
-        free_slot = jnp.searchsorted(
-            free_through, safe_rank + jnp.int32(1), method=_SEARCH
-        ).astype(jnp.int32)
-    target_slot = jnp.where(mine, free_slot, jnp.int32(local_capacity))
-    new_bucket: Columns = dict(bucket)
-    for name, column in bucket.items():
-        value = (
-            jnp.zeros((k,), dtype=column.dtype)
-            if name == DEAD.name
-            else claim.values[name]
+    free_slot: dict[int, jax.Array] = {}
+    for block in sorted(set(block_len.values())):
+        same = [b for b in sorted(block_len) if block_len[b] == block]
+        slots = nth_free_slots(
+            [deads[b] for b in same],
+            [running[b] for b in same],
+            block,
+            safe_rank[np.array(same)],
         )
-        new_bucket[name] = column.at[target_slot].set(value, mode="drop")
-    return new_bucket, overflowed, committed & claim.violating
+        free_slot.update((b, slots[i]) for i, b in enumerate(same))
+    for b, through in free_through.items():
+        free_slot[b] = jnp.searchsorted(
+            through, safe_rank[b] + jnp.int32(1), method=_SEARCH
+        ).astype(jnp.int32)
+    new_buckets: list[Columns] = []
+    for b, (bucket, claim) in enumerate(zip(buckets, claims, strict=True)):
+        local_capacity = deads[b].shape[0]
+        target_slot = jnp.where(mine[b], free_slot[b], jnp.int32(local_capacity))
+        new_bucket: Columns = dict(bucket)
+        for name, column in bucket.items():
+            value = (
+                jnp.zeros((k,), dtype=column.dtype)
+                if name == DEAD.name
+                else claim.values[name]
+            )
+            new_bucket[name] = column.at[target_slot].set(value, mode="drop")
+        new_buckets.append(new_bucket)
+    violating = jnp.stack([claim.violating for claim in claims])
+    return new_buckets, overflowed, committed & violating
 
 
 def pipeline_claim(
@@ -4650,14 +4764,25 @@ def build_add_conn_phase[GS](
                 prior = prior + grow32.sum()
             claims = capped
 
-        live_before = _live_conn_count(state.conns)
-
         # Claim free slots for every bucket's growable candidates, in
         # candidate order, and write them. The claim is a prefix in the
         # free-slot order: the i-th growable candidate takes the i-th free
         # slot, the rest overflow.
         new_conns: list[Columns]
         tail_start = state.tail_start
+        # The pipeline and Triton claims count their growth as the change in
+        # live connections (unused, and so never computed, by the XLA claim).
+        live_before = _live_conn_count(state.conns)
+
+        def live_growth(conns: list[Columns]) -> jax.Array:
+            grown = _live_conn_count(tuple(conns)) - live_before
+            if shard_axis is not None:
+                # Each shard counts its own slice of the arena; the step's
+                # total is their sum, replicated like every other scalar on
+                # the state.
+                grown = monoid.sum_.collective(grown, shard_axis)
+            return grown
+
         if is_pipeline:
             # One bucket: each level's own dead slots, then the shared tail.
             new_bucket, overflowed_p, resort_p, tail_start = pipeline_claim(
@@ -4671,6 +4796,7 @@ def build_add_conn_phase[GS](
             )
             new_conns = [new_bucket]
             overflow, reassigning = jnp.any(overflowed_p), jnp.any(resort_p)
+            grown_count = live_growth(new_conns)
         elif use_triton:
             # A fused prune sweep's counts, when it made them in this claim's
             # blocks (see build_phases); otherwise triton_claim counts.
@@ -4684,35 +4810,23 @@ def build_add_conn_phase[GS](
             new_conns, overflow, reassigning = triton_claim(
                 list(state.conns), claims, block_counts=fused_counts
             )
+            grown_count = live_growth(new_conns)
         else:
-            new_conns = []
-            overflowed, resorting = [], []
-            for bucket_idx, (bucket_conns, claim) in enumerate(
-                zip(state.conns, claims, strict=True)
-            ):
-                new_bucket, overflow_b, resort_b = xla_claim(
-                    bucket_conns,
-                    claim,
-                    shard_axis=shard_axis,
-                    num_shards=num_shards,
-                    free_counts=(
-                        free_sink[bucket_idx] if free_sink is not None else None
-                    ),
-                )
-                new_conns.append(new_bucket)
-                overflowed.append(overflow_b)
-                resorting.append(resort_b)
-            # One reduction for both flags over every bucket.
-            either = jnp.any(
-                jnp.stack([jnp.stack(overflowed), jnp.stack(resorting)]), axis=(1, 2)
+            new_conns, overflowed_x, resort_x = xla_claim_buckets(
+                state.conns,
+                claims,
+                shard_axis=shard_axis,
+                num_shards=num_shards,
+                free_counts=free_sink,
             )
+            # One reduction for both flags over every bucket.
+            either = jnp.any(jnp.stack([overflowed_x, resort_x]), axis=(1, 2))
             overflow, reassigning = either[0], either[1]
-
-        grown_count = _live_conn_count(tuple(new_conns)) - live_before
-        if shard_axis is not None:
-            # Each shard counts its own slice of the arena; the step's total
-            # is their sum, replicated like every other scalar on the state.
-            grown_count = monoid.sum_.collective(grown_count, shard_axis)
+            # Each committed candidate turns one distinct free slot live, so
+            # the committed count is the growth. It is replicated already: it
+            # needs no second pass over the dead masks, nor a collective.
+            committed = jnp.stack([claim.growable for claim in claims]) & ~overflowed_x
+            grown_count = jnp.sum(committed, dtype=jnp.int32)
         if on_overflow == "error":
             # Raises inline when the phase runs eagerly; under jit the
             # callback raises on the host when the step is consumed

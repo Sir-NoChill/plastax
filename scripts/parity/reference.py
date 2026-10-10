@@ -93,8 +93,13 @@ Growth selection pipeline
    holding live units, ascending). Selection runs per source level in that order --
    ``top_k`` takes the first ``max_new_per_level`` finite candidates,
    ``threshold`` those with score >= threshold(g) up to ``max_new_per_level``,
-   ``all`` every finite candidate -- then ``max_new_per_step`` applies across
-   levels, level ascending.
+   ``all`` every finite candidate. ``level_cap_scope`` scopes that cap:
+   ``source_level`` (the default) applies it to each source level, in both
+   propagation models; ``step`` applies it once, to the finite candidates of
+   every level together in the total order (``all`` has no cap to scope).
+   Either way the winners are then listed levels ascending, the total order
+   within a level, and ``max_new_per_step`` keeps that list's first
+   ``max_new_per_step``.
 8. Selected candidates claim free connection slots per source level, each
    level's in the total order; a candidate left without a slot is dropped and
    raises ``conn_overflow``. The free slots depend on the propagation model:
@@ -723,6 +728,7 @@ def select_growth(
     max_new_per_level: int | None = None,
     max_new_per_step: int | None = None,
     threshold: float | None = None,
+    level_cap_scope: str = "source_level",
     topological: bool = True,
 ) -> list[dict[str, Any]]:
     """Stages 3-7 of the growth pipeline: validity through selection.
@@ -777,24 +783,31 @@ def select_growth(
         )
 
     finite = [c for c in order if c["score"] != NEG_INF]
-    per_level: dict[int, list[dict[str, Any]]] = {}
-    for c in finite:
-        per_level.setdefault(units[c["src"]]["level"], []).append(c)
 
-    selected: list[dict[str, Any]] = []
-    for level in sorted(per_level):
-        bucket = per_level[level]
+    def take(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if selection == "top_k":
             assert max_new_per_level is not None
-            take = bucket[:max_new_per_level]
-        elif selection == "threshold":
+            return pool[:max_new_per_level]
+        if selection == "threshold":
             assert threshold is not None and max_new_per_level is not None
-            take = [c for c in bucket if c["score"] >= threshold][:max_new_per_level]
-        elif selection == "all":
-            take = bucket
-        else:  # pragma: no cover - emit-time misuse
-            raise ValueError(f"unknown selection {selection!r}")
-        selected.extend(take)
+            return [c for c in pool if c["score"] >= threshold][:max_new_per_level]
+        if selection == "all":
+            return pool
+        raise ValueError(f"unknown selection {selection!r}")  # pragma: no cover
+
+    if level_cap_scope == "source_level":
+        by_level: dict[int, list[dict[str, Any]]] = {}
+        for c in finite:
+            by_level.setdefault(units[c["src"]]["level"], []).append(c)
+        pools = [by_level[level] for level in sorted(by_level)]
+        winners = [c for pool in pools for c in take(pool)]
+    elif level_cap_scope == "step":
+        winners = take(finite)
+    else:  # pragma: no cover - emit-time misuse
+        raise ValueError(f"unknown level_cap_scope {level_cap_scope!r}")
+
+    # Levels ascending, the total order within a level (a stable sort).
+    selected = sorted(winners, key=lambda c: units[c["src"]]["level"])
     if max_new_per_step is not None:
         selected = selected[:max_new_per_step]
     del topological  # bucket gating is folded into validity by the callers

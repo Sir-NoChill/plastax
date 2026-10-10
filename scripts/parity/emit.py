@@ -840,9 +840,14 @@ def _grow_cases() -> list[dict[str, Any]]:
     # Per-level shortlist: one M x M grid per source level. M = 2 of the 3
     # units on every level, so both the source and the destination rankings
     # decide the grid, and it differs from the single global grid's.
-    for name, direction in (
-        ("grow_score_shortlist_per_level_any", "any"),
-        ("grow_score_shortlist_per_level_deeper", "deeper"),
+    for name, direction, scope in (
+        ("grow_score_shortlist_per_level_any", "any", {}),
+        ("grow_score_shortlist_per_level_deeper", "deeper", {}),
+        (
+            "grow_score_shortlist_per_level_cap_step",
+            "any",
+            {"level_cap_scope": "step"},
+        ),
     ):
         units, edges = _per_level_state()
         iu, ie = _units_json(units), _edges_json(edges)
@@ -862,7 +867,13 @@ def _grow_cases() -> list[dict[str, Any]]:
                 "the destinations the top-M live units inside that level's "
                 "validity window (level gap and direction), by importance; "
                 "importance ties break by ascending unit id; index = "
-                "level_rank * M * M + row-major position in the level's grid.",
+                "level_rank * M * M + row-major position in the level's grid."
+                + (
+                    " Under level_cap_scope = step, max_new_per_level caps the "
+                    "winners of every level's grid together, in the total order."
+                    if scope
+                    else ""
+                ),
                 cands=cands,
                 units=units,
                 edges=edges,
@@ -873,6 +884,7 @@ def _grow_cases() -> list[dict[str, Any]]:
                     "max_new_per_level": 2,
                     "max_level_gap": 1,
                     "direction": direction,
+                    **scope,
                 },
                 rules_used={
                     "score": "grid_score_v1",
@@ -905,6 +917,20 @@ def _grow_cases() -> list[dict[str, Any]]:
             "grow_select_max_new_per_step",
             {"selection": "top_k", "max_new_per_level": 3, "max_new_per_step": 2},
             "max_new_per_step applies across levels, level ascending.",
+        ),
+        (
+            "grow_select_cap_step",
+            {
+                "selection": "top_k",
+                "max_new_per_level": 4,
+                "max_new_per_step": 3,
+                "level_cap_scope": "step",
+                "max_level_gap": 1,
+            },
+            "level_cap_scope = step: max_new_per_level caps the step's "
+            "winners in the total order across levels; max_new_per_step "
+            "then keeps the first of them levels ascending, so a level-1 "
+            "winner ahead of a level-0 one in the total order is the one cut.",
         ),
         (
             "grow_select_overflow",
@@ -1219,8 +1245,11 @@ def _claim_cases() -> list[dict[str, Any]]:
     cases.append(doc)
 
     # Pipeline: a level's own dead slots first, then the shared tail.
-    select = {"max_level_gap": 1, "direction": "deeper", "selection": "all"}
-    pipeline_cases = (
+    claim_all = {"max_level_gap": 1, "direction": "deeper", "selection": "all"}
+    capped = {"max_level_gap": 1, "selection": "top_k", "max_new_per_level": 3}
+    pipeline_cases: tuple[
+        tuple[str, list[tuple[int, int]], int, str, dict[str, Any]], ...
+    ] = (
         (
             "grow_claim_pipeline_spill",
             [(0, 2), (1, 3), (2, 5), (4, 5)],
@@ -1229,6 +1258,7 @@ def _claim_cases() -> list[dict[str, Any]]:
             "former occupant it sourced, then spills to the never-used tail, "
             "levels ascending. Level 2's dead slot stays free: no level "
             "borrows another's.",
+            claim_all,
         ),
         (
             "grow_claim_pipeline_overflow",
@@ -1238,9 +1268,30 @@ def _claim_cases() -> list[dict[str, Any]]:
             "own dead slot; the spills reach the tail levels ascending, not "
             "by score, so level 0's exhaust it ahead of level 1's "
             "better-scored ones, which are dropped with conn_overflow.",
+            claim_all,
+        ),
+        (
+            "grow_claim_pipeline_cap_source_level",
+            [(0, 2), (2, 5), (4, 5)],
+            6,
+            "Pipeline growth under level_cap_scope = source_level (the "
+            "default): max_new_per_level caps each source level's winners, "
+            "though every level claims from the one bucket -- three per "
+            "level here, nine in all.",
+            {**capped, "level_cap_scope": "source_level"},
+        ),
+        (
+            "grow_claim_pipeline_cap_step",
+            [(0, 2), (2, 5), (4, 5)],
+            6,
+            "Pipeline growth under level_cap_scope = step: max_new_per_level "
+            "caps the whole step's winners -- the first three of the total "
+            "order, whatever their source levels -- listed levels ascending "
+            "for the claim.",
+            {**capped, "level_cap_scope": "step"},
         ),
     )
-    for name, dead_pairs, tail, comment in pipeline_cases:
+    for name, dead_pairs, tail, comment, select in pipeline_cases:
         units, edges, selected = _claim_select(select)
         iu, ie = _units_json(units), _edges_json(edges)
         dead_per_level: dict[int, int] = {}

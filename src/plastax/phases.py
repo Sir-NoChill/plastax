@@ -4150,8 +4150,8 @@ def dedupe_step(
 # network's single sort beats three radix launches.
 RADIX_TOTAL_ORDER_MIN = 1 << 17
 # The most elements of the one-hot running count `select_per_segment` ranks a
-# chunk of segments with (64 MB of int32).
-_SEGMENT_RANK_ELEMENTS = 1 << 24
+# chunk of segments with (16 MB of int32).
+_SEGMENT_RANK_ELEMENTS = 1 << 22
 
 
 def _sort_key(flat_scores: jax.Array) -> Float[Array, " n"]:
@@ -4311,18 +4311,30 @@ def select_per_segment(
     n = perm.shape[0]
     # Every segment of a chunk is ranked by one running count over a
     # (candidates x segments) one-hot, so a chunk is one pass, not one per
-    # segment; the chunk width bounds that count's size.
+    # segment. The chunk width bounds that count's size: on a long list one
+    # pass per segment moves the same bytes, and the launches it saves no
+    # longer matter.
     width = max(1, min(num_segments, _SEGMENT_RANK_ELEMENTS // max(n, 1)))
     winners: list[tuple[jax.Array, jax.Array]] = []
     for lo in range(0, num_segments, width):
         hi = min(lo + width, num_segments)
-        local = sorted_segment - jnp.int32(lo)
-        member = (local >= 0) & (local < hi - lo)
-        onehot = local[:, None] == jnp.arange(hi - lo, dtype=jnp.int32)[None, :]
-        running = jnp.cumsum(onehot.astype(jnp.int32), axis=0)
-        safe = jnp.where(member, local, jnp.int32(0))
-        rank = jnp.take_along_axis(running, safe[:, None], axis=1)[:, 0] - 1
-        slot = jnp.where(member & (rank < k), safe * jnp.int32(k) + rank, (hi - lo) * k)
+        if hi - lo == 1:
+            member = sorted_segment == jnp.int32(lo)
+            running = jnp.cumsum(member.astype(jnp.int32))[:, None]
+            rank = running[:, 0] - 1
+            slot = jnp.where(member & (rank < k), rank, jnp.int32(k))
+        else:
+            local = sorted_segment - jnp.int32(lo)
+            member = (local >= 0) & (local < hi - lo)
+            lanes = jnp.arange(hi - lo, dtype=jnp.int32)
+            running = jnp.cumsum(
+                (local[:, None] == lanes[None, :]).astype(jnp.int32), axis=0
+            )
+            safe = jnp.where(member, local, jnp.int32(0))
+            rank = jnp.take_along_axis(running, safe[:, None], axis=1)[:, 0] - 1
+            slot = jnp.where(
+                member & (rank < k), safe * jnp.int32(k) + rank, (hi - lo) * k
+            )
         top = jnp.zeros(((hi - lo) * k,), jnp.int32).at[slot].set(perm, mode="drop")
         count = running[-1] if n else jnp.zeros((hi - lo,), jnp.int32)
         filled = jnp.arange(k, dtype=jnp.int32)[None, :] < count[:, None]

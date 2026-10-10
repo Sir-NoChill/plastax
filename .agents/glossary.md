@@ -131,11 +131,13 @@ group, ordered roughly by how fundamental they are.
   unit addition and growth every n-th step; unit and connection pruning run
   every step.
 - **Overflow** — an add_conn candidate that was selected but found no free slot
-  in its bucket; the driver grows the bucket and retries. Its unit-side
+  in its bucket; the driver grows the bucket and claims the dropped candidates
+  in the same step (only the growth claim re-runs). Its unit-side
   counterpart, `unit_overflow`, flags a spawn that found no free unit slot
   (the child is dropped; the capacity is fixed).
 - **Retrace protocol** — the driver's host loop: run step; on overflow grow +
-  retrace + retry; on `needs_resort` resort + retrace.
+  retrace + claim the dropped growth candidates; on `needs_resort` resort +
+  retrace.
 
 ## Dynamic sparse training (DST)
 

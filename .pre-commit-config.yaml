@@ -1,6 +1,9 @@
 # A bare `pre-commit install` wires all three stages: the commit-msg scope
 # gate and the pre-push type/test gates, not just pre-commit.
 default_install_hook_types: [pre-commit, commit-msg, pre-push]
+# A hook without its own `stages` runs only on pre-commit, not again on
+# commit-msg and pre-push over files it has already checked.
+default_stages: [pre-commit]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -48,12 +51,20 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
+      # Parallel (pytest-xdist, at most 12 workers: more oversubscribes a
+      # 20-thread host) over a warm JAX compilation cache (tests/conftest.py).
+      # Skipped when the pushed commits touch only docs and other prose.
       - id: pytest-fast
         name: pytest (fast suite)
-        entry: uv run pytest -m "not slow" -q
+        entry: uv run pytest -m "not slow" -q -n auto --maxprocesses=12
         language: system
         pass_filenames: false
         stages: [pre-push]
+        exclude: |
+          (?x)^(
+            docs/.*|benchmarks/.*|\.agents/.*|\.github/.*|
+            .*\.md|LICENSE|CITATION\.cff|\.readthedocs\.yaml|\.gitignore
+          )$
 
       - id: commit-scope
         name: commit message type(scope) gate

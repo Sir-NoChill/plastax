@@ -859,9 +859,13 @@ def _grow_diff(net: Any, static: Any, state: Any) -> tuple[list[Any], Any]:
 
 @pytest.mark.parametrize("name", sorted(_ENFORCED_CLAIM["topological"]))
 def test_grow_claim_topological_golden(name: str) -> None:
-    """Strict per-level buckets, the Driver's regrow, then the retry's growth."""
-    import dataclasses
+    """Strict per-level buckets, the Driver's regrow, then the same-step retry.
 
+    The retry claims the attempt's dropped winners into the regrown buckets
+    (`build_growth_retry`) at the attempt's step; together they commit the
+    golden's `step_growth`, one claim over buckets that large from the start.
+    """
+    from plastax.phases import build_add_conn_phase, build_growth_retry
     from plastax.state import grow_bucket, live_conn_count
 
     doc = _load(f"{name}.json")
@@ -870,9 +874,16 @@ def test_grow_claim_topological_golden(name: str) -> None:
     net, static, state = _score_net(doc, step_cap=None, free_at=free)
     assert len(static.level_capacities) == len(free), "one bucket per level"
 
-    grown, state = _grow_diff(net, static, state)
+    before = _live_pairs(state)
+    sink: list[Any] = [None]
+    phase = build_add_conn_phase(net, static, remainder_sink=sink)
+    state, _ = phase(state, px.StepInputs(inputs=jnp.zeros((0,)), targets=None))
+    attempt = sorted(_live_pairs(state))
+    for pair in before:
+        attempt.remove(pair)
     expect = doc["expect"]
-    assert grown == _want_commits(expect), f"{name}: the attempt's commits"
+    assert attempt == _want_commits(expect), f"{name}: the attempt's commits"
+    assert int(state.grown) == expect["grown"]
     assert bool(state.overflow) == expect["conn_overflow"]
     assert bool(state.needs_resort) == expect["needs_resort"]
     # The Driver's regrow set: every bucket the attempt left full.
@@ -884,17 +895,36 @@ def test_grow_claim_topological_golden(name: str) -> None:
     assert full == expect["regrow_levels"]
 
     # The retry: grow those buckets as the Driver does, pin the golden's
-    # regrown free counts, and run the next step's growth.
+    # regrown free counts, and claim the dropped winners at the same step.
     for lvl in full:
         static, state = grow_bucket(static, state, lvl)
     retry = doc["retry"]
+    assert retry["step"] == doc["params"]["step"], "the retry is the same step"
     state = _pin_free(
         state, units, {int(k): v for k, v in retry["free_per_level"].items()}
     )
-    state = dataclasses.replace(state, step=jnp.int32(retry["step"]))
-    grown, state = _grow_diff(net, static, state)
-    assert grown == _want_commits(retry["expect"]), f"{name}: the retry's commits"
+    mid = _live_pairs(state)
+    state, left = build_growth_retry(net, static)(state, sink[0])
+    retried = sorted(_live_pairs(state))
+    for pair in mid:
+        retried.remove(pair)
+    assert retried == _want_commits(retry["expect"]), f"{name}: the retry's commits"
     assert bool(state.overflow) == retry["expect"]["conn_overflow"]
+    assert not any(bool(jnp.any(c.growable)) for c in left.claims)
+    assert int(state.grown) == expect["grown"] + retry["expect"]["grown"]
+    assert bool(state.needs_resort) == (
+        expect["needs_resort"] or retry["expect"]["needs_resort"]
+    )
+
+    # The whole step: one claim over buckets that large from the start.
+    whole = doc["step_growth"]
+    step_free = {int(k): v for k, v in whole["free_per_level"].items()}
+    net_w, static_w, state_w = _score_net(doc, step_cap=None, free_at=step_free)
+    grown, state_w = _grow_diff(net_w, static_w, state_w)
+    assert grown == _want_commits(whole["expect"]), f"{name}: the step's growth"
+    assert sorted(attempt + retried) == grown
+    assert not bool(state_w.overflow)
+    assert int(state_w.grown) == int(state.grown) == whole["expect"]["grown"]
 
 
 @pytest.mark.parametrize("name", sorted(_ENFORCED_CLAIM["pipeline"]))

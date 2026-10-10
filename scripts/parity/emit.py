@@ -1145,8 +1145,9 @@ def _claim_cases() -> list[dict[str, Any]]:
         field_defaults={"weight": 0.0},
     )
     assert first["conn_overflow"] and first["regrow_levels"] == [0, 2]
-    # The retry: the next step's growth over the attempt's output edges; a
-    # regrown bucket holds 8 free slots, the others what the attempt left.
+    # The retry, in the same step: the host loop regrows every full bucket
+    # (to 8 free slots here; the others keep what the attempt left) and the
+    # winners the attempt dropped claim them. Nothing is re-selected.
     retry_free = {
         lvl: 8
         if lvl in first["regrow_levels"]
@@ -1154,29 +1155,47 @@ def _claim_cases() -> list[dict[str, Any]]:
         for lvl, f in free.items()
     }
     after_edges = copy.deepcopy(edges)
-    cands = ref.candidates_exhaustive(
-        units, capacity=_GROW_CAPACITY, score=rules.grid_score_v1
-    )
-    retry_selected = ref.select_growth(
-        units, after_edges, cands, capacity=_GROW_CAPACITY, **select
-    )
-    retry = ref.commit_growth(
+    retry = ref.retry_growth(
         units,
         after_edges,
-        retry_selected,
+        selected,
+        first,
+        init=rules.grow_init_v1,
+        field_defaults={"weight": 0.0},
         free_per_level=retry_free,
+    )
+    assert not retry["conn_overflow"]
+    # The step's whole growth: one claim over the regrown buckets, as if they
+    # had been that large from the start.
+    step_free = {
+        lvl: f + (retry_free[lvl] if lvl in first["regrow_levels"] else 0)
+        for lvl, f in free.items()
+    }
+    whole = ref.commit_growth(
+        units,
+        copy.deepcopy(_growth_state()[1]),
+        selected,
+        free_per_level=step_free,
         init=rules.grow_init_v1,
         field_defaults={"weight": 0.0},
     )
-    assert not retry["conn_overflow"]
+    key = lambda c: (c["src"], c["dst"], c["score"])  # noqa: E731
+    assert sorted(map(key, whole["committed"])) == sorted(
+        map(key, first["committed"] + retry["committed"])
+    )
+    assert not whole["conn_overflow"]
     doc = _doc(
         "grow_claim_topological_regrow",
         "growth_v2",
         "Topological claim: each source level claims only its own bucket's "
         "free slots, so level 0 overflows while level 1 keeps spare slots. "
         "The host loop then grows every full bucket (regrow_levels) and "
-        "re-runs the step; the retry block is that step's growth, at step + "
-        "1, over the attempt's output edges with the regrown free counts.",
+        "finishes the step's growth in the same step: the retry block is the "
+        "claim of the winners the attempt dropped, at the same step (no "
+        "re-selection, no other phase), over the attempt's output edges with "
+        "the regrown free counts. step_growth is the step's whole growth: one "
+        "claim over the regrown buckets (attempt free counts plus the regrown "
+        "slots), which the attempt and the retry together equal.",
         rules=init_rules,
         params={
             **base,
@@ -1189,9 +1208,13 @@ def _claim_cases() -> list[dict[str, Any]]:
         expect=first,
     )
     doc["retry"] = {
-        "step": _GROW_STEP + 1,
+        "step": _GROW_STEP,
         "free_per_level": {str(k): v for k, v in retry_free.items()},
         "expect": retry,
+    }
+    doc["step_growth"] = {
+        "free_per_level": {str(k): v for k, v in step_free.items()},
+        "expect": whole,
     }
     cases.append(doc)
 

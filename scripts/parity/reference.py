@@ -101,9 +101,12 @@ Growth selection pipeline
 
    - topological: each level owns one bucket and claims only that bucket's
      free slots. A level whose bucket is full after the claim (no free slot
-     left) is grown by the host loop, which then re-runs the step: the
-     goldens' ``retry`` block re-runs this phase at ``step + 1`` over the
-     attempt's output edges with the regrown free counts.
+     left) is grown by the host loop, which then finishes the claim inside
+     the same step: the candidates the claim dropped claim the regrown free
+     slots, in the total order (``retry_growth``), and nothing else re-runs.
+     The step commits exactly what one claim over the regrown buckets would
+     have. The goldens' ``retry`` block is that claim, at the same step, over
+     the attempt's output edges with the regrown free counts.
    - pipeline: each level first claims the dead slots whose former occupant
      was sourced at that level; the rest spill to the shared never-used tail,
      levels ascending and in the total order within a level. Overflow means
@@ -796,6 +799,49 @@ def select_growth(
         selected = selected[:max_new_per_step]
     del topological  # bucket gating is folded into validity by the callers
     return selected
+
+
+def retry_growth(
+    units: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    attempt: dict[str, Any],
+    *,
+    init: Callable[[int, int], dict[str, float]],
+    field_defaults: dict[str, float],
+    free_per_level: dict[int, int],
+) -> dict[str, Any]:
+    """Stage 8's overflow recovery (topological): claim the dropped winners.
+
+    ``attempt`` is ``commit_growth``'s result for ``selected``; ``edges``
+    already holds its commits. After the host loop regrows the full buckets
+    (``free_per_level`` is each bucket's free count after the regrow), the
+    selected candidates the attempt dropped claim those free slots, per
+    source level and in the total order, at the same step: the selection is
+    not redone and no other phase runs. ``attempt`` plus the result commit
+    exactly what ``commit_growth`` over ``selected`` commits with each
+    bucket's free count raised by the regrow.
+    """
+    # Each level's claim is a prefix of its winners: the rest were dropped.
+    level_of = {u["id"]: u["level"] for u in units}
+    kept: dict[int, int] = {}
+    for c in attempt["committed"]:
+        kept[level_of[c["src"]]] = kept.get(level_of[c["src"]], 0) + 1
+    seen: dict[int, int] = {}
+    dropped = []
+    for c in selected:
+        level = level_of[c["src"]]
+        seen[level] = seen.get(level, 0) + 1
+        if seen[level] > kept.get(level, 0):
+            dropped.append(c)
+    return commit_growth(
+        units,
+        edges,
+        dropped,
+        init=init,
+        field_defaults=field_defaults,
+        free_per_level=free_per_level,
+    )
 
 
 def commit_growth(

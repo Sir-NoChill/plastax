@@ -676,7 +676,8 @@ def test_two_level_free_slot_search_matches_a_numpy_oracle() -> None:
 def test_driver_regrows_a_pipeline_bucket_whose_tail_ran_out() -> None:
     """PIPELINE overflow means the tail ran out, even when other levels' dead
     slots remain: the bucket is not full, but its level-0 claimants cannot
-    take level 1's dead slots, so the Driver must grow it and retry."""
+    take level 1's dead slots, so the Driver must grow it and claim the
+    dropped winners in the same step."""
     static, state = _build_net(_PipelineAddConnNet)
     live = len(_DST)
     # Exactly: the 5 live edges, 2 dead slots a level-1 DST left, 1 tail slot.
@@ -707,8 +708,10 @@ def test_driver_regrows_a_pipeline_bucket_whose_tail_ran_out() -> None:
     out = driver.state
     assert driver.static.level_capacities[0] > capacity
     assert not bool(out.overflow)
-    # The attempt's one commit, then the retry's three, all from the tail.
-    assert int(live_conn_count(out)) == live + 1 + 3
-    assert int(out.tail_start) == live + 2 + 1 + 3
+    # The step's three winners: one claimed before the regrow, the two it
+    # dropped after it, all from the tail.
+    assert int(live_conn_count(out)) == live + 3
+    assert int(out.grown) == 3
+    assert int(out.tail_start) == live + 2 + 3
     # Level 1's dead slots were never borrowed.
     assert np.asarray(out.conns[0][px.DEAD.name])[live : live + 2].all()

@@ -355,17 +355,26 @@ The decision is `step.prune_fusion.plan`.
 `Driver.step(inputs)` (`driver.py:51`) runs the jitted step and reacts to the
 flags it returns — the **retrace protocol**:
 
-- **overflow** → for each full bucket, `state.grow_bucket` (new `NetworkStatic`
-  → `make_step` retrace), retry the *same* inputs against the failed attempt's
-  **output** state (the donated input buffers may be gone).
+- **overflow** → the step's growth is finished inside the same step: for
+  each full bucket, `state.grow_bucket` (new `NetworkStatic` → `make_step`
+  retrace for the next step), then `step.make_growth_retry` claims the
+  candidates the step's claim dropped (`StepResult.growth_remainder`, a
+  `phases.GrowthRemainder`) into the regrown buckets, in the total order;
+  repeat until none is left. Nothing else re-runs: the step's selection is
+  kept, the step counter advanced once, and the state equals a step whose
+  buckets were that large from the start (`state.overflow` False,
+  `state.grown` the step's total). The jitted step donates its input, so the
+  pre-step state is gone; the step hands back its selection instead (a few
+  k-long columns per bucket, k the per-level selection size), which keeps
+  the non-overflow path one fused call.
 - **needs_resort** → `topo.resort` (new bucket layout, new `NetworkStatic`),
   rebuild the step, return.
 - else commit.
 
 `Driver(..., check_every=N)` with N > 1 reads the flags back only every N
 steps (overflow OR-accumulated on device; `needs_resort` is sticky in state):
-no retry of an overflowing step (buckets short of `max_new_per_level` free slots
-grow at the check) and a resort deferred to the check. Opt-in, for launch-
+no completion of an overflowing step's growth (its dropped candidates are
+not grown; buckets short of `max_new_per_level` free slots grow at the check) and a resort deferred to the check. Opt-in, for launch-
 bound small nets; N = 1 is the exact protocol above.
 
 `topo.resort` first rejects, in topological mode, a cycle in the live edges
@@ -537,12 +546,16 @@ edge multisets), how many of each level commit is not.
   0..D with D the deepest unit level when the net grows (`deepest_grows`). A
   level claims only its own bucket's free slots; claimants past them are
   dropped and raise `overflow`. A candidate sourced at a level with no bucket
-  is invalid, so it never overflows. Reallocate: the `Driver` grows every
-  full bucket (live == capacity) with `grow_bucket` --
+  is invalid, so it never overflows. Reallocate, inside the same step: the
+  `Driver` grows every full bucket (live == capacity) with `grow_bucket` --
   `max(capacity_policy(live + 1), floor)`, floor 2 x capacity (1.5 x under
-  `capacity_align`) -- and re-runs the step on the same inputs against the
-  attempt's output state: a full step whose growth re-selects (with
-  `dedupe_live`, the winners the attempt dropped come first). Build and
+  `capacity_align`) -- and the winners the claim dropped claim the new
+  slots in the total order (`make_growth_retry`), repeating until none is
+  left. Only the growth claim re-runs, with the step's selection (same step
+  value, same rng keys); forward, backward and the updates ran once and the
+  step counter advances once. Since an overflowing level claimed every free
+  slot of its bucket and a regrow appends never-used slots, the step ends
+  exactly where one claim over the regrown buckets would have. Build and
   resort size bucket L at `capacity_policy(live_L, capacity_headroom,
   capacity_align)`, live connections first (a resort never shrinks a bucket
   below its old capacity); resort drops tombstones.
@@ -555,21 +568,29 @@ edge multisets), how many of each level commit is not.
   order within a level, each taking the lowest tail slot and raising the mark.
   A level never borrows another level's dead slots. `overflow` means the tail
   is exhausted; the `Driver` then grows the bucket (extending the tail) and
-  re-runs the step as above. A pipeline resort compacts and resets the mark
+  the dropped winners spill into the new tail, levels ascending, as above. A pipeline resort compacts and resets the mark
   to the live count.
 
-`overflow` is per attempt: after a `Driver.step` (`check_every = 1`) it is
-False, since the Driver retries until an attempt fits. plastax-cpp keeps its
-buckets inside one fixed arena (`Traits::ConnCapacity`): its regrow moves the
-later buckets into the arena's unassigned reserve, and when that does not fit
-(or, in pipeline mode, when the arena's tail is exhausted) its overflow stands
--- the only divergence, at cx's declared memory bound.
+`overflow` after a `Driver.step` (`check_every = 1`) is False: the flag is
+raised by the step's claim and cleared once the retry has placed every
+dropped winner, which always happens since px buckets have no bound.
+plastax-cpp keeps its buckets inside one fixed arena (`Traits::ConnCapacity`):
+its regrow moves the later buckets into the arena's unassigned reserve, and
+when that does not fit (or, in pipeline mode, when the arena's tail is
+exhausted) its overflow stands with the step's claim as committed -- the only
+divergence, at cx's declared memory bound. plastax-cpp finishes an
+overflowing growth by undoing the attempt's commits and re-running its growth
+phase at the same step over the regrown buckets; the selection is a pure
+function of the unchanged state, so it is the same and the arena ends
+identical to px's remainder claim.
 
 `scripts/parity/reference.py`'s `commit_growth` is the claim's specification:
 per-level dead counts plus a tail count (pipeline) or per-level free counts
-(topological, reporting the levels a regrow grows); a golden's `retry` block
-runs the growth phase again at `step + 1` over the attempt's output edges with
-the regrown free counts it records. The single-domain goldens (`free_slots`)
+(topological, reporting the levels a regrow grows), and `retry_growth` the
+recovery: a golden's `retry` block claims the attempt's dropped winners at the
+same step over the attempt's output edges with the regrown free counts it
+records, and its `step_growth` block is the single claim over the regrown
+buckets that the attempt and the retry together equal. The single-domain goldens (`free_slots`)
 are pipeline goldens with no dead slots. Not decided here: in PIPELINE mode
 plastax selects over one segment (`max_new_per_level` caps the whole step),
 where plastax-cpp and the reference group by source level.

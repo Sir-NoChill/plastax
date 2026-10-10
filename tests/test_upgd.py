@@ -111,7 +111,6 @@ def test_utility_gate_protects_useful_weights() -> None:
     """
     update = upgd.UpgdUpdate(lr=0.1, beta=0.0, sigma=0.0)
     # sigmoid(x/eta) -> 1 for x >> eta, -> 0 for x << -eta
-    assert float(jnp.asarray(0.0)) == 0.0  # guard against a vacuous test below
 
     for utility_sign, expect_change in ((+1.0, False), (-1.0, True)):
         columns = {
@@ -177,6 +176,10 @@ def test_noise_is_deterministic_per_edge_and_step() -> None:
     assert first.keys() == second.keys()
     for key in first:
         assert first[key] == pytest.approx(second[key], abs=1e-9)
+    # Without noise both runs would agree trivially: the noise must be drawn.
+    net0, static0, state0 = _build(sigma=0.0)
+    quiet = _live_edges(_run_one_step(net0, static0, state0).state)
+    assert any(first[k] != pytest.approx(quiet[k], abs=1e-9) for k in first)
 
 
 def test_v0_net_preserves_the_broadcast_eta() -> None:

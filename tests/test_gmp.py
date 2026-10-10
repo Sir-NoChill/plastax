@@ -85,6 +85,8 @@ def test_no_pruning_before_the_window_opens() -> None:
     dense = records[0].live_edges
     for record in records[: int(0.5 * len(records))]:
         assert record.live_edges == dense, "pruned inside the dense phase"
+    # The window does open: a run that never pruned would pass the loop above.
+    assert records[-1].live_edges < dense, "never pruned after the window opened"
 
 
 def test_live_edges_never_increase() -> None:
@@ -94,6 +96,8 @@ def test_live_edges_never_increase() -> None:
     land on a plausible final count.
     """
     counts = [r.live_edges for r in _short_run(final_sparsity=0.9)]
+    # A constant count would pass the monotonicity check below vacuously.
+    assert counts[-1] < counts[0], "the run never pruned"
     assert all(a >= b for a, b in zip(counts[:-1], counts[1:], strict=True)), (
         f"live-edge count increased: {counts}"
     )

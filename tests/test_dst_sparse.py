@@ -131,6 +131,8 @@ def test_holds_sparsity(trained: dict[str, object]) -> None:
 
 
 def test_never_grows_a_duplicate(trained: dict[str, object]) -> None:
+    # Only meaningful if the probed churn grew something.
+    assert trained["n_grown"] > 0
     assert trained["distinct"]
 
 

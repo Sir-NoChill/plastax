@@ -27,6 +27,7 @@ import numpy as np
 
 import plastax as px
 from plastax import phases
+from plastax.state import live_conn_count
 
 _DUMMY_INPUTS = px.StepInputs(inputs=jnp.zeros((0,), dtype=jnp.float32), targets=None)
 
@@ -667,3 +668,44 @@ def test_two_level_free_slot_search_matches_a_numpy_oracle() -> None:
             np.testing.assert_array_equal(
                 np.asarray(got), free, err_msg=f"cap={cap} rate={rate}"
             )
+
+
+def test_driver_regrows_a_pipeline_bucket_whose_tail_ran_out() -> None:
+    """PIPELINE overflow means the tail ran out, even when other levels' dead
+    slots remain: the bucket is not full, but its level-0 claimants cannot
+    take level 1's dead slots, so the Driver must grow it and retry."""
+    static, state = _build_net(_PipelineAddConnNet)
+    live = len(_DST)
+    # Exactly: the 5 live edges, 2 dead slots a level-1 DST left, 1 tail slot.
+    capacity = live + 3
+    bucket = {}
+    for spec in static.conn_fields:
+        col = np.full((capacity,), np.asarray(spec.default), dtype=spec.dtype)
+        col[:live] = np.asarray(state.conns[0][spec.name])[:live]
+        bucket[spec.name] = col
+    bucket[px.FROM_ID.name][live : live + 2] = _DST[0]
+    bucket[px.TO_ID.name][live : live + 2] = _DST[1]
+    static = dataclasses.replace(static, level_capacities=(capacity,))
+    state = dataclasses.replace(
+        state,
+        conns=({k: jnp.asarray(v) for k, v in bucket.items()},),
+        tail_start=jnp.int32(live + 2),
+    )
+
+    # The attempt alone: one of three level-0 winners fits the tail.
+    attempt, _ = phases.build_add_conn_phase(_PipelineAddConnNet, static)(
+        _with_marker_activations(state), _DUMMY_INPUTS
+    )
+    assert bool(attempt.overflow) and int(attempt.grown) == 1
+    assert int(live_conn_count(attempt)) < capacity  # not full
+
+    driver = px.Driver(_PipelineAddConnNet, static, state)
+    driver.step(px.StepInputs(inputs=jnp.asarray([1.0, 0.0]), targets=None))
+    out = driver.state
+    assert driver.static.level_capacities[0] > capacity
+    assert not bool(out.overflow)
+    # The attempt's one commit, then the retry's three, all from the tail.
+    assert int(live_conn_count(out)) == live + 1 + 3
+    assert int(out.tail_start) == live + 2 + 1 + 3
+    # Level 1's dead slots were never borrowed.
+    assert np.asarray(out.conns[0][px.DEAD.name])[live : live + 2].all()

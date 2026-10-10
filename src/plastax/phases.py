@@ -4812,13 +4812,35 @@ def build_add_conn_phase[GS](
             )
             grown_count = live_growth(new_conns)
         else:
-            new_conns, overflowed_x, resort_x = xla_claim_buckets(
-                state.conns,
-                claims,
-                shard_axis=shard_axis,
-                num_shards=num_shards,
-                free_counts=free_sink,
-            )
+            if jax.default_backend() == "gpu":
+                # A GPU runs the claim's many small kernels one after another,
+                # so the buckets share them.
+                new_conns, overflowed_x, resort_x = xla_claim_buckets(
+                    state.conns,
+                    claims,
+                    shard_axis=shard_axis,
+                    num_shards=num_shards,
+                    free_counts=free_sink,
+                )
+            else:
+                # XLA:CPU overlaps one bucket's claim with the other buckets'
+                # selection (one sort per bucket for a per-level shortlist),
+                # which a joint claim would have to wait for.
+                per_bucket = [
+                    xla_claim(
+                        bucket_conns,
+                        claim,
+                        shard_axis=shard_axis,
+                        num_shards=num_shards,
+                        free_counts=None if free_sink is None else free_sink[b],
+                    )
+                    for b, (bucket_conns, claim) in enumerate(
+                        zip(state.conns, claims, strict=True)
+                    )
+                ]
+                new_conns = [out[0] for out in per_bucket]
+                overflowed_x = jnp.stack([out[1] for out in per_bucket])
+                resort_x = jnp.stack([out[2] for out in per_bucket])
             # One reduction for both flags over every bucket.
             either = jnp.any(jnp.stack([overflowed_x, resort_x]), axis=(1, 2))
             overflow, reassigning = either[0], either[1]

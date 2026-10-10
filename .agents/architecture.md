@@ -505,10 +505,60 @@ attribute), `direction`
 (default **False**) vetoes candidates equal to a live edge; `dedupe_step`
 (default **False**) keeps the first of equal keys; per-source-level selection
 (`top_k` of `max_new_per_level` / `threshold(g)` / `all`, then
-`max_new_per_step` across levels) in the total order; claim of free slots in
-order (drops raise `overflow`); `init` with declared field defaults; flags
+`max_new_per_step` across levels) in the total order; the per-level claim of
+free slots (below; drops raise `overflow`); `init` with declared field
+defaults; flags
 (`needs_resort`, `grown`). Without dedupe, duplicate candidates create
 parallel edges — by design; live dedupe costs a sort of live keys per step.
+
+Slot claim and capacity (identical in plastax-cpp, ADR-010). Selection never
+looks at capacity; only the claim does, and its rule depends on the
+propagation model. A candidate's level is its source unit's level as growth
+sees it this step. A slot is free when it holds no live connection: dead (a
+tombstoned connection) or never used. Within one level, the level's selected
+candidates claim in the total order and the i-th takes the level's i-th free
+slot in ascending slot order; which slot is a backend choice (goldens compare
+edge multisets), how many of each level commit is not.
+
+- TOPOLOGICAL, strict per-level buckets. One bucket per source level,
+  0..D with D the deepest unit level when the net grows (`deepest_grows`). A
+  level claims only its own bucket's free slots; claimants past them are
+  dropped and raise `overflow`. A candidate sourced at a level with no bucket
+  is invalid, so it never overflows. Reallocate: the `Driver` grows every
+  full bucket (live == capacity) with `grow_bucket` --
+  `max(capacity_policy(live + 1), floor)`, floor 2 x capacity (1.5 x under
+  `capacity_align`) -- and re-runs the step on the same inputs against the
+  attempt's output state: a full step whose growth re-selects (with
+  `dedupe_live`, the winners the attempt dropped come first). Build and
+  resort size bucket L at `capacity_policy(live_L, capacity_headroom,
+  capacity_align)`, live connections first; resort drops tombstones.
+- PIPELINE, own dead slots then the shared tail. The single bucket has a
+  high-water mark, `NetworkState.tail_start`: slots below it have held a
+  connection, slots from it up are the never-used tail. A dead slot below the
+  mark belongs to the level of its former occupant's source unit (the current
+  level of its `FROM_ID`). Each level's claimants take that level's own dead
+  slots first; the rest spill to the tail, levels ascending and in the total
+  order within a level, each taking the lowest tail slot and raising the mark.
+  A level never borrows another level's dead slots. `overflow` means the tail
+  is exhausted; the `Driver` then grows the bucket (extending the tail) and
+  re-runs the step as above. A pipeline resort compacts and resets the mark
+  to the live count.
+
+`overflow` is per attempt: after a `Driver.step` (`check_every = 1`) it is
+False, since the Driver retries until an attempt fits. plastax-cpp keeps its
+buckets inside one fixed arena (`Traits::ConnCapacity`): its regrow moves the
+later buckets into the arena's unassigned reserve, and when that does not fit
+(or, in pipeline mode, when the arena's tail is exhausted) its overflow stands
+-- the only divergence, at cx's declared memory bound.
+
+`scripts/parity/reference.py`'s `commit_growth` is the claim's specification:
+per-level dead counts plus a tail count (pipeline) or per-level free counts
+(topological, reporting the levels a regrow grows); a golden's `retry` block
+runs the growth phase again at `step + 1` over the attempt's output edges with
+the regrown free counts it records. The single-domain goldens (`free_slots`)
+are pipeline goldens with no dead slots. Not decided here: in PIPELINE mode
+plastax selects over one segment (`max_new_per_level` caps the whole step),
+where plastax-cpp and the reference group by source level.
 
 Total order: sort key `(-score, src, dst, candidate_index)` ascending.
 Candidate index: per_unit `unit_id * P + j`; per_connection `rank * P + j`

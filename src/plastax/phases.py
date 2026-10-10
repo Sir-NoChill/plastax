@@ -4035,6 +4035,9 @@ def dedupe_step(
 # whose kernel count grows as log^2 of the length. Below this count the merge
 # network's single sort beats three radix launches.
 RADIX_TOTAL_ORDER_MIN = 1 << 17
+# The most elements of the one-hot running count `select_per_segment` ranks a
+# chunk of segments with (64 MB of int32).
+_SEGMENT_RANK_ELEMENTS = 1 << 24
 
 
 def _sort_key(flat_scores: jax.Array) -> Float[Array, " n"]:
@@ -4190,16 +4193,27 @@ def select_per_segment(
         indices are placeholders).
     """
     perm = total_order(flat_scores, flat_src, flat_dst)
-    sorted_segment = segment[perm]
+    sorted_segment = segment[perm].astype(jnp.int32)
+    n = perm.shape[0]
+    # Every segment of a chunk is ranked by one running count over a
+    # (candidates x segments) one-hot, so a chunk is one pass, not one per
+    # segment; the chunk width bounds that count's size.
+    width = max(1, min(num_segments, _SEGMENT_RANK_ELEMENTS // max(n, 1)))
     winners: list[tuple[jax.Array, jax.Array]] = []
-    for s in range(num_segments):
-        member = sorted_segment == s
-        member32 = member.astype(jnp.int32)
-        rank = jnp.cumsum(member32) - 1
-        slot = jnp.where(member & (rank < k), rank, jnp.int32(k))
-        top_idx = jnp.zeros((k,), jnp.int32).at[slot].set(perm, mode="drop")
-        filled = jnp.arange(k, dtype=jnp.int32) < member32.sum()
-        winners.append((top_idx, filled))
+    for lo in range(0, num_segments, width):
+        hi = min(lo + width, num_segments)
+        local = sorted_segment - jnp.int32(lo)
+        member = (local >= 0) & (local < hi - lo)
+        onehot = local[:, None] == jnp.arange(hi - lo, dtype=jnp.int32)[None, :]
+        running = jnp.cumsum(onehot.astype(jnp.int32), axis=0)
+        safe = jnp.where(member, local, jnp.int32(0))
+        rank = jnp.take_along_axis(running, safe[:, None], axis=1)[:, 0] - 1
+        slot = jnp.where(member & (rank < k), safe * jnp.int32(k) + rank, (hi - lo) * k)
+        top = jnp.zeros(((hi - lo) * k,), jnp.int32).at[slot].set(perm, mode="drop")
+        count = running[-1] if n else jnp.zeros((hi - lo,), jnp.int32)
+        filled = jnp.arange(k, dtype=jnp.int32)[None, :] < count[:, None]
+        top = top.reshape(hi - lo, k)
+        winners.extend((top[s], filled[s]) for s in range(hi - lo))
     return winners
 
 

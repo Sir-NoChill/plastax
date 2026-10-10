@@ -525,9 +525,10 @@ failure scores -inf): live in-range endpoints, `src != dst` unless
 attribute), `direction`
 (`any`/`deeper`/`same_or_deeper`); non-finite scores veto; `dedupe_live`
 (default **False**) vetoes candidates equal to a live edge; `dedupe_step`
-(default **False**) keeps the first of equal keys; per-source-level selection
-(`top_k` of `max_new_per_level` / `threshold(g)` / `all`, then
-`max_new_per_step` across levels) in the total order; the per-level claim of
+(default **False**) keeps the first of equal keys; selection in the total
+order (`top_k` of `max_new_per_level` / `threshold(g)` / `all`), the cap
+scoped by `level_cap_scope`, then `max_new_per_step` across levels; the
+per-level claim of
 free slots (below; drops raise `overflow`); `init` with declared field
 defaults; flags
 (`needs_resort`, `grown`). Without dedupe, duplicate candidates create
@@ -591,9 +592,27 @@ recovery: a golden's `retry` block claims the attempt's dropped winners at the
 same step over the attempt's output edges with the regrown free counts it
 records, and its `step_growth` block is the single claim over the regrown
 buckets that the attempt and the retry together equal. The single-domain goldens (`free_slots`)
-are pipeline goldens with no dead slots. Not decided here: in PIPELINE mode
-plastax selects over one segment (`max_new_per_level` caps the whole step),
-where plastax-cpp and the reference group by source level.
+are pipeline goldens with no dead slots.
+
+Cap scope (identical in plastax-cpp and the reference). The growth rule's
+`level_cap_scope` says which winners `max_new_per_level` caps, the same in
+both propagation models:
+
+- `"source_level"` (default): each source level's first `max_new_per_level`
+  qualifying candidates in the total order (finite for `top_k`; finite and
+  `>= threshold(g)` for `threshold`), levels independent -- also in
+  PIPELINE mode, where every level claims from the one bucket.
+- `"step"`: the step's first `max_new_per_level` qualifying candidates in the
+  total order over every level's candidates together (for
+  `shortlist_per_level`, every level's grid), whatever their source levels.
+
+Either way the winners are then listed levels ascending, the total order
+within a level; `max_new_per_step` keeps that list's first
+`max_new_per_step`, and each winner claims in its own source level's domain
+(its bucket, or its own dead slots then the tail). `selection = "all"` has no
+cap, so the scope does not change it. The `grow_claim_pipeline_cap_*`,
+`grow_select_cap_step` and `grow_score_shortlist_per_level_cap_step` goldens
+pin both scopes.
 
 Total order: sort key `(-score, src, dst, candidate_index)` ascending.
 Candidate index: per_unit `unit_id * P + j`; per_connection `rank * P + j`

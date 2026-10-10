@@ -142,6 +142,7 @@ def _net(
         unit_capacity = capacity
         structural_interval = interval
         propagation = px.Propagation.TOPOLOGICAL
+        batch_reduction = px.MeanFloatFirstRest()
 
     _Net.add_unit = FromColumn() if rule is None else rule
     _Net.max_levels = max_levels

@@ -90,6 +90,7 @@ def _net(rule: object, **attrs: Any) -> type[px.Network[Any]]:
         "forward_pass": _SumForward(),
         "add_conn": rule,
         "propagation": px.Propagation.TOPOLOGICAL,
+        "batch_reduction": px.MeanFloatFirstRest(),
         **attrs,
     }
     return type("_Net", (px.Network,), body)

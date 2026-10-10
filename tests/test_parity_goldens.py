@@ -342,13 +342,44 @@ def test_loss_golden(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Spec-only goldens: loud per-file skips until the features land.
+# Every registry golden is consumed, and no family is silently empty.
 # ---------------------------------------------------------------------------
+
+# The fewest goldens each family may hold. Every family set above is discovered
+# by a filter (a tag, a rule name, a params key); a renamed tag or key would
+# empty the set, and pytest would collect zero cases of that family and pass.
+# Raise a floor when a family grows; never lower one without deleting goldens.
+_FAMILY_FLOORS = {
+    "registry": 58,
+    "loss_v1": 5,
+    "growth_v2 propose": 13,
+    "growth_v2 score": 28,
+    "growth_v2 claim topological": 1,
+    "growth_v2 claim pipeline": 2,
+    "unit_lifecycle_v1": 7,
+}
+
+
+def test_every_golden_family_meets_its_floor() -> None:
+    """No family's discovery filter silently matches fewer goldens than pinned."""
+    counts = {
+        "registry": len(_registry_goldens()),
+        "loss_v1": len(_ENFORCED_LOSS),
+        "growth_v2 propose": len(_ENFORCED_GROWTH),
+        "growth_v2 score": len(_ENFORCED_SCORE),
+        "growth_v2 claim topological": len(_ENFORCED_CLAIM["topological"]),
+        "growth_v2 claim pipeline": len(_ENFORCED_CLAIM["pipeline"]),
+        "unit_lifecycle_v1": len(_ENFORCED_UNIT),
+    }
+    short = {
+        k: (n, _FAMILY_FLOORS[k]) for k, n in counts.items() if n < _FAMILY_FLOORS[k]
+    }
+    assert not short, f"golden families below their floor (got, floor): {short}"
 
 
 @pytest.mark.parametrize("path", _registry_goldens(), ids=lambda p: p.stem)
-def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) -> None:
-    """Every registry golden is either consumed above or skipped by name."""
+def test_registry_golden_is_consumed(path: pathlib.Path) -> None:
+    """Every registry golden is consumed by a test above; none is skipped."""
     doc = json.loads(path.read_text())
     requires = doc["requires"]
     if requires in _IMPLEMENTED:
@@ -366,7 +397,7 @@ def test_registry_golden_is_consumed_or_knowingly_skipped(path: pathlib.Path) ->
     claim_cases = _ENFORCED_CLAIM["topological"] | _ENFORCED_CLAIM["pipeline"]
     if doc["name"] in _ENFORCED_GROWTH | _ENFORCED_SCORE | claim_cases:
         return  # consumed by the test_grow_* tests
-    pytest.skip(f"{doc['name']}: {_SPEC_ONLY[requires]} ({requires})")
+    pytest.fail(f"{doc['name']}: {_SPEC_ONLY[requires]} ({requires})")
 
 
 # ---------------------------------------------------------------------------

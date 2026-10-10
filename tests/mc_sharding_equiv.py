@@ -142,6 +142,19 @@ def _worker(pid: int, port: int) -> None:
             px.distribute_state(static_s, _copy(warmed)), sp
         ).state
 
+        # Non-vacuity: the churn must actually rewire, or single == sharded
+        # holds trivially (both unchanged from `warmed`).
+        rewired = sum(
+            int(np.sum(np.asarray(b_new[col]) != np.asarray(b_old[col])))
+            for b_new, b_old in zip(single.conns, warmed.conns, strict=True)
+            for col in ("dead", "from_id", "to_id")
+        )
+        if rewired == 0:
+            raise AssertionError(
+                f"churn:{method}: no slot was pruned or regrown; the scenario no "
+                "longer exercises prune/regrow -- retune it"
+            )
+
         s_live = int(px.state.live_conn_count(single))
         h_live = int(px.state.live_conn_count(sharded))
         if s_live != h_live:

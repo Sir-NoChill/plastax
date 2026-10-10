@@ -15,6 +15,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=4")
 
 import dataclasses
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -77,6 +78,24 @@ def _build(
     return b.finalize()
 
 
+def assert_conns_sharded(
+    state: px.NetworkState[Any], num_shards: int, what: str
+) -> None:
+    """Raise unless every conn column is split over `num_shards` devices.
+
+    A sharded-vs-single comparison is vacuous if the "sharded" run silently
+    fell back to one device: both sides would then share one code path.
+    """
+    for level, bucket in enumerate(state.conns):
+        for name, col in bucket.items():
+            sh = col.sharding
+            if len(sh.device_set) != num_shards or sh.is_fully_replicated:
+                raise AssertionError(
+                    f"{what}: bucket {level} column {name!r} is not sharded "
+                    f"over {num_shards} devices ({sh})"
+                )
+
+
 def check(net: type[px.Network[None]]) -> None:
     """Assert the sharded step matches the single-device step for `net`."""
     inputs = px.StepInputs(inputs=jnp.asarray([1.0, 2.0], jnp.float32), targets=None)
@@ -86,6 +105,7 @@ def check(net: type[px.Network[None]]) -> None:
     static_s, state_s = _build(net)
     static_s = dataclasses.replace(static_s, sharding=px.ShardSpec("shard", N_SHARDS))
     sharded = px.make_step(net, static_s)(state_s, inputs)
+    assert_conns_sharded(sharded.state, N_SHARDS, net.__name__)
 
     for name in (px.ACTIVATION.name, px.LEVEL.name):
         if not bool(

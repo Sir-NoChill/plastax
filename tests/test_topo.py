@@ -86,11 +86,21 @@ def test_layered_net_multi_round_frontier_matches_reference() -> None:
     assert np.array_equal(got, _reference_levels(n, edges))
 
 
-def test_deep_chain_falls_back_to_scalar_and_is_correct() -> None:
+def test_deep_chain_falls_back_to_scalar_and_is_correct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A chain deeper than the round cap takes the fallback; levels stay exact."""
     n = _MAX_VECTORIZED_LEVEL_ROUNDS + 40  # depth n-1 > cap -> fallback path
     edges = np.array([[i, i + 1] for i in range(n - 1)], dtype=np.int32)
+    calls: list[int] = []
+
+    def spy(num_units: int, e: np.ndarray, *, allow_cycles: bool) -> np.ndarray:
+        calls.append(num_units)
+        return _kahn_levels(num_units, e, allow_cycles=allow_cycles)
+
+    monkeypatch.setattr(topo, "_kahn_levels", spy)
     got = topo.initial_levels(n, edges)
+    assert calls == [n], "the deep chain must take the scalar fallback"
     assert np.array_equal(got, np.arange(n, dtype=np.int32))
     assert np.array_equal(got, _kahn_levels(n, edges, allow_cycles=False))
 

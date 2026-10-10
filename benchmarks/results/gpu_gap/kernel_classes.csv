@@ -1,0 +1,122 @@
+strategy,N,C,P,candidates,impl,kernel_class,us
+per_unit,65536,65536,4,262144,px_total4,sort (XLA),246.66
+per_unit,65536,65536,4,262144,px_total4,elementwise / fused,54.72
+per_unit,65536,65536,4,262144,px_total4,scatter,37.19
+per_unit,65536,65536,4,262144,px_total4,reduce,25.66
+per_unit,65536,65536,4,262144,px_total4,scan / cumsum,14.72
+per_unit,65536,65536,4,262144,px_total4,gather,7.3
+per_unit,65536,65536,4,262144,px_lsd3,sort (cub radix),105.15
+per_unit,65536,65536,4,262144,px_lsd3,elementwise / fused,52.19
+per_unit,65536,65536,4,262144,px_lsd3,scatter,37.22
+per_unit,65536,65536,4,262144,px_lsd3,reduce,25.7
+per_unit,65536,65536,4,262144,px_lsd3,gather,18.18
+per_unit,65536,65536,4,262144,px_lsd3,scan / cumsum,14.85
+per_unit,65536,65536,4,262144,cx,sort (cub radix),147.1
+per_unit,65536,65536,4,262144,cx,elementwise / fused,30.43
+per_unit,65536,65536,4,262144,cx,scan / cumsum,27.33
+per_unit,65536,65536,4,262144,cx,gather,13.22
+per_unit,65536,65536,4,262144,cx,claim,4.19
+per_unit,262144,65536,4,1048576,px_total4,sort (XLA),1006.41
+per_unit,262144,65536,4,1048576,px_total4,elementwise / fused,100.74
+per_unit,262144,65536,4,1048576,px_total4,scatter,47.71
+per_unit,262144,65536,4,1048576,px_total4,reduce,44.61
+per_unit,262144,65536,4,1048576,px_total4,scan / cumsum,22.14
+per_unit,262144,65536,4,1048576,px_lsd3,sort (cub radix),207.78
+per_unit,262144,65536,4,1048576,px_lsd3,elementwise / fused,95.14
+per_unit,262144,65536,4,1048576,px_lsd3,scatter,47.81
+per_unit,262144,65536,4,1048576,px_lsd3,reduce,44.7
+per_unit,262144,65536,4,1048576,px_lsd3,gather,32.13
+per_unit,262144,65536,4,1048576,px_lsd3,scan / cumsum,21.86
+per_unit,262144,65536,4,1048576,cx,sort (cub radix),278.72
+per_unit,262144,65536,4,1048576,cx,elementwise / fused,89.92
+per_unit,262144,65536,4,1048576,cx,scan / cumsum,40.67
+per_unit,262144,65536,4,1048576,cx,gather,38.82
+per_unit,262144,65536,4,1048576,cx,claim,8.8
+per_unit,1048576,65536,4,4194304,px_total4,sort (XLA),4558.0
+per_unit,1048576,65536,4,4194304,px_total4,elementwise / fused,375.52
+per_unit,1048576,65536,4,4194304,px_total4,scatter,96.16
+per_unit,1048576,65536,4,4194304,px_total4,reduce,90.85
+per_unit,1048576,65536,4,4194304,px_total4,scan / cumsum,22.34
+per_unit,1048576,65536,4,4194304,px_lsd3,sort (cub radix),1256.84
+per_unit,1048576,65536,4,4194304,px_lsd3,elementwise / fused,319.33
+per_unit,1048576,65536,4,4194304,px_lsd3,gather,162.47
+per_unit,1048576,65536,4,4194304,px_lsd3,scatter,94.5
+per_unit,1048576,65536,4,4194304,px_lsd3,reduce,90.85
+per_unit,1048576,65536,4,4194304,px_lsd3,scan / cumsum,23.55
+per_unit,1048576,65536,4,4194304,cx,sort (cub radix),981.54
+per_unit,1048576,65536,4,4194304,cx,elementwise / fused,491.94
+per_unit,1048576,65536,4,4194304,cx,gather,345.83
+per_unit,1048576,65536,4,4194304,cx,scan / cumsum,110.69
+per_unit,1048576,65536,4,4194304,cx,claim,39.52
+per_unit,1048576,65536,32,33554432,px_total4,sort (XLA),185262.41
+per_unit,1048576,65536,32,33554432,px_total4,gather,4868.4
+per_unit,1048576,65536,32,33554432,px_total4,elementwise / fused,2271.45
+per_unit,1048576,65536,32,33554432,px_total4,scatter,693.77
+per_unit,1048576,65536,32,33554432,px_total4,reduce,536.07
+per_unit,1048576,65536,32,33554432,px_total4,scan / cumsum,19.84
+per_unit,1048576,65536,32,33554432,px_lsd3,sort (cub radix),16424.04
+per_unit,1048576,65536,32,33554432,px_lsd3,gather,2801.88
+per_unit,1048576,65536,32,33554432,px_lsd3,elementwise / fused,2380.15
+per_unit,1048576,65536,32,33554432,px_lsd3,scatter,694.92
+per_unit,1048576,65536,32,33554432,px_lsd3,reduce,569.0
+per_unit,1048576,65536,32,33554432,px_lsd3,scan / cumsum,20.22
+per_unit,1048576,65536,32,33554432,cx,sort (cub radix),16372.93
+per_unit,1048576,65536,32,33554432,cx,elementwise / fused,7962.19
+per_unit,1048576,65536,32,33554432,cx,gather,7087.46
+per_unit,1048576,65536,32,33554432,cx,scan / cumsum,2100.92
+per_unit,1048576,65536,32,33554432,cx,claim,893.74
+global,65536,65536,4,4,px_total4,elementwise / fused,31.17
+global,65536,65536,4,4,px_total4,scatter,28.45
+global,65536,65536,4,4,px_total4,reduce,14.98
+global,65536,65536,4,4,px_total4,scan / cumsum,10.82
+global,65536,65536,4,4,px_total4,gather,2.3
+global,65536,65536,4,4,px_total4,sort (XLA),1.28
+global,65536,65536,4,4,px_lsd3,elementwise / fused,30.27
+global,65536,65536,4,4,px_lsd3,scatter,29.98
+global,65536,65536,4,4,px_lsd3,reduce,18.5
+global,65536,65536,4,4,px_lsd3,scan / cumsum,9.15
+global,65536,65536,4,4,px_lsd3,gather,4.96
+global,65536,65536,4,4,px_lsd3,sort (XLA),3.36
+global,65536,65536,4,4,cx,sort (cub radix),44.06
+global,65536,65536,4,4,cx,scan / cumsum,18.14
+global,65536,65536,4,4,cx,elementwise / fused,13.06
+global,65536,65536,4,4,cx,gather,4.42
+global,65536,65536,4,4,cx,claim,3.23
+exhaustive,4096,65536,0,16777216,px_total4,sort (XLA),89914.63
+exhaustive,4096,65536,0,16777216,px_total4,gather,2541.72
+exhaustive,4096,65536,0,16777216,px_total4,elementwise / fused,1844.56
+exhaustive,4096,65536,0,16777216,px_total4,scatter,676.16
+exhaustive,4096,65536,0,16777216,px_total4,reduce,223.07
+exhaustive,4096,65536,0,16777216,px_total4,scan / cumsum,23.39
+exhaustive,4096,65536,0,16777216,px_lsd3,sort (cub radix),8093.84
+exhaustive,4096,65536,0,16777216,px_lsd3,gather,4141.13
+exhaustive,4096,65536,0,16777216,px_lsd3,elementwise / fused,2058.77
+exhaustive,4096,65536,0,16777216,px_lsd3,scatter,679.66
+exhaustive,4096,65536,0,16777216,px_lsd3,reduce,225.44
+exhaustive,4096,65536,0,16777216,px_lsd3,scan / cumsum,22.72
+exhaustive,4096,65536,0,16777216,cx,sort (cub radix),8019.5
+exhaustive,4096,65536,0,16777216,cx,elementwise / fused,3307.74
+exhaustive,4096,65536,0,16777216,cx,gather,3104.29
+exhaustive,4096,65536,0,16777216,cx,scan / cumsum,1030.47
+exhaustive,4096,65536,0,16777216,cx,claim,453.35
+per_connection,65536,65536,4,262144,px_total4,sort (XLA),599.72
+per_connection,65536,65536,4,262144,px_total4,elementwise / fused,153.95
+per_connection,65536,65536,4,262144,px_total4,scatter,44.32
+per_connection,65536,65536,4,262144,px_total4,scan / cumsum,32.45
+per_connection,65536,65536,4,262144,px_total4,reduce,23.71
+per_connection,65536,65536,4,262144,cx,sort (cub radix),199.71
+per_connection,65536,65536,4,262144,cx,elementwise / fused,43.97
+per_connection,65536,65536,4,262144,cx,scan / cumsum,30.85
+per_connection,65536,65536,4,262144,cx,gather,15.17
+per_connection,65536,65536,4,262144,cx,claim,4.16
+shortlist,65536,65536,64,4096,px_total4,scatter,38.69
+shortlist,65536,65536,64,4096,px_total4,sort (XLA),37.5
+shortlist,65536,65536,64,4096,px_total4,sort (cub radix),36.22
+shortlist,65536,65536,64,4096,px_total4,elementwise / fused,35.97
+shortlist,65536,65536,64,4096,px_total4,reduce,21.6
+shortlist,65536,65536,64,4096,px_total4,scan / cumsum,11.1
+shortlist,65536,65536,64,4096,cx,sort (cub radix),48.19
+shortlist,65536,65536,64,4096,cx,scan / cumsum,20.19
+shortlist,65536,65536,64,4096,cx,elementwise / fused,14.34
+shortlist,65536,65536,64,4096,cx,gather,4.64
+shortlist,65536,65536,64,4096,cx,claim,3.26

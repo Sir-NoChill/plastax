@@ -313,6 +313,7 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
             return dict(ac.init(u_view, px.UnitIdx(s), px.UnitIdx(d), g).fields)
 
         claims = []
+        claim_levels = []
         for b in range(num_buckets):
             if use_per_level:
                 src, dst = phases.candidates_per_level(
@@ -369,6 +370,7 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
                     values=values,
                 )
             )
+            claim_levels.append(level[src[top]])
         if ac.max_new_per_step is not None:
             prior = jnp.int32(0)
             for i, claim in enumerate(claims):
@@ -379,8 +381,16 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
                 )
                 prior = prior + grow32.sum()
         new_conns, overflow, resort = [], jnp.bool_(False), jnp.bool_(False)
-        for bucket, claim in zip(state.conns, claims, strict=True):
-            new_bucket, over_b, resort_b = phases.xla_claim(bucket, claim)
+        tail_start = state.tail_start
+        for bucket, claim, claim_level in zip(
+            state.conns, claims, claim_levels, strict=True
+        ):
+            if is_pipeline:
+                new_bucket, over_b, resort_b, tail_start = phases.pipeline_claim(
+                    bucket, claim, claim_level, level, state.tail_start
+                )
+            else:
+                new_bucket, over_b, resort_b = phases.xla_claim(bucket, claim)
             new_conns.append(new_bucket)
             overflow = overflow | over_b.any()
             resort = resort | resort_b.any()
@@ -394,6 +404,7 @@ def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> An
             needs_resort=state.needs_resort | resort,
             grown=(live_count(new_conns) - live_count(state.conns)).astype(jnp.int32),
             overflow=overflow,
+            tail_start=tail_start,
         )
 
     return phase
@@ -438,7 +449,7 @@ def _run(kind: str, selection: str, seed: int) -> dict[str, int]:
                 np.sum(~np.asarray(gb[DEAD.name]))
                 != np.sum(~np.asarray(state.conns[b][DEAD.name]))
             )
-        for field in ("overflow", "needs_resort", "grown"):
+        for field in ("overflow", "needs_resort", "grown", "tail_start"):
             assert _same(getattr(got, field), getattr(want, field)), f"{where}: {field}"
         stats["overflow"] += int(got.overflow)
         stats["grown"] += int(got.grown)

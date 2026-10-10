@@ -2747,6 +2747,130 @@ def xla_claim(
     return new_bucket, overflowed, committed & claim.violating
 
 
+def pipeline_claim(
+    bucket: Columns,
+    claim: GrowthClaim,
+    cand_level: Int32[Array, " k"],
+    unit_level: Int32[Array, " num_units"],
+    tail_start: Int32[Array, ""],
+    *,
+    shard_axis: str | None = None,
+    num_shards: int = 1,
+) -> tuple[Columns, Bool[Array, " k"], Bool[Array, " k"], Int32[Array, ""]]:
+    """Claim the PIPELINE bucket's slots: own dead slots, then the tail.
+
+    A dead slot below `tail_start` belongs to the level of its former
+    occupant's source unit (`unit_level[FROM_ID]`). Each level's growable
+    candidates, in candidate order, first take that level's own dead slots in
+    slot order; the rest spill to the never-used tail, levels ascending and in
+    candidate order within a level, the i-th spill taking slot
+    `tail_start + i`. A spill past the end of the bucket is overflow. No level
+    takes another level's dead slot.
+
+    Under Scheme-A the dead mask is this shard's capacity slice, holding the
+    global positions `[g * local_capacity, (g + 1) * local_capacity)`. The
+    per-level dead counts are all-gathered (one `num_units`-long count vector
+    per shard), so each candidate takes its global per-level rank on the one
+    shard holding it, and a tail spill lands on the shard owning its global
+    position -- exactly where the single-device claim puts it.
+
+    Args:
+        bucket: The bucket's (local) columns.
+        claim: The bucket's candidates.
+        cand_level: Each candidate's source level.
+        unit_level: Every unit's level (levels are below `num_units`).
+        tail_start: The bucket's high-water mark (replicated).
+        shard_axis: The Scheme-A mesh axis, or None when unsharded.
+        num_shards: The Scheme-A shard count (1 when unsharded).
+
+    Returns:
+        The updated columns; per candidate whether it overflowed and whether
+        it was committed with a leveling-breaking edge (both replicated); and
+        the new high-water mark.
+    """
+    growable = claim.growable
+    k = growable.shape[0]
+    dead_b = bucket[DEAD.name]
+    local_capacity = dead_b.shape[0]
+    num_levels = unit_level.shape[0]
+    base = (
+        jax.lax.axis_index(shard_axis).astype(jnp.int32) * jnp.int32(local_capacity)
+        if shard_axis is not None
+        else jnp.int32(0)
+    )
+    position = base + jnp.arange(local_capacity, dtype=jnp.int32)
+    owner = jnp.clip(bucket[FROM_ID.name].astype(jnp.int32), 0, num_levels - 1)
+    # Each slot's claim domain: its former source's level for a used dead
+    # slot, the out-of-range `num_levels` for a live or never-used one.
+    domain = jnp.where(
+        dead_b & (position < tail_start),
+        unit_level[owner].astype(jnp.int32),
+        jnp.int32(num_levels),
+    )
+    local_count = jnp.zeros((num_levels + 1,), jnp.int32).at[domain].add(1)[:num_levels]
+    if shard_axis is not None:
+        all_counts = jax.lax.all_gather(local_count, shard_axis)
+        before = jnp.arange(num_shards) < jax.lax.axis_index(shard_axis)
+        offset = jnp.sum(jnp.where(before[:, None], all_counts, 0), axis=0)
+        total = monoid.sum_.collective(local_count, shard_axis)
+    else:
+        offset = jnp.zeros((num_levels,), jnp.int32)
+        total = local_count
+
+    # Level-major candidate order (stable, so candidate order within a
+    # level); non-growable candidates sort last.
+    level = jnp.clip(cand_level.astype(jnp.int32), 0, num_levels - 1)
+    key = jnp.where(growable, level, jnp.int32(num_levels))
+    order = jnp.argsort(key, stable=True)
+    sorted_key = key[order]
+    first = jnp.searchsorted(sorted_key, sorted_key, side="left").astype(jnp.int32)
+    own_rank = (
+        jnp.zeros((k,), jnp.int32).at[order].set(jnp.arange(k, dtype=jnp.int32) - first)
+    )
+    own = growable & (own_rank < total[level])
+    spill = growable & ~own
+    spill_rank = (
+        jnp.zeros((k,), jnp.int32)
+        .at[order]
+        .set(jnp.cumsum(spill[order].astype(jnp.int32)) - 1)
+    )
+    tail_free = jnp.int32(local_capacity * num_shards) - tail_start
+    to_tail = spill & (spill_rank < tail_free)
+    overflowed = spill & ~to_tail
+    committed = own | to_tail
+
+    # This shard's own-slot placements: the local rank inside the level's
+    # dead slots, sorted by (domain, position).
+    local_rank = own_rank - offset[level]
+    mine_own = own & (local_rank >= 0) & (local_rank < local_count[level])
+    slot_order = jnp.argsort(domain, stable=True).astype(jnp.int32)
+    local_start = jnp.cumsum(local_count) - local_count
+    own_slot = slot_order[
+        jnp.clip(local_start[level] + local_rank, 0, local_capacity - 1)
+    ]
+    tail_position = tail_start + spill_rank
+    mine_tail = (
+        to_tail
+        & (tail_position >= base)
+        & (tail_position < base + jnp.int32(local_capacity))
+    )
+    target_slot = jnp.where(
+        mine_own,
+        own_slot,
+        jnp.where(mine_tail, tail_position - base, jnp.int32(local_capacity)),
+    )
+    new_bucket: Columns = dict(bucket)
+    for name, column in bucket.items():
+        value = (
+            jnp.zeros((k,), dtype=column.dtype)
+            if name == DEAD.name
+            else claim.values[name]
+        )
+        new_bucket[name] = column.at[target_slot].set(value, mode="drop")
+    new_tail = tail_start + jnp.sum(to_tail, dtype=jnp.int32)
+    return new_bucket, overflowed, committed & claim.violating, new_tail
+
+
 # Triton claim tiling: candidates per program (TILE), block counts compared
 # against every candidate per placement step (CHUNK), block counts per coarse
 # window (WIDE), the coarse window counts (and earlier tiles' counts) one
@@ -3009,7 +3133,8 @@ def _triton_claim_kernels() -> tuple[Any, Any, Any]:
 def triton_claim_applies(static: NetworkStatic, growth: str) -> bool:
     """Whether add_conn claims through `triton_claim` (for a non-empty claim).
 
-    The fused claim needs jax_triton on an NVIDIA GPU and one device (it is not
+    The fused claim is the TOPOLOGICAL bucket claim (`pipeline_claim` serves
+    PIPELINE). It needs jax_triton on an NVIDIA GPU and one device (it is not
     validated inside shard_map), is specialised for a bounded column count,
     and reads the dead masks as 32-bit words (capacities a multiple of 4);
     anything else, or `growth="xla"`, takes the portable XLA claim.
@@ -3023,6 +3148,7 @@ def triton_claim_applies(static: NetworkStatic, growth: str) -> bool:
     """
     return (
         growth != "xla"
+        and static.propagation is Propagation.TOPOLOGICAL
         and static.sharding is None
         and len(static.conn_fields) - 1 <= TRITON_CLAIM_MAX_FIELDS
         and all(cap % 4 == 0 for cap in static.level_capacities)
@@ -3966,9 +4092,13 @@ def build_add_conn_phase[GS](
     (`Network.unit_capacity`), both endpoints must be live units: a slot
     holding none is never a candidate, a proposer, or shortlisted.
 
-    Free slots are claimed in candidate order over each bucket's own `dead`
-    mask: the rank-th growable candidate lands in the rank-th free slot, in
-    slot order. `growth` picks the claim engine: "xla" (`xla_claim`, any
+    The slot claim depends on the propagation model. TOPOLOGICAL claims in
+    candidate order over each bucket's own `dead` mask: the rank-th growable
+    candidate lands in the rank-th free slot, in slot order, and a level never
+    uses another level's bucket. PIPELINE (`pipeline_claim`) gives each source
+    level the dead slots its former connections left, then spills to the
+    bucket's never-used tail (`NetworkState.tail_start`), levels ascending.
+    For TOPOLOGICAL, `growth` picks the claim engine: "xla" (`xla_claim`, any
     backend and under Scheme-A sharding: per-block free counts, a search, and
     one scatter per column, dropping uncommitted candidates out of range);
     "triton" (`triton_claim`, one jax_triton kernel placing and writing every
@@ -3979,9 +4109,10 @@ def build_add_conn_phase[GS](
     Scheme-A sharding, more than `TRITON_CLAIM_MAX_FIELDS` connection
     columns, a bucket capacity not a multiple of 4) uses "xla".
 
-    Overflow is a real (growable, top-k-selected) candidate for which its
-    own bucket ran out of dead slots; it is dropped and the flag is
-    raised via `overflow_sink` rather than committed. A committed
+    Overflow is a real (growable, top-k-selected) candidate left without a
+    slot: its own bucket ran out of dead slots (TOPOLOGICAL), or its level's
+    dead slots and the tail both ran out (PIPELINE). It is dropped and the
+    flag is raised via `overflow_sink` rather than committed. A committed
     candidate whose destination is not strictly deeper than its source
     (the window admits same-level and behind-src pairs) sets
     `needs_resort`, since it breaks the leveling invariant that every
@@ -4273,6 +4404,7 @@ def build_add_conn_phase[GS](
                 )
 
         claims: list[GrowthClaim] = []
+        claim_levels: list[jax.Array] = []
         for flat_src, flat_dst, valid, flat_scores, top_idx, filled in selections:
             top_src = flat_src[top_idx]
             top_dst = flat_dst[top_idx]
@@ -4324,6 +4456,7 @@ def build_add_conn_phase[GS](
                     values=values,
                 )
             )
+            claim_levels.append(unit_level[top_src])
 
         # The per-step cap applies across levels, level-ascending and in
         # selection order within a level: a growable candidate whose global
@@ -4349,7 +4482,21 @@ def build_add_conn_phase[GS](
         # free-slot order: the i-th growable candidate takes the i-th free
         # slot, the rest overflow.
         new_conns: list[Columns]
-        if use_triton:
+        tail_start = state.tail_start
+        if is_pipeline:
+            # One bucket: each level's own dead slots, then the shared tail.
+            new_bucket, overflowed_p, resort_p, tail_start = pipeline_claim(
+                state.conns[0],
+                claims[0],
+                claim_levels[0],
+                unit_level,
+                state.tail_start,
+                shard_axis=shard_axis,
+                num_shards=num_shards,
+            )
+            new_conns = [new_bucket]
+            overflow, reassigning = jnp.any(overflowed_p), jnp.any(resort_p)
+        elif use_triton:
             # A fused prune sweep's counts, when it made them in this claim's
             # blocks (see build_phases); otherwise triton_claim counts.
             fused_counts = None
@@ -4402,6 +4549,7 @@ def build_add_conn_phase[GS](
             needs_resort=state.needs_resort | reassigning,
             grown=grown_count.astype(jnp.int32),
             overflow=overflow,
+            tail_start=tail_start,
         )
         return new_state, jnp.float32(0.0)
 

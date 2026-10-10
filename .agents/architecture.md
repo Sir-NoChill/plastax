@@ -539,7 +539,8 @@ edge multisets), how many of each level commit is not.
   attempt's output state: a full step whose growth re-selects (with
   `dedupe_live`, the winners the attempt dropped come first). Build and
   resort size bucket L at `capacity_policy(live_L, capacity_headroom,
-  capacity_align)`, live connections first; resort drops tombstones.
+  capacity_align)`, live connections first (a resort never shrinks a bucket
+  below its old capacity); resort drops tombstones.
 - PIPELINE, own dead slots then the shared tail. The single bucket has a
   high-water mark, `NetworkState.tail_start`: slots below it have held a
   connection, slots from it up are the never-used tail. A dead slot below the

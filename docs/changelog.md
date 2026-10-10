@@ -110,6 +110,23 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** a batched step no longer averages the unit state implicitly.
+  How the per-sample unit columns combine before the once-per-batch phases is
+  a new policy slot, `Network.batch_reduction` (`BatchReduction`), mapping
+  each unit column to a `Reduction`: `MEAN`, `SUM`, `FIRST` (sample 0) or
+  `NOT_BATCHED`. `make_step(..., batch_size=B)` requires one. Every column a
+  per-sample phase writes (the input scatter's `ACTIVATION`, the loss's seed
+  field and each column a forward, backward or unit-update rule writes) must
+  be declared `MEAN`, `SUM` or `FIRST`: an undeclared or `NOT_BATCHED` one is
+  rejected when the `Network` subclass is defined (`ACTIVATION`, the seed
+  field) or when the batched step is first traced (rule writes). Unwritten
+  columns need no declaration and keep their value. `FieldReductions`
+  declares columns one by one; `MeanFloatFirstRest()` reproduces the old
+  behaviour (the mean of every floating column, sample 0 of the rest) and
+  gives bit-identical results. To migrate, add
+  `batch_reduction = px.MeanFloatFirstRest()` to every batched net.
+  `phases.batch_mean_units` is replaced by `phases.reduce_batch_units`.
+
 - **Breaking:** the loss is whole-output. A `Loss` declares `seed_field` (the
   float unit column its gradient seed goes to) and implements
   `calculate_loss(u, outputs, targets, g) -> (loss, seed)`, called once over

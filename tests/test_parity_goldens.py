@@ -350,12 +350,12 @@ def test_loss_golden(name: str) -> None:
 # empty the set, and pytest would collect zero cases of that family and pass.
 # Raise a floor when a family grows; never lower one without deleting goldens.
 _FAMILY_FLOORS = {
-    "registry": 58,
+    "registry": 62,
     "loss_v1": 5,
     "growth_v2 propose": 13,
-    "growth_v2 score": 28,
+    "growth_v2 score": 30,
     "growth_v2 claim topological": 1,
-    "growth_v2 claim pipeline": 2,
+    "growth_v2 claim pipeline": 4,
     "unit_lifecycle_v1": 7,
 }
 
@@ -597,6 +597,8 @@ def _make_score_rule(
     }
     if "max_new_per_level" in params:
         knobs["max_new_per_level"] = int(params["max_new_per_level"])
+    if "level_cap_scope" in params:
+        knobs["level_cap_scope"] = params["level_cap_scope"]
     caps = [c for c in (params.get("max_new_per_step"), step_cap) if c is not None]
     if caps:
         knobs["max_new_per_step"] = int(min(caps))

@@ -1,0 +1,185 @@
+{
+ "_comment": "Per-level shortlist (M=2): per source level, ascending, the sources are the level's top-M live units by importance and the destinations the top-M live units inside that level's validity window (level gap and direction), by importance; importance ties break by ascending unit id; index = level_rank * M * M + row-major position in the level's grid. Under level_cap_scope = step, max_new_per_level caps the winners of every level's grid together, in the total order.",
+ "expect": {
+  "committed": [
+   {
+    "dst": 7,
+    "score": 1.0,
+    "src": 5
+   },
+   {
+    "dst": 5,
+    "score": 0.875,
+    "src": 8
+   }
+  ],
+  "conn_overflow": false,
+  "grown": 2,
+  "needs_resort": true
+ },
+ "generator": "scripts/parity/emit.py",
+ "initial_edges": [
+  {
+   "dst": 3,
+   "fields": {
+    "weight": 0.5
+   },
+   "src": 0
+  },
+  {
+   "dst": 3,
+   "fields": {
+    "weight": 0.125
+   },
+   "src": 1
+  },
+  {
+   "dst": 4,
+   "fields": {
+    "weight": -0.25
+   },
+   "src": 1
+  },
+  {
+   "dst": 5,
+   "fields": {
+    "weight": 0.75
+   },
+   "src": 2
+  },
+  {
+   "dst": 6,
+   "fields": {
+    "weight": -0.5
+   },
+   "src": 3
+  },
+  {
+   "dst": 7,
+   "fields": {
+    "weight": 0.25
+   },
+   "src": 4
+  },
+  {
+   "dst": 8,
+   "fields": {
+    "weight": 1.0
+   },
+   "src": 5
+  }
+ ],
+ "initial_units": [
+  {
+   "fields": {
+    "activation": 0.0
+   },
+   "id": 0,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 1,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 2,
+   "is_input": true,
+   "is_output": false,
+   "level": 0,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.5
+   },
+   "id": 3,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.25
+   },
+   "id": 4,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.0
+   },
+   "id": 5,
+   "is_input": false,
+   "is_output": false,
+   "level": 1,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.125
+   },
+   "id": 6,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": 0.0
+   },
+   "id": 7,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  },
+  {
+   "fields": {
+    "activation": -0.125
+   },
+   "id": 8,
+   "is_input": false,
+   "is_output": true,
+   "level": 2,
+   "pruned": false
+  }
+ ],
+ "name": "grow_score_shortlist_per_level_cap_step",
+ "params": {
+  "candidates": "shortlist_per_level",
+  "capacity": 16,
+  "direction": "any",
+  "free_slots": 8,
+  "level_cap_scope": "step",
+  "max_level_gap": 1,
+  "max_new_per_level": 2,
+  "network_seed": 7,
+  "selection": "top_k",
+  "shortlist_size": 2,
+  "step": 3
+ },
+ "requires": "growth_v2",
+ "rules": {
+  "importance": "importance_v1",
+  "init": "grow_init_v1",
+  "score": "grid_score_v1"
+ },
+ "schema": "registry_v1"
+}

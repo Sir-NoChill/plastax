@@ -176,12 +176,12 @@ def output_edge_terms(
     )
 
 
-def output_apply(
+def output_values(
     acc: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
-) -> px.UnitWrite:
-    """The output unit's write: the prediction and the lagged reductions."""
+) -> tuple[tuple[px.FieldSpec[np.float32], jax.Array], ...]:
+    """The output unit's columns from the reduced accumulator, as pairs."""
     v, tau_hat, tau_prev, b_prev, vd_prev, n_elig = acc
-    return px.UnitWrite.of(
+    return (
         (px.ACTIVATION, v),
         (TAU_HAT, tau_hat),
         (TAU_PREV, tau_prev),
@@ -191,7 +191,17 @@ def output_apply(
     )
 
 
-def swifttd_edge_update(
+def output_apply(
+    acc: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
+) -> px.UnitWrite:
+    """The output unit's write: the prediction and the lagged reductions."""
+    return px.UnitWrite.of(*output_values(acc))
+
+
+EdgeValues = tuple[tuple[px.FieldSpec[np.float32], jax.Array], ...]
+
+
+def swifttd_edge_values(
     hp: SwiftTDParams,
     c: px.ConnView,
     cid: px.ConnIdx,
@@ -202,8 +212,8 @@ def swifttd_edge_update(
     vd: jax.Array,
     f: jax.Array,
     gamma_t: jax.Array,
-) -> px.ConnWrite:
-    """The fused per-edge SwiftTD update.
+) -> EdgeValues:
+    """The fused per-edge SwiftTD update, as `(column, new value)` pairs.
 
     Runs the second loop of the previous step (over `phi_{t-1} = f`, with that
     step's `tau`, `b`) and then the first loop of this step (with `delta'_t`
@@ -226,7 +236,8 @@ def swifttd_edge_update(
             `gamma_t lambda` (so `gamma_t = 0` ends an episode exactly).
 
     Returns:
-        The edge's new SwiftTD state.
+        The edge's new SwiftTD state, one pair per column, for
+        `px.ConnWrite.of` or for masking against another rule's write.
     """
     gl = gamma_t * jnp.float32(hp.lambda_)
     eta = jnp.float32(hp.eta)
@@ -268,7 +279,7 @@ def swifttd_edge_update(
     z = z * gl
     p = p * gl
     zbar = zbar * gl
-    return px.ConnWrite.of(
+    return (
         (px.WEIGHT, w),
         (Z, z),
         (ZD, zd),
@@ -279,6 +290,41 @@ def swifttd_edge_update(
         (ZBAR, zbar),
         (P, p),
         (BETA, beta),
+    )
+
+
+def swifttd_edge_update(
+    hp: SwiftTDParams,
+    c: px.ConnView,
+    cid: px.ConnIdx,
+    *,
+    delta: jax.Array,
+    tau: jax.Array,
+    b: jax.Array,
+    vd: jax.Array,
+    f: jax.Array,
+    gamma_t: jax.Array,
+) -> px.ConnWrite:
+    """`swifttd_edge_values` as one connection write (see it for the arguments).
+
+    Args:
+        hp: the hyperparameters.
+        c: the connection view.
+        cid: the edge into the output.
+        delta: `delta'_t`, this step's TD error.
+        tau: the previous step's correction ratio.
+        b: the previous step's `sum z phi`.
+        vd: the previous step's `sum dw phi`.
+        f: the feature's value in the previous step's prediction.
+        gamma_t: this step's termination signal.
+
+    Returns:
+        The edge's new SwiftTD state.
+    """
+    return px.ConnWrite.of(
+        *swifttd_edge_values(
+            hp, c, cid, delta=delta, tau=tau, b=b, vd=vd, f=f, gamma_t=gamma_t
+        )
     )
 
 

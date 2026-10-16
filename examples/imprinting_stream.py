@@ -45,6 +45,10 @@ class StreamConfig:
         sound_len: frames per sound.
         jitter: probability that each active bit of a sound frame moves to a
             random free position in a given replay.
+        background_jitter: the same for the silence frames, which replay one
+            fixed background template (a steady noise spectrum) rather than
+            fresh random bits, so their step sizes settle as real
+            background does.
         gap: inclusive range, in steps, of the silence between the end of a
             sound and the start of the next one.
         delay: inclusive range, in steps, from the end of a sound to its
@@ -60,6 +64,7 @@ class StreamConfig:
     rewards: tuple[float, ...] = (1.0, -1.0, 0.0)
     sound_len: int = 12
     jitter: float = 0.1
+    background_jitter: float = 0.3
     gap: tuple[int, int] = (150, 300)
     delay: tuple[int, int] = (40, 80)
     steps: int = 60_000
@@ -144,14 +149,14 @@ def generate(cfg: StreamConfig) -> Stream:
         reward[t_reward] = np.float32(cfg.rewards[sound])
         events.append((sound, t_on, t_off, t_reward))
         t = t_off
-    # Silence: every frame not covered by a sound gets `active_bits` random bits.
+    # Silence: every frame not covered by a sound replays the background
+    # template with its own jitter.
+    background = rng.choice(cfg.n_obs, cfg.active_bits, replace=False)
     covered = np.zeros((cfg.steps,), bool)
     for _, t_on, t_off, _ in events:
         covered[t_on:t_off] = True
     for s in np.flatnonzero(~covered):
-        obs[s] = _frame(
-            rng, cfg.n_obs, rng.choice(cfg.n_obs, cfg.active_bits, replace=False), 0.0
-        )
+        obs[s] = _frame(rng, cfg.n_obs, background, cfg.background_jitter)
     return Stream(
         obs=obs,
         reward=reward,

@@ -465,6 +465,16 @@ def _parse(argv: list[str] | None) -> tuple[StreamConfig, Path | None]:
     p.add_argument("--n-obs", type=int, default=StreamConfig.n_obs)
     p.add_argument("--active-bits", type=int, default=StreamConfig.active_bits)
     p.add_argument("--gamma", type=float, default=StreamConfig.gamma)
+    p.add_argument("--jitter", type=float, default=StreamConfig.jitter)
+    p.add_argument(
+        "--background-jitter", type=float, default=StreamConfig.background_jitter
+    )
+    p.add_argument(
+        "--gap", type=int, nargs=2, default=StreamConfig.gap, metavar=("LO", "HI")
+    )
+    p.add_argument(
+        "--delay", type=int, nargs=2, default=StreamConfig.delay, metavar=("LO", "HI")
+    )
     a = p.parse_args(argv)
     cfg = StreamConfig(
         n_obs=a.n_obs,
@@ -472,6 +482,10 @@ def _parse(argv: list[str] | None) -> tuple[StreamConfig, Path | None]:
         steps=a.steps,
         gamma=a.gamma,
         seed=a.seed,
+        jitter=a.jitter,
+        background_jitter=a.background_jitter,
+        gap=(a.gap[0], a.gap[1]),
+        delay=(a.delay[0], a.delay[1]),
     )
     return cfg, a.out
 

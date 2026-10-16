@@ -84,7 +84,12 @@ class ImprintingParams:
     """The imprinting learner's hyperparameters (thesis section 9.5 values).
 
     Attributes:
-        swifttd: the predictor's hyperparameters.
+        swifttd: the predictor's hyperparameters. The defaults differ from the
+            thesis's audio values (`alpha_init = 3^-3`, which with 8 active
+            bits keeps `tau` above `eta` from the first step, so generation
+            only starts after tens of thousands of steps of step-size decay)
+            and use `lambda = 0.95`, whose trace reaches across the stream's
+            reward delay.
         tenure_threshold: |w| at or above which a feature is tenured.
         tenure_track_threshold: |w| below which a generated feature is idle
             (observation features never are). The thesis prints 3^-4, above
@@ -101,7 +106,7 @@ class ImprintingParams:
         seed: the network seed keying every draw.
     """
 
-    swifttd: SwiftTDParams = SwiftTDParams()
+    swifttd: SwiftTDParams = SwiftTDParams(lambda_=0.95, alpha_init=0.01)
     tenure_threshold: float = 0.01
     tenure_track_threshold: float = 1e-3
     epsilon_z: float = 0.01
@@ -723,6 +728,9 @@ def run(
     return prediction, log
 
 
+_HP0 = ImprintingParams().swifttd
+
+
 def _parse(argv: list[str] | None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument(
@@ -732,12 +740,10 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--stream-seed", type=int, default=0)
     p.add_argument("--seed", type=int, default=0, help="network seed")
     p.add_argument("--csv", type=Path, default=None, help="prediction log")
-    p.add_argument("--alpha-init", type=float, default=SwiftTDParams.alpha_init)
-    p.add_argument("--eta", type=float, default=SwiftTDParams.eta)
-    p.add_argument("--theta", type=float, default=SwiftTDParams.theta)
-    p.add_argument(
-        "--lambda", dest="lambda_", type=float, default=SwiftTDParams.lambda_
-    )
+    p.add_argument("--alpha-init", type=float, default=_HP0.alpha_init)
+    p.add_argument("--eta", type=float, default=_HP0.eta)
+    p.add_argument("--theta", type=float, default=_HP0.theta)
+    p.add_argument("--lambda", dest="lambda_", type=float, default=_HP0.lambda_)
     p.add_argument("--tenure", type=float, default=ImprintingParams.tenure_threshold)
     p.add_argument(
         "--track", type=float, default=ImprintingParams.tenure_track_threshold

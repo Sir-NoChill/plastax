@@ -49,6 +49,9 @@ class StreamConfig:
             fixed background template (a steady noise spectrum) rather than
             fresh random bits, so their step sizes settle as real
             background does.
+        background_drift: per silence step, the probability that each
+            template bit moves for good to a random free position, so the
+            background spectrum drifts slowly instead of standing still.
         gap: inclusive range, in steps, of the silence between the end of a
             sound and the start of the next one.
         delay: inclusive range, in steps, from the end of a sound to its
@@ -65,6 +68,7 @@ class StreamConfig:
     sound_len: int = 12
     jitter: float = 0.1
     background_jitter: float = 0.3
+    background_drift: float = 0.0
     gap: tuple[int, int] = (150, 300)
     delay: tuple[int, int] = (40, 80)
     steps: int = 60_000
@@ -156,6 +160,16 @@ def generate(cfg: StreamConfig) -> Stream:
     for _, t_on, t_off, _ in events:
         covered[t_on:t_off] = True
     for s in np.flatnonzero(~covered):
+        if cfg.background_drift > 0.0:
+            moved = np.flatnonzero(
+                rng.random(background.shape[0]) < cfg.background_drift
+            )
+            for k in moved:
+                while True:
+                    candidate = int(rng.integers(cfg.n_obs))
+                    if candidate not in background:
+                        background[k] = candidate
+                        break
         obs[s] = _frame(rng, cfg.n_obs, background, cfg.background_jitter)
     return Stream(
         obs=obs,
@@ -470,6 +484,10 @@ def _parse(argv: list[str] | None) -> tuple[StreamConfig, Path | None]:
         "--background-jitter", type=float, default=StreamConfig.background_jitter
     )
     p.add_argument(
+        "--background-drift", type=float, default=StreamConfig.background_drift
+    )
+    p.add_argument("--sound-len", type=int, default=StreamConfig.sound_len)
+    p.add_argument(
         "--gap", type=int, nargs=2, default=StreamConfig.gap, metavar=("LO", "HI")
     )
     p.add_argument(
@@ -484,6 +502,8 @@ def _parse(argv: list[str] | None) -> tuple[StreamConfig, Path | None]:
         seed=a.seed,
         jitter=a.jitter,
         background_jitter=a.background_jitter,
+        background_drift=a.background_drift,
+        sound_len=a.sound_len,
         gap=(a.gap[0], a.gap[1]),
         delay=(a.delay[0], a.delay[1]),
     )

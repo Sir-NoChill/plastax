@@ -11,6 +11,16 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Added
 
+- Examples: SwiftTD as traits (`examples/swifttd.py`, with the fused
+  one-step-lagged update that needs no global state, a per-step termination
+  control input, and the reference implementation ported for comparison),
+  the imprinting learner (`examples/imprinting_learner.py`: pattern and
+  memory feature generation through `add_unit` and a global-shortlist growth
+  step, removal through `prune_conn` and `prune_unit`), the synthetic
+  audio-like prediction stream with its GVF-shape metrics
+  (`examples/imprinting_stream.py`) and the figure script
+  (`examples/plot_imprinting.py`). plastax-cpp runs the same rules on the
+  same stream files, feature for feature.
 - Growth-rule knob `level_cap_scope` ("source_level" default, or "step"):
   whether `max_new_per_level` caps each source level's winners or the whole
   step's, in the total order across levels. The winners are listed levels

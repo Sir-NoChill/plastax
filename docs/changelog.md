@@ -11,6 +11,17 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Added
 
+- `Driver.scan(inputs, record=..., steps=...)`: a chunk of K steps as one
+  device-side `lax.while_loop` over the jitted step, the state donated and
+  resident, a per-step `record(StepResult)` stacked as the result. The loop
+  stops itself after a step that overflowed (or, TOPOLOGICAL, needs a
+  resort); the host completes that step exactly as `Driver.step` does and
+  re-enters the compiled loop at the next step, so the result is step for
+  step what `step` produces, whatever `check_every` is. One host round trip
+  per chunk instead of one per step: the imprinting learner runs 6-7x faster
+  on a GPU. The example uses it (`--chunk`, default 1000; `--chunk 0` steps
+  one at a time) and can pre-size its bucket (`--edge-capacity`) so a run
+  regrows nothing.
 - Examples: SwiftTD as traits (`examples/swifttd.py`, with the fused
   one-step-lagged update that needs no global state, a per-step termination
   control input, and the reference implementation ported for comparison),
@@ -126,6 +137,13 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
   Previously this combination raised `NotImplementedError`.
 
 ### Changed
+
+- The `Driver` never resorts a PIPELINE network. Growth still raises
+  `needs_resort` on a same-level or backward edge (the flag stays raised,
+  for the caller), but only a TOPOLOGICAL network acts on it, as plastax-cpp
+  sorts by level only under Topological. A pipeline net's levels are
+  bookkeeping, so the resort rebuilt the bucket and retraced for nothing; the
+  imprinting learner resorted 145 times in 20k steps.
 
 - **Behaviour change.** PIPELINE growth now applies `max_new_per_level` per
   source level, as TOPOLOGICAL growth, plastax-cpp and the parity reference

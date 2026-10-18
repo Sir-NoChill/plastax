@@ -91,8 +91,11 @@ class NetworkState[GS]:
         conns: per-level connection columns; conns[i] is sized to
             level_capacities[i].
         globals_: user-defined global state, opaque to the framework.
-        needs_resort: scalar flag marking whether a topological resort is
-            due; checked host-side by the driver between steps.
+        needs_resort: scalar flag raised by growth when a committed edge
+            breaks the leveling invariant (same-level or backward). The
+            driver reads it between steps and resorts a TOPOLOGICAL network;
+            a PIPELINE network never resorts, so there the flag is only
+            informational (and sticky).
         step: scalar count of completed framework steps. It reads 0 during
             the first step's phases and is incremented once at the end of
             every step (a batched step counts as one); rules and the

@@ -36,7 +36,9 @@ Network subclass (traits.py)  ──build_phases──▶  ordered pure phases (
                               wrap in shard_map? then jax.jit(donate_argnums=0)
                                     │
                               Driver (driver.py) host loop: run step; on overflow
-                              grow_bucket + retrace; on needs_resort → topo.resort + retrace
+                              grow_bucket + retrace; on needs_resort (TOPOLOGICAL)
+                              → topo.resort + retrace. Driver.scan: K steps in one
+                              device-side while loop, same protocol per chunk
 ```
 
 ---
@@ -90,7 +92,7 @@ These are design decisions already made. Violating one is a failed change
 | `topo.py` | `topo` | Level assignment (`initial_levels`, `recompute_levels`), `resort` (rebucket after structural change), `capacity_policy`. |
 | `step.py` | `step` | `make_step`: cached assembly, input scatter, jit, donation, Scheme-A `shard_map` wrap. `StepResult`. |
 | `builder.py` | `builder` | Host-side eager construction: `NetworkBuilder` (`add_unit`/`add_conn`/`finalize`/`from_topology`/`from_edges`). `from_edges` is the vectorized whole-array path (no per-edge Python); `from_topology` and `finalize` route through its shared `_assemble` core. |
-| `driver.py` | `driver` | Host control loop: retrace/overflow/resort protocol around one jitted step. |
+| `driver.py` | `driver` | Host control loop: retrace/overflow/resort protocol around one jitted step, or around a device-side chunk loop (`Driver.scan`). |
 | `topology.py` | `topology` | Host-side topology DSL: `dense`, `conv2d` (unrolled per-edge), `input_units`, `sequential`, `Block`/`EdgeSet`/`Topology`. |
 | `shard.py` | `shard`* | Scheme-B band-partition math (`balanced_level_cut`). Pure numpy. (*commit under `topo`/`step` per `docs/development/scopes.md` — `shard` has no dedicated scope; ask if unsure.) |
 | `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = an `UpdateConn` policy + per-connection `state_fields` (`opt/…` columns). |

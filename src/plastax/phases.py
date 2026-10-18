@@ -3429,6 +3429,10 @@ def triton_claim(
     """
     import jax_triton  # ty: ignore[unresolved-import]
 
+    # The claim hands triton_call tuples of arrays (one per bucket), which it
+    # flattens; its annotation admits only arrays, so call it untyped.
+    triton_call: Any = jax_triton.triton_call
+
     prep_kernel, claim_kernel, clear_kernel = _triton_claim_kernels()
     num_buckets = len(buckets)
     k = claims[0].growable.shape[0]
@@ -3455,7 +3459,7 @@ def triton_claim(
         ]
     ).reshape(-1)
     tiles_per = 1024 // _CLAIM_TILE
-    windows, tiles, status = jax_triton.triton_call(
+    windows, tiles, status = triton_call(
         flags,
         tuple(block_counts),
         kernel=prep_kernel,
@@ -3479,7 +3483,7 @@ def triton_claim(
     )
     cols = [{name: jax.new_ref(bucket[name]) for name in names} for bucket in buckets]
     status_ref = jax.new_ref(status)
-    slots = jax_triton.triton_call(
+    slots = triton_call(
         flags,
         tiles,
         windows,
@@ -3508,7 +3512,7 @@ def triton_claim(
         COARSE=_CLAIM_COARSE,
     )
     dead_refs = tuple(jax.new_ref(dead) for dead in deads)
-    jax_triton.triton_call(
+    triton_call(
         slots,
         dead_refs,
         kernel=clear_kernel,

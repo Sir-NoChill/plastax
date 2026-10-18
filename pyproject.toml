@@ -178,6 +178,12 @@ convention = "google"
 "tests/**" = ["D"]
 "examples/**" = ["D"]
 
+# The jax_triton imports carry `ty: ignore[unresolved-import]` for an
+# environment without the `triton` extra; where it is installed those
+# suppressions are unused, which is not a finding.
+[tool.ty.rules]
+unused-ignore-comment = "ignore"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # jaxtyping+beartype: annotated signatures become runtime contracts in tests

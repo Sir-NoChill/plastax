@@ -155,26 +155,28 @@ class BCEWithLogitsLoss(px.Loss):
     by predicting every label absent.
     """
 
+    seed_field = LossGrad
+
     def __init__(self, pos_weight: float = 1.0) -> None:
         """Bind the positive-class weight."""
         self.pos_weight = pos_weight
 
-    def per_output(
-        self, u: px.UnitView, i: px.UnitIdx, target: jax.Array, g: None
-    ) -> tuple[jax.Array, px.UnitWrite]:
-        """Return this label's loss and stage dL/dz = w'*sigmoid(z) - w*t."""
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array]:
+        """Return the summed label loss and the seed dL/dz = w'*sigmoid(z) - w*t."""
         del g
-        z = u[px.ACTIVATION, i]
+        z = u.gather(px.ACTIVATION, outputs)
         w = jnp.float32(self.pos_weight)
         # weight on the shared log-partition term: 1 for a negative label,
         # pos_weight for a positive one.
-        scale = jnp.float32(1.0) + target * (w - jnp.float32(1.0))
+        scale = jnp.float32(1.0) + targets * (w - jnp.float32(1.0))
         loss = (
             scale * (jnp.maximum(z, jnp.float32(0.0)) + jnp.log1p(jnp.exp(-jnp.abs(z))))
-            - w * target * z
+            - w * targets * z
         )
-        grad = scale * jax.nn.sigmoid(z) - w * target
-        return loss, px.UnitWrite.of((LossGrad, grad))
+        grad = scale * jax.nn.sigmoid(z) - w * targets
+        return jnp.sum(loss), grad
 
 
 class AnnealedMagnitudeStats(px.ForwardPass):
@@ -314,7 +316,6 @@ def make_net(
             extra_unit_fields = _UNIT_FIELDS
             extra_conn_fields = optimizer.state_fields
             propagation = px.Propagation.TOPOLOGICAL
-            neighbourhood = 1
 
         return _Churn
 

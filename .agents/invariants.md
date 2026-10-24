@@ -149,7 +149,10 @@ These follow from the above but are worth stating for anyone touching `topo`,
   and add break that order on the next step, so no segment reduction may pass
   `indices_are_sorted=True` (a violated hint is undefined in XLA).
 - **Deletion never resorts. Level-preserving adds never resort.** `resort` runs
-  only when `add_conn` set `needs_resort` (a non-level-preserving commit).
+  only when `add_conn` set `needs_resort` (a non-level-preserving commit), and
+  only for a TOPOLOGICAL network: the `Driver` never resorts a PIPELINE
+  network (its single bucket runs in any order; plastax-cpp sorts by level
+  only under Topological), whose flag stays raised for the caller to read.
 - **A `-inf` growth score is a hard veto** — never committed even with free
   slots — distinct from a merely-low finite score. Any non-finite score
   (NaN, +inf) vetoes too. This holds for a `ScoreAddConn` score and a

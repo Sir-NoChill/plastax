@@ -367,9 +367,24 @@ flags it returns — the **retrace protocol**:
   pre-step state is gone; the step hands back its selection instead (a few
   k-long columns per bucket, k the per-level selection size), which keeps
   the non-overflow path one fused call.
-- **needs_resort** → `topo.resort` (new bucket layout, new `NetworkStatic`),
-  rebuild the step, return.
+- **needs_resort** (TOPOLOGICAL only) → `topo.resort` (new bucket layout,
+  new `NetworkStatic`), rebuild the step, return. A PIPELINE network never
+  resorts: the Driver neither reads nor clears its flag, as plastax-cpp's
+  `RunStructuralCadence` sorts by level only under Topological.
 - else commit.
+
+`Driver.scan(inputs, record=..., steps=...)` runs a chunk of K steps (inputs
+with a leading chunk axis) as one jitted `lax.while_loop` over the same
+step, state donated and device-resident, `record(StepResult)` stacked per
+step as the return value. The loop stops itself after a step that overflowed
+(or needs a resort, TOPOLOGICAL), the host completes that step exactly as
+`step` does (regrow + `make_growth_retry`, resort), rebuilds the loop for
+the new static (one compiled loop per `(static, record)`), re-records the
+completed step and re-enters the loop at the next step with a dynamic start
+offset. Exact whatever `check_every` is; one host round trip per chunk plus
+one per structural event. On a launch-bound net (the imprinting learner:
+316 HLO instructions, 42 launches a step) it is 6-7x the per-step host loop
+on a GPU.
 
 `Driver(..., check_every=N)` with N > 1 reads the flags back only every N
 steps (overflow OR-accumulated on device; `needs_resort` is sticky in state):

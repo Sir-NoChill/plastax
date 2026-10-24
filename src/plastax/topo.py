@@ -1,7 +1,8 @@
 """Level assignment and resort.
 
 Deletion never resorts. Level-preserving adds never resort. Resort runs
-only on level reassignment; bucket growth is handled by state.grow_bucket.
+only on level reassignment, and only for a TOPOLOGICAL network (the Driver
+never resorts a PIPELINE one); bucket growth is handled by state.grow_bucket.
 """
 
 from __future__ import annotations

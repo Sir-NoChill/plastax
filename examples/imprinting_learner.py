@@ -23,6 +23,11 @@ features.
 
 Run:  uv run python examples/imprinting_learner.py --steps 20000
       uv run python examples/imprinting_learner.py --stream stream.npz --csv run.csv
+
+The stream runs in device-side chunks (`Driver.scan`, `--chunk`, default
+1000 steps): the frames are uploaded once, the predictions come back once
+per chunk, and the host only steps in when a bucket regrows. `--chunk 0`
+runs one dispatch per step instead; both are exact.
 """
 
 from __future__ import annotations
@@ -102,6 +107,11 @@ class ImprintingParams:
         k2: inclusive range of a memory feature's delay.
         shortlist_size: the growth shortlist; must cover the step's new
             units, its active tenured units and the output.
+        unique_patterns: the thesis's "no identical feature" rule for
+            pattern features, approximated locally: only the lowest-id
+            eligible unit spawns pattern children (one per step), and a child
+            is vetoed when a live pattern unit already imprinted on the same
+            eligible set (a signature kept per unit) with the same `k0`.
         unit_capacity: unit slots.
         seed: the network seed keying every draw.
     """
@@ -118,6 +128,7 @@ class ImprintingParams:
     shortlist_size: int = 256
     unit_capacity: int = 4096
     seed: int = 0
+    unique_patterns: bool = False
 
 
 # --- columns ---------------------------------------------------------------
@@ -148,6 +159,27 @@ MAX_ELIG_LEVEL = px.FieldSpec.int32("imprint/max_elig_level")
 MAX_LEVELS = 1 << 20
 OUTPUT_LEVEL = MAX_LEVELS - 1
 
+# The uniqueness rule (`unique_patterns`). Output only: the lowest eligible
+# unit id, a signature of the eligible set (sum of a hash of its ids), that
+# signature one and two steps back, and four flags: a live pattern unit
+# with the previous step's signature exists for each `k0`. Pattern units:
+# the signature at birth and the index of their `k0`.
+MIN_ELIG_ID = px.FieldSpec.int32("imprint/min_elig_id")
+ELIG_SIG = px.FieldSpec.int32("imprint/elig_sig")
+ELIG_SIG_PREV = px.FieldSpec.int32("imprint/elig_sig_prev")
+ELIG_SIG_PREV2 = px.FieldSpec.int32("imprint/elig_sig_prev2")
+DUP_FLAGS = tuple(px.FieldSpec.int32(f"imprint/dup{k}") for k in range(4))
+SIG = px.FieldSpec.int32("imprint/sig")
+K0_IDX = px.FieldSpec.int32("imprint/k0_idx", default=-1)
+_NO_UNIT = 1 << 30
+
+
+def _id_hash(i: jax.Array) -> jax.Array:
+    """A 32-bit multiplicative hash of a unit id, as int32 (sums wrap)."""
+    word = i.astype(jnp.uint32) * jnp.uint32(2654435761)
+    return jax.lax.bitcast_convert_type(word, jnp.int32)
+
+
 # Edge into the output: whether the feature is in SwiftTD's eligible set (its
 # trace is live: it was active since the trace last faded), and whether this
 # step dropped it from that set. The thesis's learner runs on the sparse
@@ -170,6 +202,13 @@ IMPRINT_UNIT_FIELDS = (
     TRACK_THR,
     BORN,
     MAX_ELIG_LEVEL,
+    MIN_ELIG_ID,
+    ELIG_SIG,
+    ELIG_SIG_PREV,
+    ELIG_SIG_PREV2,
+    *DUP_FLAGS,
+    SIG,
+    K0_IDX,
 )
 
 # Draw streams (stream 1 is the framework's growth stream).
@@ -208,7 +247,15 @@ class ImprintingForward(px.ForwardPass):
     previous feature vector, as the thesis defines them.
     """
 
-    combine = (*OUTPUT_ACC, px.monoid.sum_, px.monoid.sum_, px.monoid.max_)
+    combine = (
+        *OUTPUT_ACC,
+        px.monoid.sum_,
+        px.monoid.sum_,
+        px.monoid.max_,
+        px.monoid.min_,
+        px.monoid.sum_,
+        *(px.monoid.max_ for _ in range(4)),
+    )
 
     def __init__(self, hp: ImprintingParams) -> None:
         self.hp = hp
@@ -225,12 +272,21 @@ class ImprintingForward(px.ForwardPass):
         del g
         is_out = (u[KIND, dst] == KIND_OUTPUT).astype(jnp.float32)
         terms = output_edge_terms(u, src, c, cid, self.hp.tenure_threshold)
-        elig_level = jnp.where(terms[5] * is_out > 0.0, u[px.LEVEL, src], 0)
+        elig = terms[5] * is_out > 0.0
+        elig_level = jnp.where(elig, u[px.LEVEL, src], 0)
+        same_sig = (
+            (is_out > 0.0)
+            & (u[KIND, src] == KIND_PATTERN)
+            & (u[SIG, src] == u[ELIG_SIG_PREV, dst])
+        )
         return (
             *(t * is_out for t in terms),
             (1.0 - is_out) * u[ACT_PREV, src],
             1.0 - is_out,
             elig_level.astype(jnp.int32),
+            jnp.where(elig, src, _NO_UNIT).astype(jnp.int32),
+            jnp.where(elig, _id_hash(src), 0).astype(jnp.int32),
+            *((same_sig & (u[K0_IDX, src] == k)).astype(jnp.int32) for k in range(4)),
         )
 
     def apply(
@@ -261,10 +317,23 @@ class ImprintingForward(px.ForwardPass):
                 is_pat, pattern_act, jnp.where(is_mem, memory_act, u[px.ACTIVATION, i])
             ),
         )
+
+        # The sweep's accumulators are float32; cast the integer summaries back
+        # so the step keeps every column's declared dtype (a type-stable step
+        # is what lets the state donate and `Driver.scan` carry it).
+        def as_int(acc_k: jax.Array, column: jax.Array) -> jax.Array:
+            return jnp.where(is_out, acc_k.astype(jnp.int32), column)
+
         return px.UnitWrite.of(
             (px.ACTIVATION, activation),
             (PULSE, jnp.where(is_mem, pulse_next, pulse)),
-            (MAX_ELIG_LEVEL, jnp.where(is_out, acc[8], u[MAX_ELIG_LEVEL, i])),
+            (MAX_ELIG_LEVEL, as_int(acc[8], u[MAX_ELIG_LEVEL, i])),
+            (MIN_ELIG_ID, as_int(acc[9], u[MIN_ELIG_ID, i])),
+            (ELIG_SIG, as_int(acc[10], u[ELIG_SIG, i])),
+            *(
+                (DUP_FLAGS[k], as_int(acc[11 + k], u[DUP_FLAGS[k], i]))
+                for k in range(4)
+            ),
             *(
                 (spec, jnp.where(is_out, value, u[spec, i]))
                 for spec, value in written[1:]
@@ -299,6 +368,23 @@ class OutDegreeBackward(px.BackwardPass):
     ) -> px.UnitWrite:
         del u, i, g
         return px.UnitWrite.of((W_OUT, acc[0]), (OUT_DEG, acc[1]))
+
+
+class RollSignatures(px.UpdateUnit):
+    """`RecordActivations` plus the eligible-set signature history roll."""
+
+    def __init__(self) -> None:
+        self.base = RecordActivations()
+
+    def update(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> px.UnitWrite:
+        base = self.base.update(u, i, g)
+        return px.UnitWrite(
+            {
+                **base.fields,
+                ELIG_SIG_PREV2.name: u[ELIG_SIG_PREV, i],
+                ELIG_SIG_PREV.name: u[ELIG_SIG, i],
+            }
+        )
 
 
 class ImprintingUpdate(px.UpdateConn):
@@ -428,11 +514,31 @@ class ImprintSpawn(px.AddUnit):
         p = jnp.where(n_elig > 0.0, budget / jnp.maximum(n_elig, 1.0), 0.0)
         fire = _eligible(u, parent, self.hp.tenure_threshold) & (budget >= 1.0)
         fire = fire & (rng.uniform() < p)
+        out = px.UnitIdx(jnp.int32(self.output_unit))
+        if self.hp.unique_patterns:
+            is_mem, k0_idx, _, _ = self._child_draws(rng)
+            lowest = parent == u[MIN_ELIG_ID, out]
+            same_set = u[ELIG_SIG, out] == u[ELIG_SIG_PREV2, out]
+            dup = jnp.zeros((), jnp.bool_)
+            for k in range(4):
+                dup = dup | ((k0_idx == k) & (u[DUP_FLAGS[k], out] > 0))
+            fire = fire & (is_mem | (lowest & ~(same_set & dup)))
         # One level below the deepest feature it may imprint on (see
         # MAX_ELIG_LEVEL), so every edge it receives runs deeper.
-        out = px.UnitIdx(jnp.int32(self.output_unit))
         child_level = u[MAX_ELIG_LEVEL, out] + jnp.int32(1)
         return fire, child_level - u[px.LEVEL, parent]
+
+    def _child_draws(
+        self, rng: Rng
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """The child's draws after the spawn draw: kind, k0 index, k1, k2."""
+        hp = self.hp
+        p_mem = hp.k_mem / max(hp.k_mem + hp.k_pat, 1)
+        is_mem = rng.uniform() < jnp.float32(p_mem)
+        k0_idx = rng.uniform_int(len(hp.k0)).astype(jnp.int32)
+        k1 = jnp.uint32(hp.k1[0]) + rng.uniform_int(hp.k1[1] - hp.k1[0] + 1)
+        k2 = jnp.uint32(hp.k2[0]) + rng.uniform_int(hp.k2[1] - hp.k2[0] + 1)
+        return is_mem, k0_idx, k1, k2
 
     def init(
         self, u: px.UnitView, child: px.UnitIdx, parent: px.UnitIdx, g: Globals
@@ -441,12 +547,10 @@ class ImprintSpawn(px.AddUnit):
         hp = self.hp
         rng = self._site(parent, g)
         rng.uniform()  # the spawn draw
-        p_mem = hp.k_mem / max(hp.k_mem + hp.k_pat, 1)
-        is_mem = rng.uniform() < jnp.float32(p_mem)
-        k0 = jnp.asarray(hp.k0, jnp.float32)[rng.uniform_int(len(hp.k0))]
-        k1 = jnp.uint32(hp.k1[0]) + rng.uniform_int(hp.k1[1] - hp.k1[0] + 1)
-        k2 = jnp.uint32(hp.k2[0]) + rng.uniform_int(hp.k2[1] - hp.k2[0] + 1)
+        is_mem, k0_idx, k1, k2 = self._child_draws(rng)
+        k0 = jnp.asarray(hp.k0, jnp.float32)[k0_idx]
         pattern = ((jnp.uint32(1) << k1) - jnp.uint32(1)) << k2
+        out = px.UnitIdx(jnp.int32(self.output_unit))
         kind = jnp.where(is_mem, KIND_MEMORY, KIND_PATTERN).astype(jnp.int32)
         # A pattern feature is active on creation; a memory feature is
         # triggered on creation and active once its delay has passed.
@@ -462,6 +566,8 @@ class ImprintSpawn(px.AddUnit):
             (px.ACTIVATION, act),
             (ACT_PREV, act),
             (ACT_USED, act),
+            (SIG, jnp.where(is_mem, 0, u[ELIG_SIG, out]).astype(jnp.int32)),
+            (K0_IDX, jnp.where(is_mem, -1, k0_idx).astype(jnp.int32)),
         )
 
 
@@ -559,7 +665,7 @@ def make_net(hp: ImprintingParams, num_obs: int) -> type[px.Network[Globals]]:
         forward_pass = ImprintingForward(hp)
         loss = TDErrorLoss(hp.swifttd, gamma_unit)
         backward_pass = OutDegreeBackward()
-        update_unit = RecordActivations()
+        update_unit = RollSignatures()
         update_conn = ImprintingUpdate(hp, gamma_unit)
         prune_unit = OrphanPrune()
         prune_conn = IdleFeaturePrune()
@@ -577,7 +683,11 @@ def make_net(hp: ImprintingParams, num_obs: int) -> type[px.Network[Globals]]:
 
 
 def build(
-    net: type[px.Network[Globals]], num_obs: int, hp: ImprintingParams
+    net: type[px.Network[Globals]],
+    num_obs: int,
+    hp: ImprintingParams,
+    *,
+    edge_capacity: int | None = None,
 ) -> tuple[px.NetworkStatic, px.NetworkState[Globals], int]:
     """Build the initial network: observation units wired to the output.
 
@@ -585,6 +695,10 @@ def build(
         net: the class from `make_net`.
         num_obs: observation bits per frame.
         hp: the hyperparameters (`alpha_init` seeds every `beta`).
+        edge_capacity: pre-size the connection bucket to this many slots (a
+            run that never outgrows it regrows, and so retraces, nothing);
+            None leaves the builder's sizing, which the Driver grows on
+            demand.
 
     Returns:
         The static config, the state, and the output unit's id.
@@ -600,7 +714,41 @@ def build(
     b.mark_input(gamma_unit)
     b.mark_output(out)
     static, state = b.finalize()
+    if edge_capacity is not None:
+        static, state = presize(static, state, edge_capacity)
     return static, place_output(state, out), out
+
+
+def presize(
+    static: px.NetworkStatic, state: px.NetworkState[Globals], capacity: int
+) -> tuple[px.NetworkStatic, px.NetworkState[Globals]]:
+    """Pad the single pipeline bucket with never-used slots up to `capacity`.
+
+    Args:
+        static: the built static config.
+        state: the built state.
+        capacity: the bucket capacity wanted, at least the built one.
+
+    Returns:
+        The (static, state) pair with the bucket at `capacity`.
+    """
+    (built,) = static.level_capacities
+    if capacity < built:
+        raise ValueError(f"edge capacity {capacity} is below the built {built}")
+    pad = capacity - built
+    bucket = {
+        spec.name: jnp.concatenate(
+            [
+                state.conns[0][spec.name],
+                jnp.full((pad,), np.asarray(spec.default), dtype=spec.dtype),
+            ]
+        )
+        for spec in static.conn_fields
+    }
+    return (
+        dataclasses.replace(static, level_capacities=(capacity,)),
+        dataclasses.replace(state, conns=(bucket,)),
+    )
 
 
 def place_output(state: px.NetworkState[Globals], out: int) -> px.NetworkState[Globals]:
@@ -661,6 +809,28 @@ def counts(
     )
 
 
+def _log(
+    driver: px.Driver[Globals],
+    hp: ImprintingParams,
+    step: int,
+    t0: float,
+    log: list[Counts],
+    verbose: bool,
+) -> None:
+    """Read the counts off the state (a host sync) and print them."""
+    c = counts(driver, hp, step, time.perf_counter() - t0)
+    log.append(c)
+    if verbose:
+        print(
+            f"  step {c.step:>6d}  units {c.units:>5d}  "
+            f"pattern {c.pattern:>5d}  memory {c.memory:>5d}  "
+            f"tenured {c.tenured:>5d}  track {c.tenure_track:>5d}  "
+            f"edges {c.edges:>7d}  {c.seconds:7.1f}s"
+        )
+    if bool(driver.state.unit_overflow):
+        print("  unit capacity exhausted: spawns are being dropped")
+
+
 def run(
     hp: ImprintingParams,
     stream: ims.Stream,
@@ -668,17 +838,28 @@ def run(
     log_every: int = 500,
     csv_path: Path | None = None,
     verbose: bool = True,
+    chunk: int = 1000,
+    edge_capacity: int | None = None,
 ) -> tuple[np.ndarray, list[Counts]]:
     """Run the learner over a stream.
+
+    With `chunk > 0` the stream runs in chunks of that many steps, each one
+    device-side loop (`Driver.scan`): the frames go to the device up front,
+    the predictions come back once per chunk, and the host is involved only
+    when a bucket regrows. `chunk = 0` runs one `Driver.step` per frame and
+    reads the prediction back every step. Both are exact; the chunked run is
+    several times faster on a GPU, where the step is launch-bound.
 
     Args:
         hp: the hyperparameters (`hp.swifttd.gamma` is overridden by the
             stream's discount).
         stream: the stream.
-        log_every: steps between count read-backs.
+        log_every: steps between count read-backs (rounded up to a chunk).
         csv_path: where to write `step, reward, prediction` per step and the
             counts (or None).
         verbose: print the counts as they are read.
+        chunk: steps per device-side loop, or 0 for one step per dispatch.
+        edge_capacity: pre-size the connection bucket (see `build`).
 
     Returns:
         The prediction trace and the count log.
@@ -688,32 +869,75 @@ def run(
     )
     steps, num_obs = stream.obs.shape
     net = make_net(hp, num_obs)
-    static, state, out = build(net, num_obs, hp)
+    static, state, out = build(net, num_obs, hp, edge_capacity=edge_capacity)
     driver = px.Driver(net, static, state)
     prediction = np.zeros(steps, np.float32)
     gamma = np.float32(stream.gamma)
     log: list[Counts] = []
+    act = px.ACTIVATION.name
     t0 = time.perf_counter()
-    for t in range(steps):
-        driver.step(
-            px.StepInputs(
-                inputs=jnp.asarray(np.append(stream.obs[t].astype(np.float32), gamma)),
-                targets=jnp.asarray([stream.reward[t]], jnp.float32),
+    warm_steps, t_warm = 0, t0
+    if chunk > 0:
+        pad = (-steps) % chunk
+        frames = jnp.asarray(
+            np.concatenate(
+                [
+                    stream.obs.astype(np.float32),
+                    np.full((steps, 1), gamma, np.float32),
+                ],
+                axis=1,
             )
         )
-        prediction[t] = float(driver.state.units[px.ACTIVATION.name][out])
-        if (t + 1) % log_every == 0 or t + 1 == steps:
-            c = counts(driver, hp, t + 1, time.perf_counter() - t0)
-            log.append(c)
-            if verbose:
-                print(
-                    f"  step {c.step:>6d}  units {c.units:>5d}  "
-                    f"pattern {c.pattern:>5d}  memory {c.memory:>5d}  "
-                    f"tenured {c.tenured:>5d}  track {c.tenure_track:>5d}  "
-                    f"edges {c.edges:>7d}  {c.seconds:7.1f}s"
+        frames = jnp.concatenate([frames, jnp.zeros((pad, num_obs + 1), jnp.float32)])
+        rewards = jnp.concatenate(
+            [jnp.asarray(stream.reward, jnp.float32), jnp.zeros((pad,), jnp.float32)]
+        )[:, None]
+
+        def predicted(result: px.StepResult[Globals]) -> jax.Array:
+            return result.state.units[act][out]
+
+        logged = 0
+        for start in range(0, steps, chunk):
+            n = min(chunk, steps - start)
+            got = driver.scan(
+                px.StepInputs(
+                    inputs=frames[start : start + chunk],
+                    targets=rewards[start : start + chunk],
+                ),
+                record=predicted,
+                steps=n,
+            )
+            prediction[start : start + n] = np.asarray(got)[:n]
+            if start == 0:
+                # The first chunk compiles the loop: timed separately.
+                warm_steps, t_warm = n, time.perf_counter()
+            done = start + n
+            if done // log_every > logged or done == steps:
+                logged = done // log_every
+                _log(driver, hp, done, t0, log, verbose)
+    else:
+        for t in range(steps):
+            driver.step(
+                px.StepInputs(
+                    inputs=jnp.asarray(
+                        np.append(stream.obs[t].astype(np.float32), gamma)
+                    ),
+                    targets=jnp.asarray([stream.reward[t]], jnp.float32),
                 )
-            if bool(driver.state.unit_overflow):
-                print("  unit capacity exhausted: spawns are being dropped")
+            )
+            prediction[t] = float(driver.state.units[act][out])
+            if t == 0:
+                warm_steps, t_warm = 1, time.perf_counter()
+            if (t + 1) % log_every == 0 or t + 1 == steps:
+                _log(driver, hp, t + 1, t0, log, verbose)
+    total = time.perf_counter() - t_warm
+    timed = max(steps - warm_steps, 1)
+    print(
+        f"timing: steps={timed} total_s={total:.3f} "
+        f"per_step_ms={1000.0 * total / timed:.4f} "
+        f"warmup_s={t_warm - t0:.3f} chunk={chunk} "
+        f"device={jax.default_backend()}"
+    )
     if csv_path is not None:
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
@@ -751,8 +975,21 @@ def _parse(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--k-mem", type=int, default=ImprintingParams.k_mem)
     p.add_argument("--k-pat", type=int, default=ImprintingParams.k_pat)
     p.add_argument("--unit-capacity", type=int, default=ImprintingParams.unit_capacity)
+    p.add_argument(
+        "--edge-capacity",
+        type=int,
+        default=None,
+        help="pre-size the connection bucket; default grows it on demand",
+    )
+    p.add_argument("--unique", action="store_true", help="the pattern uniqueness rule")
     p.add_argument("--shortlist", type=int, default=ImprintingParams.shortlist_size)
     p.add_argument("--log-every", type=int, default=1000)
+    p.add_argument(
+        "--chunk",
+        type=int,
+        default=1000,
+        help="steps per device-side loop (Driver.scan); 0 steps one at a time",
+    )
     return p.parse_args(argv)
 
 
@@ -774,6 +1011,7 @@ def main(argv: list[str] | None = None) -> None:
         unit_capacity=a.unit_capacity,
         shortlist_size=a.shortlist,
         seed=a.seed,
+        unique_patterns=a.unique,
     )
     print(
         f"imprinting learner: {stream.obs.shape[0]} steps, {stream.obs.shape[1]} bits, "
@@ -782,7 +1020,14 @@ def main(argv: list[str] | None = None) -> None:
         f"theta {hp.swifttd.theta:.3g}, lambda {hp.swifttd.lambda_:.3g}, "
         f"tenure {hp.tenure_threshold:.3g}, track {hp.tenure_track_threshold:.3g}"
     )
-    prediction, _ = run(hp, stream, log_every=a.log_every, csv_path=a.csv)
+    prediction, _ = run(
+        hp,
+        stream,
+        log_every=a.log_every,
+        csv_path=a.csv,
+        chunk=a.chunk,
+        edge_capacity=a.edge_capacity,
+    )
     target = ims.learnable_return(stream)
     err = ims.lifetime_error(prediction, target)
     print(f"lifetime error vs the learnable target: {err:.4f}")

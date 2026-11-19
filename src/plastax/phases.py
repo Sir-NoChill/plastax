@@ -629,7 +629,7 @@ def nvidia_triton_available() -> bool:
     if "cuda" not in platform_version:
         return False
     try:
-        import jax_triton  # noqa: F401  # ty: ignore[unresolved-import]
+        import jax_triton  # noqa: F401  # ty: ignore[import-not-found]
         import triton  # noqa: F401
     except ImportError:
         return False
@@ -736,7 +736,7 @@ def triton_bucket_product(
     Returns:
         The `(num_units, batch)` product.
     """
-    import jax_triton  # ty: ignore[unresolved-import]
+    import jax_triton  # ty: ignore[import-not-found]
 
     cap = bucket[DEAD.name].shape[0]
     batch = x.shape[1]
@@ -2270,7 +2270,7 @@ def triton_forward_prune(
         The bucket's accumulator contribution, the new dead mask, the free
         count per block (not cumulative), and the block length.
     """
-    import jax_triton  # ty: ignore[unresolved-import]
+    import jax_triton  # ty: ignore[import-not-found]
 
     dead = bucket[DEAD.name]
     cap = dead.shape[0]
@@ -3427,7 +3427,7 @@ def triton_claim(
         ValueError: If a bucket capacity is not a multiple of 4 (the kernel
             reads the dead masks as 32-bit words).
     """
-    import jax_triton  # ty: ignore[unresolved-import]
+    import jax_triton  # ty: ignore[import-not-found]
 
     # The claim hands triton_call tuples of arrays (one per bucket), which it
     # flattens; its annotation admits only arrays, so call it untyped.

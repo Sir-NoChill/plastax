@@ -14,10 +14,12 @@ repos:
       - id: check-toml
       - id: check-merge-conflict
 
+  # Keep `rev` at the ruff version in uv.lock, so that the hook and
+  # `uv run ruff` apply the same rules.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.7
+    rev: v0.17.5
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
@@ -36,16 +38,20 @@ repos:
           - --check-class-attributes=True
           - --skip-checking-private-functions=True
 
+      # The two type checkers are given the tracked files under src/, not the
+      # directory: pre-commit sets aside unstaged changes to tracked files but
+      # leaves untracked files in place, and a new file not yet added to git
+      # is not part of the commit being checked.
       - id: ty
         name: ty check (experimental; mypy in CI is authoritative)
-        entry: uv run ty check src
+        entry: bash -c 'git ls-files -z -- "src/*.py" | xargs -0 uv run ty check'
         language: system
         types: [python]
         pass_filenames: false
 
       - id: mypy-strict
         name: mypy --strict
-        entry: uv run mypy --strict src
+        entry: bash -c 'git ls-files -z -- "src/*.py" | xargs -0 uv run mypy --strict'
         language: system
         types: [python]
         pass_filenames: false

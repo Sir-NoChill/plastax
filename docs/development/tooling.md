@@ -158,6 +158,15 @@ fast pytest suite on pre-push. Install with
 `uv run pre-commit install --hook-type pre-commit --hook-type commit-msg --hook-type pre-push`.
 These hooks must run and pass — never commit or push with `--no-verify`.
 
+The ruff hook's `rev` is kept at the ruff version in `uv.lock`, so the hook and
+`uv run ruff` apply the same rules; bump the two together.
+
+ty and mypy are given the tracked files under `src/` (`git ls-files`), not the
+directory. pre-commit sets aside unstaged changes to tracked files but leaves
+untracked files in place, so a new file not yet added to git would otherwise be
+checked along with a commit it is not part of. The pytest hook still collects
+from the working tree, untracked test files included.
+
 `default_stages: [pre-commit]` keeps the lint hooks from running again on
 commit-msg and pre-push over files they already checked. mypy is incremental
 through `.mypy_cache/` (a few seconds cold, well under a second warm), so the

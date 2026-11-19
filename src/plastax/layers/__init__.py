@@ -6,6 +6,7 @@ with private weights.
 """
 
 from plastax.layers._dense import Dense
+from plastax.layers._draw import draw
 from plastax.layers._init import ConstInit
 from plastax.layers._module import BuildError, Module
 from plastax.layers._record import ConnBlock, Record, trace
@@ -20,5 +21,6 @@ __all__ = [
     "Record",
     "ShapeError",
     "Units",
+    "draw",
     "trace",
 ]

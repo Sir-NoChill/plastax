@@ -65,6 +65,8 @@ triton = ["jax-triton>=0.4.1"]
 # against a TPU topology description (examples/benchmarks/tpu_aot_check.py).
 tpu = ["jax[tpu]>=0.11.0"]
 gpu = ["plastax[cuda12]"]
+# matplotlib, for `plastax.layers.draw`. Imported only when `draw` is called.
+plot = ["matplotlib>=3.8"]
 
 [project.urls]
 Homepage = "https://github.com/Sir-NoChill/plastax"
@@ -76,6 +78,8 @@ Documentation = "https://plastax.readthedocs.io"
 # by default, so the bare `uv run ty|mypy|pytest` hook entries resolve it.
 [dependency-groups]
 dev = [
+  # So that ty and mypy resolve the imports of `plastax.layers.draw`.
+  "matplotlib>=3.8",
   "pytest>=8",
   "pytest-xdist",
   # numpy is a runtime dependency (see [project].dependencies), not dev-only.

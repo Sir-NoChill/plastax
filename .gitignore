@@ -9,7 +9,6 @@ dist/
 .ruff_cache/
 # JAX persistent compilation cache (tests/conftest.py)
 .cache/
-uv.lock
 docs/_build/
 
 # Local agent / editor settings

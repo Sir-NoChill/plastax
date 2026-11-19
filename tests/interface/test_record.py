@@ -1,0 +1,342 @@
+"""The notation a topology is written in, checked without building a network.
+
+Plan `plans/20261116T132654Z-layers-module.md` (workspace root). So far: handles
+(step 2), modules and
+tracing (step 3).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pytest
+
+import plastax.layers as pxl
+from plastax.layers import BuildError, Record, ShapeError, Units
+
+
+def handle(*shape: int) -> Units:
+    """A handle to `prod(shape)` units numbered from 0, in row-major order."""
+    return Units(
+        np.arange(int(np.prod(shape)), dtype=np.int32).reshape(shape), Record()
+    )
+
+
+def raised_in_this_file(excinfo: pytest.ExceptionInfo[BaseException]) -> bool:
+    return any(str(entry.path) == __file__ for entry in excinfo.traceback)
+
+
+# --------------------------------------------------------------------------- #
+# What a handle reports
+# --------------------------------------------------------------------------- #
+def test_shape_ndim_and_size() -> None:
+    h = handle(2, 3, 4)
+
+    assert h.shape == (2, 3, 4)
+    assert h.ndim == 3
+    assert h.size == 24
+    assert repr(h) == "Units(shape=(2, 3, 4))"
+
+
+def test_a_handle_to_one_unit_has_no_axes() -> None:
+    h = handle()
+
+    assert h.shape == ()
+    assert h.size == 1
+
+
+def test_ids_are_int32_and_cannot_be_written() -> None:
+    h = handle(2, 3)
+
+    assert h.ids.dtype == np.int32
+    with pytest.raises(ValueError, match="read-only"):
+        h.ids[0, 0] = 9
+
+
+def test_a_handle_does_not_follow_the_array_it_was_made_from() -> None:
+    ids = np.arange(4, dtype=np.int32)
+    h = Units(ids, Record())
+
+    ids[0] = 99
+
+    assert h.ids[0] == 0
+
+
+def test_ids_must_be_integers() -> None:
+    with pytest.raises(TypeError, match="integers"):
+        Units(np.zeros(3, np.float32), Record())
+
+
+# --------------------------------------------------------------------------- #
+# Relabelling: the same units, rearranged
+# --------------------------------------------------------------------------- #
+def test_reshape_keeps_the_units_in_row_major_order() -> None:
+    h = handle(2, 3)
+
+    np.testing.assert_array_equal(h.reshape(3, 2).ids, [[0, 1], [2, 3], [4, 5]])
+    np.testing.assert_array_equal(h.reshape((3, 2)).ids, h.reshape(3, 2).ids)
+
+
+def test_reshape_works_out_one_axis() -> None:
+    assert handle(2, 3, 4).reshape(-1, 4).shape == (6, 4)
+
+
+def test_flatten() -> None:
+    h = handle(2, 3)
+
+    assert h.flatten().shape == (6,)
+    np.testing.assert_array_equal(h.flatten().ids, np.arange(6))
+
+
+def test_none_adds_an_axis() -> None:
+    h = handle(2, 3)
+
+    assert h[:, None, :].shape == (2, 1, 3)
+    np.testing.assert_array_equal(h[:, None, :].flatten().ids, h.flatten().ids)
+
+
+@pytest.mark.parametrize(
+    "index",
+    [0, -1, slice(1, 3), (slice(None), 0), (..., 0), (1, slice(None, None, 2)), ...],
+    ids=["int", "negative", "slice", "column", "ellipsis", "step", "all"],
+)
+def test_indexing_selects_what_numpy_selects(index: Any) -> None:
+    h = handle(3, 4)
+
+    np.testing.assert_array_equal(
+        h[index].ids,
+        np.arange(12).reshape(3, 4)[index],
+    )
+
+
+def test_iterating_goes_over_the_first_axis() -> None:
+    rows = list(handle(2, 3))
+
+    assert [r.shape for r in rows] == [(3,), (3,)]
+    np.testing.assert_array_equal(rows[1].ids, [3, 4, 5])
+
+
+def test_relabelling_never_changes_the_original() -> None:
+    h = handle(2, 3)
+    h.reshape(3, 2)
+    h.flatten()
+    _ = h[0]
+
+    assert h.shape == (2, 3)
+    np.testing.assert_array_equal(h.ids, [[0, 1, 2], [3, 4, 5]])
+
+
+# --------------------------------------------------------------------------- #
+# Errors, raised at the line that wrote them
+# --------------------------------------------------------------------------- #
+def test_reshape_to_a_different_number_of_units() -> None:
+    with pytest.raises(ShapeError, match="reshape") as excinfo:
+        handle(2, 3).reshape(4, 2)
+    assert raised_in_this_file(excinfo)
+
+
+@pytest.mark.parametrize("index", [5, (0, 0, 0)], ids=["out_of_range", "too_many"])
+def test_an_index_that_does_not_fit(index: Any) -> None:
+    with pytest.raises(ShapeError):
+        handle(2, 3)[index]
+
+
+@pytest.mark.parametrize(
+    "index",
+    [np.array([0, 0]), [0, 1], True, np.array([True, False])],
+    ids=["array", "list", "bool", "mask"],
+)
+def test_an_index_that_could_repeat_a_unit(index: Any) -> None:
+    with pytest.raises(TypeError):
+        handle(2, 3)[index]
+
+
+def test_a_handle_is_not_an_array() -> None:
+    with pytest.raises(TypeError, match="holds no values"):
+        np.asarray(handle(2, 3))
+
+
+def test_a_handle_with_no_axes_cannot_be_iterated() -> None:
+    with pytest.raises(TypeError):
+        list(handle())
+
+
+# --------------------------------------------------------------------------- #
+# Tracing a module with no layers
+# --------------------------------------------------------------------------- #
+class Passthrough(pxl.Module):
+    def __call__(self, x: Units) -> Units:
+        return x.flatten()
+
+
+class TwoInputs(pxl.Module):
+    def __call__(self, obs: Units, gamma: Units) -> tuple[Units, Units]:
+        return gamma, obs
+
+
+def test_a_module_that_returns_its_input() -> None:
+    record = pxl.trace(Passthrough(), {"x": (2, 3)})
+
+    assert record.num_units == 6
+    np.testing.assert_array_equal(record.inputs["x"], [[0, 1, 2], [3, 4, 5]])
+    assert record.blocks == []
+    assert record.constants.size == 0
+    assert len(record.outputs) == 1
+    np.testing.assert_array_equal(record.outputs[0], np.arange(6))
+
+
+def test_inputs_are_numbered_in_the_order_given() -> None:
+    record = pxl.trace(TwoInputs(), {"gamma": (), "obs": (3,)})
+
+    np.testing.assert_array_equal(record.inputs["gamma"], 0)
+    np.testing.assert_array_equal(record.inputs["obs"], [1, 2, 3])
+
+
+def test_inputs_reach_arguments_by_name_and_outputs_keep_their_order() -> None:
+    record = pxl.trace(TwoInputs(), {"gamma": (), "obs": (3,)})
+
+    assert [out.shape for out in record.outputs] == [(), (3,)]
+    np.testing.assert_array_equal(record.outputs[1], record.inputs["obs"])
+
+
+def test_tracing_twice_gives_the_same_record() -> None:
+    module = TwoInputs()
+    first = pxl.trace(module, {"obs": (2, 2), "gamma": ()})
+    second = pxl.trace(module, {"obs": (2, 2), "gamma": ()})
+
+    assert first is not second
+    assert first.num_units == second.num_units
+    for a, b in zip(first.outputs, second.outputs, strict=True):
+        np.testing.assert_array_equal(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# setup, arguments and paths
+# --------------------------------------------------------------------------- #
+class Inner(pxl.Module):
+    def __call__(self, x: Units) -> Units:
+        return x
+
+
+class Middle(pxl.Module):
+    def setup(self) -> None:
+        self.inner = Inner()
+
+    def __call__(self, x: Units) -> Units:
+        return self.inner(x)
+
+
+class Outer(pxl.Module):
+    def __init__(self, depth: int) -> None:
+        self.depth = depth
+        self.setups = 0
+
+    def setup(self) -> None:
+        self.setups += 1
+        self.first = Middle()
+        self.rest = [Middle() for _ in range(self.depth)]
+
+    def __call__(self, x: Units) -> Units:
+        x = self.first(x)
+        for module in self.rest:
+            x = module(x)
+        return x
+
+
+def test_setup_runs_once_however_often_the_module_is_traced() -> None:
+    module = Outer(depth=2)
+    assert module.setups == 0
+
+    pxl.trace(module, {"x": (3,)})
+    pxl.trace(module, {"x": (3,)})
+
+    assert module.setups == 1
+
+
+def test_paths_follow_attribute_names_and_list_indices() -> None:
+    module = Outer(depth=2)
+    pxl.trace(module, {"x": (3,)})
+
+    assert module.path == ()
+    assert module.first.path == ("first",)
+    assert module.first.inner.path == ("first", "inner")
+    assert module.rest[1].inner.path == ("rest", "1", "inner")
+
+
+def test_a_module_has_no_path_before_it_is_traced() -> None:
+    with pytest.raises(BuildError, match="no path"):
+        _ = Passthrough().path
+
+
+def test_one_module_declared_in_two_places() -> None:
+    class Twice(pxl.Module):
+        def setup(self) -> None:
+            self.a = Inner()
+            self.b = self.a
+
+        def __call__(self, x: Units) -> Units:
+            return self.b(self.a(x))
+
+    with pytest.raises(BuildError, match="declared at"):
+        pxl.trace(Twice(), {"x": (3,)})
+
+
+# --------------------------------------------------------------------------- #
+# Errors raised by a trace
+# --------------------------------------------------------------------------- #
+def test_an_argument_with_no_input() -> None:
+    with pytest.raises(BuildError, match=r"arguments \['gamma'\] have no input"):
+        pxl.trace(TwoInputs(), {"obs": (3,)})
+
+
+def test_an_input_with_no_argument() -> None:
+    with pytest.raises(BuildError, match=r"inputs \['extra'\] have no argument"):
+        pxl.trace(Passthrough(), {"x": (3,), "extra": ()})
+
+
+def test_call_must_name_its_inputs() -> None:
+    class Starred(pxl.Module):
+        def __call__(self, *handles: Units) -> Units:
+            return handles[0]
+
+    with pytest.raises(BuildError, match="name each input"):
+        pxl.trace(Starred(), {"x": (3,)})
+
+
+def test_a_module_without_call() -> None:
+    class Empty(pxl.Module):
+        pass
+
+    with pytest.raises(BuildError, match="no __call__"):
+        pxl.trace(Empty(), {})
+
+
+def test_returning_something_that_is_not_a_handle() -> None:
+    class ReturnsIds(pxl.Module):
+        def __call__(self, x: Units) -> Any:
+            return x.ids
+
+    with pytest.raises(BuildError, match="must return a handle"):
+        pxl.trace(ReturnsIds(), {"x": (3,)})
+
+
+def test_returning_a_handle_from_another_trace() -> None:
+    class Leaks(pxl.Module):
+        def __call__(self, x: Units) -> Units:
+            return handle(3)
+
+    with pytest.raises(BuildError, match="another trace"):
+        pxl.trace(Leaks(), {"x": (3,)})
+
+
+def test_a_finished_record_takes_no_more_units() -> None:
+    record = pxl.trace(Passthrough(), {"x": (3,)})
+
+    with pytest.raises(BuildError, match="finished"):
+        record._new_units((2,))
+
+
+def test_an_input_shape_that_is_not_a_shape() -> None:
+    with pytest.raises(ShapeError, match="non-negative"):
+        pxl.trace(Passthrough(), {"x": (2, -1)})

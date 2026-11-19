@@ -16,10 +16,10 @@ import numpy as np
 if TYPE_CHECKING:
     from plastax.layers._record import Record
 
-# One index along one axis. Integers drop the axis, slices keep it, None adds an axis
-# of length 1, an Ellipsis stands for the axes not written. These are numpy's basic
-# indices: each selects a unit at most once.
-type Index = int | np.integer | slice | None | EllipsisType
+# One index along one axis, as in numpy. Integers drop the axis, slices keep it, None
+# adds an axis of length 1, an Ellipsis stands for the axes not written, and an integer
+# array or list picks units by position, which may name a unit more than once.
+type Index = int | np.integer | slice | None | EllipsisType | np.ndarray | list[int]
 
 
 class ShapeError(ValueError):
@@ -127,10 +127,12 @@ class Units:
         return Units(self._ids.reshape(-1), self._record)
 
     def __getitem__(self, index: Index | tuple[Index, ...]) -> Units:
-        """Select or rearrange units with numpy's basic indexing.
+        """Select or rearrange units as numpy indexes an array.
 
         Creates no units and no connections. `h[:, None, :]` adds an axis, `h[0]` and
-        `h[2:5]` select a part, `h[..., 0]` selects along the last axis.
+        `h[2:5]` select a part, `h[..., 0]` selects along the last axis, and
+        `h[np.array([0, 0, 3])]` picks units by position, which may name a unit more
+        than once. Explicit wiring is written with the last form.
 
         Args:
             index: One index, or a tuple of them.
@@ -141,18 +143,26 @@ class Units:
         Raises:
             ShapeError: If an integer is out of range or there are more indices than
                 axes.
-            TypeError: If an index is an array, a list or a boolean. Those can select a
-                unit more than once, which a handle does not allow.
+            TypeError: If an index is a boolean or a boolean mask, or anything else
+                that is not an integer, a slice, None, an Ellipsis or integers in an
+                array or list.
         """
         parts = index if isinstance(index, tuple) else (index,)
         for part in parts:
-            basic = part is None or isinstance(
-                part, (int, np.integer, slice, EllipsisType)
-            )
-            if not basic or isinstance(part, (bool, np.bool_)):
+            if part is None or isinstance(part, slice | EllipsisType):
+                continue
+            if isinstance(part, np.ndarray | list):
+                allowed = np.issubdtype(np.asarray(part).dtype, np.integer)
+            elif isinstance(part, bool | np.bool_):
+                allowed = False
+            else:
+                # The annotation is not enforced for an index from user code, so the
+                # check stays although mypy can prove it from the annotation.
+                allowed = isinstance(part, int | np.integer)
+            if not allowed:
                 raise TypeError(
-                    f"a handle is indexed with integers, slices, None and ..., "
-                    f"not {type(part).__name__}"
+                    f"a handle is indexed with integers, slices, None, ... and "
+                    f"integer arrays, not {type(part).__name__}"
                 )
         try:
             ids = self._ids[index]

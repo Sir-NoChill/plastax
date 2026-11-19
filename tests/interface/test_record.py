@@ -2,7 +2,7 @@
 
 Plan `plans/20261116T132654Z-layers-module.md` (workspace root). So far: handles
 (step 2), modules and
-tracing (step 3).
+tracing (step 3). Layers are in test_primitives_record.py and test_dense_record.py.
 """
 
 from __future__ import annotations
@@ -144,10 +144,22 @@ def test_an_index_that_does_not_fit(index: Any) -> None:
 
 @pytest.mark.parametrize(
     "index",
-    [np.array([0, 0]), [0, 1], True, np.array([True, False])],
-    ids=["array", "list", "bool", "mask"],
+    [np.array([0, 0, 1]), [1, 0], (np.array([1, 1]), np.array([0, 2])), (0, [2, 2])],
+    ids=["array", "list", "two_arrays", "int_and_list"],
 )
-def test_an_index_that_could_repeat_a_unit(index: Any) -> None:
+def test_integer_arrays_select_what_numpy_selects(index: Any) -> None:
+    """An integer array picks units by position and may name one more than once."""
+    h = handle(2, 3)
+
+    np.testing.assert_array_equal(h[index].ids, np.arange(6).reshape(2, 3)[index])
+
+
+@pytest.mark.parametrize(
+    "index",
+    [True, np.array([True, False]), np.array([0.0, 1.0]), "0"],
+    ids=["bool", "mask", "floats", "string"],
+)
+def test_an_index_that_is_not_integers(index: Any) -> None:
     with pytest.raises(TypeError):
         handle(2, 3)[index]
 

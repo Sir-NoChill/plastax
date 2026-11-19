@@ -1,8 +1,10 @@
 """`Dense` with private weights, checked on the record it writes.
 
-Plan `plans/20261119T152006Z-step4-dense-draft.md` (workspace root). No test here
-asserts a literal unit id: the order in which a call numbers its units is not
-specified. Ids are compared with the ids of the handles involved.
+Plan `plans/20261119T171340Z-steps-4-5-primitives.md` (workspace root). `Dense` is a
+helper written with `CreateUnits` and `CreateConnections`, which have their own tests
+in test_primitives_record.py. No test here asserts a literal unit id: the order in
+which a call numbers its units is not specified. Ids are compared with the ids of the
+handles involved.
 """
 
 from __future__ import annotations
@@ -14,7 +16,16 @@ import numpy as np
 import pytest
 
 import plastax.layers as pxl
-from plastax.layers import BuildError, ConstInit, Dense, Record, ShapeError, Units
+from plastax.layers import (
+    BuildError,
+    ConstInit,
+    CreateConnections,
+    CreateUnits,
+    Dense,
+    Record,
+    ShapeError,
+    Units,
+)
 
 
 def net(fc: Dense, call: Callable[[Any, Units], Any] | None = None) -> pxl.Module:
@@ -59,7 +70,7 @@ def test_without_bias_there_is_one_block_and_no_constant() -> None:
     record, x, out = traced(Dense(3, bias=False), (4,))
 
     assert record.num_units == 4 + 3
-    assert [block.name for block in record.blocks] == ["weight"]
+    assert [block.path for block in record.blocks] == [("fc", "weight")]
     assert record.blocks[0].src.shape == (12,)
     assert record.blocks[0].dst.shape == (12,)
     assert record.constants.size == 0
@@ -71,7 +82,7 @@ def test_bias_is_one_constant_unit_and_one_connection_per_unit() -> None:
     weight, bias = record.blocks
 
     assert record.num_units == 4 + 3 + 1
-    assert (weight.name, bias.name) == ("weight", "bias")
+    assert (weight.path, bias.path) == (("fc", "weight"), ("fc", "bias_weight"))
     assert weight.src.size + bias.src.size == 3 * 4 + 3
     assert record.constants.shape == (1,)
     one = record.constants[0]
@@ -143,12 +154,13 @@ def test_a_leading_axis_of_length_zero_creates_nothing() -> None:
 # --------------------------------------------------------------------------- #
 # What a block carries
 # --------------------------------------------------------------------------- #
-def test_blocks_carry_the_layer_path_and_the_initializers_given() -> None:
+def test_blocks_carry_their_paths_and_the_initializers_given() -> None:
     init, bias_init = ConstInit(0.25), ConstInit(-1.0)
     record, _, _ = traced(Dense(3, init=init, bias_init=bias_init), (4,))
     weight, bias = record.blocks
 
-    assert weight.path == bias.path == ("fc",)
+    assert weight.path == ("fc", "weight")
+    assert bias.path == ("fc", "bias_weight")
     assert weight.init is init
     assert bias.init is bias_init
     assert init.value == 0.25
@@ -172,8 +184,42 @@ def test_block_ids_are_int32() -> None:
 def test_a_dense_layer_can_be_the_whole_topology() -> None:
     record = pxl.trace(Dense(3, bias=False), {"x": (4,)})
 
-    assert record.blocks[0].path == ()
+    assert record.blocks[0].path == ("weight",)
     assert record.outputs[0].shape == (3,)
+
+
+def test_dense_writes_its_units_as_unit_blocks() -> None:
+    record, _, out = traced(Dense(3), (5, 4))
+    units, one = record.unit_blocks
+
+    assert (units.path, units.shape, units.constant) == (("fc", "units"), (5, 3), None)
+    assert (one.path, one.shape, one.constant) == (("fc", "one"), (), 1.0)
+
+
+def test_dense_is_the_same_wiring_written_with_the_primitives() -> None:
+    class ByHand(pxl.Module):
+        def setup(self) -> None:
+            self.units = CreateUnits()
+            self.weight = CreateConnections()
+            self.one = CreateUnits(constant=1.0)
+            self.bias_weight = CreateConnections()
+
+        def __call__(self, x: Units) -> Units:
+            y = self.units(shape=(*x.shape[:-1], 3))
+            self.weight(x[..., None, :], y[..., :, None])
+            self.bias_weight(self.one(shape=()), y)
+            return y
+
+    helper = pxl.trace(Dense(3), {"x": (5, 4)})
+    by_hand = pxl.trace(ByHand(), {"x": (5, 4)})
+
+    assert helper.num_units == by_hand.num_units
+    np.testing.assert_array_equal(helper.outputs[0], by_hand.outputs[0])
+    np.testing.assert_array_equal(helper.constants, by_hand.constants)
+    for a, b in zip(helper.blocks, by_hand.blocks, strict=True):
+        assert a.path == b.path
+        np.testing.assert_array_equal(a.src, b.src)
+        np.testing.assert_array_equal(a.dst, b.dst)
 
 
 # --------------------------------------------------------------------------- #
@@ -193,25 +239,25 @@ def test_the_second_layer_reads_the_first_layers_units() -> None:
     module = TwoLayers()
     record = pxl.trace(module, {"x": (4,)})
     hidden_ids = module.h.ids
-    by_key = {(block.path, block.name): block for block in record.blocks}
+    by_path = {block.path: block for block in record.blocks}
 
-    assert set(by_key) == {
-        (("hidden",), "weight"),
-        (("hidden",), "bias"),
-        (("out",), "weight"),
-        (("out",), "bias"),
+    assert set(by_path) == {
+        ("hidden", "weight"),
+        ("hidden", "bias_weight"),
+        ("out", "weight"),
+        ("out", "bias_weight"),
     }
-    assert set(by_key[("hidden",), "weight"].dst.tolist()) == set(hidden_ids.tolist())
-    assert set(by_key[("out",), "weight"].src.tolist()) == set(hidden_ids.tolist())
+    assert set(by_path["hidden", "weight"].dst.tolist()) == set(hidden_ids.tolist())
+    assert set(by_path["out", "weight"].src.tolist()) == set(hidden_ids.tolist())
     assert record.num_units == 4 + 8 + 1 + 2 + 1
 
 
 def test_each_biased_layer_has_its_own_constant() -> None:
     record = pxl.trace(TwoLayers(), {"x": (4,)})
-    by_key = {(block.path, block.name): block for block in record.blocks}
+    by_path = {block.path: block for block in record.blocks}
 
-    hidden_one = by_key[("hidden",), "bias"].src[0]
-    out_one = by_key[("out",), "bias"].src[0]
+    hidden_one = by_path["hidden", "bias_weight"].src[0]
+    out_one = by_path["out", "bias_weight"].src[0]
     assert hidden_one != out_one
     assert set(record.constants.tolist()) == {hidden_one, out_one}
 
@@ -223,7 +269,7 @@ def test_tracing_twice_gives_the_same_blocks() -> None:
 
     assert len(first.blocks) == len(second.blocks) == 4
     for a, b in zip(first.blocks, second.blocks, strict=True):
-        assert (a.path, a.name) == (b.path, b.name)
+        assert a.path == b.path
         np.testing.assert_array_equal(a.src, b.src)
         np.testing.assert_array_equal(a.dst, b.dst)
     np.testing.assert_array_equal(first.constants, second.constants)

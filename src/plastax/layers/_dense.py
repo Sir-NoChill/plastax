@@ -1,5 +1,7 @@
 """The dense layer: all-to-all connections along the last axis.
 
+A helper written with the two primitives; it uses nothing a user could not.
+
 Nothing here imports JAX or any other part of plastax.
 """
 
@@ -9,7 +11,7 @@ import numpy as np
 
 from plastax.layers._init import ConstInit
 from plastax.layers._module import Module
-from plastax.layers._record import ConnBlock
+from plastax.layers._primitives import CreateConnections, CreateUnits
 from plastax.layers._units import ShapeError, Units
 
 
@@ -22,16 +24,15 @@ class Dense(Module):
     Positions are not connected to each other, and every connection has its own
     weight.
 
-    The connections are written as one block named `"weight"`, in row-major order
-    over `lead + (features, n_in)`: position outermost, then destination, then
-    source. A weight array of that shape, flattened, is in block order.
+    The layer is four primitives, which give its blocks their paths:
 
-    With `bias=True` the call also creates one unit that is always 1, and a second
-    block named `"bias"` connecting it to each new unit, in the row-major order of
-    the returned handle.
-
-    The order in which a call numbers its new units and its constant is not
-    specified.
+    - `units`: the new units.
+    - `weight`: the connections, in row-major order over `lead + (features, n_in)`:
+      position outermost, then destination, then source. A weight array of that
+      shape, flattened, is in block order.
+    - `one` and `bias_weight`, with `bias=True`: one unit that is always 1, and a
+      connection from it to each new unit, in the row-major order of the returned
+      handle.
 
     Args:
         features: The length of the last axis of the units the layer creates.
@@ -53,7 +54,7 @@ class Dense(Module):
         init: ConstInit | None = None,
         bias_init: ConstInit | None = None,
     ) -> None:
-        if isinstance(features, bool) or not isinstance(features, (int, np.integer)):
+        if isinstance(features, bool) or not isinstance(features, int | np.integer):
             raise TypeError(
                 f"Dense takes a number of features as an integer, "
                 f"got {type(features).__name__}"
@@ -66,6 +67,14 @@ class Dense(Module):
         self.bias = bias
         self.init = init
         self.bias_init = bias_init
+
+    def setup(self) -> None:
+        """Declare the primitives the layer is made of."""
+        self.units = CreateUnits()
+        self.weight = CreateConnections(init=self.init)
+        if self.bias:
+            self.one = CreateUnits(constant=1.0)
+            self.bias_weight = CreateConnections(init=self.bias_init)
 
     # `Module` declares `__call__` as an attribute so that each subclass may choose
     # its own arguments; ty reads a method with narrower arguments as an invalid
@@ -92,32 +101,19 @@ class Dense(Module):
                 "a Dense layer acts on the last axis and this handle has none; "
                 "`x.reshape(1)` gives a single unit an axis"
             )
-        n_in = x.shape[-1]
-        if n_in == 0:
+        if x.shape[-1] == 0:
             raise ShapeError(
                 f"a Dense layer needs at least one source along the last axis, "
                 f"got a handle of shape {x.shape}"
             )
-        record = x._record
-        path = record._claim(self)
+        # Before anything is created: is this layer part of the trace, and is this
+        # its first call in it?
+        x._record._claim(self)
 
-        out = record._new_units((*x.shape[:-1], self.features))
-        # One connection per element of `lead + (features, n_in)`. The source varies
-        # along the last axis and the destination along the one before it.
-        weights = (*x.shape[:-1], self.features, n_in)
-        src = np.broadcast_to(x.ids[..., None, :], weights).reshape(-1)
-        dst = np.broadcast_to(out.ids[..., :, None], weights).reshape(-1)
-        record._add_block(ConnBlock(path, "weight", src, dst, self.init))
-
+        y = self.units(shape=(*x.shape[:-1], self.features))
+        # Broadcast to `lead + (features, n_in)`: the source varies along the last
+        # axis and the destination along the one before it.
+        self.weight(x[..., None, :], y[..., :, None])
         if self.bias:
-            one = record._new_constant()
-            record._add_block(
-                ConnBlock(
-                    path,
-                    "bias",
-                    np.full(out.size, one, np.int32),
-                    out.ids.reshape(-1),
-                    self.bias_init,
-                )
-            )
-        return out
+            self.bias_weight(self.one(shape=()), y)
+        return y

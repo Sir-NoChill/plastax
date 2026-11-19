@@ -23,13 +23,31 @@ def _no_ids() -> np.ndarray:
 
 
 @dataclass(eq=False)
-class ConnBlock:
-    """The connections one layer call wrote down.
+class UnitBlock:
+    """The units one `CreateUnits` call wrote down: a run of consecutive ids.
 
     Attributes:
         path: The path of the layer that made the block.
-        name: Which of the layer's blocks this is: `"weight"` or `"bias"`. A path and
-            a name together identify one block of a record.
+        start: The id of the block's first unit. The block is the ids `start` to
+            `start + prod(shape) - 1`.
+        shape: The arrangement of the units in the handle the call returned.
+        constant: The value the units always hold, or None for ordinary units.
+    """
+
+    path: tuple[str, ...]
+    start: int
+    shape: tuple[int, ...]
+    constant: float | None = None
+
+
+@dataclass(eq=False)
+class ConnBlock:
+    """The connections one `CreateConnections` call wrote down.
+
+    A block is identified by its path.
+
+    Attributes:
+        path: The path of the layer that made the block.
         src: The source unit of each connection, as `(E,)` record ids.
         dst: The destination unit of each connection, as `(E,)` record ids.
         init: How the block's weights get their first values, or None for the
@@ -37,7 +55,6 @@ class ConnBlock:
     """
 
     path: tuple[str, ...]
-    name: str
     src: np.ndarray
     dst: np.ndarray
     init: ConstInit | None = None
@@ -53,14 +70,15 @@ class Record:
     Attributes:
         num_units: How many units exist.
         inputs: For each input name, its unit ids in the input's shape.
-        constants: The ids of the units that are always 1.
+        unit_blocks: The units layers created, one block per call, in the order
+            written. Input units are not in a block.
         blocks: The connections, one block per layer call, in the order written.
         outputs: The unit ids of each handle the topology returned.
     """
 
     num_units: int = 0
     inputs: dict[str, np.ndarray] = field(default_factory=dict)
-    constants: np.ndarray = field(default_factory=_no_ids)
+    unit_blocks: list[UnitBlock] = field(default_factory=list)
     blocks: list[ConnBlock] = field(default_factory=list)
     outputs: tuple[np.ndarray, ...] = ()
     _sealed: bool = field(default=False, repr=False)
@@ -69,6 +87,16 @@ class Record:
     # module can be traced again.
     _paths: dict[int, tuple[str, ...]] = field(default_factory=dict, repr=False)
     _called: set[int] = field(default_factory=set, repr=False)
+
+    @property
+    def constants(self) -> np.ndarray:
+        """The ids of the units that always hold one value, as an int32 array."""
+        runs = [
+            np.arange(b.start, b.start + int(np.prod(b.shape, dtype=np.int64)))
+            for b in self.unit_blocks
+            if b.constant is not None
+        ]
+        return np.concatenate([_no_ids(), *runs]).astype(np.int32)
 
     def _check_open(self) -> None:
         """Refuse to change a record whose trace has finished.
@@ -114,20 +142,23 @@ class Record:
         self._called.add(id(layer))
         return path
 
-    def _new_constant(self) -> int:
-        """Create one unit that is always 1.
+    def _add_unit_block(
+        self, path: tuple[str, ...], shape: tuple[int, ...], constant: float | None
+    ) -> Units:
+        """Create one block of units and write it down.
+
+        Args:
+            path: The path of the layer creating the units.
+            shape: The shape of the new handle.
+            constant: The value the units always hold, or None.
 
         Returns:
-            The new unit's id.
-
-        Raises:
-            BuildError: If the trace that made this record has finished.
+            A handle to the new units.
         """
-        self._check_open()
-        unit = self.num_units
-        self.num_units += 1
-        self.constants = np.append(self.constants, np.int32(unit))
-        return unit
+        start = self.num_units
+        units = self._new_units(shape)
+        self.unit_blocks.append(UnitBlock(path, start, units.shape, constant))
+        return units
 
     def _add_block(self, block: ConnBlock) -> None:
         """Write down one block of connections.
@@ -158,7 +189,7 @@ class Record:
         # The annotation is not enforced when a shape comes from user code, so the
         # check stays although mypy can prove it from the annotation.
         if not all(
-            isinstance(n, (int, np.integer)) and n >= 0  # type: ignore[redundant-expr]
+            isinstance(n, int | np.integer) and n >= 0  # type: ignore[redundant-expr]
             for n in shape
         ):
             raise ShapeError(f"a shape is non-negative integers, got {shape!r}")
@@ -186,11 +217,11 @@ def trace(module: Module, inputs: dict[str, tuple[int, ...]]) -> Record:
 
     Raises:
         BuildError: If the module has no `__call__`, if its arguments and `inputs`
-            do not have the same names, or if it returns anything other than handles
-            of this trace.
+            do not have the same names, if it returns anything other than handles
+            of this trace, or if one of its modules is already being traced.
     """
     name = type(module).__name__
-    paths = setup_tree(module)
+    tree = setup_tree(module)
     if not callable(module):
         raise BuildError(f"{name} defines no __call__")
 
@@ -210,12 +241,27 @@ def trace(module: Module, inputs: dict[str, tuple[int, ...]]) -> Record:
             problems.append(f"inputs {unread} have no argument")
         raise BuildError(f"{name}.__call__: " + " and ".join(problems))
 
-    record = Record(_paths=paths)
+    record = Record(_paths={id(m): path for m, path in tree})
     handles = {key: record._new_units(tuple(shape)) for key, shape in inputs.items()}
     record.inputs = {key: handle.ids for key, handle in handles.items()}
 
-    returned = module(*(handles[p] for p in parameters))
+    # For the length of the trace every module in the tree knows the record, so
+    # that a layer called with no handle (`CreateUnits(shape=...)`) can reach it.
+    busy = [m for m, _ in tree if m._record is not None]
+    if busy:
+        raise BuildError(
+            f"{type(busy[0]).__name__} is already being traced; a module can be "
+            f"part of one trace at a time"
+        )
+    for m, _ in tree:
+        m._record = record
+    try:
+        returned = module(*(handles[p] for p in parameters))
+    finally:
+        for m, _ in tree:
+            m._record = None
     outputs = returned if isinstance(returned, tuple) else (returned,)
+    ids: list[np.ndarray] = []
     for output in outputs:
         if not isinstance(output, Units):
             raise BuildError(
@@ -224,7 +270,8 @@ def trace(module: Module, inputs: dict[str, tuple[int, ...]]) -> Record:
             )
         if output._record is not record:
             raise BuildError(f"{name}.__call__ returned a handle from another trace")
-    record.outputs = tuple(output.ids for output in outputs)
+        ids.append(output.ids)
+    record.outputs = tuple(ids)
     record._sealed = True
     return record
 

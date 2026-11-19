@@ -1,15 +1,20 @@
 """The base class a topology is written as.
 
-A module is a description: it holds no arrays, no unit ids and no record. Tracing it
-(`plastax.layers.trace`) is what produces a record. Nothing here imports JAX or any
-other part of plastax.
+A module is a description: it holds no arrays and no unit ids, and no record outside
+a trace. Tracing it (`plastax.layers.trace`) is what produces a record; for the length
+of that trace each module in the tree is told which record it is. Nothing here imports
+JAX or any other part of plastax.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from plastax.layers._units import Units
+
+if TYPE_CHECKING:
+    from plastax.layers._record import Record
 
 
 class BuildError(ValueError):
@@ -24,7 +29,7 @@ class BuildError(ValueError):
 type _Child = tuple[tuple[str, ...], "Module"]
 
 # Instance attributes the base class sets, which are never children.
-_INTERNAL = frozenset({"_path", "_children"})
+_INTERNAL = frozenset({"_path", "_children", "_record"})
 
 
 class Module:
@@ -48,11 +53,13 @@ class Module:
 
     # Declared, not defined: a subclass's `__call__` may take any named handles, and
     # a method defined here would fix one signature for all of them.
-    __call__: Callable[..., Units | tuple[Units, ...]]
+    # A layer that only connects existing units (`CreateConnections`) returns None.
+    __call__: Callable[..., Units | tuple[Units, ...] | None]
 
     # Class-level defaults, so that a subclass's `__init__` need not call the base.
     _path: tuple[str, ...] | None = None
     _children: tuple[_Child, ...] | None = None  # None until `setup` has run
+    _record: Record | None = None  # the record being traced; None outside a trace
 
     def setup(self) -> None:
         """Declare this module's layers and sub-modules as attributes.
@@ -91,7 +98,7 @@ def _collect_children(module: Module) -> tuple[_Child, ...]:
             continue
         if isinstance(value, Module):
             children.append(((name,), value))
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, list | tuple):
             children.extend(
                 ((name, str(i)), item)
                 for i, item in enumerate(value)
@@ -100,19 +107,20 @@ def _collect_children(module: Module) -> tuple[_Child, ...]:
     return tuple(children)
 
 
-def setup_tree(root: Module) -> dict[int, tuple[str, ...]]:
+def setup_tree(root: Module) -> list[tuple[Module, tuple[str, ...]]]:
     """Run `setup` where it has not run, and give every module its path from `root`.
 
     Args:
         root: The module being traced.
 
     Returns:
-        The path of every module in the tree, keyed by the module's `id`.
+        Every module in the tree with its path.
 
     Raises:
         BuildError: If one module object appears at two places in the tree.
     """
     seen: dict[int, tuple[str, ...]] = {}
+    tree: list[tuple[Module, tuple[str, ...]]] = []
     pending: list[tuple[tuple[str, ...], Module]] = [((), root)]
     while pending:
         path, module = pending.pop()
@@ -123,12 +131,13 @@ def setup_tree(root: Module) -> dict[int, tuple[str, ...]]:
                 f"a module has one place in a topology"
             )
         seen[id(module)] = path
+        tree.append((module, path))
         if module._children is None:
             module.setup()
             module._children = _collect_children(module)
         module._path = path
         pending.extend((path + parts, child) for parts, child in module._children)
-    return seen
+    return tree
 
 
 def _show(path: tuple[str, ...]) -> str:

@@ -18,9 +18,9 @@ if TYPE_CHECKING:
 _SURFACE = "#fcfcfb"
 _INK = "#0b0b0b"
 _CREATED = "#e4e3df"  # fill of a unit a layer created; inputs and constants are plain
-# Line colours by block name. A name not listed here takes the next of `_MORE` in the
-# order the names first appear, and `_REST` once those run out.
-_BY_NAME = {"weight": "#2a78d6", "bias": "#eb6834"}
+# Line colours by the last part of a block's path. A name not listed here takes the
+# next of `_MORE` in the order the names first appear, and `_REST` once those run out.
+_BY_NAME = {"weight": "#2a78d6", "bias_weight": "#eb6834"}
 _MORE = ("#1baf7a", "#eda100", "#e87ba4")
 _REST = "#8a8984"
 # Above this many units the ids are not written inside the circles.
@@ -100,7 +100,8 @@ def draw(record: Record, *, ax: Axes | None = None, max_units: int = 500) -> Axe
     """Draw every unit and every connection of a record.
 
     Units are circles holding their record id: inputs plain, units a layer created
-    shaded, constant units square. Connections are lines, coloured by block name.
+    shaded, constant units square. Connections are lines, coloured by the last part
+    of their block's path.
     Columns run from the inputs on the left by depth, the longest path of
     connections leading to a unit.
 
@@ -146,16 +147,17 @@ def draw(record: Record, *, ax: Axes | None = None, max_units: int = 500) -> Axe
     colours: dict[str, str] = {}
     counts: dict[str, int] = {}
     for block in record.blocks:
-        if block.name not in colours:
-            spare = len([name for name in colours if name not in _BY_NAME])
-            colours[block.name] = _BY_NAME.get(
-                block.name, _MORE[spare] if spare < len(_MORE) else _REST
+        name = block.path[-1] if block.path else "connections"
+        if name not in colours:
+            spare = len([known for known in colours if known not in _BY_NAME])
+            colours[name] = _BY_NAME.get(
+                name, _MORE[spare] if spare < len(_MORE) else _REST
             )
-        counts[block.name] = counts.get(block.name, 0) + block.src.size
+        counts[name] = counts.get(name, 0) + block.src.size
         ax.add_collection(
             LineCollection(
                 list(np.stack([xy[block.src], xy[block.dst]], axis=1)),
-                colors=colours[block.name],
+                colors=colours[name],
                 linewidths=1.1,
                 alpha=0.75,
                 capstyle="round",

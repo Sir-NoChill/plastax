@@ -16,6 +16,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse as jsparse
+
+# Imported at module level on purpose. Importing jax.extend registers JAX
+# configuration values that are part of the tracing-cache key; a first import
+# in the middle of a trace changes that key, and the next call of the function
+# being traced then compiles a second time.
+from jax.extend.core import Literal
 from jaxtyping import Array, Bool, Float, Int32
 
 from plastax import monoid
@@ -1574,8 +1580,6 @@ def _live_invars(jaxpr: Any, live_out: list[bool]) -> list[bool]:
     of its inputs live, which over-approximates a read set -- the safe
     direction for the fusion check.
     """
-    from jax.extend.core import Literal
-
     live: set[Any] = {
         v
         for v, keep in zip(jaxpr.outvars, live_out, strict=True)
@@ -2000,8 +2004,6 @@ class _PredicateTranslator:
         return _TritonPredicate(source, tuple(self.params))
 
     def run(self, jaxpr: Any, env: dict[Any, _Val]) -> _Val:
-        from jax.extend.core import Literal
-
         def read(v: Any) -> _Val:
             return self.literal(v) if isinstance(v, Literal) else env[v]
 

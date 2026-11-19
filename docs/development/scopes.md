@@ -23,6 +23,7 @@ Module scopes (src/plastax/):
 - `topology` — topology.py (dense/conv2d/sequential generators)
 - `optim` — optim/ (Optimizer bundles: sgd, momentum, adam; state_fields contract)
 - `rng` — rng.py (counter-based Philox RNG, the cross-library draw contract)
+- `layers` — layers/ (modules, handles, the build record, layer helpers, draw)
 
 Cross-cutting scopes:
 

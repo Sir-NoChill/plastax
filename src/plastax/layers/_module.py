@@ -2,8 +2,7 @@
 
 A module is a description: it holds no arrays and no unit ids, and no record outside
 a trace. Tracing it (`plastax.layers.trace`) is what produces a record; for the length
-of that trace each module in the tree is told which record it is. Nothing here imports
-JAX or any other part of plastax.
+of that trace each module in the tree is told which record it is.
 """
 
 from __future__ import annotations

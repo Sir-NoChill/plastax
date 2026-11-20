@@ -1,8 +1,7 @@
 """The handle a topology is written with: a group of units and their arrangement.
 
 A handle names units; it holds no activations, weights or connections. Everything it
-does happens on the host, in numpy, while a topology is being traced. Nothing here
-imports JAX or any other part of plastax.
+does happens on the host, in numpy, while a topology is being traced.
 """
 
 from __future__ import annotations

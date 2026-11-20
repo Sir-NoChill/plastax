@@ -1,7 +1,7 @@
 """Drawing a record: every unit and every connection, for looking at small networks.
 
-matplotlib is an optional dependency (`plastax[plot]`) and is imported only when
-`draw` is called. Nothing here imports JAX or any other part of plastax.
+matplotlib is an optional dependency (`plastax[plot]`), needed only when `draw` is
+called.
 """
 
 from __future__ import annotations

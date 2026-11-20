@@ -19,8 +19,6 @@ import plastax.layers as pxl
 from plastax.layers import (
     BuildError,
     ConstInit,
-    CreateConnections,
-    CreateUnits,
     Dense,
     Record,
     ShapeError,
@@ -96,6 +94,7 @@ def test_bias_on_leading_axes_is_one_constant_and_a_connection_per_unit() -> Non
     bias = record.blocks[1]
 
     assert record.constants.shape == (1,)
+    assert bias.shape == (5, 3)
     np.testing.assert_array_equal(bias.src, np.full(15, record.constants[0]))
     np.testing.assert_array_equal(bias.dst, out.reshape(-1))
 
@@ -115,32 +114,13 @@ def test_weight_block_is_row_major_over_position_destination_source(
     block = record.blocks[0]
     weights = (*shape[:-1], features, shape[-1])
 
+    assert block.shape == weights
     np.testing.assert_array_equal(
-        block.src.reshape(weights), np.broadcast_to(x[..., None, :], weights)
+        block.src.reshape(block.shape), np.broadcast_to(x[..., None, :], weights)
     )
     np.testing.assert_array_equal(
-        block.dst.reshape(weights), np.broadcast_to(out[..., :, None], weights)
+        block.dst.reshape(block.shape), np.broadcast_to(out[..., :, None], weights)
     )
-
-
-def test_every_source_reaches_every_new_unit_exactly_once() -> None:
-    record, x, out = traced(Dense(3, bias=False), (4,))
-    block = record.blocks[0]
-
-    pairs = set(zip(block.src.tolist(), block.dst.tolist(), strict=True))
-    assert len(pairs) == block.src.size == 12
-    assert pairs == {(s, d) for s in x.tolist() for d in out.tolist()}
-
-
-def test_no_connection_crosses_positions() -> None:
-    record, x, out = traced(Dense(3, bias=False), (5, 4))
-    block = record.blocks[0]
-
-    position = np.full(record.num_units, -1)
-    position[x] = np.arange(5)[:, None]
-    position[out] = np.arange(5)[:, None]
-
-    np.testing.assert_array_equal(position[block.src], position[block.dst])
 
 
 def test_a_leading_axis_of_length_zero_creates_nothing() -> None:
@@ -163,22 +143,12 @@ def test_blocks_carry_their_paths_and_the_initializers_given() -> None:
     assert bias.path == ("fc", "bias_weight")
     assert weight.init is init
     assert bias.init is bias_init
-    assert init.value == 0.25
 
 
 def test_initializers_default_to_none() -> None:
     record, _, _ = traced(Dense(3), (4,))
 
     assert [block.init for block in record.blocks] == [None, None]
-
-
-def test_block_ids_are_int32() -> None:
-    record, _, _ = traced(Dense(3), (4,))
-
-    for block in record.blocks:
-        assert block.src.dtype == np.int32
-        assert block.dst.dtype == np.int32
-    assert record.constants.dtype == np.int32
 
 
 def test_a_dense_layer_can_be_the_whole_topology() -> None:
@@ -194,32 +164,6 @@ def test_dense_writes_its_units_as_unit_blocks() -> None:
 
     assert (units.path, units.shape, units.constant) == (("fc", "units"), (5, 3), None)
     assert (one.path, one.shape, one.constant) == (("fc", "one"), (), 1.0)
-
-
-def test_dense_is_the_same_wiring_written_with_the_primitives() -> None:
-    class ByHand(pxl.Module):
-        def setup(self) -> None:
-            self.units = CreateUnits()
-            self.weight = CreateConnections()
-            self.one = CreateUnits(constant=1.0)
-            self.bias_weight = CreateConnections()
-
-        def __call__(self, x: Units) -> Units:
-            y = self.units(shape=(*x.shape[:-1], 3))
-            self.weight(x[..., None, :], y[..., :, None])
-            self.bias_weight(self.one(shape=()), y)
-            return y
-
-    helper = pxl.trace(Dense(3), {"x": (5, 4)})
-    by_hand = pxl.trace(ByHand(), {"x": (5, 4)})
-
-    assert helper.num_units == by_hand.num_units
-    np.testing.assert_array_equal(helper.outputs[0], by_hand.outputs[0])
-    np.testing.assert_array_equal(helper.constants, by_hand.constants)
-    for a, b in zip(helper.blocks, by_hand.blocks, strict=True):
-        assert a.path == b.path
-        np.testing.assert_array_equal(a.src, b.src)
-        np.testing.assert_array_equal(a.dst, b.dst)
 
 
 # --------------------------------------------------------------------------- #

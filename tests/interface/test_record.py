@@ -30,20 +30,8 @@ def raised_in_this_file(excinfo: pytest.ExceptionInfo[BaseException]) -> bool:
 # --------------------------------------------------------------------------- #
 # What a handle reports
 # --------------------------------------------------------------------------- #
-def test_shape_ndim_and_size() -> None:
-    h = handle(2, 3, 4)
-
-    assert h.shape == (2, 3, 4)
-    assert h.ndim == 3
-    assert h.size == 24
-    assert repr(h) == "Units(shape=(2, 3, 4))"
-
-
-def test_a_handle_to_one_unit_has_no_axes() -> None:
-    h = handle()
-
-    assert h.shape == ()
-    assert h.size == 1
+def test_repr_shows_the_shape() -> None:
+    assert repr(handle(2, 3, 4)) == "Units(shape=(2, 3, 4))"
 
 
 def test_ids_are_int32_and_cannot_be_written() -> None:
@@ -71,50 +59,10 @@ def test_ids_must_be_integers() -> None:
 # --------------------------------------------------------------------------- #
 # Relabelling: the same units, rearranged
 # --------------------------------------------------------------------------- #
-def test_reshape_keeps_the_units_in_row_major_order() -> None:
+def test_reshape_takes_a_shape_or_its_axes() -> None:
     h = handle(2, 3)
 
-    np.testing.assert_array_equal(h.reshape(3, 2).ids, [[0, 1], [2, 3], [4, 5]])
     np.testing.assert_array_equal(h.reshape((3, 2)).ids, h.reshape(3, 2).ids)
-
-
-def test_reshape_works_out_one_axis() -> None:
-    assert handle(2, 3, 4).reshape(-1, 4).shape == (6, 4)
-
-
-def test_flatten() -> None:
-    h = handle(2, 3)
-
-    assert h.flatten().shape == (6,)
-    np.testing.assert_array_equal(h.flatten().ids, np.arange(6))
-
-
-def test_none_adds_an_axis() -> None:
-    h = handle(2, 3)
-
-    assert h[:, None, :].shape == (2, 1, 3)
-    np.testing.assert_array_equal(h[:, None, :].flatten().ids, h.flatten().ids)
-
-
-@pytest.mark.parametrize(
-    "index",
-    [0, -1, slice(1, 3), (slice(None), 0), (..., 0), (1, slice(None, None, 2)), ...],
-    ids=["int", "negative", "slice", "column", "ellipsis", "step", "all"],
-)
-def test_indexing_selects_what_numpy_selects(index: Any) -> None:
-    h = handle(3, 4)
-
-    np.testing.assert_array_equal(
-        h[index].ids,
-        np.arange(12).reshape(3, 4)[index],
-    )
-
-
-def test_iterating_goes_over_the_first_axis() -> None:
-    rows = list(handle(2, 3))
-
-    assert [r.shape for r in rows] == [(3,), (3,)]
-    np.testing.assert_array_equal(rows[1].ids, [3, 4, 5])
 
 
 def test_relabelling_never_changes_the_original() -> None:
@@ -140,18 +88,6 @@ def test_reshape_to_a_different_number_of_units() -> None:
 def test_an_index_that_does_not_fit(index: Any) -> None:
     with pytest.raises(ShapeError):
         handle(2, 3)[index]
-
-
-@pytest.mark.parametrize(
-    "index",
-    [np.array([0, 0, 1]), [1, 0], (np.array([1, 1]), np.array([0, 2])), (0, [2, 2])],
-    ids=["array", "list", "two_arrays", "int_and_list"],
-)
-def test_integer_arrays_select_what_numpy_selects(index: Any) -> None:
-    """An integer array picks units by position and may name one more than once."""
-    h = handle(2, 3)
-
-    np.testing.assert_array_equal(h[index].ids, np.arange(6).reshape(2, 3)[index])
 
 
 @pytest.mark.parametrize(

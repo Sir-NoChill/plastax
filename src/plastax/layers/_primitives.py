@@ -159,4 +159,4 @@ class CreateConnections(Module):
             )
 
         path = record._claim(self)
-        record._add_block(ConnBlock(path, sources, destinations, self.init))
+        record._add_block(ConnBlock(path, sources, destinations, shape, self.init))

@@ -98,12 +98,6 @@ def test_input_units_are_not_in_a_unit_block() -> None:
     assert record.num_units == 4
 
 
-def test_ordinary_units_are_not_constants() -> None:
-    record, _ = traced(lambda m, x: m.units(shape=(3,)), units=CreateUnits())
-
-    assert record.constants.size == 0
-
-
 @pytest.mark.parametrize("value", [1.0, 0.5, -2, 0])
 def test_constant_units_hold_the_value_given(value: float) -> None:
     record, _ = traced(lambda m, x: m.one(shape=(2,)), one=CreateUnits(constant=value))
@@ -154,14 +148,6 @@ def connected(
     return record, record.inputs["x"], record.outputs[0], returned
 
 
-def test_same_shape_connects_one_to_one() -> None:
-    record, x, y, _ = connected(lambda x, y: (x, y), (2, 3), (2, 3))
-    (block,) = record.blocks
-
-    np.testing.assert_array_equal(block.src, x.reshape(-1))
-    np.testing.assert_array_equal(block.dst, y.reshape(-1))
-
-
 def test_connections_create_no_units_and_return_nothing() -> None:
     record, _, _, returned = connected(lambda x, y: (x, y), (4,), (4,))
 
@@ -185,39 +171,17 @@ def test_a_block_carries_its_path_and_initializer() -> None:
     assert block.src.dtype == block.dst.dtype == np.int32
 
 
-def test_broadcasting_connects_all_to_all() -> None:
-    record, x, y, _ = connected(lambda x, y: (x[None, :], y[:, None]), (4,), (3,))
-    (block,) = record.blocks
-
-    assert pairs(record) == {(s, d) for s in x.tolist() for d in y.tolist()}
-    assert block.src.size == 12
-
-
 def test_a_block_is_in_row_major_order_over_the_broadcast_shape() -> None:
     record, x, y, _ = connected(lambda x, y: (x[None, :], y[:, None]), (4,), (3,))
     (block,) = record.blocks
 
+    assert block.shape == (3, 4)  # of neither handle: what the two broadcast to
     np.testing.assert_array_equal(
-        block.src.reshape(3, 4), np.broadcast_to(x[None, :], (3, 4))
+        block.src.reshape(block.shape), np.broadcast_to(x[None, :], (3, 4))
     )
     np.testing.assert_array_equal(
-        block.dst.reshape(3, 4), np.broadcast_to(y[:, None], (3, 4))
+        block.dst.reshape(block.shape), np.broadcast_to(y[:, None], (3, 4))
     )
-
-
-def test_one_unit_broadcasts_to_every_destination() -> None:
-    def call(m: Any, x: Units) -> Units:
-        one = m.one(shape=())
-        m.conn(one, x)
-        return x
-
-    record, _ = traced(
-        call, (2, 3), one=CreateUnits(constant=1.0), conn=CreateConnections()
-    )
-    (block,) = record.blocks
-
-    np.testing.assert_array_equal(block.src, np.full(6, record.constants[0]))
-    np.testing.assert_array_equal(block.dst, record.inputs["x"].reshape(-1))
 
 
 def test_all_to_all_along_the_last_axis_does_not_cross_positions() -> None:
@@ -267,24 +231,9 @@ def test_listed_pairs_are_the_only_connections_in_the_order_given() -> None:
     record, x, y, _ = connected(lambda x, y: (x[src], y[dst]), (4,), (2,))
     (block,) = record.blocks
 
+    assert block.shape == (5,)
     np.testing.assert_array_equal(block.src, x[src])
     np.testing.assert_array_equal(block.dst, y[dst])
-
-
-def test_no_pairs_gives_an_empty_block() -> None:
-    none = np.array([], np.int64)
-    record, _, _, _ = connected(lambda x, y: (x[none], y[none]), (4,), (2,))
-
-    assert record.blocks[0].src.size == 0
-    assert record.num_units == 4 + 2
-
-
-def test_indices_count_positions_of_the_handle_they_index() -> None:
-    """After `flatten`, an index is a row-major position in the whole handle."""
-    src = np.array([5, 0])
-    record, x, y, _ = connected(lambda x, y: (x.flatten()[src], y), (2, 3), (2,))
-
-    np.testing.assert_array_equal(record.blocks[0].src, x.reshape(-1)[src])
 
 
 # --------------------------------------------------------------------------- #

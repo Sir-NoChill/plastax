@@ -50,6 +50,10 @@ class ConnBlock:
         path: The path of the layer that made the block.
         src: The source unit of each connection, as `(E,)` record ids.
         dst: The destination unit of each connection, as `(E,)` record ids.
+        shape: The shape the two handles of the call broadcast to. `src` and `dst`
+            are in row-major order over it: connection `k` is at
+            `np.unravel_index(k, shape)`, and `src.reshape(shape)` arranges the
+            sources as the call saw them.
         init: How the block's weights get their first values, or None for the
             layer's default. Stored here and not called while tracing.
     """
@@ -57,6 +61,7 @@ class ConnBlock:
     path: tuple[str, ...]
     src: np.ndarray
     dst: np.ndarray
+    shape: tuple[int, ...]
     init: ConstInit | None = None
 
 

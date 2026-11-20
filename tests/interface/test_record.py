@@ -65,6 +65,28 @@ def test_reshape_takes_a_shape_or_its_axes() -> None:
     np.testing.assert_array_equal(h.reshape((3, 2)).ids, h.reshape(3, 2).ids)
 
 
+@pytest.mark.parametrize(
+    ("shape", "index", "unit"),
+    [((4,), 2, 2), ((4,), -1, 3), ((2, 3), (1, 2), 5), ((2, 3), (..., 0, 0), 0)],
+)
+def test_integers_for_every_axis_select_a_single_unit(
+    shape: tuple[int, ...], index: Any, unit: int
+) -> None:
+    """The result is a handle with no axes, not a bare id."""
+    one = handle(*shape)[index]
+
+    assert isinstance(one, Units)
+    assert one.shape == ()
+    assert one.ids == unit
+
+
+def test_iterating_a_handle_with_one_axis_gives_its_units_one_by_one() -> None:
+    units = list(handle(3))
+
+    assert [u.shape for u in units] == [(), (), ()]
+    assert [int(u.ids) for u in units] == [0, 1, 2]
+
+
 def test_relabelling_never_changes_the_original() -> None:
     h = handle(2, 3)
     h.reshape(3, 2)

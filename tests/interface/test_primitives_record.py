@@ -196,6 +196,15 @@ def test_a_block_is_in_row_major_order_over_the_broadcast_shape() -> None:
     )
 
 
+def test_a_single_unit_selected_by_an_integer_feeds_every_destination() -> None:
+    record, x, y, _ = connected(lambda x, y: (x[1], y), (4,), (2, 3))
+    (block,) = record.blocks
+
+    assert block.shape == (2, 3)
+    np.testing.assert_array_equal(block.src, np.full(6, x[1]))
+    np.testing.assert_array_equal(block.dst, y.reshape(-1))
+
+
 def test_all_to_all_along_the_last_axis_does_not_cross_positions() -> None:
     record, x, y, _ = connected(
         lambda x, y: (x[..., None, :], y[..., :, None]), (5, 4), (5, 3)

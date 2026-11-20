@@ -169,7 +169,9 @@ class Units:
             raise ShapeError(
                 f"index {index!r} does not fit a handle of shape {self.shape}: {error}"
             ) from None
-        return Units(ids, self._record)
+        # Integers for every axis select one unit, which numpy returns as a bare
+        # scalar; a handle holds an array, of no axes here.
+        return Units(np.asarray(ids), self._record)
 
     def __iter__(self) -> Iterator[Units]:
         """Iterate over the first axis, as an array does.

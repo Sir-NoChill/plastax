@@ -24,6 +24,7 @@ Module scopes (src/plastax/):
 - `optim` — optim/ (Optimizer bundles: sgd, momentum, adam; state_fields contract)
 - `rng` — rng.py (counter-based Philox RNG, the cross-library draw contract)
 - `layers` — layers/ (modules, handles, the build record, layer helpers, draw)
+- `init` — init.py (weight initializers, Fans)
 
 Cross-cutting scopes:
 

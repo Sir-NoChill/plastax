@@ -2,7 +2,9 @@
 
 Under construction: see `plans/20261116T132654Z-layers-module.md` at the workspace
 root. So far: handles, modules, tracing a module to a record, the two primitives
-`CreateUnits` and `CreateConnections`, and `Dense`, a helper written with them.
+`CreateUnits` and `CreateConnections`, `Dense`, a helper written with them, and
+`materialize`, which turns a record into a state that today's engine can step.
+Weights are drawn by the initializers of `plastax.init`.
 """
 
 from plastax.layers._dense import Dense

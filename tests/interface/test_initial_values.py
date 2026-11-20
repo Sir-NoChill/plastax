@@ -78,14 +78,14 @@ def test_array_initializer() -> None:
 
 
 def test_zeros_initializer() -> None:
-    fc = px.layers.Dense(3, bias=False, init=px.init.zeros)
+    fc = px.layers.Dense(3, bias=False, init=px.init.zeros())
 
     support.close(built(fc).weights(fc), np.zeros((3, 4), f32))
 
 
 def test_lecun_uniform_is_bounded_by_the_fan_in() -> None:
     fan_in = 100
-    fc = px.layers.Dense(50, bias=False, init=px.init.lecun_uniform)
+    fc = px.layers.Dense(50, bias=False, init=px.init.lecun_uniform())
     w = built(fc, input_shape=(fan_in,)).weights(fc)
 
     bound = np.sqrt(3.0 / fan_in)
@@ -101,7 +101,7 @@ def test_initializer_sees_the_fan_in_of_a_sparse_layer() -> None:
         50,
         connectivity=px.layers.sparse(fan_in=4),
         bias=False,
-        init=px.init.lecun_uniform,
+        init=px.init.lecun_uniform(),
     )
     r = built(fc, input_shape=(400,))
     w = r.conn_field(fc, px.WEIGHT)
@@ -112,7 +112,7 @@ def test_initializer_sees_the_fan_in_of_a_sparse_layer() -> None:
 
 def test_initial_weights_replay_for_the_same_seed() -> None:
     def weights(seed: int) -> np.ndarray:
-        fc = px.layers.Dense(3, bias=False, init=px.init.lecun_uniform)
+        fc = px.layers.Dense(3, bias=False, init=px.init.lecun_uniform())
         model = support.topology(lambda m, x: m.fc(x), fc=fc)
         r = support.Runner(support.network(model, input_shape=(4,)), seed=seed)
         return r.weights(fc)
@@ -174,7 +174,7 @@ def test_policy_set_init_may_depend_on_a_hyperparameter() -> None:
         return {LOG_STEP: jnp.log(g.hp.alpha_init)}
 
     fc = px.layers.Dense(
-        3, bias=False, init=px.init.zeros, conn_policy=conn_set(init=init)
+        3, bias=False, init=px.init.zeros(), conn_policy=conn_set(init=init)
     )
     r = built(fc, globals=Globals(hp=Params(alpha_init=0.05)))
 

@@ -81,7 +81,7 @@ Also assumed:
 
 - `@px.policy` makes a policy a dataclass: its attributes are constructor keywords
   (`Keeps(sign=-1.0)`), and a policy may subclass another.
-- `px.init.constant`, `px.init.array`, `px.init.zeros`, `px.init.lecun_uniform`, and `bias_init=`
+- `px.init.constant`, `px.init.array`, `px.init.zeros()`, `px.init.lecun_uniform()`, and `bias_init=`
   on a layer.
 - `px.SquaredErrorLossPolicy`: 0.5 * sum((y - t)^2), with seed y - t.
 - `px.policies.Unit(init=...)` for initial unit field values.

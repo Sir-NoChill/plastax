@@ -119,7 +119,7 @@ def test_bias_is_one_constant_unit_and_one_connection_per_unit() -> None:
 
 def test_shared_dense_has_one_weight_per_entry_and_one_connection_per_use() -> None:
     positions, d_in, d_out = 5, 4, 3
-    fc = px.layers.Dense(d_out, shared=True, bias=False, init=px.init.lecun_uniform)
+    fc = px.layers.Dense(d_out, shared=True, bias=False, init=px.init.lecun_uniform())
     r = built(lambda m, x: m.fc(x), (positions, d_in), fc=fc)
 
     weights = r.conn_field(fc, px.WEIGHT)
@@ -129,7 +129,7 @@ def test_shared_dense_has_one_weight_per_entry_and_one_connection_per_use() -> N
 
 def test_unshared_dense_on_leading_axes_has_a_weight_per_position() -> None:
     positions, d_in, d_out = 5, 4, 3
-    fc = px.layers.Dense(d_out, shared=False, bias=False, init=px.init.lecun_uniform)
+    fc = px.layers.Dense(d_out, shared=False, bias=False, init=px.init.lecun_uniform())
     r = built(lambda m, x: m.fc(x), (positions, d_in), fc=fc)
 
     weights = r.conn_field(fc, px.WEIGHT)
@@ -139,7 +139,7 @@ def test_unshared_dense_on_leading_axes_has_a_weight_per_position() -> None:
 
 def test_shared_convolution_counts() -> None:
     conv = px.layers.Conv(
-        2, 3, padding="valid", shared=True, bias=False, init=px.init.lecun_uniform
+        2, 3, padding="valid", shared=True, bias=False, init=px.init.lecun_uniform()
     )
     r = built(lambda m, x: m.conv(x), (5, 5, 1), conv=conv)
 

@@ -254,7 +254,7 @@ def test_rewired_layer_keeps_its_connection_count_while_it_rewires() -> None:
         n_hidden,
         connectivity=px.layers.sparse(fan_in=fan_in, capacity=px.Capacity.INITIAL),
         bias=False,
-        init=px.init.lecun_uniform,
+        init=px.init.lecun_uniform(),
         conn_policy=rewired,
         hint=px.Hint(format=px.Format.COO),
     )

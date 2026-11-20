@@ -7,7 +7,6 @@ root. So far: handles, modules, tracing a module to a record, the two primitives
 
 from plastax.layers._dense import Dense
 from plastax.layers._draw import draw
-from plastax.layers._init import ConstInit
 from plastax.layers._module import BuildError, Module
 from plastax.layers._primitives import CreateConnections, CreateUnits
 from plastax.layers._record import ConnBlock, Record, UnitBlock, trace
@@ -16,7 +15,6 @@ from plastax.layers._units import ShapeError, Units
 __all__ = [
     "BuildError",
     "ConnBlock",
-    "ConstInit",
     "CreateConnections",
     "CreateUnits",
     "Dense",

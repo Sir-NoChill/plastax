@@ -13,10 +13,10 @@ from typing import Any
 import numpy as np
 import pytest
 
+import plastax.init as init
 import plastax.layers as pxl
 from plastax.layers import (
     BuildError,
-    ConstInit,
     CreateConnections,
     CreateUnits,
     Record,
@@ -156,19 +156,31 @@ def test_connections_create_no_units_and_return_nothing() -> None:
     assert returned == [None]
 
 
-def test_a_block_carries_its_path_and_initializer() -> None:
-    init = ConstInit(0.25)
+def user_written(key: Any, fans: init.Fans) -> np.ndarray:
+    return np.zeros(fans.shape, np.float32)
+
+
+@pytest.mark.parametrize(
+    "given", [init.constant(0.25), user_written], ids=["shipped", "user_written"]
+)
+def test_a_block_carries_its_path_and_initializer(given: init.Initializer) -> None:
+    """Any function `(key, fans) -> weights` is an initializer. It is not called."""
 
     def call(m: Any, x: Units) -> Units:
         m.skip(x, x[::-1])
         return x
 
-    record, _ = traced(call, skip=CreateConnections(init=init))
+    record, _ = traced(call, skip=CreateConnections(init=given))
     (block,) = record.blocks
 
     assert block.path == ("skip",)
-    assert block.init is init
+    assert block.init is given
     assert block.src.dtype == block.dst.dtype == np.int32
+
+
+def test_something_that_cannot_be_called_is_not_an_initializer() -> None:
+    with pytest.raises(TypeError):
+        CreateConnections(init=0.25)  # ty: ignore[invalid-argument-type]
 
 
 def test_a_block_is_in_row_major_order_over_the_broadcast_shape() -> None:

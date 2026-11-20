@@ -1,15 +1,14 @@
 """The dense layer: all-to-all connections along the last axis.
 
 A helper written with the two primitives; it uses nothing a user could not.
-
-Nothing here imports JAX or any other part of plastax.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from plastax.layers._init import ConstInit
+from plastax import init as px_init
+from plastax.init import Initializer
 from plastax.layers._module import Module
 from plastax.layers._primitives import CreateConnections, CreateUnits
 from plastax.layers._units import ShapeError, Units
@@ -37,9 +36,9 @@ class Dense(Module):
     Args:
         features: The length of the last axis of the units the layer creates.
         bias: Whether the layer has a bias.
-        init: How the weights get their first values, or None for the layer's
-            default.
-        bias_init: The same for the bias weights.
+        init: How the weights get their first values (see `plastax.init`), or None
+            for the default.
+        bias_init: The same for the bias weights. None starts them at 0.
 
     Raises:
         TypeError: If `features` is not an integer.
@@ -51,8 +50,8 @@ class Dense(Module):
         features: int,
         *,
         bias: bool = True,
-        init: ConstInit | None = None,
-        bias_init: ConstInit | None = None,
+        init: Initializer | None = None,
+        bias_init: Initializer | None = None,
     ) -> None:
         if isinstance(features, bool) or not isinstance(features, int | np.integer):
             raise TypeError(
@@ -74,7 +73,8 @@ class Dense(Module):
         self.weight = CreateConnections(init=self.init)
         if self.bias:
             self.one = CreateUnits(constant=1.0)
-            self.bias_weight = CreateConnections(init=self.bias_init)
+            bias_init = px_init.zeros() if self.bias_init is None else self.bias_init
+            self.bias_weight = CreateConnections(init=bias_init)
 
     # `Module` declares `__call__` as an attribute so that each subclass may choose
     # its own arguments; ty reads a method with narrower arguments as an invalid

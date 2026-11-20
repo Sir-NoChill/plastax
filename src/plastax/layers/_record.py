@@ -2,8 +2,8 @@
 
 A record is plain numpy and Python. It says which units exist and which connections
 run between them, and nothing about how they are stored. Materialization, a separate
-step, turns a record into a state. Nothing here imports JAX or any other part of
-plastax.
+step, turns a record into a state. A record stores the initializer of each block and
+never calls it.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from plastax.layers._init import ConstInit
+from plastax.init import Initializer
 from plastax.layers._module import BuildError, Module, setup_tree
 from plastax.layers._units import ShapeError, Units
 
@@ -54,15 +54,15 @@ class ConnBlock:
             are in row-major order over it: connection `k` is at
             `np.unravel_index(k, shape)`, and `src.reshape(shape)` arranges the
             sources as the call saw them.
-        init: How the block's weights get their first values, or None for the
-            layer's default. Stored here and not called while tracing.
+        init: How the block's weights get their first values (see `plastax.init`),
+            or None for the default. Stored here and not called while tracing.
     """
 
     path: tuple[str, ...]
     src: np.ndarray
     dst: np.ndarray
     shape: tuple[int, ...]
-    init: ConstInit | None = None
+    init: Initializer | None = None
 
 
 @dataclass(eq=False)

@@ -3,15 +3,14 @@
 Each call creates a block: a run of consecutive units, or a run of connections. A
 block is named by the path of the primitive that made it, and that is what policy
 sets, capacities, hints and initializers attach to. Everything else in
-`plastax.layers` can be written with these two. Nothing here imports JAX or any other
-part of plastax.
+`plastax.layers` can be written with these two.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from plastax.layers._init import ConstInit
+from plastax.init import Initializer
 from plastax.layers._module import BuildError, Module
 from plastax.layers._record import ConnBlock
 from plastax.layers._units import ShapeError, Units
@@ -109,11 +108,12 @@ class CreateConnections(Module):
     connect the same pair of units, as two connections.
 
     Args:
-        init: How the block's weights get their first values, or None for the
+        init: How the block's weights get their first values: an initializer of
+            `plastax.init`, or any function `(key, fans) -> weights`. None for the
             default.
     """
 
-    def __init__(self, *, init: ConstInit | None = None) -> None:
+    def __init__(self, *, init: Initializer | None = None) -> None:
         self.init = init
 
     # See the note on `CreateUnits.__call__`.

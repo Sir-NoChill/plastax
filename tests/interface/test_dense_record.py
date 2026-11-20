@@ -15,10 +15,10 @@ from typing import Any
 import numpy as np
 import pytest
 
+import plastax.init as init
 import plastax.layers as pxl
 from plastax.layers import (
     BuildError,
-    ConstInit,
     Dense,
     Record,
     ShapeError,
@@ -135,20 +135,23 @@ def test_a_leading_axis_of_length_zero_creates_nothing() -> None:
 # What a block carries
 # --------------------------------------------------------------------------- #
 def test_blocks_carry_their_paths_and_the_initializers_given() -> None:
-    init, bias_init = ConstInit(0.25), ConstInit(-1.0)
-    record, _, _ = traced(Dense(3, init=init, bias_init=bias_init), (4,))
+    given, bias_given = init.constant(0.25), init.constant(-1.0)
+    record, _, _ = traced(Dense(3, init=given, bias_init=bias_given), (4,))
     weight, bias = record.blocks
 
     assert weight.path == ("fc", "weight")
     assert bias.path == ("fc", "bias_weight")
-    assert weight.init is init
-    assert bias.init is bias_init
+    assert weight.init is given
+    assert bias.init is bias_given
 
 
-def test_initializers_default_to_none() -> None:
-    record, _, _ = traced(Dense(3), (4,))
+def test_by_default_the_weight_is_left_to_materialization_and_the_bias_is_zero() -> (
+    None
+):
+    weight, bias = traced(Dense(3), (4,))[0].blocks
 
-    assert [block.init for block in record.blocks] == [None, None]
+    assert weight.init is None
+    assert bias.init == init.zeros()
 
 
 def test_a_dense_layer_can_be_the_whole_topology() -> None:

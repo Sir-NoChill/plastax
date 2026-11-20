@@ -478,6 +478,107 @@ def test_from_edges_rejects_unknown_extra_conn_column() -> None:
         )
 
 
+_DIAMOND_FROM = np.array([0, 0, 1, 2], dtype=np.int32)
+_DIAMOND_TO = np.array([1, 2, 3, 3], dtype=np.int32)
+_UNIT_VALUES: dict[str, list[float]] = {
+    "activation": [0.0, 0.5, 1.0, -2.0],
+    "bias": [4.0, 3.0, 2.0, 1.0],
+}
+
+
+@pytest.mark.parametrize(
+    "given",
+    [("activation", "bias"), ("bias",), ("activation",)],
+    ids=["both", "extra_field_only", "activation_only"],
+)
+def test_from_edges_unit_columns_equal_the_manual_builder(
+    given: tuple[str, ...],
+) -> None:
+    """Unit values given as whole columns land as add_unit's keywords do.
+
+    Byte-for-byte against the per-unit path, so the dtype of each column and
+    the default of a field that is not given are checked with the values.
+    """
+    vectorized = px.NetworkBuilder.from_edges(
+        _ExtraFieldsNet,
+        4,
+        _DIAMOND_FROM,
+        _DIAMOND_TO,
+        input_ids=(0,),
+        output_ids=(3,),
+        globals_=None,
+        extra_unit_columns={
+            name: np.asarray(_UNIT_VALUES[name], dtype=np.float32) for name in given
+        },
+    )
+
+    manual = px.NetworkBuilder(_ExtraFieldsNet, None)
+    for unit in range(4):
+        manual.add_unit(**{name: _UNIT_VALUES[name][unit] for name in given})
+    manual.mark_input(0)
+    manual.mark_output(3)
+    for s, d in zip(_DIAMOND_FROM.tolist(), _DIAMOND_TO.tolist(), strict=True):
+        manual.add_conn(s, d)
+
+    _assert_arenas_equal(vectorized, manual.finalize())
+
+
+def test_from_edges_unit_with_no_input_keeps_its_given_activation() -> None:
+    """What a bias is built on: unit 1 is fed by nothing and is not an input.
+
+    Under topological propagation it is never written, so it holds the value
+    it was built with across steps, and unit 2 reads it every time.
+    """
+    static, state = px.NetworkBuilder.from_edges(
+        _TopoNet,
+        3,
+        np.array([0, 1], dtype=np.int32),
+        np.array([2, 2], dtype=np.int32),
+        weights=np.array([2.0, 3.0], dtype=np.float32),
+        input_ids=(0,),
+        output_ids=(2,),
+        globals_=None,
+        extra_unit_columns={"activation": np.array([0.0, 0.5, 0.0], np.float32)},
+    )
+    step = px.make_step(_TopoNet, static)
+
+    for x in (1.0, -4.0, 0.25):
+        state = step(state, px.StepInputs(inputs=jnp.asarray([x]), targets=None)).state
+        activation = np.asarray(state.units["activation"])
+        assert activation[1] == 0.5
+        assert activation[2] == 2.0 * x + 3.0 * 0.5
+
+
+@pytest.mark.parametrize("name", ["not_a_field", "level", "weight"])
+def test_from_edges_rejects_unknown_or_derived_unit_column(name: str) -> None:
+    with pytest.raises(ValueError, match=f"unit field '{name}' in extra_unit_columns"):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            2,
+            np.array([0], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(1,),
+            globals_=None,
+            extra_unit_columns={name: np.zeros(2, dtype=np.float32)},
+        )
+
+
+@pytest.mark.parametrize("shape", [(3,), (1,), (2, 1)])
+def test_from_edges_rejects_unit_column_of_wrong_shape(shape: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match=r"unit column 'activation' has shape"):
+        px.NetworkBuilder.from_edges(
+            _TopoNet,
+            2,
+            np.array([0], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+            input_ids=(0,),
+            output_ids=(1,),
+            globals_=None,
+            extra_unit_columns={"activation": np.zeros(shape, dtype=np.float32)},
+        )
+
+
 def test_from_edges_capacity_headroom_pre_allocates_dead_slots() -> None:
     """capacity_headroom enlarges each bucket's capacity (extra dead slots) but
     leaves the live edges identical to the no-headroom build -- so add_conn can

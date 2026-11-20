@@ -186,6 +186,7 @@ class NetworkBuilder[GS]:
         output_ids: Sequence[int],
         globals_: GS,
         extra_conn_columns: Mapping[str, np.ndarray] | None = None,
+        extra_unit_columns: Mapping[str, np.ndarray] | None = None,
         capacity_headroom: float = 0.0,
         capacity_align: int | None = None,
         sharding: ShardSpec | None = None,
@@ -200,10 +201,11 @@ class NetworkBuilder[GS]:
         route through the same assembler), so a large sparse or dense net
         builds in one vectorized pass rather than E Python calls.
 
-        Units carry field defaults (topology construction sets no per-unit
-        values); a conn field is filled from ``weights``/``extra_conn_columns``
-        if given, else its spec default. All edges live (``DEAD`` false); the
-        assembler tombstones only the per-bucket capacity padding.
+        A unit field is filled from ``extra_unit_columns`` if given, else its
+        spec default; a conn field is filled from
+        ``weights``/``extra_conn_columns`` if given, else its spec default. All
+        edges live (``DEAD`` false); the assembler tombstones only the
+        per-bucket capacity padding.
 
         Args:
             net: The network type to build.
@@ -220,6 +222,12 @@ class NetworkBuilder[GS]:
             extra_conn_columns: Optional per-edge values for settable conn
                 fields (e.g. an optimizer's ``opt/…`` columns), each ``(E,)``;
                 unset fields take their spec default.
+            extra_unit_columns: Optional per-unit values for settable unit
+                fields, each ``(num_units,)``: ``activation`` and the net's
+                extra unit fields, as `add_unit` takes them. Unset fields take
+                their spec default. A unit that is not an input and has no
+                incoming connection keeps the activation given here under
+                topological propagation.
             capacity_headroom: Extra dead-slot fraction to pre-allocate per
                 bucket above its live count (0.0 = size to live). Reserves
                 slots add_conn can grow into device-resident, cutting overflow
@@ -243,7 +251,8 @@ class NetworkBuilder[GS]:
 
         Raises:
             ValueError: On mismatched array lengths, an out-of-range unit id,
-                an unknown/non-settable ``extra_conn_columns`` key, a negative
+                an unknown/non-settable ``extra_conn_columns`` or
+                ``extra_unit_columns`` key, a column of the wrong shape, a negative
                 ``capacity_headroom``, a bucket capacity not divisible by the
                 shard count, or a unit capacity below ``num_units``.
         """
@@ -282,10 +291,28 @@ class NetworkBuilder[GS]:
                 )
             else:
                 conn_columns[name] = supplied
-        unit_columns: dict[str, np.ndarray] = {
-            name: np.full((num_units,), spec.default, dtype=spec.dtype)
-            for name, spec in builder._settable_unit_fields.items()
-        }
+        extra_units = dict(extra_unit_columns or {})
+        for name in extra_units:
+            if name not in builder._settable_unit_fields:
+                raise ValueError(
+                    f"from_edges: unknown or non-settable unit field {name!r} "
+                    "in extra_unit_columns"
+                )
+
+        unit_columns: dict[str, np.ndarray] = {}
+        for name, spec in builder._settable_unit_fields.items():
+            given = extra_units.get(name)
+            if given is None:
+                unit_columns[name] = np.full(
+                    (num_units,), spec.default, dtype=spec.dtype
+                )
+            elif given.shape != (num_units,):
+                raise ValueError(
+                    f"from_edges: unit column {name!r} has shape {given.shape}, "
+                    f"expected ({num_units},)"
+                )
+            else:
+                unit_columns[name] = given
         return builder._assemble(
             num_units,
             src_arr,

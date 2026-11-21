@@ -160,6 +160,9 @@ ignore_missing_imports = true
 [tool.ruff]
 line-length = 88
 src = ["src", "tests"]
+# The design sketches are pseudocode for an interface that does not exist yet. They are
+# written at 100 columns and are not linted or formatted.
+extend-exclude = ["docs/design/sketches"]
 
 [tool.ruff.lint]
 # D (pydocstyle): the library ships Google-style docstrings; see docs/development/tooling.md.

@@ -59,12 +59,16 @@ class StepResult[GS]:
             dropped for lack of room (`overflow`), which `make_growth_retry`
             claims after a regrow; None when the net does not grow
             connections.
+        outputs: The output units' activation right after the forward phase,
+            in the network's declared output shape; None unless the step was
+            made with `outputs=True`.
     """
 
     state: NetworkState[GS]
     overflow: Bool[Array, ""]
     loss: Float[Array, ""]
     growth_remainder: GrowthRemainder | None = None
+    outputs: Float[Array, "*shape"] | None = None
 
 
 StepFn = Callable[[NetworkState[GS], StepInputs], StepResult[GS]]
@@ -81,6 +85,7 @@ def make_step[GS](
     layout: Literal["auto", "edge_list", "csr", "triton"] = "auto",
     fuse_prune: Literal["auto", "triton", "xla", "off"] = "auto",
     growth: Literal["auto", "xla", "triton"] = "auto",
+    outputs: bool = False,
 ) -> StepFn[GS]:
     """Assemble the present phases and jit them with donate_argnums=0.
 
@@ -159,6 +164,18 @@ def make_step[GS](
     it in an outer jit or scan lowers it outside that scope, onto the
     generic (much slower, still correct) kernel.
 
+    A network that declares its shapes (`static.input_shape`,
+    `static.output_shape`, set when it is built from a topology) is given
+    `StepInputs.inputs` and `StepInputs.targets` in those shapes, behind the
+    batch axis of a batched step; the step flattens them in row-major order.
+    A network that declares none takes the flat vectors.
+
+    `outputs=True` makes the step return the output units' activation as
+    `StepResult.outputs`, read right after the forward phase: what the forward
+    policy computed for this input, before the loss, the backward pass, any
+    update and any structural change. Left off, the step contains no trace of
+    the read.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -171,11 +188,14 @@ def make_step[GS](
         fuse_prune: Whether a streaming step fuses the prune predicate into
             the forward sweep: "auto", "triton", "xla", or "off".
         growth: The add_conn claim engine: "auto", "xla", or "triton".
+        outputs: Whether the step returns the forward pass's outputs.
 
     Returns:
         A jitted step function for the given network and static config.
 
     Raises:
+        NotImplementedError: If `outputs` is set for a batched step, whose
+            per-sample outputs are not kept.
         ValueError: If `batch_size` is below 1, or set for a PIPELINE net
             (whose carried unit state is per-sample recurrent state) or for a
             net without a `batch_reduction`, or if `layout`, `fuse_prune` or
@@ -184,6 +204,12 @@ def make_step[GS](
             `batch_reduction` leaves undeclared or declares NOT_BATCHED.
     """
     if batch_size is not None:
+        if outputs:
+            raise NotImplementedError(
+                "make_step: outputs=True is not supported with batch_size; a "
+                "batched step reduces every unit column over the batch and "
+                "keeps no per-sample outputs"
+            )
         if batch_size < 1:
             raise ValueError(f"make_step: batch_size must be >= 1, got {batch_size}")
         if net.propagation is Propagation.PIPELINE:
@@ -233,8 +259,52 @@ def make_step[GS](
     # identity; hence the cast.
     return cast(
         StepFn[GS],
-        _cached_make_step(net, static, batch_size, engine, fuse_prune, growth),  # type: ignore[arg-type]
+        _cached_make_step(  # type: ignore[arg-type]
+            net, static, batch_size, engine, fuse_prune, growth, outputs
+        ),
     )
+
+
+def _flatten_declared(
+    inputs: StepInputs, static: NetworkStatic, lead: tuple[int, ...]
+) -> StepInputs:
+    """Flatten inputs and targets given in the network's declared shapes.
+
+    A network built from a topology declares the shape of its input units and
+    of its output units, and a step is given its inputs and targets in those
+    shapes. The phases work on flat vectors over `input_ids` and `output_ids`,
+    in row-major order of the declared shape.
+
+    Args:
+        inputs: The step's inputs as the caller gave them.
+        static: The network's static configuration.
+        lead: The axes in front of the declared shape: `(batch_size,)` for a
+            batched step, `()` otherwise.
+
+    Returns:
+        The inputs with every declared shape flattened to one axis. Unchanged
+        for a network that declares no shapes.
+
+    Raises:
+        ValueError: If the inputs or the targets do not have the declared
+            shape.
+    """
+    x, t = inputs.inputs, inputs.targets
+    if static.input_shape is not None:
+        want = (*lead, *static.input_shape)
+        if x.shape != want:
+            raise ValueError(
+                f"step: inputs must have the declared shape {want}, got {x.shape}"
+            )
+        x = x.reshape((*lead, -1))
+    if static.output_shape is not None and t is not None:
+        want = (*lead, *static.output_shape)
+        if t.shape != want:
+            raise ValueError(
+                f"step: targets must have the declared shape {want}, got {t.shape}"
+            )
+        t = t.reshape((*lead, -1))
+    return StepInputs(inputs=x, targets=t)
 
 
 def _spec(cls: type[Any], **fields: Any) -> Any:
@@ -278,6 +348,7 @@ def _shard_map_step(
         overflow=repl,
         loss=repl,
         growth_remainder=repl,
+        outputs=repl,
     )
     sharded: Any = jax.shard_map(
         step, mesh=scheme_a_mesh(static), in_specs=in_specs, out_specs=out_specs
@@ -396,6 +467,7 @@ def _batched_step(
         return jax.vmap(one)(units_b, inputs.inputs, inputs.targets)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        inputs = _flatten_declared(inputs, static, (batch_size,))
         # Shapes are static, so a mis-shaped batch fails at trace time instead
         # of broadcasting (an unbatched input) or vmapping the feature axis.
         want = (batch_size, len(static.input_ids))
@@ -550,6 +622,7 @@ def _cached_make_step(
     engine: str | None = None,
     fuse_prune: str = "auto",
     growth: str = "auto",
+    outputs: bool = False,
 ) -> StepFn[Any]:
     # overflow_sink (see build_phases): a length-1 out-parameter
     # build_add_conn_phase (when net.add_conn is set) overwrites on every
@@ -574,8 +647,10 @@ def _cached_make_step(
             growth,
         )
     record = PruneFusionRecord()
+    output_ids = jnp.asarray(static.output_ids, dtype=jnp.int32)
 
     def step(state: NetworkState[Any], inputs: StepInputs) -> StepResult[Any]:
+        inputs = _flatten_declared(inputs, static, ())
         # The fusion decision needs the globals' shapes (the predicate may
         # read them), so it is made here, once per trace, in Python: the
         # phase tuple is still fixed before any equation is emitted.
@@ -601,9 +676,21 @@ def _cached_make_step(
         )
 
         total_loss = jnp.float32(0.0)
-        for phase in phases:
+        forward_outputs = None
+        for position, phase in enumerate(phases):
             state, contribution = phase(state, inputs)
             total_loss = total_loss + contribution
+            # `build_phases` puts the forward phase first. The read is left out
+            # in Python when it is not asked for.
+            if outputs and position == 0:
+                shape = (
+                    (len(static.output_ids),)
+                    if static.output_shape is None
+                    else static.output_shape
+                )
+                forward_outputs = state.units[ACTIVATION.name][output_ids].reshape(
+                    shape
+                )
 
         # Completed-steps counter: phases above saw the pre-increment value.
         state = dataclasses.replace(state, step=state.step + 1)
@@ -612,6 +699,7 @@ def _cached_make_step(
             overflow=overflow_sink[0],
             loss=total_loss,
             growth_remainder=remainder_sink[0],
+            outputs=forward_outputs,
         )
 
     # Under Scheme-A sharding, wrap the step in a shard_map (connections

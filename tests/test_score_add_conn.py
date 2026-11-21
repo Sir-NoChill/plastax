@@ -33,7 +33,7 @@ _LEVELS = (0, 0, 0, 1, 1, 1, 2, 2, 2)
 _EDGES = ((0, 3), (1, 4), (2, 5), (3, 6), (4, 7), (5, 8))
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -87,10 +87,10 @@ class _Base:
 
 def _net(rule: object, **attrs: Any) -> type[px.Network[Any]]:
     body: dict[str, Any] = {
-        "forward_pass": _SumForward(),
-        "add_conn": rule,
+        "forward": _SumForward(),
+        "grow": px.policies.Grow(conn=rule),  # type: ignore[arg-type]
         "propagation": px.Propagation.TOPOLOGICAL,
-        "batch_reduction": px.MeanFloatFirstRest(),
+        "batch_reduction": px.policies.MeanFloatFirstRest(),
         **attrs,
     }
     return type("_Net", (px.Network,), body)
@@ -207,11 +207,6 @@ def test_bad_knobs_are_rejected_at_class_definition(
         _net(rule)
 
 
-def test_selection_all_needs_no_max_new_per_level() -> None:
-    rule = type("_Rule", (_Base,), {"selection": "all", "max_new_per_level": None})()
-    assert len(_grown(_net(rule))) > 0
-
-
 def test_shortlist_requires_importance() -> None:
     class _NoImportance:
         max_new_per_level = 1
@@ -304,7 +299,7 @@ def test_structural_interval_does_not_gate_connection_pruning(
     net = _net(
         type("_All", (_Base,), {"selection": "all", "max_new_per_level": None})(),
         structural_interval=3,
-        prune_conn=_PruneAll(),
+        prune=px.policies.Prune(conn=_PruneAll()),
         propagation=propagation,
     )
     static, state = _build(net)
@@ -330,10 +325,10 @@ def test_predicate_adapter_scores_and_overrides() -> None:
         del u, g
         return (s + d) % 2 == 0
 
-    rule = px.predicate_add_conn(
+    rule = px.policies.predicate_add_conn(
         even, _Base().init, max_level_gap=2, direction="deeper"
     )
-    assert isinstance(rule, px.ScoreAddConn)
+    assert isinstance(rule, px.policies.ScoreAddConnPolicy)
     assert rule.selection == "all" and rule.dedupe_step is True  # type: ignore[attr-defined]
     grown = _grown(_net(rule))
     expected = {

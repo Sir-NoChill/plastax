@@ -61,7 +61,7 @@ def _score(h: jax.Array) -> jax.Array:
     return jnp.where((h >> 12) % jnp.uint32(13) == 0, jnp.nan, score)
 
 
-class _Forward(px.ForwardPass):
+class _Forward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -98,7 +98,7 @@ class _Knobs:
         return jnp.float32(1.0)
 
 
-class _PerUnit(_Knobs, px.ProposeAddConn):
+class _PerUnit(_Knobs, px.policies.ProposeAddConnPolicy):
     proposer = "per_unit"
 
     def __init__(self, num_units: int) -> None:
@@ -106,13 +106,15 @@ class _PerUnit(_Knobs, px.ProposeAddConn):
 
     def propose(
         self, u: px.UnitView, i: px.UnitIdx, j: jax.Array, g: Any, rng: px.rng.Rng
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         del u, j, g
         dst = rng.uniform_int(self.num_units).astype(jnp.int32)
-        return px.Proposal(jnp.asarray(i), dst, _score(_mix(rng.uniform_int(1 << 20))))
+        return px.policies.Proposal(
+            jnp.asarray(i), dst, _score(_mix(rng.uniform_int(1 << 20)))
+        )
 
 
-class _PerConnection(_Knobs, px.ProposeAddConn):
+class _PerConnection(_Knobs, px.policies.ProposeAddConnPolicy):
     proposer = "per_connection"
 
     def __init__(self, num_units: int) -> None:
@@ -126,14 +128,14 @@ class _PerConnection(_Knobs, px.ProposeAddConn):
         j: jax.Array,
         g: Any,
         rng: px.rng.Rng,
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         del u, j, g
         dst = rng.uniform_int(self.num_units).astype(jnp.int32)
         score = _score(_mix(rng.uniform_int(1 << 20)))
-        return px.Proposal(c[px.FROM_ID, cid], dst, score)
+        return px.policies.Proposal(c[px.FROM_ID, cid], dst, score)
 
 
-class _Global(_Knobs, px.ProposeAddConn):
+class _Global(_Knobs, px.policies.ProposeAddConnPolicy):
     proposer = "global"
 
     def __init__(self, num_units: int) -> None:
@@ -141,14 +143,14 @@ class _Global(_Knobs, px.ProposeAddConn):
 
     def propose(
         self, u: px.UnitView, j: jax.Array, g: Any, rng: px.rng.Rng
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         del u, j, g
         src = rng.uniform_int(self.num_units).astype(jnp.int32)
         dst = rng.uniform_int(self.num_units).astype(jnp.int32)
-        return px.Proposal(src, dst, _score(_mix(rng.uniform_int(1 << 20))))
+        return px.policies.Proposal(src, dst, _score(_mix(rng.uniform_int(1 << 20))))
 
 
-class _Scored(_Knobs, px.ScoreAddConn):
+class _Scored(_Knobs, px.policies.ScoreAddConnPolicy):
     def score(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Any
     ) -> jax.Array:
@@ -160,7 +162,7 @@ class _Scored(_Knobs, px.ScoreAddConn):
         return (_mix(jnp.asarray(i) ^ g["t"]) & jnp.uint32(15)).astype(jnp.float32)
 
 
-class _Tick(px.ResetGlobal):
+class _Tick(px.policies.ResetGlobalPolicy):
     def reset(self, g: Any) -> Any:
         return {"t": g["t"] + jnp.int32(1)}
 
@@ -234,8 +236,8 @@ def _build(
     rule.allow_self_loops = cfg["allow_self_loops"]
 
     class Net(px.Network[Any]):
-        forward_pass = _Forward()
-        add_conn = rule
+        forward = _Forward()
+        grow = px.policies.Grow(conn=rule)
         reset_global = _Tick()
         propagation = (
             px.Propagation.PIPELINE if cfg["pipeline"] else px.Propagation.TOPOLOGICAL
@@ -258,11 +260,11 @@ def _build(
 
 def _reference_phase(net: type[px.Network[Any]], static: px.NetworkStatic) -> Any:
     """The per-bucket-sort add_conn phase (XLA claim, unsharded, ungated)."""
-    ac: Any = net.add_conn
+    ac: Any = net.resolved().grow_conn
     num_units = static.num_units
     num_buckets = len(static.level_capacities)
     is_pipeline = net.propagation is px.Propagation.PIPELINE
-    use_propose = isinstance(ac, px.ProposeAddConn)
+    use_propose = isinstance(ac, px.policies.ProposeAddConnPolicy)
     kind = "" if use_propose else str(getattr(ac, "candidates", "exhaustive"))
     m = getattr(ac, "shortlist_size", None)
     use_shortlist = kind != "exhaustive" and m is not None and 0 < m < num_units

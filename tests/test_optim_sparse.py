@@ -40,7 +40,7 @@ _GROWN_WEIGHT = 7.0  # distinctive init marker so grown edges are identifiable
 _ADAM = px.optim.adam(0.1, mlp_xor.GradPreAct)
 
 
-class _PruneFromUnit0(px.PruneConn):
+class _PruneFromUnit0(px.policies.PruneConnPolicy):
     """Tombstone every edge whose source is unit 0 -- deterministic, and frees
     the low-index bucket-0 slots that add_conn then reclaims."""
 
@@ -51,7 +51,7 @@ class _PruneFromUnit0(px.PruneConn):
         return c[px.FROM_ID, cid] == jnp.int32(0)
 
 
-class _GrowAhead(px.ScoreAddConn[None]):
+class _GrowAhead(px.policies.ScoreAddConnPolicy[None]):
     """Grow level-ahead edges (dst deeper than src, so no resort), each marked
     with a distinctive weight. Optimizer columns are untouched, so the phase
     resets them to their FieldSpec default."""
@@ -76,24 +76,24 @@ class _GrowAhead(px.ScoreAddConn[None]):
 
 
 class _TrainNet(px.Network[None]):
-    forward_pass = mlp_xor.SigmoidForward()
-    backward_pass = mlp_xor.SigmoidBackward()
+    forward = mlp_xor.SigmoidForward()
+    backward = mlp_xor.SigmoidBackward()
     loss = mlp_xor.MSELoss()
-    update_conn = _ADAM.update_conn()
+    update = px.policies.Update(conn=_ADAM.update().conn)
     extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
-    extra_conn_fields = _ADAM.state_fields
+    extra_conn_fields = _ADAM.conn_fields
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class _ChurnNet(px.Network[None]):
-    forward_pass = mlp_xor.SigmoidForward()
-    backward_pass = mlp_xor.SigmoidBackward()
+    forward = mlp_xor.SigmoidForward()
+    backward = mlp_xor.SigmoidBackward()
     loss = mlp_xor.MSELoss()
-    update_conn = _ADAM.update_conn()
-    prune_conn = _PruneFromUnit0()
-    add_conn = _GrowAhead()
+    update = px.policies.Update(conn=_ADAM.update().conn)
+    prune = px.policies.Prune(conn=_PruneFromUnit0())
+    grow = px.policies.Grow(conn=_GrowAhead())
     extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
-    extra_conn_fields = _ADAM.state_fields
+    extra_conn_fields = _ADAM.conn_fields
     propagation = px.Propagation.TOPOLOGICAL
 
 

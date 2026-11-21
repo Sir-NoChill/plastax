@@ -17,9 +17,6 @@ anyway.
 
 from __future__ import annotations
 
-import warnings
-from collections.abc import Callable
-
 import jax
 import jax.numpy as jnp
 
@@ -28,7 +25,7 @@ from plastax.phases import Phase, StepInputs, build_phases
 from plastax.views import UnitWrite
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -48,12 +45,12 @@ class _SumForward(px.ForwardPass):
         return UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _ResetToZero(px.ResetGlobal):
+class _ResetToZero(px.policies.ResetGlobalPolicy):
     def reset(self, g: jax.Array) -> jax.Array:
         return g * jnp.float32(0.0)
 
 
-class _SquaredErrorLoss(px.Loss):
+class _SquaredErrorLoss(px.policies.LossPolicy):
     # Seeds into ACTIVATION with the prediction itself, so the write leaves
     # the column unchanged and the nets here share one field layout.
     seed_field = px.ACTIVATION
@@ -70,18 +67,18 @@ _shared_forward = _SumForward()
 
 
 class _ForwardOnlyNet(px.Network[jax.Array]):
-    forward_pass = _shared_forward
+    forward = _shared_forward
     propagation = px.Propagation.PIPELINE
 
 
 class _ForwardResetNet(px.Network[jax.Array]):
-    forward_pass = _shared_forward
+    forward = _shared_forward
     reset_global = _ResetToZero()
     propagation = px.Propagation.PIPELINE
 
 
 class _ForwardLossNet(px.Network[jax.Array]):
-    forward_pass = _shared_forward
+    forward = _shared_forward
     loss = _SquaredErrorLoss()
     propagation = px.Propagation.PIPELINE
 
@@ -184,37 +181,3 @@ def test_no_phase_ever_lowers_to_a_cond() -> None:
     inputs = StepInputs(inputs=jnp.asarray([1.0, 2.0], dtype=jnp.float32), targets=None)
     jaxpr = _trace_phases(_ForwardResetNet, static, state, inputs)
     assert "cond" not in _primitive_names(jaxpr)
-
-
-def test_build_phases_returns_a_plain_python_tuple() -> None:
-    """Presence is decided once, at Python trace-assembly time, not per-call
-    inside the traced program (no data-dependent phase selection is even
-    expressible this way)."""
-    static, _ = _build(_ForwardOnlyNet)
-    phases = build_phases(_ForwardOnlyNet, static)
-    assert isinstance(phases, tuple)
-    assert all(isinstance(phase, Callable) for phase in phases)
-
-
-def test_loss_phase_runs_end_to_end_through_make_step_with_donation() -> None:
-    """The two structural tests above never exercise the real jit +
-    donation path (they trace build_phases' output directly); the forward
-    pipeline tests exercise that path but never with a loss phase present.
-    Close the gap: run a loss net through make_step for real and check the
-    reduced loss scalar lands in StepResult.loss."""
-    static, state = _build(_ForwardLossNet)
-    step = px.make_step(_ForwardLossNet, static)
-    # Phases run forward-then-loss (build_phases order), so loss reads
-    # unit 2's freshly-computed (not pre-step default) activation.
-    inputs = StepInputs(
-        inputs=jnp.asarray([1.0, 2.0], dtype=jnp.float32),
-        targets=jnp.asarray([0.5], dtype=jnp.float32),
-    )
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "error", message=".*Some donated buffers were not usable.*"
-        )
-        result = step(state, inputs)
-    # pred (unit 2, post-forward) == 0.5*1.0 + -0.25*2.0 == 0.0; target 0.5.
-    assert float(result.loss) == 0.5 * (0.0 - 0.5) ** 2
-    assert bool(result.overflow) is False

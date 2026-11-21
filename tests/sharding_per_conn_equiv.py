@@ -53,7 +53,7 @@ _INPUTS, _HIDDEN, _OUTPUTS = 4, 8, 4
 _NUM_UNITS = _INPUTS + _HIDDEN + _OUTPUTS
 
 
-class _Forward(px.ForwardPass):
+class _Forward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward; present only so the network has a forward pass."""
 
     combine = px.monoid.sum_
@@ -77,7 +77,7 @@ class _Forward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _HashPrune(px.PruneConn):
+class _HashPrune(px.policies.PruneConnPolicy):
     """Tombstone a hashed subset of edges, so every step frees slots."""
 
     def predicate(
@@ -89,7 +89,7 @@ class _HashPrune(px.PruneConn):
         return (h >> jnp.uint32(24)) < jnp.uint32(70)
 
 
-class _PerConnPropose(px.ProposeAddConn[None]):
+class _PerConnPropose(px.policies.ProposeAddConnPolicy[None]):
     """Each live edge proposes P edges from its endpoints to a drawn unit."""
 
     proposer = "per_connection"
@@ -123,15 +123,15 @@ class _PerConnPropose(px.ProposeAddConn[None]):
 
 
 class _ChurnNet(px.Network[None]):
-    forward_pass = _Forward()
-    prune_conn = _HashPrune()
-    add_conn = _PerConnPropose()
+    forward = _Forward()
+    prune = px.policies.Prune(conn=_HashPrune())
+    grow = px.policies.Grow(conn=_PerConnPropose())
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class _PruneNet(px.Network[None]):
-    forward_pass = _Forward()
-    prune_conn = _HashPrune()
+    forward = _Forward()
+    prune = px.policies.Prune(conn=_HashPrune())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -237,7 +237,7 @@ def _candidates(
     num_shards: int | None,
 ) -> tuple[np.ndarray, ...]:
     """The per-connection candidate arrays, single-device or Scheme-A sharded."""
-    rule = _ChurnNet.add_conn
+    rule = _ChurnNet.resolved().grow_conn
     assert isinstance(rule, _PerConnPropose)
 
     def run(

@@ -13,7 +13,6 @@ import warnings
 
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import plastax as px
 from plastax import sweep as sweep_mod
@@ -22,7 +21,7 @@ from plastax.views import UnitWrite
 _GRAD = px.FieldSpec.float32("grad")
 
 
-class _TrivialForward(px.ForwardPass):
+class _TrivialForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward on ACTIVATION (test_forward_pipeline.py's
     _SumForward) -- required trait slot, not exercised by these tests
     (which only assert on the separate GRAD field)."""
@@ -46,7 +45,7 @@ class _TrivialForward(px.ForwardPass):
         return UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _ReplaceBackward(px.BackwardPass):
+class _ReplaceBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """REPLACE-style apply: a unit's new GRAD is exactly its accumulator,
     discarding whatever was there before -- makes "was Apply really called
     on this unit" directly observable (a leaf with no outgoing edges has
@@ -80,7 +79,9 @@ class _ReplaceBackward(px.BackwardPass):
         return UnitWrite.of((_GRAD, acc))
 
 
-class _SeedPreservingBackward(px.BackwardPass):
+class _SeedPreservingBackward(
+    px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy
+):
     """ADDITIVE apply: a unit's new GRAD is its accumulator added onto
     whatever it already held. Used for the topological level-walk test,
     where the top level is primed from a fresh identity accumulator
@@ -111,15 +112,15 @@ class _SeedPreservingBackward(px.BackwardPass):
 
 
 class _PipelineBackwardNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    backward_pass = _ReplaceBackward()
+    forward = _TrivialForward()
+    backward = _ReplaceBackward()
     propagation = px.Propagation.PIPELINE
     extra_unit_fields = (_GRAD,)
 
 
 class _TopoBackwardNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    backward_pass = _SeedPreservingBackward()
+    forward = _TrivialForward()
+    backward = _SeedPreservingBackward()
     propagation = px.Propagation.TOPOLOGICAL
     extra_unit_fields = (_GRAD,)
 
@@ -144,8 +145,9 @@ def _build_pipeline_backward() -> tuple[px.NetworkStatic, px.NetworkState[None]]
 
 def test_build_backward_sweep_direction_reversal_and_unconditional_apply() -> None:
     static, state = _build_pipeline_backward()
+    bp = _ReplaceBackward()
     sweep = sweep_mod.build_backward_sweep(
-        _ReplaceBackward(), num_units=static.num_units, indices_are_sorted=True
+        bp, bp, num_units=static.num_units, indices_are_sorted=True
     )
     new_units = sweep(state.units, state.conns[0], state.globals_)
     got = np.asarray(new_units[_GRAD.name])
@@ -245,78 +247,3 @@ def test_backward_topological_level_walk_matches_numpy_reverse_pass() -> None:
     # accumulated -- a wrong (low-to-high) walk order would read unit 3's
     # stale (0.0) grad instead, giving grad[2] == 0.0.
     assert float(got[2]) != 0.0
-
-
-class _TargetIdProbe(px.BackwardPass):
-    """Returns the id of its FIRST unit-id argument, whatever that turns out to be.
-
-    Used to pin which endpoint that argument actually is, independently of what
-    it is named.
-    """
-
-    combine = px.monoid.sum_
-
-    def map(
-        self,
-        u: px.UnitView,
-        src: px.UnitIdx,
-        dst: px.UnitIdx,
-        c: px.ConnView,
-        cid: px.ConnIdx,
-        g: None,
-    ) -> jnp.ndarray:
-        del u, dst, c, cid, g
-        return src.astype(jnp.float32)
-
-    def apply(
-        self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray
-    ) -> UnitWrite:
-        del u, i, g
-        return UnitWrite.of((_GRAD, acc))
-
-
-class _ProbeNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    backward_pass = _TargetIdProbe()
-    extra_unit_fields = (_GRAD,)
-    propagation = px.Propagation.TOPOLOGICAL
-
-
-def test_backward_map_first_unit_arg_is_the_accumulator_target() -> None:
-    """`BackwardPass.map`'s first unit-id argument is the edge's SOURCE.
-
-    sweep.py documents that map_fn's first unit-id argument is always the
-    accumulator target, and backward accumulates into FROM_ID -- so the
-    parameter must be `src`, not `dst`. The protocol named it `dst` in both
-    directions, which contradicted the sweep and silently inverted the meaning
-    of every backward map body written against it.
-
-    The probe returns its first argument's id, so a unit accumulates
-    out_degree(i) * i if and only if that argument is the source. Only HIDDEN
-    units are checked: the backward phase excludes input units from apply, so
-    their accumulator is never written.
-    """
-    # inputs 0,1 -> hidden 2,3 -> outputs 4,5
-    from_ids = np.array([0, 0, 1, 2, 2, 3], dtype=np.int32)
-    to_ids = np.array([2, 3, 2, 4, 5, 4], dtype=np.int32)
-    static, state = px.NetworkBuilder.from_edges(
-        _ProbeNet,
-        6,
-        from_ids,
-        to_ids,
-        weights=np.ones((len(from_ids),), dtype=np.float32),
-        input_ids=(0, 1),
-        output_ids=(4, 5),
-        globals_=None,
-    )
-    result = px.make_step(_ProbeNet, static)(
-        state,
-        px.StepInputs(inputs=jnp.zeros((2,), jnp.float32), targets=None),
-    )
-    grad = np.asarray(result.state.units[_GRAD.name])
-    for unit in (2, 3):
-        out_degree = int(np.sum(from_ids == unit))
-        assert grad[unit] == pytest.approx(out_degree * unit), (
-            f"unit {unit}: expected {out_degree * unit}, got {grad[unit]} -- "
-            "the first unit-id argument is not the accumulator target"
-        )

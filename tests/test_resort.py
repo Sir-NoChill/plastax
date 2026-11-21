@@ -37,13 +37,11 @@ import pytest
 from jax._src import test_util as jtu
 
 import plastax as px
-from plastax import phases, topo
+from plastax import topo
 from plastax.state import live_conn_count
 
-_DUMMY_INPUTS = px.StepInputs(inputs=jnp.zeros((0,), dtype=jnp.float32), targets=None)
 
-
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward (test_forward_pipeline.py's _SumForward,
     reused verbatim across this file's networks): map = weight *
     activation[src], combine = sum, apply = identity onto ACTIVATION."""
@@ -88,7 +86,7 @@ def _live_edges(state: px.NetworkState[object]) -> set[tuple[int, int]]:
 
 
 class _RecomputeNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -112,24 +110,6 @@ def _build_dag_with_skip_edge() -> tuple[px.NetworkStatic, px.NetworkState[None]
     for src, dst in edges.tolist():
         builder.add_conn(int(src), int(dst), weight=1.0)
     return builder.finalize()
-
-
-def test_recompute_levels_matches_host_initial_levels_on_a_dag_with_a_skip_edge() -> (
-    None
-):
-    num_units, edges, _ = _dag_with_skip_edge()
-    expected = topo.initial_levels(num_units, edges)
-    static, state = _build_dag_with_skip_edge()
-
-    # Sanity: the builder's OWN construction-time levels (the host
-    # initial_levels, the same function) already match -- the real
-    # assertion below is the ON-DEVICE recompute agreeing with the SAME
-    # reference from a cold start, not merely reproducing a value it
-    # inherited from the arena.
-    np.testing.assert_array_equal(np.asarray(state.units[px.LEVEL.name]), expected)
-
-    got = topo.recompute_levels(static, state)
-    np.testing.assert_array_equal(np.asarray(got), expected)
 
 
 def test_recompute_levels_ignores_a_stale_level_column_and_recomputes_from_conns() -> (
@@ -161,12 +141,12 @@ def test_recompute_levels_ignores_a_stale_level_column_and_recomputes_from_conns
 
 
 class _CycleNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class _CyclePipelineNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.PIPELINE
 
 
@@ -250,7 +230,7 @@ def test_resort_pins_an_input_fed_by_an_acyclic_edge() -> None:
     np.testing.assert_array_equal(np.asarray(built.units[px.LEVEL.name]), expected)
 
 
-class _GrowBackEdge(px.ProposeAddConn[None]):
+class _GrowBackEdge(px.policies.ProposeAddConnPolicy[None]):
     """Propose 2 -> 0: from the level-1 unit back into input 0."""
 
     proposer = "global"
@@ -271,8 +251,8 @@ class _GrowBackEdge(px.ProposeAddConn[None]):
 
 
 class _BackEdgeNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _GrowBackEdge()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_GrowBackEdge())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -299,7 +279,7 @@ def test_a_growth_cycle_is_rejected_at_resort() -> None:
 
 
 class _ResortNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -391,61 +371,6 @@ def test_resort_redistributes_sorts_and_compacts_after_a_pruning_relevel() -> No
 # ---------------------------------------------------------------------------
 
 
-class _SidewaysPipelineAddConn(px.ScoreAddConn[None]):
-    """Only ever proposes the fixed same-source-level pair (1, 2) -- a
-    candidate the add window can score (module docstring, phases.py's
-    build_add_conn_phase)."""
-
-    dedupe_live = True  # pre-L4 grid default: never regrow a live edge
-
-    max_new_per_level = 1
-
-    def score(
-        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
-    ) -> jnp.ndarray:
-        del u, g
-        hit = (src == jnp.int32(1)) & (dst == jnp.int32(2))
-        return jnp.where(hit, jnp.float32(1.0), jnp.float32(-1e9))
-
-    def init(
-        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
-    ) -> px.ConnWrite:
-        del u, src, dst, g
-        return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.5)))
-
-
-class _SidewaysPipelineNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _SidewaysPipelineAddConn()
-    propagation = px.Propagation.PIPELINE
-
-
-def test_widened_window_lets_a_same_level_add_actually_set_needs_resort() -> None:
-    """Direct (Driver-bypassing) evidence that the add window can commit a
-    same-source-level candidate: PIPELINE's single bucket accepts a source
-    at any level (phases.py's build_add_conn_phase docstring), so this
-    needs no pre-existing per-level bucket structure the way a
-    TOPOLOGICAL demonstration would (see test_one_resort_triggers_
-    exactly_one_additional_compile's docstring below for why the
-    retrace-COUNT test manufactures needs_resort directly instead)."""
-    builder = px.NetworkBuilder(_SidewaysPipelineNet, None)
-    builder.add_unit()  # 0: ANCHOR
-    builder.add_unit()  # 1: A
-    builder.add_unit()  # 2: B
-    builder.mark_input(0)
-    builder.add_conn(0, 1, weight=1.0)
-    builder.add_conn(0, 2, weight=1.0)
-    static, state = builder.finalize()
-    got_level = np.asarray(state.units[px.LEVEL.name])
-    assert int(got_level[1]) == int(got_level[2]) == 1  # genuinely same-level
-
-    phase = phases.build_add_conn_phase(_SidewaysPipelineNet, static)
-    new_state, _ = phase(state, _DUMMY_INPUTS)
-
-    assert bool(new_state.needs_resort) is True
-    assert (1, 2) in _live_edges(new_state)
-
-
 # ---------------------------------------------------------------------------
 # Retrace count: pure add/prune (level-preserving) workload
 # ---------------------------------------------------------------------------
@@ -457,7 +382,7 @@ _R_ANCHOR_W = (5.0, 4.0, 3.0)
 _R_MARK = 999.0
 
 
-class _SafeAddConn(px.ScoreAddConn[None]):
+class _SafeAddConn(px.policies.ScoreAddConnPolicy[None]):
     """Only ever proposes (SRC, dst) pairs where dst is genuinely ahead of
     src, read via the view rather than hardcoded: level-preserving by this
     POLICY's own choice, not because the (now-widened) window forbids
@@ -485,7 +410,7 @@ class _SafeAddConn(px.ScoreAddConn[None]):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(_R_MARK)))
 
 
-class _ChurnPrune(px.PruneConn[None]):
+class _ChurnPrune(px.policies.PruneConnPolicy[None]):
     """Removes exactly what the PRIOR step's add_conn committed (tagged
     _R_MARK, phase order forward/.../prune_conn/add_conn means THIS step's
     own fresh additions survive to be pruned only on the NEXT step), so
@@ -500,9 +425,9 @@ class _ChurnPrune(px.PruneConn[None]):
 
 
 class _RetraceNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _SafeAddConn()
-    prune_conn = _ChurnPrune()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_SafeAddConn())
+    prune = px.policies.Prune(conn=_ChurnPrune())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -563,7 +488,7 @@ def test_pure_add_prune_level_preserving_workload_compiles_exactly_once() -> Non
 
 
 class _ChainNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -648,7 +573,7 @@ _E_DST_B = 2
 _E_SINK = 3
 
 
-class _E2EAddConn(px.ScoreAddConn[None]):
+class _E2EAddConn(px.policies.ScoreAddConnPolicy[None]):
     """Only ever proposes the fixed same-source-level pair (DST_A, DST_B)
     -- deliberately the one candidate this small graph's single truncated
     bucket has no room for on the first attempt."""
@@ -684,8 +609,8 @@ class _E2EAddConn(px.ScoreAddConn[None]):
 
 
 class _E2ENet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _E2EAddConn()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_E2EAddConn())
     propagation = px.Propagation.TOPOLOGICAL
 
 

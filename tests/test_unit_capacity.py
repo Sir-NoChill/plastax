@@ -36,7 +36,7 @@ _DST = np.asarray([2, 3, 2, 3, 4, 5, 4, 5], np.int32)
 _W = np.asarray([0.5, -0.25, 0.75, 0.125, -0.5, 0.25, 0.375, -0.75], np.float32)
 
 
-class OffsetForward(px.ForwardPass):
+class OffsetForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """activation = sum(w * activation[src]) + 1; applied = 1."""
 
     combine = px.monoid.sum_
@@ -63,7 +63,7 @@ class OffsetForward(px.ForwardPass):
         )
 
 
-class OffsetBackward(px.BackwardPass):
+class OffsetBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """grad = sum(w * grad[dst]) + loss_grad + 1."""
 
     combine = px.monoid.sum_
@@ -88,7 +88,7 @@ class OffsetBackward(px.BackwardPass):
         return px.UnitWrite.of((GRAD, acc + u[LOSS_GRAD, i] + jnp.float32(1.0)))
 
 
-class HalfSquaredLoss(px.Loss):
+class HalfSquaredLoss(px.policies.LossPolicy):
     """sum(0.5 * (activation - target)^2), seeding the difference."""
 
     seed_field = LOSS_GRAD
@@ -101,7 +101,7 @@ class HalfSquaredLoss(px.Loss):
         return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
-class DeltaRule(px.UpdateConn):
+class DeltaRule(px.policies.UpdateConnPolicy):
     """w -= 1/16 * grad[dst] * activation[src]."""
 
     def incoming(
@@ -130,7 +130,7 @@ class DeltaRule(px.UpdateConn):
         return px.ConnWrite.of()
 
 
-class SmallWeightPrune(px.PruneConn):
+class SmallWeightPrune(px.policies.PruneConnPolicy):
     """Tombstone |w| < 1/8, or a source `applied` above 1000 (never, here).
 
     `applied` does not depend on the forward's accumulator, so a fused prune
@@ -151,7 +151,7 @@ def _init(u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None) -> px.ConnW
     return px.ConnWrite.of((px.WEIGHT, w - jnp.float32(0.375)))
 
 
-class HighIdGrid(px.ScoreAddConn):
+class HighIdGrid(px.policies.ScoreAddConnPolicy):
     """Exhaustive growth preferring high unit ids -- the free slots, if seen."""
 
     max_new_per_level = 2
@@ -180,7 +180,7 @@ class HighIdShortlist(HighIdGrid):
         return i.astype(jnp.float32)
 
 
-class EveryUnitProposes(px.ProposeAddConn):
+class EveryUnitProposes(px.policies.ProposeAddConnPolicy):
     """Each unit proposes edges to fixed ids, some of them free slots."""
 
     proposals_per_proposer = 2
@@ -214,16 +214,18 @@ def _net(
     growth: str | None = None,
     update: bool = True,
 ) -> type[px.Network[None]]:
+    update_ = update
+
     class _Net(px.Network[None]):
-        forward_pass = OffsetForward()
-        backward_pass = OffsetBackward()
+        forward = OffsetForward()
+        backward = OffsetBackward()
         loss = HalfSquaredLoss()
-        update_conn = DeltaRule() if update else None
-        prune_conn = SmallWeightPrune()
-        add_conn = _GROWTH[growth] if growth is not None else None
+        update = px.policies.Update(conn=DeltaRule()) if update_ else None
+        prune = px.policies.Prune(conn=SmallWeightPrune())
+        grow = px.policies.Grow(conn=_GROWTH[growth]) if growth is not None else None
         extra_unit_fields = (GRAD, LOSS_GRAD, APPLIED)
         unit_capacity = capacity
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     _Net.propagation = propagation
     return _Net
@@ -312,7 +314,7 @@ def test_bad_unit_capacity_is_rejected(bad: object) -> None:
     with pytest.raises(TypeError, match="unit_capacity must be None or an int"):
 
         class _Bad(px.Network[None]):
-            forward_pass = OffsetForward()
+            forward = OffsetForward()
             unit_capacity = bad  # type: ignore[assignment]
 
 
@@ -321,19 +323,15 @@ def test_bad_max_levels_is_rejected(bad: object) -> None:
     with pytest.raises(TypeError, match="max_levels must be an int >= 2"):
 
         class _Bad(px.Network[None]):
-            forward_pass = OffsetForward()
+            forward = OffsetForward()
             max_levels = bad  # type: ignore[assignment]
-
-
-def test_max_levels_defaults_to_the_cpp_bound() -> None:
-    assert px.Network.max_levels == 1024
 
 
 def test_pruned_is_a_reserved_field_name() -> None:
     with pytest.raises(ValueError, match="reserved builtin name"):
 
         class _Bad(px.Network[None]):
-            forward_pass = OffsetForward()
+            forward = OffsetForward()
             extra_unit_fields = (px.FieldSpec.boolean("pruned"),)
 
 

@@ -154,7 +154,7 @@ def test_scan_rejects_a_chunkless_or_ragged_input() -> None:
 # --- a PIPELINE network never resorts -----------------------------------------
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -176,7 +176,7 @@ class _SumForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _SameLevelGrowth(px.ScoreAddConn[jax.Array]):
+class _SameLevelGrowth(px.policies.ScoreAddConnPolicy[jax.Array]):
     """Grows one edge per step between the two hidden units, which sit at the
     same level: a same-level edge, which raises `needs_resort`."""
 
@@ -197,15 +197,15 @@ class _SameLevelGrowth(px.ScoreAddConn[jax.Array]):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.5)))
 
 
-class _Count(px.ResetGlobal[jax.Array]):
+class _Count(px.policies.ResetGlobalPolicy[jax.Array]):
     def reset(self, g: jax.Array) -> jax.Array:
         return g + jnp.int32(1)
 
 
 def _chain_net(propagation: px.Propagation) -> type[px.Network[jax.Array]]:
     class Chain(px.Network[jax.Array]):
-        forward_pass = _SumForward()
-        add_conn = _SameLevelGrowth()
+        forward = _SumForward()
+        grow = px.policies.Grow(conn=_SameLevelGrowth())
         reset_global = _Count()
 
     Chain.propagation = propagation

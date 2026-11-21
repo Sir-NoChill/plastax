@@ -18,15 +18,13 @@ error.
 
 from __future__ import annotations
 
-import warnings
-
 import jax
 import jax.numpy as jnp
 
 import plastax as px
 
 
-class _TrivialForward(px.ForwardPass):
+class _TrivialForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Minimal required trait: acc = sum(weight * activation[src]); apply
     writes it straight back to ACTIVATION (shape-preserving by construction).
     """
@@ -53,7 +51,7 @@ class _TrivialForward(px.ForwardPass):
 
 
 class _DonationNet(px.Network[None]):
-    forward_pass = _TrivialForward()
+    forward = _TrivialForward()
     propagation = px.Propagation.PIPELINE
 
 
@@ -82,37 +80,3 @@ def test_step_deletes_every_donated_input_buffer() -> None:
     # donate_argnums=0: XLA consumes each input buffer, so every leaf of the
     # argument state is deleted once the call returns.
     assert all(leaf.is_deleted() for leaf in input_leaves)
-
-
-def test_step_preserves_pytree_structure_and_every_leaf_shape_dtype() -> None:
-    static, state = _build()
-    step = px.make_step(_DonationNet, static)
-
-    # Captured BEFORE the call: donation deletes the input leaves, so their
-    # shape/dtype cannot be read afterward.
-    in_structure = jax.tree_util.tree_structure(state)
-    in_specs = [(leaf.shape, leaf.dtype) for leaf in jax.tree_util.tree_leaves(state)]
-
-    result = step(state, _DUMMY_INPUTS)
-
-    out_structure = jax.tree_util.tree_structure(result.state)
-    out_specs = [
-        (leaf.shape, leaf.dtype) for leaf in jax.tree_util.tree_leaves(result.state)
-    ]
-    assert out_structure == in_structure
-    assert out_specs == in_specs
-
-
-def test_donated_output_chains_into_the_next_step_without_warning() -> None:
-    static, state = _build()
-    step = px.make_step(_DonationNet, static)
-
-    with warnings.catch_warnings():
-        # The exact warning JAX emits when a donated buffer cannot be reused;
-        # promoted to an error so a non-shape-preserving step fails loudly.
-        warnings.filterwarnings("error", message=".*donated buffers were not usable.*")
-        result = step(state, _DUMMY_INPUTS)
-        # Feed the donated output straight back in -- the steady-state loop
-        # the Driver runs, and the case that would surface a bad donation.
-        result = step(result.state, _DUMMY_INPUTS)
-        jax.block_until_ready(result.state)

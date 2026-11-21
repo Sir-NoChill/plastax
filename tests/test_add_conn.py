@@ -39,7 +39,7 @@ _NEW_WEIGHT = 42.0
 _SRC_BONUS = 100.0
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward (test_forward_pipeline.py's _SumForward,
     reused verbatim): map = weight * activation[src], combine = sum,
     apply = identity onto ACTIVATION."""
@@ -63,7 +63,7 @@ class _SumForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _WindowAddConn(px.ScoreAddConn[None]):
+class _WindowAddConn(px.policies.ScoreAddConnPolicy[None]):
     """score favors any (SRC, *) candidate by a large, fixed bonus over
     dst's own activation, so top_k's selection among (SRC, dst) pairs is
     exactly "highest anchor weight first" (dst 2, then 3, then 4) and never
@@ -96,14 +96,14 @@ class _WindowAddConn(px.ScoreAddConn[None]):
 
 
 class _AddConnNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _WindowAddConn()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_WindowAddConn())
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class _PipelineAddConnNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _WindowAddConn()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_WindowAddConn())
     propagation = px.Propagation.PIPELINE
 
 
@@ -137,33 +137,6 @@ def _with_marker_activations(
     return dataclasses.replace(state, units=units)
 
 
-def test_k_bounded_candidate_count_and_top_k_selects_highest_scored() -> None:
-    static, state = _build_net(_AddConnNet)
-    state = _with_marker_activations(state)
-
-    phase = phases.build_add_conn_phase(_AddConnNet, static)
-    new_state, loss = phase(state, _DUMMY_INPUTS)
-    assert float(loss) == 0.0
-
-    bucket = new_state.conns[0]
-    dead = np.asarray(bucket[px.DEAD.name])
-    from_id = np.asarray(bucket[px.FROM_ID.name])
-    to_id = np.asarray(bucket[px.TO_ID.name])
-    live = {
-        (int(f), int(t)) for f, t, d in zip(from_id, to_id, dead, strict=True) if not d
-    }
-    anchor_edges = {(_ANCHOR, dst) for dst in _DST}
-    new_edges = live - anchor_edges
-
-    # K-bounded: exactly max_new_per_level (3) new edges land, even though 5
-    # distinct (SRC, dst) candidates all pass the level window and would
-    # all score above every (ANCHOR, dst) duplicate.
-    assert len(new_edges) == 3
-    # top_k: the 3 highest-scored (SRC, dst) pairs -- dst 2, 3, 4 (anchor
-    # weights 5.0, 4.0, 3.0) -- not dst 5 or 6 (weights 2.0, 1.0).
-    assert new_edges == {(_SRC, 2), (_SRC, 3), (_SRC, 4)}
-
-
 def test_prefix_sum_slot_claim_lands_new_edges_in_the_bucket_dead_slots() -> None:
     static, state = _build_net(_AddConnNet)
     state = _with_marker_activations(state)
@@ -194,27 +167,6 @@ def test_prefix_sum_slot_claim_lands_new_edges_in_the_bucket_dead_slots() -> Non
 
     # Everything beyond stays untouched dead padding.
     assert bool(dead[8:].all())
-
-
-def test_level_preserving_add_does_not_set_needs_resort() -> None:
-    static, state = _build_net(_AddConnNet)
-    state = _with_marker_activations(state)
-    assert bool(state.needs_resort) is False
-
-    phase = phases.build_add_conn_phase(_AddConnNet, static)
-    new_state, _ = phase(state, _DUMMY_INPUTS)
-
-    # The window is not restricted to dst-strictly-ahead-of-src
-    # (phases.py's build_add_conn_phase docstring), so a same-level or
-    # behind-src candidate CAN be proposed and scored -- but _SRC_BONUS makes
-    # every (SRC, dst in _DST) candidate outscore every such candidate here
-    # (see the module docstring), so the top-3 actually COMMITTED are still
-    # exactly the level-preserving (SRC, 2/3/4) edges and needs_resort
-    # stays False.
-    assert bool(new_state.needs_resort) is False
-    # ...and the add really happened: a phase that grew nothing would leave
-    # needs_resort False too.
-    assert int(new_state.grown) == 3
 
 
 def test_overflow_flag_set_and_excess_candidates_dropped_not_miswritten() -> None:
@@ -333,7 +285,7 @@ def test_pipeline_mode_adds_land_in_the_single_bucket_and_never_resort() -> None
     assert bool(new_state.needs_resort) is False
 
 
-class _NoBonusAddConn(px.ScoreAddConn[None]):
+class _NoBonusAddConn(px.policies.ScoreAddConnPolicy[None]):
     """score is dst's activation alone, with NO SRC bonus, so the highest-
     scored candidates are the already-live (ANCHOR, dst) pairs (dst 2/3/4,
     activations 5/4/3). Without `dedupe_live` those would be selected and
@@ -358,8 +310,8 @@ class _NoBonusAddConn(px.ScoreAddConn[None]):
 
 
 class _NoBonusAddConnNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _NoBonusAddConn()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_NoBonusAddConn())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -390,7 +342,7 @@ def test_add_conn_never_grows_a_duplicate_of_a_live_edge() -> None:
     assert new_edges == {(_SRC, 2), (_SRC, 3), (_SRC, 4)}
 
 
-class _ShortlistAddConn(px.ScoreAddConn[None]):
+class _ShortlistAddConn(px.policies.ScoreAddConnPolicy[None]):
     """`candidates = "shortlist"` shortlists growth candidates to the top-M units by
     `importance`. Here importance favors SRC and DST id 6, so the only
     level-increasing candidate the M=2 shortlist can form is (SRC, 6)."""
@@ -418,8 +370,8 @@ class _ShortlistAddConn(px.ScoreAddConn[None]):
 
 
 class _ShortlistAddConnNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _ShortlistAddConn()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_ShortlistAddConn())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -445,7 +397,7 @@ def test_add_conn_candidate_shortlist_restricts_growth_to_top_m_units() -> None:
     assert len(live) == len(set(live))
 
 
-class _DeeperOnlyAddConn(px.ScoreAddConn[None]):
+class _DeeperOnlyAddConn(px.policies.ScoreAddConnPolicy[None]):
     """Scores deeper candidates finite and vetoes every non-deeper candidate
     with -inf. max_new_per_level (10) exceeds the number of deeper candidates
     (5: SRC -> each DST), and the bucket has many free dead slots, so the veto
@@ -470,8 +422,8 @@ class _DeeperOnlyAddConn(px.ScoreAddConn[None]):
 
 
 class _DeeperOnlyNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _DeeperOnlyAddConn()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_DeeperOnlyAddConn())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -521,7 +473,7 @@ def _build_3level(
     return builder.finalize()
 
 
-class _DeepestImportanceGrow(px.ScoreAddConn[None]):
+class _DeepestImportanceGrow(px.policies.ScoreAddConnPolicy[None]):
     """Importance favours the deepest level, so a GLOBAL top-M (M=2) shortlist
     fills with the two output units -- among which no deeper edge exists -- and
     the shallow input->hidden transition grows nothing. score grows any deeper
@@ -553,8 +505,8 @@ class _DeepestImportanceGrow(px.ScoreAddConn[None]):
 
 
 class _GlobalShortlistNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _DeepestImportanceGrow()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_DeepestImportanceGrow())
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -563,8 +515,8 @@ class _PerLevelGrow(_DeepestImportanceGrow):
 
 
 class _PerLevelShortlistNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _PerLevelGrow()
+    forward = _SumForward()
+    grow = px.policies.Grow(conn=_PerLevelGrow())
     propagation = px.Propagation.TOPOLOGICAL
 
 

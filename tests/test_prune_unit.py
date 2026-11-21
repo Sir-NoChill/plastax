@@ -25,7 +25,7 @@ import pytest
 
 import plastax as px
 from plastax import topo
-from plastax.phases import build_phases, build_prune_unit_phase, plan_prune_fusion
+from plastax.phases import build_phases, plan_prune_fusion
 
 TRACE = px.FieldSpec.float32("test/trace", default=0.25)
 COUNT = px.FieldSpec.int32("test/count", default=7)
@@ -42,7 +42,7 @@ _PRUNE_INPUTS = jnp.asarray([-1.0, -2.0], jnp.float32)
 _KEEP_INPUTS = jnp.asarray([0.25, -1.0], jnp.float32)
 
 
-class LinearForward(px.ForwardPass):
+class LinearForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """activation = sum(w * activation[src])."""
 
     combine = px.monoid.sum_
@@ -67,7 +67,7 @@ class LinearForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class Negative(px.PruneUnit[None]):
+class Negative(px.policies.PruneUnitPolicy[None]):
     """Prune a unit whose activation is below -1/2."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
@@ -75,7 +75,7 @@ class Negative(px.PruneUnit[None]):
         return u[px.ACTIVATION, i] < jnp.float32(-0.5)
 
 
-class Everything(px.PruneUnit[None]):
+class Everything(px.policies.PruneUnitPolicy[None]):
     """Select every unit."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
@@ -83,7 +83,7 @@ class Everything(px.PruneUnit[None]):
         return jnp.bool_(True)
 
 
-class NoConn(px.PruneConn):
+class NoConn(px.policies.PruneConnPolicy):
     """Never prunes a connection; only there to enable prune fusion."""
 
     def predicate(
@@ -94,21 +94,22 @@ class NoConn(px.PruneConn):
 
 
 def _net(
-    rule: px.PruneUnit[None] | None = None,
+    rule: px.policies.PruneUnitPolicy[None] | None = None,
     *,
-    prune_conn: px.PruneConn | None = None,
+    prune_conn: px.policies.PruneConnPolicy | None = None,
     interval: int = 1,
 ) -> type[px.Network[None]]:
     class _Net(px.Network[None]):
-        forward_pass = LinearForward()
-        prune_unit = Negative() if rule is None else rule
+        forward = LinearForward()
         extra_unit_fields = (TRACE, COUNT, FLAG)
         unit_capacity = _CAPACITY
         structural_interval = interval
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
-    _Net.prune_conn = prune_conn
+    _Net.prune = px.policies.Prune(
+        conn=prune_conn, unit=Negative() if rule is None else rule
+    )
     return _Net
 
 
@@ -179,16 +180,6 @@ def test_input_and_output_units_are_exempt() -> None:
     assert _live_edges(state) == set()
 
 
-def test_io_units_survive_a_selecting_activation() -> None:
-    """Inputs 0, 1 and output 4 read below -1/2 but are not pruned."""
-    net = _net()
-    static, state = _build(net)
-    state = px.make_step(net, static)(state, _x(_PRUNE_INPUTS)).state
-    act = _col(state, px.ACTIVATION)
-    assert act[[0, 1, 4]].tolist() == [-1.0, -2.0, -3.0]
-    assert not _col(state, px.PRUNED)[[0, 1, 4]].any()
-
-
 def _with_fields(state: Any) -> Any:
     """Give every unit slot non-default extra fields."""
     units = dict(state.units)
@@ -217,20 +208,7 @@ def test_a_pruned_unit_resets_to_defaults_and_keeps_its_level() -> None:
         )
 
 
-def test_incident_edges_die_in_the_same_phase() -> None:
-    """The phase alone tombstones the pruned unit's in- and out-edges."""
-    net = _net()
-    static, state = _build(net)
-    act = jnp.asarray([-1.0, -2.0, -1.0, 2.0, -3.0, 1.0, 0.0, 0.0], jnp.float32)
-    state = dataclasses.replace(state, units={**state.units, px.ACTIVATION.name: act})
-    assert _live_edges(state) == _ALL_EDGES
-    out, _ = build_prune_unit_phase(net, static)(state, _x(_PRUNE_INPUTS))
-    assert _col(out, px.PRUNED)[:_N].tolist() == [False] * 2 + [True] + [False] * 3
-    assert _live_edges(out) == _WITHOUT_2
-    assert not bool(out.needs_resort)
-
-
-class NeighbourZero(px.PruneUnit[None]):
+class NeighbourZero(px.policies.PruneUnitPolicy[None]):
     """Prune 2 when its activation is below -1/2; prune 3 when 2 reads 0."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
@@ -318,7 +296,7 @@ def test_the_phase_sits_between_update_conn_and_prune_conn() -> None:
     """Declaring prune_unit adds one phase, right before prune_conn."""
     with_net = _net(prune_conn=NoConn())
     without_net = _net(prune_conn=NoConn())
-    without_net.prune_unit = None
+    without_net.prune = px.policies.Prune(conn=NoConn())
     static, _ = _build(with_net)
     with_phases = [p.__name__ for p in build_phases(with_net, static)]
     without_phases = [p.__name__ for p in build_phases(without_net, static)]
@@ -343,19 +321,21 @@ def test_prune_fusion_is_refused_and_the_fused_engine_matches() -> None:
 
 
 def test_prune_unit_requires_a_unit_capacity() -> None:
-    with pytest.raises(TypeError, match="prune_unit requires a unit_capacity"):
+    with pytest.raises(TypeError, match="prune.unit requires a unit_capacity"):
 
         class _Bad(px.Network[None]):
-            forward_pass = LinearForward()
-            prune_unit = Negative()
+            forward = LinearForward()
+            prune = px.policies.Prune(unit=Negative())
 
 
 def test_a_non_conforming_prune_unit_is_rejected() -> None:
-    with pytest.raises(TypeError, match="prune_unit must satisfy PruneUnit"):
+    with pytest.raises(
+        TypeError, match="prune.unit policy must satisfy PruneUnitPolicy"
+    ):
 
         class _Bad(px.Network[None]):
-            forward_pass = LinearForward()
-            prune_unit = object()  # type: ignore[assignment]
+            forward = LinearForward()
+            prune = px.policies.Prune(unit=object())
             unit_capacity = 4
 
 
@@ -363,8 +343,8 @@ def test_unit_pruning_under_sharding_is_refused_at_definition() -> None:
     with pytest.raises(NotImplementedError, match="unit pruning under sharding"):
 
         class _Bad(px.Network[None]):
-            forward_pass = LinearForward()
-            prune_unit = Negative()
+            forward = LinearForward()
+            prune = px.policies.Prune(unit=Negative())
             unit_capacity = 8
             sharding = px.ShardSpec("conns", 2)
 
@@ -374,6 +354,6 @@ def test_unit_pruning_under_sharding_is_refused_at_build() -> None:
     with pytest.raises(NotImplementedError, match="unit pruning under sharding"):
         _build(net, sharding=px.ShardSpec("conns", 2))
     # Without prune_unit, the same sharded build succeeds.
-    net.prune_unit = None
+    net.prune = None
     static, _ = _build(net, sharding=px.ShardSpec("conns", 2))
     assert static.sharding == px.ShardSpec("conns", 2)

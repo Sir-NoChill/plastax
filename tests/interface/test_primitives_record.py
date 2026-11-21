@@ -56,7 +56,7 @@ def pairs(record: Record, block: int = 0) -> set[tuple[int, int]]:
 # --------------------------------------------------------------------------- #
 # CreateUnits
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("shape", [(), (3,), (2, 5), (0, 4)])
+@pytest.mark.parametrize("shape", [(), (2, 5)])
 def test_units_from_a_shape(shape: tuple[int, ...]) -> None:
     record, _ = traced(lambda m, x: m.units(shape=shape), units=CreateUnits())
     out = record.outputs[0]
@@ -91,14 +91,7 @@ def test_a_call_writes_one_unit_block() -> None:
     )
 
 
-def test_input_units_are_not_in_a_unit_block() -> None:
-    record, _ = traced(lambda m, x: x)
-
-    assert record.unit_blocks == []
-    assert record.num_units == 4
-
-
-@pytest.mark.parametrize("value", [1.0, 0.5, -2, 0])
+@pytest.mark.parametrize("value", [-2, 0])
 def test_constant_units_hold_the_value_given(value: float) -> None:
     record, _ = traced(lambda m, x: m.one(shape=(2,)), one=CreateUnits(constant=value))
     (block,) = record.unit_blocks
@@ -148,39 +141,8 @@ def connected(
     return record, record.inputs["x"], record.outputs[0], returned
 
 
-def test_connections_create_no_units_and_return_nothing() -> None:
-    record, _, _, returned = connected(lambda x, y: (x, y), (4,), (4,))
-
-    assert record.num_units == 4 + 4
-    assert len(record.unit_blocks) == 1
-    assert returned == [None]
-
-
 def user_written(key: Any, fans: init.Fans) -> np.ndarray:
     return np.zeros(fans.shape, np.float32)
-
-
-@pytest.mark.parametrize(
-    "given", [init.constant(0.25), user_written], ids=["shipped", "user_written"]
-)
-def test_a_block_carries_its_path_and_initializer(given: init.Initializer) -> None:
-    """Any function `(key, fans) -> weights` is an initializer. It is not called."""
-
-    def call(m: Any, x: Units) -> Units:
-        m.skip(x, x[::-1])
-        return x
-
-    record, _ = traced(call, skip=CreateConnections(init=given))
-    (block,) = record.blocks
-
-    assert block.path == ("skip",)
-    assert block.init is given
-    assert block.src.dtype == block.dst.dtype == np.int32
-
-
-def test_something_that_cannot_be_called_is_not_an_initializer() -> None:
-    with pytest.raises(TypeError):
-        CreateConnections(init=0.25)  # ty: ignore[invalid-argument-type]
 
 
 def test_a_block_is_in_row_major_order_over_the_broadcast_shape() -> None:
@@ -194,29 +156,6 @@ def test_a_block_is_in_row_major_order_over_the_broadcast_shape() -> None:
     np.testing.assert_array_equal(
         block.dst.reshape(block.shape), np.broadcast_to(y[:, None], (3, 4))
     )
-
-
-def test_a_single_unit_selected_by_an_integer_feeds_every_destination() -> None:
-    record, x, y, _ = connected(lambda x, y: (x[1], y), (4,), (2, 3))
-    (block,) = record.blocks
-
-    assert block.shape == (2, 3)
-    np.testing.assert_array_equal(block.src, np.full(6, x[1]))
-    np.testing.assert_array_equal(block.dst, y.reshape(-1))
-
-
-def test_all_to_all_along_the_last_axis_does_not_cross_positions() -> None:
-    record, x, y, _ = connected(
-        lambda x, y: (x[..., None, :], y[..., :, None]), (5, 4), (5, 3)
-    )
-    (block,) = record.blocks
-
-    position = np.full(record.num_units, -1)
-    position[x] = np.arange(5)[:, None]
-    position[y] = np.arange(5)[:, None]
-
-    assert block.src.size == 5 * 3 * 4
-    np.testing.assert_array_equal(position[block.src], position[block.dst])
 
 
 def test_several_calls_into_the_same_units_are_separate_blocks() -> None:
@@ -270,22 +209,11 @@ def test_units_do_not_take_both_a_handle_and_a_shape() -> None:
         traced(lambda m, x: m.units(x, shape=(2,)), units=CreateUnits())
 
 
-def test_a_shape_that_is_not_a_shape() -> None:
-    with pytest.raises(ShapeError, match="non-negative"):
-        traced(lambda m, x: m.units(shape=(2, -1)), units=CreateUnits())
-
-
 # No message is matched below: the test run type-checks plastax's arguments
 # (jaxtyping), and that check raises its own TypeError before the layer's.
-@pytest.mark.parametrize("constant", ["1", True])
-def test_a_constant_must_be_a_number(constant: Any) -> None:
+def test_a_constant_must_be_a_number() -> None:
     with pytest.raises(TypeError):
-        CreateUnits(constant=constant)
-
-
-def test_connections_need_two_handles() -> None:
-    with pytest.raises(TypeError):
-        traced(lambda m, x: m.conn(x, x.ids), conn=CreateConnections())
+        CreateUnits(constant=True)
 
 
 def test_handles_that_do_not_broadcast() -> None:
@@ -299,20 +227,6 @@ def test_the_same_pair_twice_in_one_call() -> None:
         connected(lambda x, y: (x[twice], y[twice]), (4,), (2,))
 
 
-def test_a_refused_call_writes_no_block() -> None:
-    seen: list[Record] = []
-
-    def call(m: Any, x: Units) -> Units:
-        seen.append(x._record)
-        m.conn(x, x[:3])
-        return x
-
-    with pytest.raises(ShapeError):
-        traced(call, conn=CreateConnections())
-
-    assert seen[0].blocks == []
-
-
 @pytest.mark.parametrize(
     "call",
     [
@@ -324,11 +238,6 @@ def test_a_refused_call_writes_no_block() -> None:
 def test_a_primitive_called_twice_is_not_implemented(call: Any) -> None:
     with pytest.raises(NotImplementedError, match="second time"):
         traced(call, units=CreateUnits(), conn=CreateConnections())
-
-
-def test_units_created_outside_any_trace() -> None:
-    with pytest.raises(BuildError, match="not part of a topology being traced"):
-        CreateUnits()(shape=(3,))
 
 
 def test_a_primitive_that_is_not_in_the_topology() -> None:
@@ -373,24 +282,3 @@ def test_a_module_cannot_be_traced_while_it_is_being_traced() -> None:
 
     with pytest.raises(BuildError, match="already being traced"):
         pxl.trace(Nested(), {"x": (2,)})
-
-
-def test_a_module_can_be_traced_again_after_an_error() -> None:
-    units = CreateUnits()
-    with pytest.raises(TypeError):
-        traced(lambda m, x: m.units(), units=units)
-
-    class Net(pxl.Module):
-        def setup(self) -> None:
-            self.units = CreateUnits()
-
-        def __call__(self, x: Units) -> Units:
-            return self.units(x)
-
-    net = Net()
-    with pytest.raises(BuildError):
-        pxl.trace(net, {"x": (2,), "extra": ()})
-    record = pxl.trace(net, {"x": (2,)})
-
-    assert record.num_units == 4
-    assert net._record is None

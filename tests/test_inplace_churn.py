@@ -33,7 +33,7 @@ def _hash01(a: jax.Array, b: jax.Array, c: jax.Array) -> jax.Array:
     return (h >> jnp.uint32(8)).astype(jnp.float32) / jnp.float32(1 << 24)
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -55,7 +55,7 @@ class _SumForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _HashPrune(px.PruneConn):
+class _HashPrune(px.policies.PruneConnPolicy):
     def predicate(
         self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: dict[str, jax.Array]
     ) -> jax.Array:
@@ -63,7 +63,7 @@ class _HashPrune(px.PruneConn):
         return _hash01(c[px.FROM_ID, cid], c[px.TO_ID, cid], g["step"]) < _KILL_P
 
 
-class _HashGrow(px.ScoreAddConn):
+class _HashGrow(px.policies.ScoreAddConnPolicy):
     dedupe_live = True  # pre-L4 grid default: never regrow a live edge
     max_new_per_level = 32
 
@@ -80,15 +80,15 @@ class _HashGrow(px.ScoreAddConn):
         return px.ConnWrite.of((px.WEIGHT, _hash01(dst, src, g["step"]) - 0.5))
 
 
-class _Tick(px.ResetGlobal):
+class _Tick(px.policies.ResetGlobalPolicy):
     def reset(self, g: dict[str, jax.Array]) -> dict[str, jax.Array]:
         return {"step": g["step"] + 1}
 
 
 class _ChurnNet(px.Network[dict[str, jax.Array]]):
-    forward_pass = _SumForward()
-    prune_conn = _HashPrune()
-    add_conn = _HashGrow()
+    forward = _SumForward()
+    prune = px.policies.Prune(conn=_HashPrune())
+    grow = px.policies.Grow(conn=_HashGrow())
     reset_global = _Tick()
     propagation = px.Propagation.TOPOLOGICAL
 
@@ -178,7 +178,7 @@ def test_forward_is_exact_on_buckets_scrambled_by_in_place_churn() -> None:
 _FANOUT = 2
 
 
-class _FanoutGrow(px.ProposeAddConn[dict[str, jax.Array]]):
+class _FanoutGrow(px.policies.ProposeAddConnPolicy[dict[str, jax.Array]]):
     """Each unit proposes _FANOUT random partners; only src < dst (a DAG)."""
 
     proposer = "global"
@@ -205,7 +205,7 @@ class _FanoutGrow(px.ProposeAddConn[dict[str, jax.Array]]):
         return px.ConnWrite.of((px.WEIGHT, _hash01(dst, src, g["step"]) - 0.5))
 
 
-class _SlowPrune(px.PruneConn):
+class _SlowPrune(px.policies.PruneConnPolicy):
     def predicate(
         self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: dict[str, jax.Array]
     ) -> jax.Array:
@@ -214,16 +214,16 @@ class _SlowPrune(px.PruneConn):
 
 
 class _GrowingNet(px.Network[dict[str, jax.Array]]):
-    forward_pass = _SumForward()
-    prune_conn = _SlowPrune()
-    add_conn = _FanoutGrow()
+    forward = _SumForward()
+    prune = px.policies.Prune(conn=_SlowPrune())
+    grow = px.policies.Grow(conn=_FanoutGrow())
     reset_global = _Tick()
     propagation = px.Propagation.TOPOLOGICAL
-    batch_reduction = px.MeanFloatFirstRest()
+    batch_reduction = px.policies.MeanFloatFirstRest()
 
 
 class _ForwardOnly(px.Network[dict[str, jax.Array]]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 

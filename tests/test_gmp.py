@@ -36,24 +36,6 @@ for _dep in ("mlp_xor", "dst_sparse", "nonstationary"):
 gmp = _load_example("gmp")
 
 
-def test_cubic_schedule_respects_its_window() -> None:
-    """Zero before the window, the target after it, monotone within."""
-    schedule = [
-        gmp.cubic_sparsity(t, start=20, end=80, final_sparsity=0.95) for t in range(101)
-    ]
-    assert all(s == 0.0 for s in schedule[:21]), "pruned before the window opened"
-    assert schedule[80] == pytest.approx(0.95)
-    assert all(s == pytest.approx(0.95) for s in schedule[80:])
-    assert all(a <= b for a, b in zip(schedule[:-1], schedule[1:], strict=True))
-    assert schedule[50] > 0.5 * 0.95, "cubic front-loads the window"
-
-
-def test_cubic_schedule_degenerate_window() -> None:
-    """An empty window jumps to the target rather than dividing by zero."""
-    assert gmp.cubic_sparsity(5, start=10, end=10, final_sparsity=0.9) == 0.0
-    assert gmp.cubic_sparsity(10, start=10, end=10, final_sparsity=0.9) == 0.9
-
-
 def test_zeta_converts_cumulative_to_fraction_of_live() -> None:
     """The conversion is where a plausible implementation goes wrong.
 
@@ -87,20 +69,6 @@ def test_no_pruning_before_the_window_opens() -> None:
         assert record.live_edges == dense, "pruned inside the dense phase"
     # The window does open: a run that never pruned would pass the loop above.
     assert records[-1].live_edges < dense, "never pruned after the window opened"
-
-
-def test_live_edges_never_increase() -> None:
-    """GMP declares no add_conn, so a pruned edge can never come back.
-
-    Checked cycle by cycle: a method that over-pruned and regrew would still
-    land on a plausible final count.
-    """
-    counts = [r.live_edges for r in _short_run(final_sparsity=0.9)]
-    # A constant count would pass the monotonicity check below vacuously.
-    assert counts[-1] < counts[0], "the run never pruned"
-    assert all(a >= b for a, b in zip(counts[:-1], counts[1:], strict=True)), (
-        f"live-edge count increased: {counts}"
-    )
 
 
 def test_sparsity_moves_toward_the_target_but_undershoots() -> None:

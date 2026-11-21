@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 import plastax as px
-from plastax.phases import build_phases, plan_prune_fusion
+from plastax.phases import plan_prune_fusion
 
 GRAD = px.FieldSpec.float32("test/grad")
 LOSS_GRAD = px.FieldSpec.float32("test/loss_grad")
@@ -31,7 +31,7 @@ _DST = np.asarray([2, 2, 3, 3], np.int32)
 _W = np.asarray([0.5, -0.25, 0.75, 0.375], np.float32)
 
 
-class Forward(px.ForwardPass):
+class Forward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """activation = sum(w * activation[src]) + 1."""
 
     combine = px.monoid.sum_
@@ -56,7 +56,7 @@ class Forward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc + jnp.float32(1.0)))
 
 
-class Backward(px.BackwardPass):
+class Backward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """grad = sum(w * grad[dst]) + loss_grad."""
 
     combine = px.monoid.sum_
@@ -81,7 +81,7 @@ class Backward(px.BackwardPass):
         return px.UnitWrite.of((GRAD, acc + u[LOSS_GRAD, i]))
 
 
-class Loss(px.Loss):
+class Loss(px.policies.LossPolicy):
     """sum(0.5 * (activation - target)^2), seeding the difference."""
 
     seed_field = LOSS_GRAD
@@ -94,7 +94,7 @@ class Loss(px.Loss):
         return jnp.sum(jnp.float32(0.5) * diff * diff), diff
 
 
-class Trace(px.UpdateUnit[None]):
+class Trace(px.policies.UpdateUnitPolicy[None]):
     """trace = trace / 2 + grad * activation + 1."""
 
     def update(self, u: px.UnitView, i: px.UnitIdx, g: None) -> px.UnitWrite:
@@ -107,7 +107,7 @@ class Trace(px.UpdateUnit[None]):
         return px.UnitWrite.of((TRACE, value))
 
 
-class TraceRule(px.UpdateConn):
+class TraceRule(px.policies.UpdateConnPolicy):
     """w -= lr * trace[dst] * activation[src]."""
 
     def incoming(
@@ -142,15 +142,14 @@ def _net(
     rule = Trace() if update_unit else None
 
     class _Net(px.Network[None]):
-        forward_pass = Forward()
-        backward_pass = Backward()
+        forward = Forward()
+        backward = Backward()
         loss = Loss()
-        update_unit = rule
-        update_conn = TraceRule()
+        update = px.policies.Update(conn=TraceRule(), unit=rule)
         extra_unit_fields = (GRAD, LOSS_GRAD, TRACE)
         unit_capacity = capacity
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     return _Net
 
@@ -243,18 +242,6 @@ def test_update_unit_skips_slots_holding_no_live_unit() -> None:
     assert (trace[[0, 1, 3]] != 0.0).all()
 
 
-def test_the_phase_sits_between_backward_and_update_conn() -> None:
-    """Declaring update_unit adds exactly one phase, before update_conn."""
-    with_net, without_net = _net(), _net(update_unit=False)
-    static, _ = _build(with_net)
-    with_phases = build_phases(with_net, static)
-    without_phases = build_phases(without_net, static)
-    assert len(with_phases) == len(without_phases) + 1
-    names = [p.__name__ for p in with_phases]
-    assert names.index("update_unit_phase") == names.index("update_conn_phase") - 1
-    assert "update_unit_phase" not in [p.__name__ for p in without_phases]
-
-
 @pytest.mark.parametrize("layout", ["edge_list", "triton"])
 def test_a_batch_of_one_is_the_streaming_step(layout: str) -> None:
     """update_unit runs per sample before update_conn, as when streaming."""
@@ -306,14 +293,16 @@ def test_a_batch_averages_the_per_sample_unit_updates() -> None:
 
 
 def test_a_non_conforming_update_unit_is_rejected() -> None:
-    with pytest.raises(TypeError, match="update_unit must satisfy UpdateUnit"):
+    with pytest.raises(
+        TypeError, match="update unit policy must satisfy UpdateUnitPolicy"
+    ):
 
         class _Bad(px.Network[None]):
-            forward_pass = Forward()
-            update_unit = object()  # type: ignore[assignment]
+            forward = Forward()
+            update = px.policies.Update(unit=object())
 
 
-class _TracePrune(px.PruneConn):
+class _TracePrune(px.policies.PruneConnPolicy):
     """Reads TRACE, which update_unit writes between forward and prune."""
 
     def predicate(
@@ -326,12 +315,13 @@ class _TracePrune(px.PruneConn):
 def test_prune_fusion_sees_the_unit_update_between_forward_and_prune() -> None:
     """A predicate reading a field update_unit writes is not fused."""
     net = _net()
-    net.prune_conn = _TracePrune()
-    net.update_conn = None
+    net.prune = px.policies.Prune(conn=_TracePrune())
+    unit_update = net.update.unit
+    net.update = px.policies.Update(unit=unit_update)
     static, state = _build(net)
     plan = plan_prune_fusion(net, static, state.globals_, engine="xla")
     assert not plan.fused
     assert "test/trace" in plan.reason
-    net.update_unit = None
+    net.update = None
     plan = plan_prune_fusion(net, static, state.globals_, engine="xla")
     assert plan.fused, plan

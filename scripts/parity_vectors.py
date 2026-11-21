@@ -79,7 +79,9 @@ class _WeightedSumMap:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
 
-class SigmoidForward(_WeightedSumMap, px.ForwardPass):
+class SigmoidForward(
+    _WeightedSumMap, px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy
+):
     """apply = sigmoid(acc). Mirrors the fixture's SigmoidForward."""
 
     def apply(
@@ -90,7 +92,7 @@ class SigmoidForward(_WeightedSumMap, px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, jax.nn.sigmoid(acc)))
 
 
-class SigmoidBackward(px.BackwardPass):
+class SigmoidBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """Reverse walk: dL/da -> dL/dz through the sigmoid derivative.
 
     `map`'s first unit-id argument is the accumulator target, which for the
@@ -128,7 +130,7 @@ class SigmoidBackward(px.BackwardPass):
         return px.UnitWrite.of((GRAD_PRE_ACT, grad))
 
 
-class MSELoss(px.Loss):
+class MSELoss(px.policies.LossPolicy):
     """L = 0.5*sum((pred - target)^2); seed dL/dpred = pred - target.
 
     Matches plastax::MSELoss, which seeds the same gradient into BackwardAcc.
@@ -345,13 +347,13 @@ def _optim_net(update_conn: Any, extra_conn_fields: tuple[Any, ...]) -> Any:
     """
 
     class _OptimNet(px.Network[None]):
-        forward_pass = SigmoidForward()
-        backward_pass = SigmoidBackward()
+        forward = SigmoidForward()
+        backward = SigmoidBackward()
         loss = MSELoss()
         propagation = px.Propagation.TOPOLOGICAL
         extra_unit_fields = (GRAD_PRE_ACT, LOSS_GRAD)
 
-    _OptimNet.update_conn = update_conn
+    _OptimNet.update = px.policies.Update(conn=update_conn)
     _OptimNet.extra_conn_fields = extra_conn_fields
     return _OptimNet
 
@@ -438,7 +440,7 @@ def _optim_vectors() -> tuple[Vector, ...]:
                 f"{description} Same net, inputs and seeds as mlp_xor_seeded, so "
                 "the update rule is the only difference between these vectors."
             ),
-            net=_optim_net(bundle.update_conn(), bundle.state_fields),
+            net=_optim_net(bundle.update().conn, bundle.conn_fields),
             input_dim=3,
             layers=(Layer(4, UniformInit(seed=1)), Layer(1, UniformInit(seed=2))),
             steps=steps,

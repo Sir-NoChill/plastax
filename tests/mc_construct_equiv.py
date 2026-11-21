@@ -65,7 +65,7 @@ def _worker(pid: int, port: int) -> None:
     from plastax.distributed import _addressable_window, _shardings_for_spec
     from plastax.views import UnitWrite
 
-    class _SumForward(px.ForwardPass):
+    class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
         combine = px.monoid.sum_
 
         def map(
@@ -85,7 +85,7 @@ def _worker(pid: int, port: int) -> None:
             return UnitWrite.of((px.ACTIVATION, acc))
 
     class _Net(px.Network[None]):
-        forward_pass = _SumForward()
+        forward = _SumForward()
         propagation = px.Propagation.TOPOLOGICAL
 
     froms, tos = _edges()

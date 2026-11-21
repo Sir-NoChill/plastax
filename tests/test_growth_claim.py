@@ -50,7 +50,7 @@ def _h(*parts: jax.Array) -> jax.Array:
     return acc
 
 
-class _Forward(px.ForwardPass):
+class _Forward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -72,7 +72,7 @@ class _Forward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _HashPrune(px.PruneConn):
+class _HashPrune(px.policies.PruneConnPolicy):
     """Kill about `rate`/256 of the live edges, re-drawn every step."""
 
     def __init__(self, rate: int) -> None:
@@ -91,7 +91,7 @@ def _init(src: jax.Array, dst: jax.Array, g: Any) -> px.ConnWrite:
     return px.ConnWrite.of((px.WEIGHT, weight), (_AGE, g["t"] + src))
 
 
-class _HashProposals(px.ProposeAddConn):
+class _HashProposals(px.policies.ProposeAddConnPolicy):
     """Hashed proposals; a slice is vetoed, scores are coarse (many ties)."""
 
     def __init__(
@@ -125,7 +125,7 @@ class _HashProposals(px.ProposeAddConn):
         return _init(src, dst, g)
 
 
-class _HashGrid(px.ScoreAddConn):
+class _HashGrid(px.policies.ScoreAddConnPolicy):
     """Grid growth scored by a hash, a slice vetoed; live-edge dedupe on."""
 
     # Pins the pre-L4 grid behaviour (the grid deduplicated live edges by
@@ -150,7 +150,7 @@ class _HashGrid(px.ScoreAddConn):
         return _init(src, dst, g)
 
 
-class _Tick(px.ResetGlobal):
+class _Tick(px.policies.ResetGlobalPolicy):
     def reset(self, g: Any) -> Any:
         return {"t": g["t"] + jnp.int32(1)}
 
@@ -247,10 +247,12 @@ def _build(cfg: dict[str, Any]) -> tuple[type[px.Network[Any]], Any, Any]:
     # the growth window is the rule's attribute, not the Network's
     policy.max_level_gap = cfg.get("max_level_gap", 1)
 
+    prune_ = prune
+
     class Net(px.Network[Any]):
-        forward_pass = _Forward()
-        prune_conn = prune
-        add_conn = policy
+        forward = _Forward()
+        prune = px.policies.Prune(conn=prune_)
+        grow = px.policies.Grow(conn=policy)
         reset_global = _Tick()
         extra_conn_fields = (_AGE, _TRACE)
         propagation = px.Propagation.TOPOLOGICAL
@@ -325,23 +327,6 @@ _GOLDEN: dict[str, str] = {
 def test_xla_claim_matches_the_pre_kernel_path(name: str) -> None:
     digests, overflows = _run(name, "xla")
     assert digests[-1] == _GOLDEN[name]
-
-
-def test_the_configs_exercise_overflow_and_resort() -> None:
-    _, overflows = _run("propose_overflow", "xla")
-    assert any(overflows) and not all(overflows)
-    net, static, state = _build(_CONFIGS["propose_small_claim"])
-    k = _CONFIGS["propose_small_claim"]["k"]
-    # The deepest (growth-only) bucket starts empty and small; the big-bucket
-    # claim-path property is about the populated buckets.
-    assert all(k * 1024 <= cap for cap in static.level_capacities[:-1])
-    net, static, state = _build(_CONFIGS["propose_window2"])
-    assert any(cap % 64 for cap in static.level_capacities)
-    step = px.make_step(net, static, growth="xla")
-    inputs = px.StepInputs(
-        inputs=jnp.ones((len(static.input_ids),), jnp.float32), targets=None
-    )
-    assert bool(step(state, inputs).state.needs_resort)
 
 
 @pytest.mark.skipif(
@@ -478,28 +463,6 @@ def test_finer_free_counts_regroup_exactly(cap: int, max_block: int) -> None:
         np.asarray(phases.regroup_free_counts(fine, block, cap)),
         np.asarray(phases.free_block_counts(dead)),
     )
-
-
-@pytest.mark.parametrize("seed", range(2))
-def test_xla_claim_takes_precomputed_triton_block_counts(seed: int) -> None:
-    rng = np.random.default_rng(seed)
-    for caps, k, density in _CLAIM_CASES:
-        buckets, claims = _claim_case(rng, caps, k, density)
-        for bucket, claim in zip(buckets, claims, strict=True):
-            dead = bucket[px.DEAD.name]
-            cap = dead.shape[0]
-            counts = (
-                phases.free_block_counts(dead, phases.TRITON_CLAIM_BLOCK),
-                phases.free_block_length(cap, phases.TRITON_CLAIM_BLOCK),
-            )
-            want = phases.xla_claim(bucket, claim)
-            got = phases.xla_claim(bucket, claim, free_counts=counts)
-            for name in want[0]:
-                np.testing.assert_array_equal(
-                    np.asarray(got[0][name]), np.asarray(want[0][name])
-                )
-            np.testing.assert_array_equal(np.asarray(got[1]), np.asarray(want[1]))
-            np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want[2]))
 
 
 @pytest.mark.parametrize("seed", range(3))

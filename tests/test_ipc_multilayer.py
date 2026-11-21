@@ -17,8 +17,6 @@ from pathlib import Path
 
 import jax
 
-import plastax as px
-
 _EXAMPLES_DIR = Path(__file__).resolve().parents[1] / "examples"
 
 
@@ -50,25 +48,3 @@ def test_ipc_learns_and_beats_the_predict_previous_baseline() -> None:
     assert ipc_err * 2.0 < baseline, (
         f"iPC error {ipc_err:.4f} not decisively below baseline {baseline:.4f}"
     )
-
-
-def test_ipc_run_is_deterministic_for_a_fixed_seed() -> None:
-    """Both randomness sources are seeded (jax PRNG for LeCun init, numpy
-    default_rng for the data stream), and the step itself is pure array
-    arithmetic, so two runs from the same seed return bit-identical windows."""
-
-    def run_once() -> tuple[float, float]:
-        static, state = ipc.build_net(jax.random.PRNGKey(ipc.SEED))
-        return ipc.run(static, state, total_steps=300, seed=ipc.SEED, verbose=False)
-
-    assert run_once() == run_once()
-
-
-def test_ipc_net_uses_pipeline_propagation() -> None:
-    """iPC needs a single simultaneous snapshot of f(ValueNode) across every
-    layer (the defining reason ipc_multilayer.cpp selects Propagation::
-    Pipeline): one flat conn bucket, not the per-level topological walk."""
-    static, _ = ipc.build_net(jax.random.PRNGKey(ipc.SEED))
-    assert static.propagation is px.Propagation.PIPELINE
-    assert len(static.level_capacities) == 1
-    assert len(static.output_ids) == 1

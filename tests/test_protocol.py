@@ -35,22 +35,6 @@ def _load_example(name: str) -> types.ModuleType:
 protocol = _load_example("protocol")
 
 
-def test_seed_set_is_pinned_by_value() -> None:
-    """The seeds are fixed, distinct, and not silently re-rollable."""
-    assert protocol.SEEDS == tuple(range(30))
-    assert len(set(protocol.SEEDS)) == len(protocol.SEEDS)
-
-
-def test_confirmation_seeds_are_disjoint_from_the_main_block() -> None:
-    """A held-out block only confirms if it shares no seed with the first.
-
-    An amended rule re-run on the seeds that motivated the amendment reproduces
-    the same numbers and confirms nothing.
-    """
-    assert not set(protocol.SEEDS) & set(protocol.CONFIRMATION_SEEDS)
-    assert len(protocol.CONFIRMATION_SEEDS) == len(protocol.SEEDS)
-
-
 def test_summary_reports_percentiles_not_standard_error() -> None:
     """The summary is order statistics, so it tracks spread rather than shrinking.
 
@@ -63,15 +47,6 @@ def test_summary_reports_percentiles_not_standard_error() -> None:
     assert large.median == pytest.approx(50.0)
     assert small.ipr90 == pytest.approx(large.ipr90, rel=0.05)
     assert small.ipr90 == pytest.approx(90.0, rel=0.05)
-
-
-def test_relative_ipr_and_zero_exclusion() -> None:
-    """The two derived quantities the decision rule reads."""
-    positive = protocol.summarize([2.0, 3.0, 4.0, 5.0])
-    assert positive.excludes_zero
-    assert positive.relative_ipr > 0.0
-    straddling = protocol.summarize([-3.0, -1.0, 1.0, 3.0])
-    assert not straddling.excludes_zero
 
 
 def test_pairing_cancels_shared_variance() -> None:

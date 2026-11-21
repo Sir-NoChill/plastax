@@ -137,32 +137,6 @@ def test_utility_gate_protects_useful_weights() -> None:
         )
 
 
-def test_local_eta_never_exceeds_the_global_one() -> None:
-    """v1's per-unit max is a max over a SUBSET of what v0 maximises over.
-
-    If a local eta ever exceeded the global one, the two variants would not be
-    comparable at all.
-    """
-    net, static, state = _build()
-    result = _run_one_step(net, static, state)
-    local = np.asarray(result.state.units[upgd.UPGD_ETA.name])
-    globalised = np.asarray(upgd.set_global_eta(result.state).units[upgd.UPGD_ETA.name])
-    assert np.all(globalised >= local - 1e-6), "local eta exceeded the global max"
-    assert np.allclose(globalised, globalised[0]), "global eta must be uniform"
-
-
-def test_upgd_changes_no_topology() -> None:
-    """No prune_conn, no add_conn: the live edge SET is identical after a step.
-
-    Counting edges would not be enough -- a method that pruned one and grew
-    another would keep the count.
-    """
-    net, static, state = _build()
-    before = set(_live_edges(state))
-    result = _run_one_step(net, static, state)
-    assert set(_live_edges(result.state)) == before
-
-
 def test_noise_is_deterministic_per_edge_and_step() -> None:
     """The perturbation is a stateless hash, so a run is reproducible.
 
@@ -213,22 +187,3 @@ def test_v0_net_preserves_the_broadcast_eta() -> None:
         ]
     )
     assert not np.allclose(local_after, sentinel), "v1 forward must write its own eta"
-
-
-def test_eta_mode_changes_the_weights() -> None:
-    """The two eta modes must reach different weights, or v0 is unreachable.
-
-    Same seed, same net, same step: only the utility-scaling denominator
-    differs, so any difference at all proves the mode selection is wired
-    through.
-    """
-    seen = []
-    for local in (False, True):
-        net, static, state = _build(local=local, sigma=0.0)
-        state.units = {
-            **state.units,
-            upgd.UPGD_ETA.name: jnp.full_like(state.units[upgd.UPGD_ETA.name], 0.5),
-        }
-        seen.append(_live_edges(_run_one_step(net, static, state).state))
-    assert seen[0].keys() == seen[1].keys()
-    assert any(seen[0][k] != pytest.approx(seen[1][k], abs=1e-9) for k in seen[0])

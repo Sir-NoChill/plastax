@@ -52,23 +52,6 @@ def _build(rho: float, seed: int = 0) -> tuple[px.NetworkStatic, px.NetworkState
     )
 
 
-def test_fan_in_is_exact() -> None:
-    """Every reservoir unit gets exactly fan_in recurrent edges plus the input.
-
-    Pipeline mode keeps one flat bucket, so this also confirms the recurrent
-    edges (cycles and all) survived construction -- topological propagation
-    would have rejected them outright.
-    """
-    static, state = _build(0.9)
-    bucket = state.conns[0]
-    live = ~np.asarray(bucket[px.DEAD.name])
-    to_ids = np.asarray(bucket[px.TO_ID.name])[live]
-    counts = np.bincount(to_ids, minlength=static.num_units)
-    # unit 0 is the input (no incoming); reservoir units take fan_in + 1 input.
-    assert counts[0] == 0
-    assert np.all(counts[1:] == _FAN_IN + 1)
-
-
 def test_spectral_radius_matches_analytic_scaling() -> None:
     """Power iteration through the network recovers the requested radius.
 

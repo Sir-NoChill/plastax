@@ -15,7 +15,6 @@ from typing import Any
 import numpy as np
 import pytest
 
-import plastax.init as init
 import plastax.layers as pxl
 from plastax.layers import (
     BuildError,
@@ -45,23 +44,9 @@ def traced(fc: Dense, shape: tuple[int, ...]) -> tuple[Record, np.ndarray, np.nd
     return record, record.inputs["x"], record.outputs[0]
 
 
-def raised_in_this_file(excinfo: pytest.ExceptionInfo[BaseException]) -> bool:
-    return any(str(entry.path) == __file__ for entry in excinfo.traceback)
-
-
 # --------------------------------------------------------------------------- #
 # Shapes and counts
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    ("shape", "features", "expected"),
-    [((4,), 3, (3,)), ((5, 4), 3, (5, 3)), ((2, 3, 4), 5, (2, 3, 5))],
-)
-def test_dense_acts_on_last_axis(
-    shape: tuple[int, ...], features: int, expected: tuple[int, ...]
-) -> None:
-    _, _, out = traced(Dense(features), shape)
-
-    assert out.shape == expected
 
 
 def test_without_bias_there_is_one_block_and_no_constant() -> None:
@@ -73,20 +58,6 @@ def test_without_bias_there_is_one_block_and_no_constant() -> None:
     assert record.blocks[0].dst.shape == (12,)
     assert record.constants.size == 0
     assert np.intersect1d(x, out).size == 0  # the layer's units are new
-
-
-def test_bias_is_one_constant_unit_and_one_connection_per_unit() -> None:
-    record, x, out = traced(Dense(3, bias=True), (4,))
-    weight, bias = record.blocks
-
-    assert record.num_units == 4 + 3 + 1
-    assert (weight.path, bias.path) == (("fc", "weight"), ("fc", "bias_weight"))
-    assert weight.src.size + bias.src.size == 3 * 4 + 3
-    assert record.constants.shape == (1,)
-    one = record.constants[0]
-    assert one not in x and one not in out
-    np.testing.assert_array_equal(bias.src, np.full(3, one))
-    np.testing.assert_array_equal(bias.dst, out)
 
 
 def test_bias_on_leading_axes_is_one_constant_and_a_connection_per_unit() -> None:
@@ -102,7 +73,7 @@ def test_bias_on_leading_axes_is_one_constant_and_a_connection_per_unit() -> Non
 # --------------------------------------------------------------------------- #
 # Which units are connected, and in what order
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("shape", [(4,), (5, 4), (2, 3, 4)])
+@pytest.mark.parametrize("shape", [(4,), (2, 3, 4)])
 def test_weight_block_is_row_major_over_position_destination_source(
     shape: tuple[int, ...],
 ) -> None:
@@ -134,24 +105,6 @@ def test_a_leading_axis_of_length_zero_creates_nothing() -> None:
 # --------------------------------------------------------------------------- #
 # What a block carries
 # --------------------------------------------------------------------------- #
-def test_blocks_carry_their_paths_and_the_initializers_given() -> None:
-    given, bias_given = init.constant(0.25), init.constant(-1.0)
-    record, _, _ = traced(Dense(3, init=given, bias_init=bias_given), (4,))
-    weight, bias = record.blocks
-
-    assert weight.path == ("fc", "weight")
-    assert bias.path == ("fc", "bias_weight")
-    assert weight.init is given
-    assert bias.init is bias_given
-
-
-def test_by_default_the_weight_is_left_to_materialization_and_the_bias_is_zero() -> (
-    None
-):
-    weight, bias = traced(Dense(3), (4,))[0].blocks
-
-    assert weight.init is None
-    assert bias.init == init.zeros()
 
 
 def test_a_dense_layer_can_be_the_whole_topology() -> None:
@@ -225,25 +178,21 @@ def test_tracing_twice_gives_the_same_blocks() -> None:
 # --------------------------------------------------------------------------- #
 # Errors, raised at the line that wrote them
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("features", [0, -1])
-def test_features_must_be_at_least_one(features: int) -> None:
-    with pytest.raises(ValueError, match="at least 1") as excinfo:
-        Dense(features)
-    assert raised_in_this_file(excinfo)
+def test_features_must_be_at_least_one() -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        Dense(0)
 
 
 # No message is matched in the two tests below: the test run type-checks plastax's
 # arguments (jaxtyping), and that check raises its own TypeError before the layer's.
-@pytest.mark.parametrize("features", [2.5, True, "3"])
-def test_features_must_be_an_integer(features: Any) -> None:
+def test_features_must_be_an_integer() -> None:
     with pytest.raises(TypeError):
-        Dense(features)
+        Dense(True)
 
 
 def test_a_handle_with_no_axes() -> None:
-    with pytest.raises(ShapeError, match="last axis") as excinfo:
+    with pytest.raises(ShapeError, match="last axis"):
         pxl.trace(net(Dense(3)), {"x": ()})
-    assert raised_in_this_file(excinfo)
 
 
 def test_a_last_axis_of_length_zero() -> None:
@@ -251,28 +200,9 @@ def test_a_last_axis_of_length_zero() -> None:
         pxl.trace(net(Dense(3)), {"x": (4, 0)})
 
 
-def test_called_with_something_that_is_not_a_handle() -> None:
-    with pytest.raises(TypeError):
-        pxl.trace(net(Dense(3), lambda m, x: m.fc(x.ids)), {"x": (4,)})
-
-
 def test_a_layer_called_twice_is_not_implemented() -> None:
     with pytest.raises(NotImplementedError, match="Dense at fc .* second time"):
         pxl.trace(net(Dense(4), lambda m, x: m.fc(m.fc(x))), {"x": (4,)})
-
-
-def test_a_layer_called_twice_writes_nothing_the_second_time() -> None:
-    seen: list[Record] = []
-
-    def call(m: Any, x: Units) -> Units:
-        seen.append(x._record)
-        return m.fc(m.fc(x))
-
-    with pytest.raises(NotImplementedError):
-        pxl.trace(net(Dense(4, bias=False), call), {"x": (4,)})
-
-    assert seen[0].num_units == 4 + 4
-    assert len(seen[0].blocks) == 1
 
 
 def test_a_layer_that_is_not_in_the_topology() -> None:

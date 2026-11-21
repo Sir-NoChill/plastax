@@ -113,10 +113,10 @@ def _check_prune_step_shards(
     """Magnitude prune is edge-local, so it must shard identically."""
 
     class _PruneNet(px.Network[None]):
-        forward_pass = MagnitudeStats(0.3)
-        prune_conn = SetPrune()
+        forward = MagnitudeStats(0.3)
+        prune = px.policies.Prune(conn=SetPrune())
         extra_unit_fields = _EXTRA_UNIT_FIELDS
-        extra_conn_fields = _OPT.state_fields
+        extra_conn_fields = _OPT.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
 
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
@@ -158,7 +158,7 @@ def _check_churn_step_shards(
         raise AssertionError("churn: rewired conn columns differ sharded vs single")
 
 
-class _HashPropose(px.ProposeAddConn[None]):
+class _HashPropose(px.policies.ProposeAddConnPolicy[None]):
     """Two random deeper partners per unit, from one global proposer."""
 
     def __init__(self, num_units: int, *, dedupe: bool) -> None:
@@ -200,11 +200,11 @@ def _check_propose_churn_shards(
     for dedupe in (False, True):
 
         class _ProposeNet(px.Network[None]):
-            forward_pass = MagnitudeStats(0.3)
-            prune_conn = SetPrune()
-            add_conn = _HashPropose(sum(_LAYERS), dedupe=dedupe)
+            forward = MagnitudeStats(0.3)
+            prune = px.policies.Prune(conn=SetPrune())
+            grow = px.policies.Grow(conn=_HashPropose(sum(_LAYERS), dedupe=dedupe))
             extra_unit_fields = _EXTRA_UNIT_FIELDS
-            extra_conn_fields = _OPT.state_fields
+            extra_conn_fields = _OPT.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
@@ -225,7 +225,7 @@ def _check_propose_churn_shards(
             raise AssertionError(f"propose(dedupe={dedupe}): nothing grew")
 
 
-class _HashPrune(px.PruneConn):
+class _HashPrune(px.policies.PruneConnPolicy):
     """Tombstone a hashed fraction of edges: reads only edge columns."""
 
     def predicate(
@@ -248,11 +248,11 @@ def _check_fused_prune_shards(
     """
 
     class _FusedNet(px.Network[None]):
-        forward_pass = MagnitudeStats(0.3)
-        prune_conn = _HashPrune()
-        add_conn = _HashPropose(sum(_LAYERS), dedupe=False)
+        forward = MagnitudeStats(0.3)
+        prune = px.policies.Prune(conn=_HashPrune())
+        grow = px.policies.Grow(conn=_HashPropose(sum(_LAYERS), dedupe=False))
         extra_unit_fields = _EXTRA_UNIT_FIELDS
-        extra_conn_fields = _OPT.state_fields
+        extra_conn_fields = _OPT.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
 
     sp = px.StepInputs(inputs=jnp.zeros((_LAYERS[0],), jnp.float32), targets=None)
@@ -275,7 +275,7 @@ def _check_batched_train_step_shards(
     """A batched (B = 5) train step shards like the streaming one."""
 
     class train_net(make_net(_OPT, method="set", mode="train")):  # type: ignore[misc]
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     rng = np.random.default_rng(0)
     xs = jnp.asarray(rng.standard_normal((5, _LAYERS[0])).astype(np.float32))

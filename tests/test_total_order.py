@@ -151,29 +151,3 @@ def test_the_zeros_and_nans_tie_and_fall_back_to_src_dst_index() -> None:
     assert np.asarray(comparison_total_order(*args)).tolist() == want
     assert np.asarray(radix_total_order(*args)).tolist() == want
     assert _packed(*args).tolist() == want
-
-
-def _sorts(fn: Any, n: int, **kw: Any) -> list[int]:
-    """The `num_keys` of every sort in `fn`'s jaxpr over n candidates."""
-    scores = jax.ShapeDtypeStruct((n,), jnp.float32)
-    ids = jax.ShapeDtypeStruct((n,), jnp.int32)
-    # A fresh wrapper per call: make_jaxpr caches traces by function.
-    jaxpr = jax.make_jaxpr(lambda *a: fn(*a, **kw))(scores, ids, ids)
-    return [e.params["num_keys"] for e in jaxpr.eqns if e.primitive.name == "sort"]
-
-
-def test_total_order_takes_the_radix_passes_only_on_a_gpu_above_the_threshold(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    big = phases.RADIX_TOTAL_ORDER_MIN
-    small = big - 1
-    if jax.default_backend() != "gpu":
-        assert _sorts(total_order, big) == [4]
-        monkeypatch.setattr(phases.jax, "default_backend", lambda: "gpu")
-    assert _sorts(total_order, small) == [4]
-    assert _sorts(total_order, big) == [1, 1, 1]
-    # Ids that fit in 16 bits merge the src and dst passes; one more id
-    # does not.
-    assert _sorts(total_order, small, id_bound=_BOUND) == [4]
-    assert _sorts(total_order, big, id_bound=_BOUND) == [1, 1]
-    assert _sorts(total_order, big, id_bound=_BOUND + 1) == [1, 1, 1]

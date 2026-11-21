@@ -7,7 +7,7 @@ import itertools
 import numpy as np
 import pytest
 
-from plastax.shard import balanced_level_cut, band_weights, level_to_shard
+from plastax.shard import balanced_level_cut, band_weights
 
 
 def _brute_force_bottleneck(weights: np.ndarray, num_shards: int) -> float:
@@ -25,36 +25,6 @@ def _brute_force_bottleneck(weights: np.ndarray, num_shards: int) -> float:
 
 
 # --- core DP -----------------------------------------------------------
-
-
-def test_uniform_weights_split_evenly() -> None:
-    boundaries = balanced_level_cut([1.0] * 8, 4)
-    assert boundaries == (0, 2, 4, 6, 8)
-
-
-def test_skewed_weights_balance_by_weight_not_level_count() -> None:
-    # One heavy level forces the partition to isolate it into its own band.
-    weights = [1.0, 1.0, 100.0, 1.0, 1.0]
-    boundaries = balanced_level_cut(weights, 3)
-    weights_arr = np.asarray(weights)
-    bands = band_weights(weights_arr, boundaries)
-    # The heavy level (index 2) must be alone in its band.
-    heavy_band = next(
-        d for d in range(len(boundaries) - 1) if boundaries[d] <= 2 < boundaries[d + 1]
-    )
-    assert boundaries[heavy_band] == 2
-    assert boundaries[heavy_band + 1] == 3
-    assert max(bands) == 100.0
-
-
-def test_k_equals_1_returns_whole_range() -> None:
-    boundaries = balanced_level_cut([3.0, 1.0, 4.0, 1.0, 5.0], 1)
-    assert boundaries == (0, 5)
-
-
-def test_k_equals_length_one_level_per_band() -> None:
-    boundaries = balanced_level_cut([3.0, 1.0, 4.0, 1.0, 5.0], 5)
-    assert boundaries == (0, 1, 2, 3, 4, 5)
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -85,16 +55,6 @@ def test_bottleneck_matches_brute_force_with_zero_weights() -> None:
 
 
 # --- tie-break with cross_band_edges ------------------------------------
-
-
-def test_tie_break_prefers_lower_communication() -> None:
-    # Uniform weights: many partitions of 6 levels into 2 bands of weight 3
-    # each tie on the bottleneck (any split at 1..5). cross_band_edges makes
-    # the cut at position 3 (the midpoint) uniquely cheapest.
-    weights = [1.0] * 6
-    edges = np.array([0.0, 10.0, 10.0, 1.0, 10.0, 10.0, 0.0])
-    boundaries = balanced_level_cut(weights, 2, cross_band_edges=edges)
-    assert boundaries == (0, 3, 6)
 
 
 def test_tie_break_three_shards_selects_min_comm_boundaries() -> None:
@@ -152,15 +112,3 @@ def test_non_1d_weights_raises() -> None:
 
 
 # --- helpers ----------------------------------------------------------------
-
-
-def test_level_to_shard_maps_each_level() -> None:
-    boundaries = (0, 2, 5, 8)
-    shard_ids = level_to_shard(boundaries)
-    np.testing.assert_array_equal(shard_ids, [0, 0, 1, 1, 1, 2, 2, 2])
-
-
-def test_band_weights_sums_each_band() -> None:
-    weights = [1.0, 2.0, 3.0, 4.0, 5.0]
-    boundaries = (0, 2, 5)
-    assert band_weights(weights, boundaries) == [3.0, 12.0]

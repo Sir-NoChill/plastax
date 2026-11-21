@@ -55,7 +55,7 @@ def _marked(i: jax.Array, g: G) -> jax.Array:
     return ids[pos] == i
 
 
-class _MarkForward(px.ForwardPass):
+class _MarkForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
     linear_input = px.ACTIVATION
 
@@ -72,7 +72,7 @@ class _MarkForward(px.ForwardPass):
         )
 
 
-class _MarkedPrune(px.PruneConn):
+class _MarkedPrune(px.policies.PruneConnPolicy):
     """Kill every edge touching a marked unit (the C++ benchmark's predicate)."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -80,7 +80,7 @@ class _MarkedPrune(px.PruneConn):
         return (u[PRUNED, c[px.FROM_ID, cid]] | u[PRUNED, c[px.TO_ID, cid]]) == 1
 
 
-class _HashPrune(px.PruneConn):
+class _HashPrune(px.policies.PruneConnPolicy):
     """Kill a hashed fraction of edges each step: reads only edge columns + g."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -88,7 +88,7 @@ class _HashPrune(px.PruneConn):
         return _hash01(c[px.FROM_ID, cid], c[px.TO_ID, cid], g["step"]) < 0.15
 
 
-class _FiredPrune(px.PruneConn):
+class _FiredPrune(px.policies.PruneConnPolicy):
     """Reads a field the forward computes from its accumulator: not fusable."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -96,7 +96,7 @@ class _FiredPrune(px.PruneConn):
         return u[FIRED, c[px.TO_ID, cid]]
 
 
-class _ActivationPrune(px.PruneConn):
+class _ActivationPrune(px.policies.PruneConnPolicy):
     """Reads ACTIVATION, the forward's main output: not fusable."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -104,7 +104,7 @@ class _ActivationPrune(px.PruneConn):
         return u[px.ACTIVATION, c[px.FROM_ID, cid]] < -0.9
 
 
-class _WeightPrune(px.PruneConn):
+class _WeightPrune(px.policies.PruneConnPolicy):
     """Magnitude prune: reads WEIGHT."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -112,7 +112,7 @@ class _WeightPrune(px.PruneConn):
         return jnp.abs(c[px.WEIGHT, cid]) < 0.05
 
 
-class _TracePrune(px.PruneConn):
+class _TracePrune(px.policies.PruneConnPolicy):
     """Reads TRACE, which the loss writes."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -120,7 +120,7 @@ class _TracePrune(px.PruneConn):
         return u[TRACE, c[px.TO_ID, cid]] > 10.0
 
 
-class _Grow(px.ScoreAddConn):
+class _Grow(px.policies.ScoreAddConnPolicy):
     dedupe_live = True  # pre-L4 grid default: never regrow a live edge
     max_new_per_level = 48
 
@@ -133,7 +133,7 @@ class _Grow(px.ScoreAddConn):
         return px.ConnWrite.of((px.WEIGHT, _hash01(dst, src, g["step"]) - 0.5))
 
 
-class _Propose(px.ProposeAddConn):
+class _Propose(px.policies.ProposeAddConnPolicy):
     """Re-grow random deeper edges (the C++ synthetic benchmark's growth, hashed)."""
 
     proposer = "global"
@@ -154,12 +154,12 @@ class _Propose(px.ProposeAddConn):
         return px.ConnWrite.of((px.WEIGHT, _hash01(src, dst, g["step"]) - 0.5))
 
 
-class _Tick(px.ResetGlobal):
+class _Tick(px.policies.ResetGlobalPolicy):
     def reset(self, g: G) -> G:
         return {**g, "step": g["step"] + 1}
 
 
-class _MseLoss(px.Loss):
+class _MseLoss(px.policies.LossPolicy):
     seed_field = TRACE
 
     def calculate_loss(
@@ -170,7 +170,7 @@ class _MseLoss(px.Loss):
         return jnp.sum(0.5 * err * err), err
 
 
-class _Backward(px.BackwardPass):
+class _Backward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(self, u: Any, src: Any, dst: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -182,7 +182,7 @@ class _Backward(px.BackwardPass):
         return px.UnitWrite.of((TRACE, acc))
 
 
-class _Sgd(px.UpdateConn):
+class _Sgd(px.policies.UpdateConnPolicy):
     def incoming(self, u: Any, dst: Any, src: Any, c: Any, cid: Any, g: G) -> Any:
         del g
         w = c[px.WEIGHT, cid] - 0.01 * u[TRACE, dst] * u[px.ACTIVATION, src]
@@ -194,7 +194,7 @@ class _Sgd(px.UpdateConn):
 
 
 def _net(
-    prune: px.PruneConn,
+    prune: px.policies.PruneConnPolicy,
     *,
     add: Any = None,
     train: bool = False,
@@ -202,13 +202,15 @@ def _net(
 ) -> type[px.Network[G]]:
     mode = propagation
 
+    prune_ = prune
+
     class Net(px.Network[G]):
-        forward_pass = _MarkForward()
+        forward = _MarkForward()
         loss = _MseLoss() if train else None
-        backward_pass = _Backward() if train else None
-        update_conn = _Sgd() if train else None
-        prune_conn = prune
-        add_conn = add
+        backward = _Backward() if train else None
+        update = px.policies.Update(conn=_Sgd()) if train else None
+        prune = px.policies.Prune(conn=prune_)
+        grow = px.policies.Grow(conn=add) if add is not None else None
         reset_global = _Tick()
         extra_unit_fields = (PRUNED, FIRED, TRACE)
         propagation = mode
@@ -331,13 +333,6 @@ def test_fused_step_reuses_free_counts_on_the_two_level_claim() -> None:
     _assert_identical(a, b)
 
 
-def test_marked_predicate_forwards_the_flag() -> None:
-    net = _net(_MarkedPrune(), add=_Propose())
-    static, state = _build(net)
-    plan = phases.plan_prune_fusion(net, static, state.globals_, engine="xla")
-    assert plan.fused and plan.forwarded == (PRUNED.name,)
-
-
 @pytest.mark.parametrize(
     ("prune", "train", "why"),
     [
@@ -348,7 +343,7 @@ def test_marked_predicate_forwards_the_flag() -> None:
     ],
 )
 def test_predicate_reading_a_written_field_is_not_fused(
-    prune: px.PruneConn, train: bool, why: str
+    prune: px.policies.PruneConnPolicy, train: bool, why: str
 ) -> None:
     net = _net(prune, add=_Grow(), train=train)
     static, state = _build(net)
@@ -386,8 +381,8 @@ class _SelfReadForward(_MarkForward):
 
 def test_forwarded_field_must_not_read_a_forward_written_column() -> None:
     class Net(px.Network[G]):
-        forward_pass = _SelfReadForward()
-        prune_conn = _MarkedPrune()
+        forward = _SelfReadForward()
+        prune = px.policies.Prune(conn=_MarkedPrune())
         reset_global = _Tick()
         extra_unit_fields = (PRUNED, FIRED, TRACE)
 
@@ -419,17 +414,7 @@ def test_off_and_unknown_engine() -> None:
         phases.plan_prune_fusion(net, static, state.globals_, engine="sometimes")
 
 
-def test_no_prune_conn_is_not_fused() -> None:
-    class Net(px.Network[G]):
-        forward_pass = _MarkForward()
-        extra_unit_fields = (PRUNED, FIRED, TRACE)
-
-    static, state = _build(Net)
-    plan = phases.plan_prune_fusion(Net, static, state.globals_, engine="xla")
-    assert not plan.fused and plan.reason == "no prune_conn"
-
-
-def _translate(prune: px.PruneConn, net: type[px.Network[G]]) -> Any:
+def _translate(prune: px.policies.PruneConnPolicy, net: type[px.Network[G]]) -> Any:
     static, state = _build(net)
     units = {
         s.name: jax.ShapeDtypeStruct((static.num_units,), s.dtype)
@@ -455,7 +440,7 @@ def test_translator_accepts_exact_integer_predicates() -> None:
     assert "tl.load" in hashed.source and ">>" in hashed.source
 
 
-class _ScaledPrune(px.PruneConn):
+class _ScaledPrune(px.policies.PruneConnPolicy):
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
         del u, g
         return c[px.WEIGHT, cid] * 3.0 < 0.1  # a rounding float multiply

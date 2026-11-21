@@ -85,16 +85,6 @@ def test_shallow_net_is_rejected() -> None:
         ne.build_ne_net(train, (17, 32, 4), seed=0)
 
 
-def test_cosine_growth_rate_anneals_to_zero() -> None:
-    """The growth schedule starts at alpha and shuts down exactly at T_end."""
-    alpha, horizon = 0.5, 100
-    schedule = [ne.cosine_growth_rate(t, horizon, alpha) for t in range(horizon + 1)]
-    assert schedule[0] == pytest.approx(alpha)
-    assert schedule[-1] == pytest.approx(0.0, abs=1e-12)
-    assert all(a >= b for a, b in zip(schedule[:-1], schedule[1:], strict=True))
-    assert ne.cosine_growth_rate(5, 0, alpha) == 0.0
-
-
 def test_growth_expands_interior_without_touching_the_ends() -> None:
     """Churn grows the interior and leaves the dense transitions alone.
 

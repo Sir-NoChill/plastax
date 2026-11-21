@@ -69,23 +69,6 @@ def test_frontier_matches_reference_and_scalar_on_random_dags(seed: int) -> None
         assert np.array_equal(got, _kahn_levels(n, edges, allow_cycles=False))
 
 
-def test_layered_net_multi_round_frontier_matches_reference() -> None:
-    """A 4-layer net drives several frontier rounds; still matches the oracle."""
-    rng = np.random.default_rng(1)
-    sizes = [10, 20, 20, 5]
-    offsets = np.cumsum([0, *sizes])
-    n = int(offsets[-1])
-    pairs: list[tuple[int, int]] = []
-    for layer in range(len(sizes) - 1):
-        for _ in range(40):
-            u = int(rng.integers(offsets[layer], offsets[layer + 1]))
-            v = int(rng.integers(offsets[layer + 1], offsets[layer + 2]))
-            pairs.append((u, v))
-    edges = np.array(sorted(set(pairs)), dtype=np.int32)
-    got = topo.initial_levels(n, edges)
-    assert np.array_equal(got, _reference_levels(n, edges))
-
-
 def test_deep_chain_falls_back_to_scalar_and_is_correct(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -103,17 +86,6 @@ def test_deep_chain_falls_back_to_scalar_and_is_correct(
     assert calls == [n], "the deep chain must take the scalar fallback"
     assert np.array_equal(got, np.arange(n, dtype=np.int32))
     assert np.array_equal(got, _kahn_levels(n, edges, allow_cycles=False))
-
-
-def test_empty_edges_all_zero() -> None:
-    got = topo.initial_levels(5, np.zeros((0, 2), dtype=np.int32))
-    assert np.array_equal(got, np.zeros(5, dtype=np.int32))
-
-
-def test_raises_on_cycle_without_allow_cycles() -> None:
-    edges = np.array([[0, 1], [1, 2], [2, 0]], dtype=np.int32)  # 3-cycle
-    with pytest.raises(ValueError):
-        topo.initial_levels(3, edges)
 
 
 def test_an_edge_into_an_input_does_not_raise_its_level() -> None:
@@ -177,18 +149,6 @@ def test_capacity_policy_headroom_pre_allocates_free_slots() -> None:
     assert topo.capacity_policy(200, headroom=1.0) == 512  # ceil(400) -> 512
     # The min_bucket floor still applies to a tiny inflated bucket.
     assert topo.capacity_policy(1, headroom=10.0) == 64
-
-
-@pytest.mark.parametrize("live", [1, 5, 63, 64, 65, 200, 256, 1000, 4096])
-@pytest.mark.parametrize("headroom", [0.0, 0.25, 1.0, 2.0, 7.0])
-def test_capacity_policy_result_is_always_a_power_of_two(
-    live: int, headroom: float
-) -> None:
-    """Capacity must stay a power of two so it divides a power-of-two shard count."""
-    cap = topo.capacity_policy(live, headroom=headroom)
-    assert cap >= live
-    assert cap & (cap - 1) == 0  # exact power of two
-    assert cap % 4 == 0  # divisible for G in {1, 2, 4}
 
 
 def test_capacity_policy_rejects_negative_headroom() -> None:

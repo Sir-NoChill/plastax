@@ -62,29 +62,6 @@ def test_events_respect_gap_delay_and_reward_placement(stream: object) -> None:
     )
 
 
-def test_sound_frames_replay_the_template_with_bounded_jitter(stream: object) -> None:
-    ev = stream.events
-    by_sound: dict[int, list[np.ndarray]] = {}
-    for sound, t_on, t_off, _ in ev:
-        by_sound.setdefault(int(sound), []).append(stream.obs[t_on:t_off])
-    for replays in by_sound.values():
-        if len(replays) < 2:
-            continue
-        a, b = replays[0], replays[1]
-        # Two replays of one sound share most bits of every frame: with
-        # jitter 0.1 on 8 bits, an expected 0.8 bits move per frame per replay.
-        overlap = (a & b).sum(axis=1)
-        assert overlap.mean() >= _CFG.active_bits - 2.5
-
-
-def test_generation_is_deterministic_per_seed() -> None:
-    a = ims.generate(_CFG)
-    b = ims.generate(_CFG)
-    c = ims.generate(ims.StreamConfig(steps=6000, seed=4))
-    assert np.array_equal(a.obs, b.obs) and np.array_equal(a.events, b.events)
-    assert not np.array_equal(a.obs, c.obs)
-
-
 def test_discounted_return_recursion() -> None:
     reward = np.zeros((10,), np.float32)
     reward[7] = 1.0

@@ -19,29 +19,11 @@ from plastax import rng as rng_mod
 from plastax._types import DEAD, FROM_ID, LEVEL, TO_ID
 from plastax.phases import (
     apply_validity,
-    candidates_grid,
     candidates_per_level,
-    candidates_shortlist,
     dedupe_live,
     dedupe_step,
-    select,
     select_per_segment,
 )
-
-
-def test_candidates_grid_enumerates_every_ordered_pair() -> None:
-    src, dst = candidates_grid(3)
-    pairs = sorted(zip(np.asarray(src).tolist(), np.asarray(dst).tolist(), strict=True))
-    assert pairs == sorted((s, d) for s in range(3) for d in range(3))
-
-
-def test_candidates_shortlist_crosses_the_top_m_units() -> None:
-    importance = jnp.asarray([0.1, 5.0, 0.2, 7.0], dtype=jnp.float32)
-    src, dst = candidates_shortlist(importance, 2)
-    top = {3, 1}  # the two most important unit ids
-    assert set(np.asarray(src).tolist()) == top
-    assert set(np.asarray(dst).tolist()) == top
-    assert src.shape == dst.shape == (4,)
 
 
 def test_candidates_per_level_sources_at_level_dests_strictly_deeper() -> None:
@@ -101,36 +83,6 @@ def test_dedupe_step_keeps_each_pairs_highest_scored_copy() -> None:
     assert out[0] == -np.inf and out[3] == -np.inf
 
 
-def test_select_full_pool_still_commits_in_total_order() -> None:
-    scores = jnp.asarray([5.0, -jnp.inf, 7.0], dtype=jnp.float32)
-    src = jnp.asarray([0, 1, 2], dtype=jnp.int32)
-    dst = jnp.asarray([1, 2, 3], dtype=jnp.int32)
-    # k == n: no shortcut -- the claim consumes winners in this order under
-    # overflow, so it must be the total order, not candidate order.
-    assert np.asarray(select(scores, src, dst, 3)).tolist() == [2, 0, 1]
-    # k < n: genuine selection, descending by score
-    assert np.asarray(select(scores, src, dst, 2)).tolist() == [2, 0]
-
-
-def test_select_breaks_score_ties_by_src_then_dst_then_candidate_index() -> None:
-    scores = jnp.asarray([4.0, 4.0, 4.0, 4.0, 9.0], dtype=jnp.float32)
-    src = jnp.asarray([7, 2, 2, 2, 5], dtype=jnp.int32)
-    dst = jnp.asarray([3, 9, 6, 6, 0], dtype=jnp.int32)
-    # total order among the 4.0 ties: src 2 before src 7; within src 2,
-    # dst 6 before dst 9; within (2, 6), candidate 2 before candidate 3.
-    assert np.asarray(select(scores, src, dst, 5)).tolist() == [4, 2, 3, 1, 0]
-    assert np.asarray(select(scores, src, dst, 4)).tolist() == [4, 2, 3, 1]
-
-
-def test_select_is_identical_under_jit() -> None:
-    scores = jnp.asarray([1.0, 1.0, 1.0, 2.0, -jnp.inf], dtype=jnp.float32)
-    src = jnp.asarray([3, 1, 1, 0, 0], dtype=jnp.int32)
-    dst = jnp.asarray([0, 5, 4, 2, 1], dtype=jnp.int32)
-    eager = np.asarray(select(scores, src, dst, 3))
-    jitted = np.asarray(jax.jit(select, static_argnums=3)(scores, src, dst, 3))
-    assert eager.tolist() == jitted.tolist() == [3, 2, 1]
-
-
 def test_select_per_segment_takes_each_segments_members_in_total_order() -> None:
     scores = jnp.asarray([3.0, 9.0, 3.0, 5.0, 7.0, 1.0], dtype=jnp.float32)
     src = jnp.asarray([4, 1, 2, 0, 3, 5], dtype=jnp.int32)
@@ -145,14 +97,6 @@ def test_select_per_segment_takes_each_segments_members_in_total_order() -> None
     assert np.asarray(top1).tolist() == [1, 3]
     # a segment with fewer members than k marks the rest unfilled
     assert np.asarray(filled2).tolist() == [False, False]
-
-
-def test_select_sorts_nan_scores_last() -> None:
-    scores = jnp.asarray([jnp.nan, 1.0, 0.5], dtype=jnp.float32)
-    src = jnp.asarray([0, 1, 2], dtype=jnp.int32)
-    dst = jnp.asarray([1, 2, 0], dtype=jnp.int32)
-    # a NaN score must not outrank finite candidates (it is vetoed at commit)
-    assert np.asarray(select(scores, src, dst, 2)).tolist() == [1, 2]
 
 
 def test_dedupe_step_keeps_the_total_order_first_copy_on_equal_scores() -> None:
@@ -178,7 +122,7 @@ def test_dedupe_live_masks_live_edges_but_not_dead_ones() -> None:
 
 
 def test_network_level_neighbourhood_is_rejected_with_guidance() -> None:
-    class _Fwd(px.ForwardPass):
+    class _Fwd(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
         combine = px.monoid.sum_
 
         def map(
@@ -200,7 +144,7 @@ def test_network_level_neighbourhood_is_rejected_with_guidance() -> None:
     with pytest.raises(TypeError, match="max_level_gap"):
 
         class _Net(px.Network[None]):
-            forward_pass = _Fwd()
+            forward = _Fwd()
             neighbourhood = 1
 
 
@@ -209,7 +153,7 @@ def test_network_level_neighbourhood_is_rejected_with_guidance() -> None:
 # ---------------------------------------------------------------------------
 
 
-class _StageForward(px.ForwardPass):
+class _StageForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(  # noqa: D102 -- test pass

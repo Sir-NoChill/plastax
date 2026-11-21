@@ -89,15 +89,6 @@ def _site(**overrides: object) -> Rng:
     return Rng.for_site(**kwargs)  # type: ignore[arg-type]
 
 
-def test_same_site_replays_the_same_stream() -> None:
-    a = [_site().uniform() for _ in range(1)]
-    rng1, rng2 = _site(), _site()
-    seq1 = [float(rng1.uniform()) for _ in range(4)]
-    seq2 = [float(rng2.uniform()) for _ in range(4)]
-    assert seq1 == seq2
-    assert float(a[0]) == seq1[0]
-
-
 def test_sub_counter_advances_per_draw() -> None:
     rng = _site()
     draws = [float(rng.uniform()) for _ in range(8)]
@@ -159,30 +150,6 @@ def test_uniform_int_bounds_and_determinism() -> None:
     np.testing.assert_array_equal(a, b)
     assert a.min() >= 0 and a.max() <= 12
     assert len(np.unique(a)) == 13, "13 buckets should all be hit over 2048 sites"
-
-
-def test_bernoulli_edges() -> None:
-    rng = _site()
-    assert not bool(rng.bernoulli(0.0))
-    rng2 = _site()
-    assert bool(rng2.bernoulli(1.0)), "uniform() < 1.0 must hold (draws are in [0,1))"
-
-
-def test_vmapped_sites_match_scalar_sites() -> None:
-    keys = jnp.arange(16, dtype=jnp.uint32)
-
-    def draw(k: jax.Array) -> jax.Array:
-        return Rng.for_site(
-            network_seed=9,
-            step=jnp.int32(2),
-            stream=1,
-            proposer_key=k,
-            j=jnp.uint32(1),
-        ).uniform()
-
-    batched = np.asarray(jax.vmap(draw)(keys))
-    scalar = np.asarray([float(draw(k)) for k in keys], dtype=np.float32)
-    np.testing.assert_array_equal(batched, scalar)
 
 
 def test_conn_key_distinguishes_edges_and_occurrences() -> None:

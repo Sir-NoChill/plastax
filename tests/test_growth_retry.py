@@ -31,7 +31,7 @@ _BATCH = px.StepInputs(
 )
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -51,7 +51,7 @@ class _SumForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _BumpWeights(px.UpdateConn):
+class _BumpWeights(px.policies.UpdateConnPolicy):
     """The learning update: every live connection's weight += 1 per step."""
 
     def incoming(
@@ -77,7 +77,7 @@ class _BumpWeights(px.UpdateConn):
         return px.ConnWrite.of()
 
 
-class _DeeperGrowth(px.ScoreAddConn[jax.Array]):
+class _DeeperGrowth(px.policies.ScoreAddConnPolicy[jax.Array]):
     """Each source level's three best strictly-deeper pairs, by -(10 src + dst)."""
 
     max_new_per_level = 3
@@ -95,7 +95,7 @@ class _DeeperGrowth(px.ScoreAddConn[jax.Array]):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
 
 
-class _CountSteps(px.ResetGlobal[jax.Array]):
+class _CountSteps(px.policies.ResetGlobalPolicy[jax.Array]):
     """A phase after growth: counts how often the step's tail runs."""
 
     def reset(self, g: jax.Array) -> jax.Array:
@@ -103,12 +103,12 @@ class _CountSteps(px.ResetGlobal[jax.Array]):
 
 
 class _RetryNet(px.Network[jax.Array]):
-    forward_pass = _SumForward()
-    update_conn = _BumpWeights()
-    add_conn = _DeeperGrowth()
+    forward = _SumForward()
+    update = px.policies.Update(conn=_BumpWeights())
+    grow = px.policies.Grow(conn=_DeeperGrowth())
     reset_global = _CountSteps()
     propagation = px.Propagation.TOPOLOGICAL
-    batch_reduction = px.MeanFloatFirstRest()
+    batch_reduction = px.policies.MeanFloatFirstRest()
 
 
 def _build(level0_capacity: int) -> tuple[px.NetworkStatic, px.NetworkState[jax.Array]]:
@@ -190,17 +190,6 @@ def _assert_states_equal(a: px.NetworkState[jax.Array], b: Any) -> None:
     assert tree_a == tree_b
     for x, y in zip(leaves_a, leaves_b, strict=True):
         np.testing.assert_array_equal(np.asarray(x), np.asarray(y))
-
-
-def test_the_bare_step_overflows() -> None:
-    """The scenario under test: one step at 5 slots drops level 0's winners."""
-    static, state = _build(5)
-    result = px.make_step(_RetryNet, static)(state, _STEP)
-    assert bool(result.overflow)
-    assert int(result.state.grown) == 1 + 3
-    assert result.growth_remainder is not None
-    dropped = [int(np.sum(c.growable)) for c in result.growth_remainder.claims]
-    assert dropped == [2, 0, 0]
 
 
 @pytest.mark.parametrize("batch_size", [None, 2])

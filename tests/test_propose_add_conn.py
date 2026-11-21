@@ -26,7 +26,7 @@ _BASE0 = [(0, 4), (1, 5), (2, 6), (3, 7)]
 _BASE1 = [(4, 8), (5, 9), (6, 10), (7, 11)]
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -48,7 +48,7 @@ class _SumForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _TableProposals(px.ProposeAddConn[None]):
+class _TableProposals(px.policies.ProposeAddConnPolicy[None]):
     """Proposal j is row j of a fixed (src, dst, score) table."""
 
     def __init__(
@@ -81,10 +81,10 @@ class _TableProposals(px.ProposeAddConn[None]):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(_NEW_WEIGHT)))
 
 
-def _net(policy: px.ProposeAddConn[None]) -> type[px.Network[None]]:
+def _net(policy: px.policies.ProposeAddConnPolicy[None]) -> type[px.Network[None]]:
     class Net(px.Network[None]):
-        forward_pass = _SumForward()
-        add_conn = policy
+        forward = _SumForward()
+        grow = px.policies.Grow(conn=policy)
         propagation = px.Propagation.TOPOLOGICAL
 
     return Net
@@ -206,7 +206,7 @@ def test_removed_dedupe_flag_names_the_split_flags() -> None:
 
 
 def test_wrong_propose_arity_for_declared_proposer_is_rejected() -> None:
-    class _PerUnitShapeMismatch(px.ProposeAddConn[None]):
+    class _PerUnitShapeMismatch(px.policies.ProposeAddConnPolicy[None]):
         proposer = "per_unit"
         max_new_per_level = 1
         proposals_per_proposer = 1
@@ -227,7 +227,7 @@ def test_wrong_propose_arity_for_declared_proposer_is_rejected() -> None:
         _net(_PerUnitShapeMismatch())
 
 
-class _WideProposals(px.ProposeAddConn[None]):
+class _WideProposals(px.policies.ProposeAddConnPolicy[None]):
     proposer = "global"
     max_new_per_level = 4
     proposals_per_proposer = 8
@@ -267,8 +267,10 @@ def test_building_a_proposal_phase_allocates_no_candidate_grid() -> None:
 
 
 class _PipelineNet(px.Network[None]):
-    forward_pass = _SumForward()
-    add_conn = _TableProposals([(1, 4, 1.0), (5, 8, 1.0), (4, 1, 1.0)], 3)
+    forward = _SumForward()
+    grow = px.policies.Grow(
+        conn=_TableProposals([(1, 4, 1.0), (5, 8, 1.0), (4, 1, 1.0)], 3)
+    )
     propagation = px.Propagation.PIPELINE
 
 

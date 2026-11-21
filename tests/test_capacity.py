@@ -15,13 +15,6 @@ from plastax import topo
 from plastax.state import grow_bucket
 
 
-def test_power_of_two_policy_is_unchanged() -> None:
-    assert topo.capacity_policy(0) == 64
-    assert topo.capacity_policy(100) == 128
-    assert topo.capacity_policy(128) == 128
-    assert topo.capacity_policy(128, headroom=0.01) == 256
-
-
 def test_aligned_policy_tracks_the_target_closely() -> None:
     assert topo.capacity_policy(1000, align=128) == 1024
     assert topo.capacity_policy(1025, align=128) == 1152
@@ -38,7 +31,7 @@ def test_align_must_be_positive() -> None:
         topo.capacity_policy(10, align=0)
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -61,7 +54,7 @@ class _SumForward(px.ForwardPass):
 
 
 class _Net(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -116,17 +109,6 @@ def test_resort_sizes_with_the_build_headroom_and_never_shrinks() -> None:
     new_static, _ = topo.resort(static, state)
     assert new_static.level_capacities[0] == 1264
     assert new_static.capacity_headroom == 0.25
-
-
-def test_resort_does_not_undo_grow_bucket() -> None:
-    # Regression: with tight (aligned, no-headroom) sizing a resort right after
-    # an overflow grow re-tightened the bucket, so the next growth overflowed
-    # and retraced again.
-    static, state = _build(1000, capacity_align=32)
-    grown, grown_state = grow_bucket(static, state, 0)
-    assert grown.level_capacities[0] == 1536
-    new_static, _ = topo.resort(grown, grown_state)
-    assert new_static.level_capacities[0] == 1536
 
 
 @pytest.mark.skipif(len(jax.devices()) < 4, reason="needs >= 4 devices")

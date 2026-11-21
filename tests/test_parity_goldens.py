@@ -148,7 +148,9 @@ class _WeightedSumMap:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
 
-class ReluForward(_WeightedSumMap, px.ForwardPass):
+class ReluForward(
+    _WeightedSumMap, px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy
+):
     """apply = max(acc, 0); mirrors golden rule relu_mlp_v1."""
 
     def apply(
@@ -159,7 +161,7 @@ class ReluForward(_WeightedSumMap, px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, jnp.maximum(acc, jnp.float32(0.0))))
 
 
-class ReluBackward(px.BackwardPass):
+class ReluBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """grad_pre_act = (acc + loss_grad) * [activation > 0]."""
 
     combine = px.monoid.sum_
@@ -186,7 +188,7 @@ class ReluBackward(px.BackwardPass):
         return px.UnitWrite.of((GRAD_PRE_ACT, (acc + u[LOSS_GRAD, i]) * gate))
 
 
-class MSELoss(px.Loss):
+class MSELoss(px.policies.LossPolicy):
     """L = 0.5*sum((pred - target)^2); seeds dL/dpred into loss_grad."""
 
     seed_field = LOSS_GRAD
@@ -201,15 +203,15 @@ class MSELoss(px.Loss):
 
 
 class _ReluMlpNet(px.Network[None]):
-    forward_pass = ReluForward()
-    backward_pass = ReluBackward()
+    forward = ReluForward()
+    backward = ReluBackward()
     loss = MSELoss()
     extra_unit_fields = (GRAD_PRE_ACT, LOSS_GRAD)
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class _ReluPipelineNet(px.Network[None]):
-    forward_pass = ReluForward()
+    forward = ReluForward()
     propagation = px.Propagation.PIPELINE
 
 
@@ -283,7 +285,9 @@ def test_passes_relu_pipeline_matches_golden_exactly() -> None:
 # ---------------------------------------------------------------------------
 
 
-class LinearForward(_WeightedSumMap, px.ForwardPass):
+class LinearForward(
+    _WeightedSumMap, px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy
+):
     """apply = acc; golden rule linear_v1."""
 
     def apply(
@@ -295,8 +299,8 @@ class LinearForward(_WeightedSumMap, px.ForwardPass):
 
 
 class _SoftmaxNet(px.Network[None]):
-    forward_pass = LinearForward()
-    loss = px.SoftmaxCrossEntropyLoss(LOSS_GRAD)
+    forward = LinearForward()
+    loss = px.policies.SoftmaxCrossEntropyLossPolicy(LOSS_GRAD)
     extra_unit_fields = (LOSS_GRAD,)
     propagation = px.Propagation.TOPOLOGICAL
 
@@ -415,7 +419,9 @@ def _registry_score(rng: Any) -> jax.Array:
     return jnp.floor(rng.uniform() * jnp.float32(256.0)) / jnp.float32(256.0)
 
 
-def _make_propose_rule(doc: dict[str, Any], n_units: int) -> px.ProposeAddConn[None]:
+def _make_propose_rule(
+    doc: dict[str, Any], n_units: int
+) -> px.policies.ProposeAddConnPolicy[None]:
     """The golden's registry propose rule, on the shipped rng."""
     params = doc["params"]
     assert doc["rules"]["propose"] in {
@@ -426,7 +432,7 @@ def _make_propose_rule(doc: dict[str, Any], n_units: int) -> px.ProposeAddConn[N
     assert doc["rules"]["init"] == "grow_init_v1"
     kind = params["proposer"]
 
-    class _Rule(px.ProposeAddConn[None]):
+    class _Rule(px.policies.ProposeAddConnPolicy[None]):
         proposer = kind
         proposals_per_proposer = int(params["proposals_per_proposer"])
         max_new_per_level = int(params["max_new_per_level"])
@@ -488,8 +494,8 @@ def test_grow_propose_golden(name: str) -> None:
     rule = _make_propose_rule(doc, n_units)
 
     class _Net(px.Network[None]):
-        forward_pass = ReluForward()
-        add_conn = rule
+        forward = ReluForward()
+        grow = px.policies.Grow(conn=rule)
         seed = int(params["network_seed"])
         propagation = px.Propagation.TOPOLOGICAL
 
@@ -573,7 +579,7 @@ def _importance_v1(i: jax.Array) -> jax.Array:
 
 def _make_score_rule(
     doc: dict[str, Any], *, step_cap: int | None
-) -> px.ScoreAddConn[dict[str, jax.Array]]:
+) -> px.policies.ScoreAddConnPolicy[dict[str, jax.Array]]:
     """The golden's registry score rule, every knob from its params."""
     params = doc["params"]
     rules = doc["rules"]
@@ -623,7 +629,7 @@ def _make_score_rule(
             del u, g
             return (src + dst) % 2 == 0
 
-        return px.predicate_add_conn(should_add, init, **knobs)
+        return px.policies.predicate_add_conn(should_add, init, **knobs)
 
     class _Rule:
         if params["candidates"] in ("shortlist", "shortlist_per_level"):
@@ -719,8 +725,8 @@ def _score_net(
     rule = _make_score_rule(doc, step_cap=step_cap)
 
     class _Net(px.Network[dict[str, jax.Array]]):
-        forward_pass = ReluForward()
-        add_conn = rule
+        forward = ReluForward()
+        grow = px.policies.Grow(conn=rule)
         seed = int(params["network_seed"])
         propagation = mode
 
@@ -758,7 +764,7 @@ def _score_net(
         }
         batched[px.ACTIVATION.name] = per_sample
         units = reduce_batch_units(
-            px.MeanFloatFirstRest(), static.unit_fields, batched, state.units
+            px.policies.MeanFloatFirstRest(), static.unit_fields, batched, state.units
         )
         state = dataclasses.replace(state, units=units)
     else:
@@ -978,7 +984,7 @@ def test_grow_claim_pipeline_golden(name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-class _UnitUpdateV1(px.UpdateUnit[None]):
+class _UnitUpdateV1(px.policies.UpdateUnitPolicy[None]):
     """unit_update_v1: activation += 1/8."""
 
     def update(self, u: px.UnitView, i: px.UnitIdx, g: None) -> px.UnitWrite:
@@ -987,7 +993,7 @@ class _UnitUpdateV1(px.UpdateUnit[None]):
         return px.UnitWrite.of((px.ACTIVATION, u[px.ACTIVATION, i] + 0.125))
 
 
-class _UnitPruneV1(px.PruneUnit[None]):
+class _UnitPruneV1(px.policies.PruneUnitPolicy[None]):
     """unit_prune_v1: prune iff activation < -1/2."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
@@ -996,7 +1002,7 @@ class _UnitPruneV1(px.PruneUnit[None]):
         return u[px.ACTIVATION, i] < jnp.float32(-0.5)
 
 
-class _UnitSpawnV1(px.AddUnit[None]):
+class _UnitSpawnV1(px.policies.AddUnitPolicy[None]):
     """unit_spawn_v1 + unit_child_init_v1: spawn iff activation >= 1/2."""
 
     offset = 1
@@ -1039,10 +1045,18 @@ def _unit_golden_net(doc: dict[str, Any]) -> type[px.Network[None]]:
         return _UNIT_RULES[rules[slot]]() if slot in rules else None
 
     class _Net(px.Network[None]):
-        forward_pass = ReluForward()
-        update_unit = rule("update_unit")
-        prune_unit = rule("prune_unit")
-        add_unit = rule("add_unit")
+        forward = ReluForward()
+        update = (
+            px.policies.Update(unit=rule("update_unit"))
+            if "update_unit" in rules
+            else None
+        )
+        prune = (
+            px.policies.Prune(unit=rule("prune_unit"))
+            if "prune_unit" in rules
+            else None
+        )
+        grow = px.policies.Grow(unit=rule("add_unit")) if "add_unit" in rules else None
         unit_capacity = int(doc["capacity"])
         max_levels = int(doc["max_levels"])
         propagation = px.Propagation.TOPOLOGICAL

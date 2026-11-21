@@ -29,7 +29,7 @@ LossGrad = px.FieldSpec.float32("loss_grad")
 _NO_INPUT = jnp.zeros((1,), dtype=jnp.float32)
 
 
-class _IdSensitiveLoss(px.Loss):
+class _IdSensitiveLoss(px.policies.LossPolicy):
     """0.5*sum((pred-target)^2), with a seed that depends on the unit id.
 
     Scaling each seed by its unit's own id makes the per-output writes
@@ -48,7 +48,7 @@ class _IdSensitiveLoss(px.Loss):
         return loss, diff * outputs.astype(jnp.float32)
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Trivial weighted sum; present only because a Network needs a forward
     pass -- these tests build the loss phase directly and never run it."""
 
@@ -74,7 +74,7 @@ class _SumForward(px.ForwardPass):
 
 
 class _Net(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     loss = _IdSensitiveLoss()
     extra_unit_fields = (LossGrad,)
     propagation = px.Propagation.TOPOLOGICAL
@@ -145,7 +145,7 @@ def _net_with_loss(loss: object, fields: tuple[px.FieldSpec[np.float32], ...]) -
     type(
         "_Checked",
         (px.Network,),
-        {"forward_pass": _SumForward(), "loss": loss, "extra_unit_fields": fields},
+        {"forward": _SumForward(), "loss": loss, "extra_unit_fields": fields},
     )
 
 
@@ -163,16 +163,16 @@ def test_retired_per_output_signature_is_rejected_with_a_migration_hint() -> Non
 def test_seed_field_must_be_a_declared_float_unit_column() -> None:
     """The seed column must exist on the network and hold floats."""
     with pytest.raises(TypeError, match="seed_field"):
-        _net_with_loss(px.SoftmaxCrossEntropyLoss(LossGrad), ())
+        _net_with_loss(px.policies.SoftmaxCrossEntropyLossPolicy(LossGrad), ())
     counts = px.FieldSpec.int32("counts")
     with pytest.raises(TypeError, match="float"):
-        _net_with_loss(px.SoftmaxCrossEntropyLoss(counts), (counts,))  # type: ignore[arg-type]
-    _net_with_loss(px.SoftmaxCrossEntropyLoss(LossGrad), (LossGrad,))
+        _net_with_loss(px.policies.SoftmaxCrossEntropyLossPolicy(counts), (counts,))  # type: ignore[arg-type]
+    _net_with_loss(px.policies.SoftmaxCrossEntropyLossPolicy(LossGrad), (LossGrad,))
 
 
 class _SoftmaxNet(px.Network[None]):
-    forward_pass = _SumForward()
-    loss = px.SoftmaxCrossEntropyLoss(LossGrad)
+    forward = _SumForward()
+    loss = px.policies.SoftmaxCrossEntropyLossPolicy(LossGrad)
     extra_unit_fields = (LossGrad,)
     propagation = px.Propagation.TOPOLOGICAL
 

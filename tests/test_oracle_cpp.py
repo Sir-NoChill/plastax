@@ -49,7 +49,7 @@ _GOLDEN: tuple[tuple[tuple[float, float], float], ...] = (
 )
 
 
-class _TanhForward(px.ForwardPass):
+class _TanhForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """manual_fcc.cpp's TanhForwardPass: acc = sum(weight * activation[src]),
     apply = tanh(acc)."""
 
@@ -75,7 +75,7 @@ class _TanhForward(px.ForwardPass):
 
 
 class _ManualFcc(px.Network[None]):
-    forward_pass = _TanhForward()
+    forward = _TanhForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 

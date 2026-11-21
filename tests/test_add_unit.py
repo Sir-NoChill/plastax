@@ -23,7 +23,7 @@ import numpy as np
 import pytest
 
 import plastax as px
-from plastax.phases import build_add_unit_phase, build_phases
+from plastax.phases import build_add_unit_phase
 
 SPAWN = px.FieldSpec.int32("test/spawn", default=0)
 OFFSET = px.FieldSpec.int32("test/offset", default=1)
@@ -42,7 +42,7 @@ _ALL_EDGES = {(int(s), int(d)) for s, d in zip(_SRC, _DST, strict=True)}
 _ZERO_INPUTS = jnp.zeros((2,), jnp.float32)
 
 
-class LinearForward(px.ForwardPass):
+class LinearForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """activation = sum(w * activation[src])."""
 
     combine = px.monoid.sum_
@@ -79,7 +79,7 @@ class _Child:
         )
 
 
-class FromColumn(_Child, px.AddUnit[None]):
+class FromColumn(_Child, px.policies.AddUnitPolicy[None]):
     """Spawn where `test/spawn` is set, at the `test/offset` level offset."""
 
     def spawn(
@@ -89,7 +89,7 @@ class FromColumn(_Child, px.AddUnit[None]):
         return u[SPAWN, parent] != 0, u[OFFSET, parent]
 
 
-class Everything(_Child, px.AddUnit[None]):
+class Everything(_Child, px.policies.AddUnitPolicy[None]):
     """Every slot asks to spawn, free slots included."""
 
     def spawn(
@@ -99,7 +99,7 @@ class Everything(_Child, px.AddUnit[None]):
         return jnp.bool_(True), jnp.int32(1)
 
 
-class HighActivation(_Child, px.AddUnit[None]):
+class HighActivation(_Child, px.policies.AddUnitPolicy[None]):
     """Unit 2 spawns when its activation is at least 1/2."""
 
     def spawn(
@@ -109,7 +109,7 @@ class HighActivation(_Child, px.AddUnit[None]):
         return (parent == 2) & (u[px.ACTIVATION, parent] >= 0.5), jnp.int32(1)
 
 
-class Never(_Child, px.AddUnit[None]):
+class Never(_Child, px.policies.AddUnitPolicy[None]):
     """Never spawns."""
 
     def spawn(
@@ -119,7 +119,7 @@ class Never(_Child, px.AddUnit[None]):
         return jnp.bool_(False), jnp.int32(1)
 
 
-class PruneMarked(px.PruneUnit[None]):
+class PruneMarked(px.policies.PruneUnitPolicy[None]):
     """Prune a unit whose `test/spawn` is negative."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
@@ -128,26 +128,27 @@ class PruneMarked(px.PruneUnit[None]):
 
 
 def _net(
-    rule: px.AddUnit[None] | None = None,
+    rule: px.policies.AddUnitPolicy[None] | None = None,
     *,
     capacity: int = _CAPACITY,
     interval: int = 1,
     max_levels: int = 1024,
-    prune_unit: px.PruneUnit[None] | None = None,
-    add_conn: px.ProposeAddConn[None] | None = None,
+    prune_unit: px.policies.PruneUnitPolicy[None] | None = None,
+    add_conn: px.policies.ProposeAddConnPolicy[None] | None = None,
 ) -> type[px.Network[None]]:
     class _Net(px.Network[None]):
-        forward_pass = LinearForward()
+        forward = LinearForward()
         extra_unit_fields = (SPAWN, OFFSET, PARENT, TRACE)
         unit_capacity = capacity
         structural_interval = interval
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
-    _Net.add_unit = FromColumn() if rule is None else rule
+    _Net.grow = px.policies.Grow(
+        conn=add_conn, unit=FromColumn() if rule is None else rule
+    )
     _Net.max_levels = max_levels
-    _Net.prune_unit = prune_unit
-    _Net.add_conn = add_conn
+    _Net.prune = None if prune_unit is None else px.policies.Prune(unit=prune_unit)
     return _Net
 
 
@@ -361,7 +362,7 @@ def test_the_structural_interval_gates_unit_addition() -> None:
     assert _children(state) == {6: 0, 7: 0}
 
 
-class _GrowZeroToThree(px.ProposeAddConn[None]):
+class _GrowZeroToThree(px.policies.ProposeAddConnPolicy[None]):
     """Propose 0 -> 3 (an edge the net lacks), only when units were added."""
 
     proposer = "global"
@@ -397,38 +398,11 @@ def test_growth_on_units_added_fires_on_the_phase_output() -> None:
     assert int(state.grown) == 1
 
 
-def test_the_phase_sits_between_prune_conn_and_add_conn() -> None:
-    class _NoConn(px.PruneConn):
-        def predicate(
-            self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: None
-        ) -> jax.Array:
-            del u, g
-            return c[px.WEIGHT, cid] > jnp.float32(100.0)
-
-    with_net = _net(add_conn=_GrowZeroToThree())
-    with_net.prune_conn = _NoConn()
-    without_net = _net(add_conn=_GrowZeroToThree())
-    without_net.prune_conn = _NoConn()
-    without_net.add_unit = None
-    static, _ = _build(with_net)
-    with_phases = [p.__name__ for p in build_phases(with_net, static)]
-    without_phases = [p.__name__ for p in build_phases(without_net, static)]
-    assert "add_unit_phase" not in without_phases
-    # The growth phase is named for its trigger gate.
-    assert with_phases == [
-        "forward_phase",
-        "prune_conn_phase",
-        "add_unit_phase",
-        "gated",
-    ]
-    assert [p for p in with_phases if p != "add_unit_phase"] == without_phases
-
-
 def test_a_rule_that_never_spawns_changes_nothing() -> None:
     """Declaring add_unit that never fires leaves every step bit-identical."""
     with_net = _net(Never(), prune_unit=PruneMarked())
     without_net = _net(Never(), prune_unit=PruneMarked())
-    without_net.add_unit = None
+    without_net.grow = None
     static, state = _build(with_net)
     state = _set(state, SPAWN, {2: -1})
     states = {}
@@ -446,11 +420,11 @@ def test_a_rule_that_never_spawns_changes_nothing() -> None:
 
 
 def test_add_unit_requires_a_unit_capacity() -> None:
-    with pytest.raises(TypeError, match="add_unit requires a unit_capacity"):
+    with pytest.raises(TypeError, match="grow.unit requires a unit_capacity"):
 
         class _Bad(px.Network[None]):
-            forward_pass = LinearForward()
-            add_unit = FromColumn()
+            forward = LinearForward()
+            grow = px.policies.Grow(unit=FromColumn())
 
 
 def test_a_non_conforming_add_unit_is_rejected() -> None:
@@ -458,11 +432,11 @@ def test_a_non_conforming_add_unit_is_rejected() -> None:
         def spawn(self, u: Any, parent: Any, g: Any) -> Any:
             return jnp.bool_(True), jnp.int32(1)
 
-    with pytest.raises(TypeError, match="add_unit must satisfy AddUnit"):
+    with pytest.raises(TypeError, match="grow.unit policy must satisfy AddUnitPolicy"):
 
         class _Bad(px.Network[None]):
-            forward_pass = LinearForward()
-            add_unit = _SpawnOnly()  # type: ignore[assignment]
+            forward = LinearForward()
+            grow = px.policies.Grow(unit=_SpawnOnly())
             unit_capacity = 8
 
 
@@ -470,8 +444,8 @@ def test_unit_addition_under_sharding_is_refused_at_definition() -> None:
     with pytest.raises(NotImplementedError, match="unit addition under sharding"):
 
         class _Bad(px.Network[None]):
-            forward_pass = LinearForward()
-            add_unit = FromColumn()
+            forward = LinearForward()
+            grow = px.policies.Grow(unit=FromColumn())
             unit_capacity = 8
             sharding = px.ShardSpec("conns", 2)
 
@@ -481,6 +455,6 @@ def test_unit_addition_under_sharding_is_refused_at_build() -> None:
     with pytest.raises(NotImplementedError, match="unit addition under sharding"):
         _build(net, sharding=px.ShardSpec("conns", 2))
     # Without add_unit, the same sharded build succeeds.
-    net.add_unit = None
+    net.grow = None
     static, _ = _build(net, sharding=px.ShardSpec("conns", 2))
     assert static.sharding == px.ShardSpec("conns", 2)

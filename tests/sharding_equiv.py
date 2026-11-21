@@ -34,7 +34,7 @@ _EDGES = (
 )
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -55,12 +55,12 @@ class _SumForward(px.ForwardPass):
 
 
 class _PipelineNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.PIPELINE
 
 
 class _TopoNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 

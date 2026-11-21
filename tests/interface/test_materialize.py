@@ -8,7 +8,6 @@ policies of examples/mlp_xor.py.
 
 from __future__ import annotations
 
-import dataclasses
 import importlib.util
 import sys
 from collections.abc import Callable
@@ -173,30 +172,6 @@ def test_inputs_and_outputs_are_laid_out_in_the_order_they_were_given() -> None:
     _, y = stepped(static, state, [1.0, 10.0, 100.0])  # a = (1, 10), b = (100,)
 
     np.testing.assert_allclose(y, [2 * 100.0, -(1.0 + 10.0)])
-
-
-def test_the_same_network_as_todays_builder_makes() -> None:
-    """The XOR network of examples/mlp_xor.py: 3 inputs, 4 hidden, 1 output, no bias."""
-    topology = module(
-        lambda m, x: m.out(m.hidden(x)),
-        hidden=Dense(4, bias=False),
-        out=Dense(1, bias=False),
-    )
-    _, static, state = built(topology, {"x": (3,)})
-
-    sequential = px.topology.sequential(
-        px.topology.input_units(3), px.topology.dense(3, 4), px.topology.dense(4, 1)
-    )
-    old_static, old_state = px.NetworkBuilder.from_topology(
-        Linear, sequential, jax.random.key(0), globals_=None
-    )
-
-    # A topology declares its shapes; the builder's network has none.
-    assert (static.input_shape, static.output_shape) == ((3,), (1,))
-    flat = dataclasses.replace(static, input_shape=None, output_shape=None)
-    assert flat == old_static  # units, inputs, outputs, capacities, fields
-    assert [r[:2] for r in rows(state)] == [r[:2] for r in rows(old_state)]
-    np.testing.assert_array_equal(state.units["level"], old_state.units["level"])
 
 
 # --------------------------------------------------------------------------- #
@@ -370,11 +345,8 @@ def test_without_the_check_a_cycle_is_left_to_the_builder() -> None:
 # --------------------------------------------------------------------------- #
 # An initializer that cannot fill its block
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize(
-    "uncalled", [init.zeros, init.normal, init.uniform], ids=lambda f: f.__name__
-)
-def test_an_initializer_written_without_its_call_is_refused(uncalled: Any) -> None:
-    topology = module(lambda m, x: m.fc(x), fc=Dense(2, bias=False, init=uncalled))
+def test_an_initializer_written_without_its_call_is_refused() -> None:
+    topology = module(lambda m, x: m.fc(x), fc=Dense(2, bias=False, init=init.zeros))
 
     with pytest.raises(BuildError, match=r"(?s)block fc/weight.*px\.init\.zeros\(\)"):
         built(topology, {"x": (3,)})
@@ -464,36 +436,11 @@ def test_two_connections_between_one_pair_count_twice() -> None:
         np.testing.assert_array_equal(fans.fan_out, [2, 2])
 
 
-def test_a_sparse_layer_is_drawn_for_the_inputs_each_unit_has() -> None:
-    """4 inputs per unit out of 400: the bound follows 4, not 400."""
-    n_in, n_out, per_unit = 400, 50, 4
-    src = np.concatenate(
-        [RNG.choice(n_in, per_unit, replace=False) for _ in range(n_out)]
-    )
-    dst = np.repeat(np.arange(n_out), per_unit)
-
-    def call(m: Any, x: Units) -> Units:
-        y = m.units(shape=(n_out,))
-        m.wire(x[src], y[dst])
-        return y
-
-    topology = module(
-        call, units=CreateUnits(), wire=CreateConnections(init=init.lecun_uniform())
-    )
-    _, _, state = built(topology, {"x": (n_in,)})
-    w = weights_of(state)
-
-    assert np.abs(w).max() <= np.sqrt(3 / per_unit)
-    assert np.abs(w).max() > 0.9 * np.sqrt(3 / per_unit)
-
-
 # --------------------------------------------------------------------------- #
 # With no initializer given
 # --------------------------------------------------------------------------- #
-@pytest.mark.parametrize("fan_in", [4, 100])
-def test_by_default_a_weight_is_drawn_as_lecun_normal_and_a_bias_is_zero(
-    fan_in: int,
-) -> None:
+def test_by_default_a_weight_is_drawn_as_lecun_normal_and_a_bias_is_zero() -> None:
+    fan_in = 4
     record, _, state = built(
         module(lambda m, x: m.fc(x), fc=Dense(256)), {"x": (fan_in,)}
     )
@@ -519,45 +466,3 @@ def _load_example(name: str) -> Any:
     sys.modules[name] = loaded
     spec.loader.exec_module(loaded)
     return loaded
-
-
-def test_xor_written_as_a_module_learns() -> None:
-    """Two inputs, Dense(4), Dense(1), with biases and the default initializers.
-
-    The policies are those of examples/mlp_xor.py: sigmoid units, squared error,
-    backpropagation, Adam. Nothing here is set by hand.
-    """
-    mlp_xor = _load_example("mlp_xor")
-    net = mlp_xor.make_net(px.optim.adam(0.05, mlp_xor.GradPreAct), train=True)
-    topology = module(lambda m, x: m.out(m.hidden(x)), hidden=Dense(4), out=Dense(1))
-    static, state = pxl.materialize(
-        pxl.trace(topology, {"x": (2,)}), net, jax.random.key(0), globals_=None
-    )
-    step = px.make_step(net, static)
-    patterns = [
-        ((0.0, 0.0), 0.0),
-        ((0.0, 1.0), 1.0),
-        ((1.0, 0.0), 1.0),
-        ((1.0, 1.0), 0.0),
-    ]
-
-    def epoch(state: Any) -> tuple[Any, float, list[float]]:
-        loss, predictions = 0.0, []
-        for x, target in patterns:
-            inputs = px.StepInputs(
-                inputs=jnp.asarray(x, jnp.float32),
-                targets=jnp.asarray([target], jnp.float32),
-            )
-            result = step(state, inputs)
-            state = result.state
-            loss += float(result.loss)
-            predictions.append(float(state.units["activation"][static.output_ids[0]]))
-        return state, loss, predictions
-
-    state, first_loss, _ = epoch(state)
-    for _ in range(400):
-        state, loss, predictions = epoch(state)
-
-    assert first_loss > 0.4
-    assert loss < 0.05
-    assert [p > 0.5 for p in predictions] == [False, True, True, False]

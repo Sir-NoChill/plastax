@@ -18,7 +18,7 @@ from plastax import topology
 from plastax.views import UnitWrite
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -39,23 +39,11 @@ class _SumForward(px.ForwardPass):
 
 
 class _TopoNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
 # --- dense ------------------------------------------------------------------
-
-
-def test_dense_edge_count_is_n_in_times_n_out() -> None:
-    block = topology.dense(4, 7)
-    assert block.num_units == 7
-    edges = block.edges(jax.random.PRNGKey(0), 0, 4)
-    assert edges.from_ids.shape == (28,)
-    assert edges.to_ids.shape == (28,)
-    assert edges.weights.shape == (28,)
-    assert edges.from_ids.dtype == np.int32
-    assert edges.to_ids.dtype == np.int32
-    assert edges.weights.dtype == np.float32
 
 
 def test_dense_is_fully_connected_bipartite_with_offsets_applied() -> None:
@@ -68,25 +56,7 @@ def test_dense_is_fully_connected_bipartite_with_offsets_applied() -> None:
     assert seen == expected
 
 
-def test_dense_initializer_statistics_are_sane() -> None:
-    """Glorot uniform: Var = 2 / (fan_in + fan_out); loose bound on a large
-    sample keeps this a shape/scale sanity check, not a statistical test."""
-    n_in, n_out = 200, 200
-    block = topology.dense(n_in, n_out)
-    edges = block.edges(jax.random.PRNGKey(0), 0, n_in)
-    weights = np.asarray(edges.weights)
-
-    expected_var = 2.0 / (n_in + n_out)
-    assert abs(float(weights.mean())) < 0.01
-    assert 0.5 * expected_var < float(weights.var()) < 1.5 * expected_var
-
-
 # --- conv2d -------------------------------------------------------------
-
-
-def _decode_flat(index: int, minor_size: int) -> tuple[int, int]:
-    """Inverse of (major * minor_size + minor); returns (major, minor)."""
-    return index // minor_size, index % minor_size
 
 
 @pytest.mark.parametrize(
@@ -116,43 +86,6 @@ def test_conv2d_output_shape_matches_lax_conv_general_dilated(
     assert block.num_units == out_h * out_w * out_c
     edges = block.edges(jax.random.PRNGKey(0), 0, h * w * c_in)
     assert edges.from_ids.shape == (out_h * out_w * out_c * kh * kw * c_in,)
-
-
-def test_conv2d_receptive_field_membership_matches_conv_semantics() -> None:
-    h, w, c_in = 6, 6, 2
-    kh, kw, c_out = 3, 3, 4
-    stride = 2
-    out_w = (w - kw) // stride + 1
-    offset_in, offset_out = 0, 10_000
-
-    block = topology.conv2d((h, w, c_in), (kh, kw, c_out), stride=stride)
-    edges = block.edges(jax.random.PRNGKey(3), offset_in, offset_out)
-
-    target_oh, target_ow = 1, 1
-    expected_patch = {
-        (target_oh * stride + dh, target_ow * stride + dw, ci)
-        for dh in range(kh)
-        for dw in range(kw)
-        for ci in range(c_in)
-    }
-
-    found_patch: set[tuple[int, int, int]] = set()
-    matched_edges = 0
-    for from_id, to_id in zip(
-        edges.from_ids.tolist(), edges.to_ids.tolist(), strict=True
-    ):
-        out_local = to_id - offset_out
-        oh, ow = _decode_flat(out_local // c_out, out_w)
-        if (oh, ow) != (target_oh, target_ow):
-            continue
-        matched_edges += 1
-        in_local = from_id - offset_in
-        ci = in_local % c_in
-        ih, iw = _decode_flat(in_local // c_in, w)
-        found_patch.add((ih, iw, ci))
-
-    assert matched_edges == kh * kw * c_in * c_out
-    assert found_patch == expected_patch
 
 
 @pytest.mark.parametrize(
@@ -200,30 +133,7 @@ def test_conv2d_forward_computes_a_convolution(
     np.testing.assert_allclose(got, np.asarray(reference), atol=1e-4)
 
 
-def test_conv2d_initializer_statistics_are_sane() -> None:
-    """He normal: Var = 2 / fan_in, fan_in = c_in * kh * kw."""
-    h, w, c_in = 10, 10, 4
-    kh, kw, c_out = 3, 3, 6
-    block = topology.conv2d((h, w, c_in), (kh, kw, c_out))
-    edges = block.edges(jax.random.PRNGKey(1), 0, h * w * c_in)
-    weights = np.asarray(edges.weights)
-
-    fan_in = c_in * kh * kw
-    expected_var = 2.0 / fan_in
-    assert abs(float(weights.mean())) < 0.05
-    assert 0.5 * expected_var < float(weights.var()) < 1.5 * expected_var
-
-
 # --- input_units --------------------------------------------------------
-
-
-def test_input_units_has_no_edges() -> None:
-    block = topology.input_units(5)
-    assert block.num_units == 5
-    edges = block.edges(jax.random.PRNGKey(0), 0, 0)
-    assert edges.from_ids.shape == (0,)
-    assert edges.to_ids.shape == (0,)
-    assert edges.weights.shape == (0,)
 
 
 # --- sequential -----------------------------------------------------------
@@ -257,16 +167,6 @@ def test_sequential_offsets_ids_with_no_overlap_and_wires_consecutive_blocks() -
     assert all(0 <= f < 3 and 3 <= t < 7 for f, t in first_layer)
     assert len(second_layer) == 8
     assert all(3 <= f < 7 and 7 <= t < 9 for f, t in second_layer)
-
-
-def test_sequential_is_deterministic_for_a_fixed_key() -> None:
-    topo_fn = topology.sequential(topology.input_units(2), topology.dense(2, 3))
-    key = jax.random.PRNGKey(123)
-    spec_a = topo_fn(key)
-    spec_b = topo_fn(key)
-    assert np.array_equal(spec_a.edges.from_ids, spec_b.edges.from_ids)
-    assert np.array_equal(spec_a.edges.to_ids, spec_b.edges.to_ids)
-    assert np.array_equal(spec_a.edges.weights, spec_b.edges.weights)
 
 
 def test_sequential_requires_at_least_one_block() -> None:

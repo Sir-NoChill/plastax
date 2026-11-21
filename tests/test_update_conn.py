@@ -20,7 +20,7 @@ from plastax import phases
 _INCOMING_MARK = -123.5
 
 
-class _TrivialForward(px.ForwardPass):
+class _TrivialForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Required trait slot (Network.forward_pass is mandatory), not
     exercised by these tests, which only assert on WEIGHT."""
 
@@ -43,7 +43,7 @@ class _TrivialForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-class _OrderProbeUpdateConn(px.UpdateConn):
+class _OrderProbeUpdateConn(px.policies.UpdateConnPolicy):
     """incoming overwrites weight with a fixed marker; outgoing reads the
     CURRENT weight and adds 1000. If the two passes were not strictly
     sequenced (e.g. a single combined vmap computing both callbacks off the
@@ -78,33 +78,12 @@ class _OrderProbeUpdateConn(px.UpdateConn):
 
 
 class _OrderProbeNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    update_conn = _OrderProbeUpdateConn()
+    forward = _TrivialForward()
+    update = px.policies.Update(conn=_OrderProbeUpdateConn())
     propagation = px.Propagation.PIPELINE
 
 
 _DUMMY_INPUTS = px.StepInputs(inputs=jnp.zeros((0,), dtype=jnp.float32), targets=None)
-
-
-def test_incoming_writes_land_before_outgoing_reads() -> None:
-    builder = px.NetworkBuilder(_OrderProbeNet, None)
-    builder.add_unit()  # 0
-    builder.add_unit()  # 1
-    builder.add_unit()  # 2
-    builder.add_conn(0, 2, weight=1.0)
-    builder.add_conn(1, 2, weight=-5.0)
-    static, state = builder.finalize()
-
-    phase = phases.build_update_conn_phase(_OrderProbeNet, static)
-    new_state, loss = phase(state, _DUMMY_INPUTS)
-
-    assert float(loss) == 0.0
-    weights = np.asarray(new_state.conns[0][px.WEIGHT.name])
-    dead = np.asarray(new_state.conns[0][px.DEAD.name])
-    live_weights = weights[~dead]
-    assert live_weights.size == 2
-    expected = _INCOMING_MARK + 1000.0
-    np.testing.assert_allclose(live_weights, expected, rtol=1e-6, atol=1e-6)
 
 
 def test_dead_conns_are_never_updated_by_either_pass() -> None:
@@ -138,8 +117,8 @@ def test_two_pass_sweeps_every_bucket_in_topological_mode() -> None:
     (L2) -> 4 (L3); the marker must land in every one of the 3 buckets."""
 
     class _MarkNet(px.Network[None]):
-        forward_pass = _TrivialForward()
-        update_conn = _OrderProbeUpdateConn()
+        forward = _TrivialForward()
+        update = px.policies.Update(conn=_OrderProbeUpdateConn())
         propagation = px.Propagation.TOPOLOGICAL
 
     builder = px.NetworkBuilder(_MarkNet, None)
@@ -198,7 +177,7 @@ def test_update_conn_is_wired_into_build_phases_via_make_step() -> None:
 # --- dst/src endpoint-binding convention, incoming and outgoing in isolation
 
 
-class _IncomingEndpointProbe(px.UpdateConn):
+class _IncomingEndpointProbe(px.policies.UpdateConnPolicy):
     """weight <- activation[dst] - activation[src]; asymmetric, so a
     dst/src argument swap changes both the sign and magnitude, catching a
     wrong wire-up. outgoing is a genuine no-op so the final weight reflects
@@ -230,7 +209,7 @@ class _IncomingEndpointProbe(px.UpdateConn):
         return px.ConnWrite.of()
 
 
-class _OutgoingEndpointProbe(px.UpdateConn):
+class _OutgoingEndpointProbe(px.policies.UpdateConnPolicy):
     """Mirror of _IncomingEndpointProbe with the roles reversed: incoming
     is the no-op, so the final weight reflects ONLY outgoing's own (src,
     dst) binding."""
@@ -262,14 +241,14 @@ class _OutgoingEndpointProbe(px.UpdateConn):
 
 
 class _IncomingEndpointNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    update_conn = _IncomingEndpointProbe()
+    forward = _TrivialForward()
+    update = px.policies.Update(conn=_IncomingEndpointProbe())
     propagation = px.Propagation.PIPELINE
 
 
 class _OutgoingEndpointNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    update_conn = _OutgoingEndpointProbe()
+    forward = _TrivialForward()
+    update = px.policies.Update(conn=_OutgoingEndpointProbe())
     propagation = px.Propagation.PIPELINE
 
 

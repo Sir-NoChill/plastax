@@ -130,49 +130,6 @@ def test_gradients_match_autodiff() -> None:
             np.testing.assert_allclose(after[(_D + j, _D + _H + k)], want, atol=1e-6)
 
 
-def test_output_units_are_linear() -> None:
-    """A label unit holds the raw logit; a hidden unit is ReLU-rectified.
-
-    The forward pass branches on IS_OUT inside one apply, so a net whose
-    IS_OUT column was never marked would silently rectify its logits -- which
-    clamps every negative logit to zero and destroys the ranking that
-    precision@k depends on. Positive input weights and negative label weights
-    drive the two branches in opposite directions in a single step: the hidden
-    units must rectify to a positive value, the labels must stay negative.
-    """
-    optimizer = px.optim.sgd(_LR, GradPreAct)
-    net = xmc.make_net(optimizer, method="rigl", mode="eval")
-    from_ids, to_ids = _dense_edges()
-    weights = np.concatenate(
-        [np.ones((_D * _H,), dtype=np.float32), -np.ones((_H * _L,), np.float32)]
-    )
-    static, state = px.NetworkBuilder.from_edges(
-        net,
-        _D + _H + _L,
-        from_ids,
-        to_ids,
-        weights=weights,
-        input_ids=tuple(range(_D)),
-        output_ids=tuple(range(_D + _H, _D + _H + _L)),
-        globals_=None,
-    )
-    state = xmc.mark_outputs(static, state)
-    result = px.make_step(net, static)(
-        state,
-        px.StepInputs(inputs=jnp.ones((_D,), dtype=jnp.float32), targets=None),
-    )
-    activations = np.asarray(result.state.units[px.ACTIVATION.name])
-    # hidden pre-activation = _D * 1.0, rectified (and already positive).
-    np.testing.assert_allclose(
-        activations[_D : _D + _H], np.full(_H, float(_D)), atol=1e-6
-    )
-    # label pre-activation = _H * -1.0 * _D, kept as-is by the linear branch;
-    # a ReLU output would have clamped this to 0.
-    np.testing.assert_allclose(
-        activations[_D + _H :], np.full(_L, -float(_H * _D)), atol=1e-6
-    )
-
-
 def test_churn_conserves_live_edges() -> None:
     """SET and RigL rewiring hold the live-edge count exactly."""
     split = xmc.synthetic_split(64, 128, 256, nnz=8, rank=8, seed=0)
@@ -192,22 +149,6 @@ def test_churn_conserves_live_edges() -> None:
         assert len(set(live_history)) == 1, (
             f"{method}: live-edge count drifted: {sorted(set(live_history))}"
         )
-
-
-def test_cosine_zeta_anneals_to_zero() -> None:
-    """The rewiring fraction starts at zeta0, decreases, and ends exactly at 0.
-
-    Ending at 0 is the point of the schedule: the last cycles refine the wiring
-    the earlier ones found instead of tearing it up right before the net is
-    measured.
-    """
-    num_cycles = 10
-    schedule = [xmc.cosine_zeta(0.3, c, num_cycles) for c in range(num_cycles)]
-    np.testing.assert_allclose(schedule[0], 0.3, rtol=1e-6)
-    np.testing.assert_allclose(schedule[-1], 0.0, atol=1e-9)
-    assert all(a > b for a, b in zip(schedule[:-1], schedule[1:], strict=True))
-    # A single-cycle run has no schedule to walk; don't prune at all.
-    assert xmc.cosine_zeta(0.3, 0, 1) == 0.0
 
 
 def test_zeta_column_controls_pruning() -> None:

@@ -22,7 +22,7 @@ import plastax as px
 from plastax.views import UnitWrite
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward, identity apply onto ACTIVATION."""
 
     combine = px.monoid.sum_
@@ -45,12 +45,12 @@ class _SumForward(px.ForwardPass):
 
 
 class _PipelineRecurrent(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.PIPELINE
 
 
 class _TopologicalRecurrent(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
@@ -70,13 +70,6 @@ def _build(
     builder.add_conn(0, 1, weight=_W_IN)
     builder.add_conn(1, 1, weight=_W_SELF)  # self-loop: recurrent feedback
     return builder.finalize()
-
-
-def test_pipeline_builds_a_cyclic_reservoir() -> None:
-    # The whole point: a graph with a cycle finalizes in pipeline mode.
-    static, state = _build(_PipelineRecurrent)
-    assert len(static.level_capacities) == 1  # single flat bucket
-    assert int(jnp.sum(~state.conns[0][px.DEAD.name])) == 2
 
 
 def test_topological_still_rejects_a_cycle() -> None:

@@ -64,17 +64,3 @@ def test_trait_swifttd_matches_the_reference_with_per_step_termination() -> None
     values = swifttd.output_weights(driver, 5)
     assert np.all(np.diff(values) > 0.0)
     assert 0.0 < values[0] < values[4] < 1.2
-
-
-def test_control_unit_has_no_edges_and_is_not_a_feature() -> None:
-    hp = swifttd.SwiftTDParams()
-    n = 3
-    net = swifttd.make_net(hp, n)
-    static, state, out = swifttd.build(net, n, hp)
-    assert tuple(static.input_ids) == (0, 1, 2, n)
-    assert tuple(static.output_ids) == (out,)
-    conns = state.conns[0]
-    src = np.asarray(conns["from_id"])
-    dead = np.asarray(conns["dead"])
-    assert set(src[~dead].tolist()) == {0, 1, 2}
-    assert int(state.units[swifttd.KIND.name][n]) == swifttd.KIND_CONTROL

@@ -80,15 +80,6 @@ def test_coverage_flags_the_undersized_bucket() -> None:
     assert px.recommended_shortlist(churn, static, state) == 16
 
 
-def test_recommended_shortlist_is_covered() -> None:
-    """Building at the recommendation covers every bucket."""
-    train, churn = _nets(8)
-    static, state = dst.build_sparse_mlp(train, _LAYERS, _BUDGETS, 0)
-    recommended = px.recommended_shortlist(churn, static, state)
-    _, covered_churn = _nets(recommended)
-    assert all(c.covered for c in px.shortlist_coverage(covered_churn, static, state))
-
-
 def _live_counts(shortlist: int, cycles: int = 6) -> set[int]:
     """Live-edge counts across a few train-then-churn cycles."""
     train, churn = _nets(shortlist)

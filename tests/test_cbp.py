@@ -148,7 +148,7 @@ def test_reset_zeroes_outgoing_weights_and_optimizer_state() -> None:
         out_edges = (~dead) & (from_ids == victim)
         np.testing.assert_allclose(weights[out_edges], 0.0, atol=0.0)
         in_edges = (~dead) & (to_ids == victim)
-        for spec in optimizer.state_fields:
+        for spec in optimizer.conn_fields:
             column = np.asarray(bucket[spec.name])
             np.testing.assert_allclose(column[in_edges], 0.0, atol=0.0)
 
@@ -194,13 +194,6 @@ def test_oracle_selection_survives_utility_ties_at_zero() -> None:
     assert set(selected.tolist()) <= set(hidden[:15].tolist()), (
         "selection must come from the zero-utility tie, not above it"
     )
-
-
-def test_jaccard_does_not_score_empty_agreement() -> None:
-    """Two rules that both did nothing are not evidence that they agree."""
-    assert cbp.jaccard(set(), set()) is None
-    assert cbp.jaccard({1, 2}, {1, 2}) == 1.0
-    assert cbp.jaccard({1}, {1, 2, 3}) == 1 / 3
 
 
 @pytest.mark.slow

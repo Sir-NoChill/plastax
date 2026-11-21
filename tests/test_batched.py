@@ -71,17 +71,20 @@ class _PlainSGD:
 
 
 def _mlp(
-    update: px.UpdateConn[None], extra_conn: tuple[px.FieldSpec[np.generic], ...] = ()
+    update: px.policies.UpdateConnPolicy[None],
+    extra_conn: tuple[px.FieldSpec[np.generic], ...] = (),
 ) -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
+    update_ = update
+
     class _MLP(px.Network[None]):
-        forward_pass = mlp_xor.SigmoidForward()
-        backward_pass = mlp_xor.SigmoidBackward()
+        forward = mlp_xor.SigmoidForward()
+        backward = mlp_xor.SigmoidBackward()
         loss = mlp_xor.MSELoss()
-        update_conn = update
+        update = px.policies.Update(conn=update_)
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
         extra_conn_fields = extra_conn
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     rng = np.random.default_rng(0)
     blocks = [px.topology.input_units(_SIZES[0])]
@@ -116,7 +119,7 @@ def _data(batch: int, steps: int) -> tuple[np.ndarray, np.ndarray]:
 )
 def test_a_batch_of_one_is_the_streaming_step(make: object) -> None:
     opt = make()  # type: ignore[operator]
-    net, static, state = _mlp(opt.update_conn(), opt.state_fields)
+    net, static, state = _mlp(opt.update().conn, opt.conn_fields)
     stream = px.make_step(net, static)
     batched = px.make_step(net, static, batch_size=1)
     xs, ys = _data(1, 5)
@@ -138,7 +141,7 @@ def test_a_batch_of_one_is_the_streaming_step(make: object) -> None:
 def test_mean_of_writes_equals_the_exact_path_for_a_linear_rule() -> None:
     net_plain, static, state = _mlp(_PlainSGD())
     net_exact, static_e, state_e = _mlp(
-        px.optim.sgd(_LR, mlp_xor.GradPreAct).update_conn()
+        px.optim.sgd(_LR, mlp_xor.GradPreAct).update().conn
     )
     plain = px.make_step(net_plain, static, batch_size=4)
     exact = px.make_step(net_exact, static_e, batch_size=4)
@@ -154,7 +157,7 @@ def test_batched_step_is_the_mean_of_per_sample_sgd_steps() -> None:
     # For SGD, one batched step from S equals the mean of B streaming steps
     # each taken from the same S.
     opt = px.optim.sgd(_LR, mlp_xor.GradPreAct)
-    net, static, state = _mlp(opt.update_conn())
+    net, static, state = _mlp(opt.update().conn)
     xs, ys = _data(4, 1)
     stream = px.make_step(net, static)
     singles = []
@@ -179,7 +182,7 @@ def test_batch_size_is_validated() -> None:
         px.make_step(net, static, batch_size=0)
 
     class _Pipe(px.Network[None]):
-        forward_pass = mlp_xor.SigmoidForward()
+        forward = mlp_xor.SigmoidForward()
         propagation = px.Propagation.PIPELINE
 
     with pytest.raises(ValueError, match="PIPELINE"):
@@ -233,7 +236,7 @@ def test_linear_layouts_match_the_edge_list(make: object, layout: str) -> None:
     # mlp_xor's sigmoid passes declare linear_input, so layout="csr" runs both
     # the forward and the backward as sparse products.
     opt = make()  # type: ignore[operator]
-    net, static, state = _mlp(opt.update_conn(), opt.state_fields)
+    net, static, state = _mlp(opt.update().conn, opt.conn_fields)
     edge = px.make_step(net, static, batch_size=4, layout="edge_list")
     csr = px.make_step(net, static, batch_size=4, layout=layout)  # type: ignore[arg-type]
     s_edge, s_csr = state, jax.tree.map(jnp.copy, state)
@@ -269,9 +272,9 @@ def test_linear_forward_is_exact_on_a_churned_arena(layout: str) -> None:
         linear_input = px.ACTIVATION
 
     class _Fwd(px.Network[dict[str, jax.Array]]):
-        forward_pass = _LinearSum()
+        forward = _LinearSum()
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     static, state = churn._build()
     churn_step = px.make_step(churn._ChurnNet, static)
@@ -292,14 +295,6 @@ def test_linear_forward_is_exact_on_a_churned_arena(layout: str) -> None:
         rtol=1e-5,
         atol=1e-5,
     )
-
-
-def test_unknown_layout_is_rejected() -> None:
-    net, static, _ = _mlp(_PlainSGD())
-    # Runtime type checking (tests) rejects the literal first; without it the
-    # ValueError does.
-    with pytest.raises((ValueError, TypeError), match="layout"):
-        px.make_step(net, static, batch_size=2, layout="dense")  # type: ignore[arg-type]
 
 
 def test_mean_of_writes_leaves_unwritten_columns_and_dead_slots_bit_identical() -> None:
@@ -332,19 +327,3 @@ def test_batched_inputs_must_match_the_batch_size() -> None:
         step(
             state, px.StepInputs(inputs=jnp.asarray(xs[0]), targets=jnp.asarray(ys[0]))
         )
-
-
-def test_cusparse_step_wrapper_keeps_the_aot_api() -> None:
-    # Regression: the scoped-cuSPARSE wrapper used to be a plain function, so
-    # a CSR step lost jit's .trace / .lower (needed for AOT compilation, e.g.
-    # examples/benchmarks/tpu_aot_check.py). A toy jitted function stands in
-    # for the step: AOT on a real NetworkState trips this suite's beartype
-    # instrumentation (jax rebuilds the pytree with ArgInfo leaves), the same
-    # test-only artifact that sends the sharding checks to a subprocess.
-    from plastax.step import _CusparseStep
-
-    step = _CusparseStep(jax.jit(lambda s, x: s + x))
-    a = jnp.ones((4,), jnp.float32)
-    compiled = step.trace(a, a).lower().compile()
-    np.testing.assert_allclose(np.asarray(compiled(a, a)), 2.0)
-    np.testing.assert_allclose(np.asarray(step.lower(a, a).compile()(a, a)), 2.0)

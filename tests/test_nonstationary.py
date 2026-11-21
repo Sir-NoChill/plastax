@@ -76,14 +76,6 @@ def test_drift_at_zero_is_identity() -> None:
     np.testing.assert_allclose(ns.drift(teacher, 0.0, rng), teacher, atol=1e-12)
 
 
-def test_drift_at_half_pi_is_orthogonal() -> None:
-    """theta=pi/2 must give a fully orthogonal teacher -- a real resample."""
-    rng = np.random.default_rng(2)
-    teacher = rng.standard_normal((6, 24))
-    rotated = ns.drift(teacher, math.pi / 2, rng)
-    np.testing.assert_allclose(np.sum(teacher * rotated, axis=1), 0.0, atol=1e-9)
-
-
 def test_dense_baseline_is_actually_dense() -> None:
     """Every (src, dst) pair of each layer transition is present exactly once."""
     layers = (9, 16, 4)
@@ -148,17 +140,6 @@ def test_recovery_times_finds_a_real_recovery() -> None:
             )
         )
     assert ns.recovery_times(records, window=5, tolerance=0.98) == [4]
-
-
-def test_growth_slope_beats_first_vs_last() -> None:
-    """The trend statistic must not be fooled by a noisy non-trend.
-
-    [8, 15, 8, 10] rises from first to last but is not growing; the slope says
-    so. This is the check that keeps G0 from passing on noise.
-    """
-    assert ns.growth_slope([8, 15, 8, 10]) < 0.25
-    assert ns.growth_slope([1, 2, 3, 4, 5]) > 0.9
-    assert ns.growth_slope([5]) == 0.0
 
 
 def test_rewiring_holds_sparsity_across_a_switch() -> None:

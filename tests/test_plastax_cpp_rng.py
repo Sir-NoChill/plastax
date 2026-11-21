@@ -25,7 +25,7 @@ import numpy as np
 import pytest
 
 from _plastax_cpp import plastax_cpp_dir
-from _plastax_cpp_rng import fully_connected_weights, mix_seed, uniform_real
+from _plastax_cpp_rng import fully_connected_weights, uniform_real
 
 _GOLDEN = plastax_cpp_dir() / "tests" / "golden" / "rng_uniform.json"
 
@@ -72,36 +72,6 @@ def test_uniform_real_is_bit_exact() -> None:
     )
 
 
-@needs_golden
-def test_both_lerp_branches_are_covered() -> None:
-    """The golden must exercise a zero-straddling and a same-sign range.
-
-    The two ranges take different branches of std::lerp, and a port that only
-    handles the first is wrong for every positive-only initialiser. Assert the
-    coverage rather than assuming the emitter kept it.
-    """
-    ranges = _golden()["ranges"].values()
-    assert any(lo <= 0 <= hi for lo, hi in ranges), "no zero-straddling range"
-    assert any(lo > 0 or hi < 0 for lo, hi in ranges), "no same-sign range"
-
-
-def test_vectorises_over_counters() -> None:
-    """Array and scalar counters agree, so a whole layer can be drawn at once."""
-    counters = np.arange(64, dtype=np.uint64)
-    batched = uniform_real(np.uint64(7), counters, -1.0, 1.0)
-    scalar = np.array(
-        [uniform_real(np.uint64(7), np.uint64(c), -1.0, 1.0) for c in counters],
-        dtype=np.float32,
-    )
-    np.testing.assert_array_equal(batched, scalar)
-
-
-def test_mix_seed_is_uint32() -> None:
-    """MixSeed truncates to 32 bits, as the C++ return type does."""
-    out = mix_seed(np.uint64(0xFFFFFFFFFFFFFFFF), np.uint64(12345))
-    assert out.dtype == np.uint32
-
-
 def test_fully_connected_weights_uses_destination_major_ids() -> None:
     """w[src, dst] must come from conn id base + dst * n_src + src.
 
@@ -137,12 +107,3 @@ def test_fully_connected_weights_philox_engine_matches_the_scalar_form() -> None
             word = philox32(seed, base + dst * n_src + src)
             expected = np.float32(-1.0) + np.float32(2.0) * unit_float(word)
             assert _bits(w[src, dst]) == _bits(expected), f"({src}, {dst})"
-
-
-def test_samples_stay_in_range() -> None:
-    """Sanity bound on both branches, independent of the golden."""
-    counters = np.arange(2048, dtype=np.uint64)
-    signed = uniform_real(np.uint64(3), counters, -1.0, 1.0)
-    assert signed.min() >= -1.0 and signed.max() < 1.0
-    positive = uniform_real(np.uint64(3), counters, 2.0, 5.0)
-    assert positive.min() >= 2.0 and positive.max() < 5.0

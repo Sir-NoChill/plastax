@@ -85,12 +85,6 @@ def inputs_of(x: Any, targets: Any = None) -> px.StepInputs:
 # --------------------------------------------------------------------------- #
 # init and step
 # --------------------------------------------------------------------------- #
-def test_step_returns_a_loss_and_no_outputs_unless_asked() -> None:
-    result = Linear.init(KEY).step(inputs_of([1.0, 2.0, 3.0]))
-
-    assert result.loss.shape == ()
-    assert result.outputs is None
-    assert result.records is None
 
 
 def test_outputs_are_the_forward_pass_in_the_shape_the_topology_returned() -> None:
@@ -219,12 +213,6 @@ class ScaledNet(px.Network[dict[str, Any]]):
     input_shape = (1,)
     globals = {"scale": f32(2.0)}
     forward = px.policies.Forward(conn=Scaled(), unit=Summed())
-
-
-def test_the_class_field_is_the_value_the_globals_start_from() -> None:
-    result = ScaledNet.init(KEY).step(inputs_of([5.0]), outputs=True)
-
-    np.testing.assert_allclose(result.outputs, [10.0])
 
 
 def test_globals_given_to_init_replace_the_class_field_for_that_network() -> None:

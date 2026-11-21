@@ -16,7 +16,7 @@ import plastax as px
 from plastax.views import UnitWrite
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward (test_forward_pipeline.py's _SumForward,
     reused verbatim): map = weight * activation[src], combine = sum,
     apply = identity onto ACTIVATION."""
@@ -41,12 +41,12 @@ class _SumForward(px.ForwardPass):
 
 
 class _TopoNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class _PipelineNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.PIPELINE
 
 

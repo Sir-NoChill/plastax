@@ -17,7 +17,7 @@ from plastax import state as state_mod
 from plastax.views import UnitWrite
 
 
-class _SumForward(px.ForwardPass):
+class _SumForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted-sum forward, the DefaultForwardPass analogue
     (traits.hpp:111-121): map = weight * activation[src], combine = sum,
     apply = identity onto ACTIVATION."""
@@ -42,7 +42,7 @@ class _SumForward(px.ForwardPass):
 
 
 class _PipelineNet(px.Network[None]):
-    forward_pass = _SumForward()
+    forward = _SumForward()
     propagation = px.Propagation.PIPELINE
 
 

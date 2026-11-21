@@ -91,14 +91,14 @@ def _build_plastax(
     optimizer: px.optim.Optimizer, sizes: list[int], weights: list[np.ndarray]
 ) -> tuple[type[px.Network[None]], px.NetworkStatic, px.NetworkState[None]]:
     class _MLP(px.Network[None]):
-        forward_pass = mlp_xor.SigmoidForward()
-        backward_pass = mlp_xor.SigmoidBackward()
+        forward = mlp_xor.SigmoidForward()
+        backward = mlp_xor.SigmoidBackward()
         loss = mlp_xor.MSELoss()
-        update_conn = optimizer.update_conn()
+        update = px.policies.Update(conn=optimizer.update().conn)
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
-        extra_conn_fields = optimizer.state_fields
+        extra_conn_fields = optimizer.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     blocks = [px.topology.input_units(sizes[0])]
     for i, w in enumerate(weights):

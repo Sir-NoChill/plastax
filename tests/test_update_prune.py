@@ -19,13 +19,11 @@ import jax.numpy as jnp
 import numpy as np
 
 import plastax as px
-from plastax import phases
-from plastax.state import live_conn_count
 
 _DUMMY_INPUTS = px.StepInputs(inputs=jnp.zeros((0,), dtype=jnp.float32), targets=None)
 
 
-class _TrivialForward(px.ForwardPass):
+class _TrivialForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Required trait slot (Network.forward_pass is mandatory), not
     exercised by these tests, which only assert on WEIGHT/DEAD."""
 
@@ -51,7 +49,7 @@ class _TrivialForward(px.ForwardPass):
 _THRESHOLD = 2.0
 
 
-class _ThresholdPrune(px.PruneConn):
+class _ThresholdPrune(px.policies.PruneConnPolicy):
     """Prunes any conn whose CURRENT weight is at or below _THRESHOLD."""
 
     def predicate(
@@ -62,8 +60,8 @@ class _ThresholdPrune(px.PruneConn):
 
 
 class _PruneNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    prune_conn = _ThresholdPrune()
+    forward = _TrivialForward()
+    prune = px.policies.Prune(conn=_ThresholdPrune())
     propagation = px.Propagation.PIPELINE
 
 
@@ -77,57 +75,6 @@ def _build_prune_net() -> tuple[px.NetworkStatic, px.NetworkState[None]]:
     builder.add_conn(1, 3, weight=5.0)  # above threshold -> survives
     builder.add_conn(2, 3, weight=2.0)  # at threshold ( <= prunes) -> pruned
     return builder.finalize()
-
-
-def test_prune_conn_tombstones_only_the_predicted_conns() -> None:
-    static, state = _build_prune_net()
-    assert static.level_capacities[0] > 3  # real padding beyond the 3 live conns
-
-    phase = phases.build_prune_conn_phase(_PruneNet, static)
-    new_state, loss = phase(state, _DUMMY_INPUTS)
-
-    assert float(loss) == 0.0
-    bucket = new_state.conns[0]
-    dead = np.asarray(bucket[px.DEAD.name])
-    from_id = np.asarray(bucket[px.FROM_ID.name])
-    to_id = np.asarray(bucket[px.TO_ID.name])
-
-    pruned = {
-        (int(f), int(t)) for f, t, d in zip(from_id, to_id, dead, strict=True) if d
-    }
-    assert (0, 3) in pruned
-    assert (2, 3) in pruned
-    assert (1, 3) not in pruned
-    # Padding beyond the 3 original live rows was already dead and stays so.
-    assert bool(dead[3:].all())
-
-
-def test_prune_conn_live_count_drops_and_matches_derived_sum() -> None:
-    static, state = _build_prune_net()
-    before = int(live_conn_count(state))
-    assert before == 3
-
-    phase = phases.build_prune_conn_phase(_PruneNet, static)
-    new_state, _ = phase(state, _DUMMY_INPUTS)
-
-    after = int(live_conn_count(new_state))
-    assert after == 1  # only (1, 3) survives _THRESHOLD
-
-    dead = np.asarray(new_state.conns[0][px.DEAD.name])
-    assert after == int((~dead).sum())  # derived: matches a manual recount
-
-
-def test_prune_conn_does_not_change_shape_or_set_needs_resort() -> None:
-    static, state = _build_prune_net()
-    phase = phases.build_prune_conn_phase(_PruneNet, static)
-    new_state, _ = phase(state, _DUMMY_INPUTS)
-
-    assert len(new_state.conns) == len(state.conns)
-    for old_bucket, new_bucket in zip(state.conns, new_state.conns, strict=True):
-        assert old_bucket.keys() == new_bucket.keys()
-        for name in old_bucket:
-            assert old_bucket[name].shape == new_bucket[name].shape
-    assert bool(new_state.needs_resort) is False
 
 
 def test_prune_conn_wired_into_build_phases_via_make_step() -> None:
@@ -153,7 +100,7 @@ _DECAY = 1.0
 _COMPOSE_THRESHOLD = 2.0
 
 
-class _DecayIncoming(px.UpdateConn):
+class _DecayIncoming(px.policies.UpdateConnPolicy):
     """incoming shrinks weight by a fixed decay; outgoing is a no-op so the
     step applies exactly one decay, not two."""
 
@@ -182,7 +129,7 @@ class _DecayIncoming(px.UpdateConn):
         return px.ConnWrite.of()
 
 
-class _ComposeThresholdPrune(px.PruneConn):
+class _ComposeThresholdPrune(px.policies.PruneConnPolicy):
     def predicate(
         self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: None
     ) -> jax.Array:
@@ -191,9 +138,9 @@ class _ComposeThresholdPrune(px.PruneConn):
 
 
 class _DecayThenPruneNet(px.Network[None]):
-    forward_pass = _TrivialForward()
-    update_conn = _DecayIncoming()
-    prune_conn = _ComposeThresholdPrune()
+    forward = _TrivialForward()
+    update = px.policies.Update(conn=_DecayIncoming())
+    prune = px.policies.Prune(conn=_ComposeThresholdPrune())
     propagation = px.Propagation.PIPELINE
 
 

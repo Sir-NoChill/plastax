@@ -48,6 +48,13 @@ class NetworkStatic:
             but growth may (the committed edge is backward and triggers a
             resort), so the bucket must exist for the claim to land in.
             Resort preserves the convention.
+        input_shape: the shape a step's inputs are given in, when the network
+            declares one (a network built from a topology). The step flattens
+            it in row-major order onto `input_ids`. None for the flat
+            `(len(input_ids),)` vector.
+        output_shape: the same for a step's targets and for the outputs it
+            returns, over `output_ids`. None for the flat
+            `(len(output_ids),)` vector.
     """
 
     num_units: int = dataclasses.field(metadata=dict(static=True))
@@ -73,6 +80,12 @@ class NetworkStatic:
     )
     seed: int = dataclasses.field(default=0, metadata=dict(static=True))
     deepest_grows: bool = dataclasses.field(default=False, metadata=dict(static=True))
+    input_shape: tuple[int, ...] | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
+    output_shape: tuple[int, ...] | None = dataclasses.field(
+        default=None, metadata=dict(static=True)
+    )
 
 
 Columns = dict[str, Array]  # keyed by FieldSpec.name; one array per SOA tag

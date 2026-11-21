@@ -29,7 +29,7 @@ N_OUTPUT = 8
 N_SHARDS = 4
 
 
-class _TanhForward(px.ForwardPass):
+class _TanhForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Layer update: pre-activation is a weighted sum, apply is tanh."""
 
     combine = px.monoid.sum_
@@ -54,7 +54,7 @@ class _TanhForward(px.ForwardPass):
 class ShardedReservoir(px.Network[None]):
     """Feedforward sparse tanh reservoir, sharded edge-wise across the mesh."""
 
-    forward_pass = _TanhForward()
+    forward = _TanhForward()
     propagation = px.Propagation.TOPOLOGICAL
     sharding = px.ShardSpec("shard", N_SHARDS)
 

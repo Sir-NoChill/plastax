@@ -150,7 +150,7 @@ _UNIT_FIELDS = (
 )
 
 
-class CbpFanInUtility(px.ForwardPass):
+class CbpFanInUtility(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Hop one of the local rule: log-utility moments over the fan-in sources.
 
     Reduces `(log u, (log u)^2, 1)` over the ELIGIBLE incoming sources -- mature
@@ -241,7 +241,7 @@ class CbpFanInUtility(px.ForwardPass):
         )
 
 
-class CbpUtility(px.BackwardPass):
+class CbpUtility(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """Contribution utility over OUTGOING edges, and the reset decision.
 
     `sum_{j in out(i)} |w_ij|` is a reduction into the SOURCE unit, which is
@@ -372,7 +372,7 @@ class CbpUtility(px.BackwardPass):
         )
 
 
-class CbpReinit(px.UpdateConn[None]):
+class CbpReinit(px.policies.UpdateConnPolicy[None]):
     """Reinitialize a reset unit's incoming edges; zero its outgoing edges.
 
     Zeroing the outputs is the paper's rule: a replaced unit must not perturb
@@ -394,7 +394,7 @@ class CbpReinit(px.UpdateConn[None]):
                 from the bundle rather than hardcoded so any optimizer works.
             init_scale: multiplies the 1/sqrt(fan-in) reinit scale.
         """
-        self.state_fields = state_fields
+        self.conn_fields = state_fields
         self.init_scale = init_scale
 
     def incoming(
@@ -416,7 +416,7 @@ class CbpReinit(px.UpdateConn[None]):
         writes: list[tuple[px.FieldSpec[np.generic], jax.Array]] = [
             (px.WEIGHT, jnp.where(reset, fresh, c[px.WEIGHT, cid]))
         ]
-        for spec in self.state_fields:
+        for spec in self.conn_fields:
             zero = jnp.zeros((), dtype=spec.dtype)
             writes.append((spec, jnp.where(reset, zero, c[spec, cid])))
         return px.ConnWrite.of(*writes)
@@ -471,12 +471,12 @@ def make_net(
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
-            backward_pass = ReluBackward()
+            forward = ReluForward(ema_decay)
+            backward = ReluBackward()
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
@@ -484,9 +484,9 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
+            forward = ReluForward(ema_decay)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Eval
@@ -494,16 +494,18 @@ def make_net(
     if mode == "churn":
 
         class _Churn(px.Network[None]):
-            forward_pass = CbpFanInUtility(maturity)
-            backward_pass = CbpUtility(
+            forward = CbpFanInUtility(maturity)
+            backward = CbpUtility(
                 decay=decay,
                 maturity=maturity,
                 local=local,
                 rho=rho,
             )
-            update_conn = CbpReinit(optimizer.state_fields, init_scale=init_scale)
+            update = px.policies.Update(
+                conn=CbpReinit(optimizer.conn_fields, init_scale=init_scale)
+            )
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Churn

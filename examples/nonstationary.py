@@ -65,7 +65,7 @@ _UNIT_FIELDS = (GradPreAct, LossGrad, SET_THRESH, SET_CURSOR, ACT_EMA, IS_OUT)
 _GROWTH = {"set": RandomGrow, "rigl": GradientGrow}
 
 
-class ReluForward(px.ForwardPass):
+class ReluForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted sum; ReLU on hidden units, identity on outputs.
 
     Also advances the per-unit activation EMA that supplies the dormancy
@@ -103,7 +103,7 @@ class ReluForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, activation), (ACT_EMA, ema))
 
 
-class ReluBackward(px.BackwardPass):
+class ReluBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """Reverse walk; dL/dz from the loss at the output, ReLU derivative inside.
 
     Backward accumulates into the edge's SOURCE, so `src` is this pass's
@@ -171,12 +171,12 @@ def make_net(
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
-            backward_pass = ReluBackward()
+            forward = ReluForward(ema_decay)
+            backward = ReluBackward()
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
@@ -184,9 +184,9 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
+            forward = ReluForward(ema_decay)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Eval
@@ -196,12 +196,14 @@ def make_net(
             raise ValueError(f"make_net: unknown method {method!r} (set|rigl)")
         grow = _GROWTH[method](max_new_per_level, grow_scale, shortlist)
 
+        grow_ = grow
+
         class _Churn(px.Network[None]):
-            forward_pass = MagnitudeStats(zeta)
-            prune_conn = SetPrune()
-            add_conn = grow
+            forward = MagnitudeStats(zeta)
+            prune = px.policies.Prune(conn=SetPrune())
+            grow = px.policies.Grow(conn=grow_)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Churn

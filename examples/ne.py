@@ -86,7 +86,7 @@ _UNIT_FIELDS = (
 )
 
 
-class NeStats(px.ForwardPass):
+class NeStats(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Churn-step forward: advance the per-unit rewiring cursor only.
 
     NE's dormancy statistic is the activation EMA that the TRAIN forward pass
@@ -118,7 +118,7 @@ class NeStats(px.ForwardPass):
         return px.UnitWrite.of((SET_CURSOR, u[SET_CURSOR, i] + jnp.int32(1)))
 
 
-class NeGrow(px.ScoreAddConn[None]):
+class NeGrow(px.policies.ScoreAddConnPolicy[None]):
     """Gradient-scored growth, thinned to a cosine-annealed rate, interior only.
 
     The score is RigL's absent-edge gradient. Two gates sit on top: the edge's
@@ -167,7 +167,7 @@ class NeGrow(px.ScoreAddConn[None]):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(self.grow_scale)))
 
 
-class NePrune(px.PruneConn):
+class NePrune(px.policies.PruneConnPolicy):
     """Tombstone the incoming edges of a fully dormant interior unit.
 
     The paper's threshold is exactly zero -- only units whose activation has
@@ -227,12 +227,12 @@ def make_net(
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
-            backward_pass = ReluBackward()
+            forward = ReluForward(ema_decay)
+            backward = ReluBackward()
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
@@ -240,9 +240,9 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
+            forward = ReluForward(ema_decay)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Eval
@@ -250,11 +250,13 @@ def make_net(
     if mode == "churn":
 
         class _Churn(px.Network[None]):
-            forward_pass = NeStats()
-            prune_conn = NePrune(tau)
-            add_conn = NeGrow(max_new_per_level, grow_scale, shortlist)
+            forward = NeStats()
+            prune = px.policies.Prune(conn=NePrune(tau))
+            grow = px.policies.Grow(
+                conn=NeGrow(max_new_per_level, grow_scale, shortlist)
+            )
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Churn

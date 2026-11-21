@@ -53,20 +53,20 @@ def make_convnet(
     if train:
 
         class _Train(px.Network[None]):
-            forward_pass = SigmoidForward()
-            backward_pass = SigmoidBackward()
+            forward = SigmoidForward()
+            backward = SigmoidBackward()
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = (GradPreAct, LossGrad)
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
 
     class _Eval(px.Network[None]):
-        forward_pass = SigmoidForward()
+        forward = SigmoidForward()
         extra_unit_fields = (GradPreAct, LossGrad)
-        extra_conn_fields = optimizer.state_fields
+        extra_conn_fields = optimizer.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
 
     return _Eval

@@ -66,7 +66,7 @@ def _f(x: jax.Array, src: px.UnitIdx) -> jax.Array:
     return jnp.where(src < NUM_INPUTS, x, jnp.tanh(x))
 
 
-class IpcForward(px.ForwardPass):
+class IpcForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """mu = sum_src W * f(ValueNode[src]); apply writes eps = ValueNode - mu
     into Error for every unit (ipc_multilayer.cpp's iPCForwardPass, minus
     the pre-step copy -- f(ValueNode) is read inline here)."""
@@ -92,7 +92,7 @@ class IpcForward(px.ForwardPass):
         return px.UnitWrite.of((Error, u[ValueNode, i] - acc))
 
 
-class IpcBackward(px.BackwardPass):
+class IpcBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """Accumulates W * Error(downstream) into each source unit; apply stores
     the hidden bottom-up signal f'(x) * (theta^T eps) (iPCBackwardPass).
 
@@ -128,7 +128,7 @@ class IpcBackward(px.BackwardPass):
         return px.UnitWrite.of((BottomUp, jnp.where(is_hidden, deriv * acc, 0.0)))
 
 
-class IpcUpdateConn(px.UpdateConn):
+class IpcUpdateConn(px.policies.UpdateConnPolicy):
     """Local Hebbian rule theta += alpha * eps_dst * f(x_src), entirely in
     the incoming pass; outgoing is a genuine no-op (iPCUpdateConn)."""
 
@@ -162,9 +162,9 @@ class IpcUpdateConn(px.UpdateConn):
 
 
 class IpcNet(px.Network[None]):
-    forward_pass = IpcForward()
-    backward_pass = IpcBackward()
-    update_conn = IpcUpdateConn()
+    forward = IpcForward()
+    backward = IpcBackward()
+    update = px.policies.Update(conn=IpcUpdateConn())
     extra_unit_fields = (ValueNode, Error, BottomUp)
     propagation = px.Propagation.PIPELINE
 

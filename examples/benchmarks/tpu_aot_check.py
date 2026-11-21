@@ -105,14 +105,14 @@ def main() -> None:
     opt = px.optim.adam(0.01, mlp_xor.GradPreAct)
 
     class MLP(px.Network[None]):
-        forward_pass = mlp_xor.SigmoidForward()
-        backward_pass = mlp_xor.SigmoidBackward()
+        forward = mlp_xor.SigmoidForward()
+        backward = mlp_xor.SigmoidBackward()
         loss = mlp_xor.MSELoss()
-        update_conn = opt.update_conn()
+        update = px.policies.Update(conn=opt.update().conn)
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
-        extra_conn_fields = opt.state_fields
+        extra_conn_fields = opt.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
-        batch_reduction = px.MeanFloatFirstRest()
+        batch_reduction = px.policies.MeanFloatFirstRest()
 
     static, state = px.NetworkBuilder.from_edges(
         MLP, n, frm, to, weights=weights, globals_=None, capacity_align=256, **io

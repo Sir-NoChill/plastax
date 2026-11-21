@@ -43,7 +43,7 @@ N_STEPS = 600
 SEED = 0
 
 
-class _TanhReservoir(px.ForwardPass):
+class _TanhReservoir(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Reservoir update: weighted-sum pre-activation, tanh apply.
 
     In pipeline mode the sum reads the previous step's activations, so a
@@ -72,7 +72,7 @@ class _TanhReservoir(px.ForwardPass):
 class EchoStateNetwork(px.Network[None]):
     """Sparse recurrent tanh reservoir, propagated in pipeline mode."""
 
-    forward_pass = _TanhReservoir()
+    forward = _TanhReservoir()
     propagation = px.Propagation.PIPELINE
 
 

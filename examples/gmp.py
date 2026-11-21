@@ -130,12 +130,12 @@ def make_net(
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
-            backward_pass = ReluBackward()
+            forward = ReluForward(ema_decay)
+            backward = ReluBackward()
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
@@ -143,9 +143,9 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = ReluForward(ema_decay)
+            forward = ReluForward(ema_decay)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Eval
@@ -153,10 +153,10 @@ def make_net(
     if mode == "churn":
 
         class _Churn(px.Network[None]):
-            forward_pass = AnnealedMagnitudeStats()
-            prune_conn = SetPrune()
+            forward = AnnealedMagnitudeStats()
+            prune = px.policies.Prune(conn=SetPrune())
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Churn

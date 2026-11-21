@@ -85,7 +85,7 @@ def _hash01(a: jax.Array, b: jax.Array, c: jax.Array) -> jax.Array:
     return (h >> jnp.uint32(8)).astype(jnp.float32) / jnp.float32(1 << 24)
 
 
-class MagnitudeStats(px.ForwardPass):
+class MagnitudeStats(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Churn-step forward: per-unit incoming-weight stats -> prune threshold.
 
     Ignores activations; reduces `(count, sum|w|)` over each destination's live
@@ -138,7 +138,9 @@ class MagnitudeStats(px.ForwardPass):
 ZETA = px.FieldSpec.float32("dst/zeta")
 
 
-class AnnealedMagnitudeStats(px.ForwardPass):
+class AnnealedMagnitudeStats(
+    px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy
+):
     """MagnitudeStats with the prune fraction read from the ZETA column.
 
     Identical statistics; only the source of zeta differs. At zeta = 0 the
@@ -186,7 +188,7 @@ def set_zeta(state: px.NetworkState[None], zeta: float) -> px.NetworkState[None]
     return state
 
 
-class SetPrune(px.PruneConn):
+class SetPrune(px.policies.PruneConnPolicy):
     """Connection-local magnitude pruning against the destination's threshold."""
 
     def predicate(
@@ -198,7 +200,7 @@ class SetPrune(px.PruneConn):
         return jnp.abs(c[px.WEIGHT, cid]) < u[SET_THRESH, dst]
 
 
-class _Growth(px.ScoreAddConn[None]):
+class _Growth(px.policies.ScoreAddConnPolicy[None]):
     """Shared growth: deeper-only (non-deeper vetoed with -inf), fill-to-capacity,
     small weight init, and -- when `shortlist` is set -- an `importance`-driven
     M x M candidate grid instead of the exhaustive num_units^2 one.
@@ -269,7 +271,7 @@ class GradientGrow(_Growth):
         return jnp.where(deeper, jnp.abs(grad), -jnp.inf)
 
 
-class RandomGrowPropose(px.ProposeAddConn[None]):
+class RandomGrowPropose(px.policies.ProposeAddConnPolicy[None]):
     """SET by proposal: each unit draws random edges into the next layer.
 
     The per-unit proposal form of `RandomGrow`. Instead of scoring a
@@ -307,7 +309,7 @@ class RandomGrowPropose(px.ProposeAddConn[None]):
 
     def propose(
         self, u: px.UnitView, i: px.UnitIdx, j: jax.Array, g: None, rng: px.rng.Rng
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         """Propose edge `j` of unit `i`: a random next-layer target, random priority."""
         del u, j, g
         layer = jnp.sum(i >= self._next_start)
@@ -315,7 +317,7 @@ class RandomGrowPropose(px.ProposeAddConn[None]):
         offset = (rng.uniform() * width.astype(jnp.float32)).astype(jnp.int32)
         dst = self._next_start[layer] + jnp.minimum(offset, width - 1)
         score = jnp.where(width > 0, rng.uniform(), -jnp.inf)
-        return px.Proposal(src=i, dst=dst, score=score)
+        return px.policies.Proposal(src=i, dst=dst, score=score)
 
     def init(
         self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: None
@@ -368,12 +370,12 @@ def make_net(
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = SigmoidForward()
-            backward_pass = SigmoidBackward()
+            forward = SigmoidForward()
+            backward = SigmoidBackward()
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = _EXTRA_UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
@@ -381,15 +383,18 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = SigmoidForward()
+            forward = SigmoidForward()
             extra_unit_fields = _EXTRA_UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Eval
 
     if mode == "churn":
-        grow: px.ScoreAddConn[None] | px.ProposeAddConn[None]
+        grow: (
+            px.policies.ScoreAddConnPolicy[None]
+            | px.policies.ProposeAddConnPolicy[None]
+        )
         if method == "set_propose":
             if shortlist is not None or layer_sizes is None:
                 raise ValueError(
@@ -399,12 +404,14 @@ def make_net(
         else:
             grow = _GROWTH[method](max_new_per_level, grow_scale, shortlist)
 
+        grow_ = grow
+
         class _Churn(px.Network[None]):
-            forward_pass = MagnitudeStats(zeta)
-            prune_conn = SetPrune()
-            add_conn = grow
+            forward = MagnitudeStats(zeta)
+            prune = px.policies.Prune(conn=SetPrune())
+            grow = px.policies.Grow(conn=grow_)
             extra_unit_fields = _EXTRA_UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Churn

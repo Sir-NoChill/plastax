@@ -48,7 +48,7 @@ WASHOUT = 400  # steps discarded before the readout sees the state;
 #            also the largest delay the memory-capacity fit can score
 
 
-class TanhReservoir(px.ForwardPass):
+class TanhReservoir(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Reservoir update: weighted sum of the PREVIOUS step's activations, tanh.
 
     In pipeline mode every edge lives in one flat bucket and the sweep reads
@@ -79,7 +79,7 @@ class TanhReservoir(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, jnp.tanh(acc)))
 
 
-class LinearReservoir(px.ForwardPass):
+class LinearReservoir(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """The same sweep with no squashing: the raw linear operator `x -> Wx`.
 
     Used only by `spectral_radius`, where the point is to iterate the actual
@@ -112,14 +112,14 @@ class LinearReservoir(px.ForwardPass):
 class Reservoir(px.Network[None]):
     """Sparse recurrent tanh reservoir, propagated in pipeline mode."""
 
-    forward_pass = TanhReservoir()
+    forward = TanhReservoir()
     propagation = px.Propagation.PIPELINE
 
 
 class LinearProbe(px.Network[None]):
     """Field-identical sibling of `Reservoir` with the squashing removed."""
 
-    forward_pass = LinearReservoir()
+    forward = LinearReservoir()
     propagation = px.Propagation.PIPELINE
 
 

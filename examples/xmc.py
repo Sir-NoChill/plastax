@@ -64,7 +64,7 @@ _UNIT_FIELDS = (GradPreAct, LossGrad, SET_THRESH, SET_CURSOR, IS_OUT, ZETA)
 _GROWTH = {"set": RandomGrow, "rigl": GradientGrow}
 
 
-class XmcForward(px.ForwardPass):
+class XmcForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """map = weight*activation[src]; apply = ReLU, except linear at the output.
 
     The output unit stores the raw logit rather than sigmoid(logit): the loss
@@ -98,7 +98,7 @@ class XmcForward(px.ForwardPass):
         )
 
 
-class XmcBackward(px.BackwardPass):
+class XmcBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """Direction-reversed accumulate; dL/dz comes straight from the loss at
     the output level and through the ReLU derivative everywhere else.
 
@@ -144,7 +144,7 @@ class XmcBackward(px.BackwardPass):
         )
 
 
-class BCEWithLogitsLoss(px.Loss):
+class BCEWithLogitsLoss(px.policies.LossPolicy):
     """Per-label binary cross-entropy on logits, with a positive-class weight.
 
     Uses the stable form `max(z,0) - z*t + log1p(exp(-|z|))`, never
@@ -179,7 +179,9 @@ class BCEWithLogitsLoss(px.Loss):
         return jnp.sum(loss), grad
 
 
-class AnnealedMagnitudeStats(px.ForwardPass):
+class AnnealedMagnitudeStats(
+    px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy
+):
     """dst_sparse.MagnitudeStats with the prune fraction read from a column.
 
     Identical statistics -- reduce `(count, sum|w|)` over each unit's live
@@ -285,12 +287,12 @@ def make_net(
     if mode == "train":
 
         class _Train(px.Network[None]):
-            forward_pass = XmcForward()
-            backward_pass = XmcBackward()
+            forward = XmcForward()
+            backward = XmcBackward()
             loss = BCEWithLogitsLoss(pos_weight)
-            update_conn = optimizer.update_conn()
+            update = px.policies.Update(conn=optimizer.update().conn)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
@@ -298,9 +300,9 @@ def make_net(
     if mode == "eval":
 
         class _Eval(px.Network[None]):
-            forward_pass = XmcForward()
+            forward = XmcForward()
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Eval
@@ -309,12 +311,14 @@ def make_net(
         del zeta  # now a runtime column (ZETA); see AnnealedMagnitudeStats
         grow = _GROWTH[method](max_candidates, grow_scale, shortlist)
 
+        grow_ = grow
+
         class _Churn(px.Network[None]):
-            forward_pass = AnnealedMagnitudeStats()
-            prune_conn = SetPrune()
-            add_conn = grow
+            forward = AnnealedMagnitudeStats()
+            prune = px.policies.Prune(conn=SetPrune())
+            grow = px.policies.Grow(conn=grow_)
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.state_fields
+            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Churn

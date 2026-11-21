@@ -136,7 +136,7 @@ def hash01(a: jax.Array, b: jax.Array, salt: int) -> jax.Array:
     return (h >> jnp.uint32(8)).astype(jnp.float32) / jnp.float32(1 << 24)
 
 
-def next_level(src: jax.Array, width: int, rng: px.rng.Rng) -> px.Proposal:
+def next_level(src: jax.Array, width: int, rng: px.rng.Rng) -> px.policies.Proposal:
     """A random unit of the next built level, or a veto from the last one.
 
     Edges only run toward higher ids, so growth never closes a cycle.
@@ -153,10 +153,10 @@ def next_level(src: jax.Array, width: int, rng: px.rng.Rng) -> px.Proposal:
     lvl = src // width
     dst = (lvl + 1) * width + rng.uniform_int(width).astype(jnp.int32)
     score = jnp.where(lvl + 1 < LEVELS, rng.uniform(), -jnp.inf)
-    return px.Proposal(src, dst, score)
+    return px.policies.Proposal(src, dst, score)
 
 
-class LinearForward(px.ForwardPass):
+class LinearForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """A weighted-sum forward pass; only present because a net needs one."""
 
     combine = px.monoid.sum_
@@ -193,7 +193,7 @@ class GrowthKnobs:
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.0)))
 
 
-class PerUnitGrow(GrowthKnobs, px.ProposeAddConn):
+class PerUnitGrow(GrowthKnobs, px.policies.ProposeAddConnPolicy):
     proposer = "per_unit"
 
     def __init__(self, p: int, width: int) -> None:
@@ -207,12 +207,12 @@ class PerUnitGrow(GrowthKnobs, px.ProposeAddConn):
         j: jax.Array,
         g: Globals,
         rng: px.rng.Rng,
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         del u, j, g
         return next_level(jnp.asarray(i), self.width, rng)
 
 
-class PerConnectionGrow(GrowthKnobs, px.ProposeAddConn):
+class PerConnectionGrow(GrowthKnobs, px.policies.ProposeAddConnPolicy):
     proposer = "per_connection"
 
     def __init__(self, p: int, width: int) -> None:
@@ -227,12 +227,12 @@ class PerConnectionGrow(GrowthKnobs, px.ProposeAddConn):
         j: jax.Array,
         g: Globals,
         rng: px.rng.Rng,
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         del u, j, g
         return next_level(c[px.FROM_ID, cid], self.width, rng)
 
 
-class GlobalGrow(GrowthKnobs, px.ProposeAddConn):
+class GlobalGrow(GrowthKnobs, px.policies.ProposeAddConnPolicy):
     proposer = "global"
 
     def __init__(self, p: int, width: int) -> None:
@@ -241,13 +241,13 @@ class GlobalGrow(GrowthKnobs, px.ProposeAddConn):
 
     def propose(
         self, u: px.UnitView, j: jax.Array, g: Globals, rng: px.rng.Rng
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         del u, j, g
         src = rng.uniform_int(self.width * (LEVELS - 1))
         return next_level(src, self.width, rng)
 
 
-class ScoreGrow(GrowthKnobs, px.ScoreAddConn):
+class ScoreGrow(GrowthKnobs, px.policies.ScoreAddConnPolicy):
     """Hashed scores over the exhaustive grid or an importance shortlist."""
 
     def __init__(self, candidates: str, m: int) -> None:
@@ -300,8 +300,8 @@ def make_net(rule: Any) -> type[px.Network[Globals]]:
     """
 
     class Net(px.Network[Globals]):
-        forward_pass = LinearForward()
-        add_conn = rule
+        forward = LinearForward()
+        grow = px.policies.Grow(conn=rule)
         propagation = px.Propagation.TOPOLOGICAL
 
     return Net

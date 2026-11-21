@@ -236,7 +236,7 @@ def _eligible(u: px.UnitView, i: px.UnitIdx, tenure_threshold: float) -> jax.Arr
 # --- the policies ------------------------------------------------------------
 
 
-class ImprintingForward(px.ForwardPass):
+class ImprintingForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """One sweep: the output's prediction and lagged sums; the features' values.
 
     Into the output, each edge contributes the SwiftTD terms. Into a
@@ -341,7 +341,7 @@ class ImprintingForward(px.ForwardPass):
         )
 
 
-class OutDegreeBackward(px.BackwardPass):
+class OutDegreeBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
     """Mirror each unit's prediction weight and live out-degree onto the unit."""
 
     combine = (px.monoid.sum_, px.monoid.sum_)
@@ -370,7 +370,7 @@ class OutDegreeBackward(px.BackwardPass):
         return px.UnitWrite.of((W_OUT, acc[0]), (OUT_DEG, acc[1]))
 
 
-class RollSignatures(px.UpdateUnit):
+class RollSignatures(px.policies.UpdateUnitPolicy):
     """`RecordActivations` plus the eligible-set signature history roll."""
 
     def __init__(self) -> None:
@@ -387,7 +387,7 @@ class RollSignatures(px.UpdateUnit):
         )
 
 
-class ImprintingUpdate(px.UpdateConn):
+class ImprintingUpdate(px.policies.UpdateConnPolicy):
     """The fused SwiftTD update on the edges into the output; others untouched.
 
     On top of the fused update, the sparse version's eligible set: a feature
@@ -452,7 +452,7 @@ class ImprintingUpdate(px.UpdateConn):
         return px.ConnWrite.of()
 
 
-class IdleFeaturePrune(px.PruneConn):
+class IdleFeaturePrune(px.policies.PruneConnPolicy):
     """Remove a generated feature (its output edge) when idle as its trace fades."""
 
     def predicate(
@@ -466,14 +466,14 @@ class IdleFeaturePrune(px.PruneConn):
         return is_out & _generated(u, src) & idle & (c[DROPPED, cid] > 0.0)
 
 
-class OrphanPrune(px.PruneUnit):
+class OrphanPrune(px.policies.PruneUnitPolicy):
     """Delete a generated unit nothing reads any more (not a fresh one)."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> jax.Array:
         return _generated(u, i) & (u[OUT_DEG, i] == 0.0) & (u[BORN, i] < g["step"])
 
 
-class ImprintSpawn(px.AddUnit):
+class ImprintSpawn(px.policies.AddUnitPolicy):
     """Feature generation: active tenured units spawn pattern or memory children.
 
     The step's budget is the thesis's: at most `k_mem + k_pat` features while
@@ -571,7 +571,7 @@ class ImprintSpawn(px.AddUnit):
         )
 
 
-class ImprintWiring(px.ScoreAddConn):
+class ImprintWiring(px.policies.ScoreAddConnPolicy):
     """Wire the step's new units: imprint inputs plus one edge into the output.
 
     A global shortlist over the units that matter this step -- the output,
@@ -634,7 +634,7 @@ class ImprintWiring(px.ScoreAddConn):
         )
 
 
-class Tick(px.ResetGlobal):
+class Tick(px.policies.ResetGlobalPolicy):
     """Advance the step counter the draw sites key on."""
 
     def reset(self, g: Globals) -> Globals:
@@ -662,15 +662,16 @@ def make_net(hp: ImprintingParams, num_obs: int) -> type[px.Network[Globals]]:
     output_unit = num_obs + 1
 
     class ImprintingNet(px.Network[Globals]):
-        forward_pass = ImprintingForward(hp)
+        forward = ImprintingForward(hp)
         loss = TDErrorLoss(hp.swifttd, gamma_unit)
-        backward_pass = OutDegreeBackward()
-        update_unit = RollSignatures()
-        update_conn = ImprintingUpdate(hp, gamma_unit)
-        prune_unit = OrphanPrune()
-        prune_conn = IdleFeaturePrune()
-        add_unit = ImprintSpawn(hp, output_unit, hp.seed)
-        add_conn = ImprintWiring(hp)
+        backward = OutDegreeBackward()
+        update = px.policies.Update(
+            conn=ImprintingUpdate(hp, gamma_unit), unit=RollSignatures()
+        )
+        prune = px.policies.Prune(conn=IdleFeaturePrune(), unit=OrphanPrune())
+        grow = px.policies.Grow(
+            conn=ImprintWiring(hp), unit=ImprintSpawn(hp, output_unit, hp.seed)
+        )
         reset_global = Tick()
         extra_unit_fields = IMPRINT_UNIT_FIELDS
         extra_conn_fields = IMPRINT_CONN_FIELDS

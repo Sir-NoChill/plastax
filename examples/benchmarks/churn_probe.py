@@ -39,7 +39,7 @@ def hash01(a: jax.Array, b: jax.Array, c: jax.Array) -> jax.Array:
     return (h >> jnp.uint32(8)).astype(jnp.float32) / jnp.float32(1 << 24)
 
 
-class TanhForward(px.ForwardPass):
+class TanhForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     combine = px.monoid.sum_
 
     def map(
@@ -61,7 +61,7 @@ class TanhForward(px.ForwardPass):
         return px.UnitWrite.of((px.ACTIVATION, jnp.tanh(acc)))
 
 
-class HashPrune(px.PruneConn):
+class HashPrune(px.policies.PruneConnPolicy):
     def __init__(self, kill_p: float) -> None:
         self.kill_p = kill_p
 
@@ -73,7 +73,7 @@ class HashPrune(px.PruneConn):
         return h < jnp.float32(self.kill_p)
 
 
-class HashGrow(px.ScoreAddConn):
+class HashGrow(px.policies.ScoreAddConnPolicy):
     """Grid growth over a per-level top-M shortlist with a random score."""
 
     dedupe_live = True  # pre-L4 grid default: never regrow a live edge
@@ -101,7 +101,7 @@ class HashGrow(px.ScoreAddConn):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.01)))
 
 
-class ProposeGrow(px.ProposeAddConn):
+class ProposeGrow(px.policies.ProposeAddConnPolicy):
     """Uniform proposals: 4k per bucket, a random (src, dst) between layers."""
 
     def __init__(self, k: int, width: int, *, dedupe: bool) -> None:
@@ -134,20 +134,24 @@ class ProposeGrow(px.ProposeAddConn):
         return px.ConnWrite.of((px.WEIGHT, jnp.float32(0.01)))
 
 
-class Tick(px.ResetGlobal):
+class Tick(px.policies.ResetGlobalPolicy):
     def reset(self, g: Globals) -> Globals:
         return {"step": g["step"] + 1}
 
 
 def make_net(
-    *, prune: px.PruneConn | None, add: px.ScoreAddConn | px.ProposeAddConn | None
+    *,
+    prune: px.policies.PruneConnPolicy | None,
+    add: px.policies.ScoreAddConnPolicy | px.policies.ProposeAddConnPolicy | None,
 ) -> type[px.Network[Globals]]:
     """A churn-net variant; every variant shares the same field layout."""
 
+    prune_ = prune
+
     class Net(px.Network[Globals]):
-        forward_pass = TanhForward()
-        prune_conn = prune
-        add_conn = add
+        forward = TanhForward()
+        prune = None if prune_ is None else px.policies.Prune(conn=prune_)
+        grow = None if add is None else px.policies.Grow(conn=add)
         reset_global = Tick()
         propagation = px.Propagation.TOPOLOGICAL
 
@@ -201,7 +205,7 @@ def main() -> None:
     rng = np.random.default_rng(0)
     frm, to = random_layers(args.width, args.edges, rng)
     prune = HashPrune(args.k / (args.edges / 2))
-    grow: px.ScoreAddConn | px.ProposeAddConn = (
+    grow: px.policies.ScoreAddConnPolicy | px.policies.ProposeAddConnPolicy = (
         HashGrow(args.k, args.m)
         if args.grow == "grid"
         else ProposeGrow(args.k, args.width, dedupe=args.dedupe)

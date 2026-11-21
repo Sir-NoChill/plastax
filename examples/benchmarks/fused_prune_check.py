@@ -36,7 +36,7 @@ def _hash01(a: jax.Array, b: jax.Array, c: jax.Array) -> jax.Array:
     return (h >> jnp.uint32(8)).astype(jnp.float32) / jnp.float32(1 << 24)
 
 
-class Forward(px.ForwardPass):
+class Forward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Weighted sum; also flags the units on this step's prune row."""
 
     combine = px.monoid.sum_
@@ -57,7 +57,7 @@ class Forward(px.ForwardPass):
         )
 
 
-class MarkedPrune(px.PruneConn):
+class MarkedPrune(px.policies.PruneConnPolicy):
     """Kill every edge touching a unit the forward marked."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -65,7 +65,7 @@ class MarkedPrune(px.PruneConn):
         return (u[MARKED, c[px.FROM_ID, cid]] | u[MARKED, c[px.TO_ID, cid]]) == 1
 
 
-class HashPrune(px.PruneConn):
+class HashPrune(px.policies.PruneConnPolicy):
     """Kill a hashed ~1% of edges (uint32 arithmetic, shifts, a float compare)."""
 
     def predicate(self, u: Any, c: Any, cid: Any, g: G) -> jax.Array:
@@ -73,7 +73,7 @@ class HashPrune(px.PruneConn):
         return _hash01(c[px.FROM_ID, cid], c[px.TO_ID, cid], g["step"]) < 0.01
 
 
-class Propose(px.ProposeAddConn):
+class Propose(px.policies.ProposeAddConnPolicy):
     """Grow `num_proposals` random next-layer edges per step."""
 
     def __init__(self, num_units: int, width: int, num_proposals: int) -> None:
@@ -100,7 +100,7 @@ class Propose(px.ProposeAddConn):
         return px.ConnWrite.of((px.WEIGHT, _hash01(src, dst, g["step"]) - 0.5))
 
 
-class Tick(px.ResetGlobal):
+class Tick(px.policies.ResetGlobalPolicy):
     def reset(self, g: G) -> G:
         return {**g, "step": g["step"] + 1}
 
@@ -128,10 +128,12 @@ def main() -> None:
     rows = np.sort(rng.integers(width, n, (64, 64)), axis=1).astype(np.int32)
     prune = MarkedPrune() if args.predicate == "marked" else HashPrune()
 
+    prune_ = prune
+
     class Net(px.Network[G]):
-        forward_pass = Forward()
-        prune_conn = prune
-        add_conn = Propose(n, width, 4096)
+        forward = Forward()
+        prune = px.policies.Prune(conn=prune_)
+        grow = px.policies.Grow(conn=Propose(n, width, 4096))
         reset_global = Tick()
         extra_unit_fields = (MARKED,)
 

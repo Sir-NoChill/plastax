@@ -331,7 +331,7 @@ def swifttd_edge_update(
 # --- the policies (static features) -----------------------------------------
 
 
-class SwiftTDForward(px.ForwardPass):
+class SwiftTDForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """Every edge feeds the output: the prediction plus the lagged sums."""
 
     combine = OUTPUT_ACC
@@ -363,7 +363,7 @@ class SwiftTDForward(px.ForwardPass):
         return output_apply(acc)
 
 
-class TDErrorLoss(px.Loss):
+class TDErrorLoss(px.policies.LossPolicy):
     """`delta' = r + gamma_t v - v_old`, seeded into the output's DELTA column.
 
     `targets[0]` is the reward observed with this step's input and `gamma_t`
@@ -389,7 +389,7 @@ class TDErrorLoss(px.Loss):
         return jnp.sum(jnp.float32(0.5) * delta * delta), delta
 
 
-class RecordActivations(px.UpdateUnit):
+class RecordActivations(px.policies.UpdateUnitPolicy):
     """Record what the output read this step, and roll the activations.
 
     Runs after the loss and before the connection update, on every live
@@ -412,7 +412,7 @@ class RecordActivations(px.UpdateUnit):
         )
 
 
-class SwiftTDUpdate(px.UpdateConn):
+class SwiftTDUpdate(px.policies.UpdateConnPolicy):
     """The fused update on every edge into an output unit."""
 
     def __init__(self, hp: SwiftTDParams, gamma_unit: int) -> None:
@@ -469,10 +469,11 @@ def make_net(hp: SwiftTDParams, num_features: int) -> type[px.Network[None]]:
     gamma_unit = num_features
 
     class SwiftTDNet(px.Network[None]):
-        forward_pass = SwiftTDForward(hp)
+        forward = SwiftTDForward(hp)
         loss = TDErrorLoss(hp, gamma_unit)
-        update_unit = RecordActivations()
-        update_conn = SwiftTDUpdate(hp, gamma_unit)
+        update = px.policies.Update(
+            conn=SwiftTDUpdate(hp, gamma_unit), unit=RecordActivations()
+        )
         extra_unit_fields = SWIFTTD_UNIT_FIELDS
         extra_conn_fields = SWIFTTD_CONN_FIELDS
         propagation = px.Propagation.PIPELINE

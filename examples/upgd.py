@@ -82,7 +82,7 @@ def _gaussian(src: jax.Array, dst: jax.Array, salt: jax.Array) -> jax.Array:
     return jnp.sqrt(-2.0 * jnp.log(u1)) * jnp.cos(2.0 * jnp.pi * u2)
 
 
-class UpgdForward(px.ForwardPass):
+class UpgdForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
     """ReLU forward that also reduces a local utility max into each destination.
 
     The product monoid carries both reductions in one sweep: `sum_` builds the
@@ -132,7 +132,7 @@ class UpgdForward(px.ForwardPass):
         )
 
 
-class UpgdUpdate(px.UpdateConn[None]):
+class UpgdUpdate(px.policies.UpdateConnPolicy[None]):
     """The UPGD weight update: utility-gated, perturbed gradient descent.
 
     A weight with scaled utility 1 is left alone by both the gradient and the
@@ -262,12 +262,13 @@ def make_net(
     """
     forward = UpgdForward(ema_decay) if local else ReluForward(ema_decay)
     if mode == "train":
+        forward_ = forward
 
         class _Train(px.Network[None]):
-            forward_pass = forward
-            backward_pass = ReluBackward()
+            forward = forward_
+            backward = ReluBackward()
             loss = MSELoss()
-            update_conn = UpgdUpdate(lr=lr, beta=beta, sigma=sigma)
+            update = px.policies.Update(conn=UpgdUpdate(lr=lr, beta=beta, sigma=sigma))
             extra_unit_fields = _UNIT_FIELDS
             extra_conn_fields = _CONN_FIELDS
             propagation = px.Propagation.TOPOLOGICAL
@@ -275,9 +276,10 @@ def make_net(
         return _Train
 
     if mode == "eval":
+        forward_ = forward
 
         class _Eval(px.Network[None]):
-            forward_pass = forward
+            forward = forward_
             extra_unit_fields = _UNIT_FIELDS
             extra_conn_fields = _CONN_FIELDS
             propagation = px.Propagation.TOPOLOGICAL

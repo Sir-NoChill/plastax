@@ -259,8 +259,14 @@ def make_step[GS](
     # identity; hence the cast.
     return cast(
         StepFn[GS],
-        _cached_make_step(  # type: ignore[arg-type]
-            net, static, batch_size, engine, fuse_prune, growth, outputs
+        _cached_make_step(
+            net,  # type: ignore[arg-type]
+            static,
+            batch_size,
+            engine,
+            fuse_prune,
+            growth,
+            outputs,
         ),
     )
 

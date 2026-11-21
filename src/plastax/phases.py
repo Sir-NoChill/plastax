@@ -39,6 +39,13 @@ from plastax._types import (
     Propagation,
     UnitIdx,
 )
+from plastax.network import Network
+from plastax.policies import (
+    BatchReductionPolicy,
+    ProposeAddConnPolicy,
+    Reduction,
+    ScoreAddConnPolicy,
+)
 from plastax.state import Columns, NetworkState, NetworkStatic, live_unit_mask
 from plastax.sweep import (
     build_backward_accumulate,
@@ -51,13 +58,6 @@ from plastax.sweep import (
     build_outgoing_conn_update,
     identity_accumulator,
     unit_id_mask,
-)
-from plastax.traits import (
-    BatchReduction,
-    Network,
-    ProposeAddConn,
-    Reduction,
-    ScoreAddConn,
 )
 from plastax.views import ConnView, UnitView
 
@@ -311,7 +311,7 @@ def build_batched_phases[GS](
 
 
 def reduce_batch_units(
-    policy: BatchReduction,
+    policy: BatchReductionPolicy,
     fields: Sequence[FieldSpec[Any]],
     units_b: Columns,
     units: Columns,
@@ -407,14 +407,14 @@ def build_batched_update_conn[GS](
 ) -> Callable[[NetworkState[GS], Columns], NetworkState[GS]]:
     """One connection update per step from a batch of unit states.
 
-    Two reductions, chosen by what the UpdateConn declares:
+    Two reductions, chosen by what the UpdateConnPolicy declares:
 
     - **Exact** (`per_sample` + `incoming_batched`, e.g. every `optim/`
       bundle): `per_sample` is evaluated per edge for every sample and
       averaged, then `incoming_batched` applies the rule once with that
       average -- an optimizer step on the batch-mean gradient. It reads
       the unit state reduced by the network's `batch_reduction`.
-    - **Mean of writes** (any other UpdateConn): the incoming and outgoing
+    - **Mean of writes** (any other UpdateConnPolicy): the incoming and outgoing
       passes run once per sample against the unchanged connections and each
       written floating column is averaged over the batch. This equals the
       batch-mean update for rules linear in the per-sample term (SGD,
@@ -1221,8 +1221,8 @@ def build_update_conn_phase[GS](
     The two passes are sequenced across all buckets (every bucket's
     incoming write is merged before any bucket's outgoing pass reads conn
     state) so an edge's `outgoing` call observes that same edge's
-    `incoming` write already landed. UpdateConn writes only ConnWrite
-    (never a UnitWrite, traits.py's Protocol), so no edge's write is ever
+    `incoming` write already landed. UpdateConnPolicy writes only ConnWrite
+    (never a UnitWrite, the policies' Protocol), so no edge's write is ever
     visible to a different edge's callback regardless of bucketing -- the
     cross-bucket sequencing only matters for an edge observing its own
     prior write, which per-bucket sequencing alone would already
@@ -4509,10 +4509,10 @@ def build_add_conn_phase[GS](
 ) -> Phase[GS]:
     """Select each source level's growth candidates and claim free slots.
 
-    Candidates come from the rule. A `ProposeAddConn` emits
+    Candidates come from the rule. A `ProposeAddConnPolicy` emits
     `proposals_per_proposer` proposals per proposing site (`proposer`:
     "per_unit", the default, "per_connection" or "global"), each with its
-    own keyed `Rng`. A `ScoreAddConn` scores the (src, dst) unit-id grid --
+    own keyed `Rng`. A `ScoreAddConnPolicy` scores the (src, dst) unit-id grid --
     the full num_units^2 grid, or, when the rule declares
     `candidates = "shortlist"` / `"shortlist_per_level"` (M =
     `shortlist_size`, with an `importance(u, i, g)` method), the M x M grid
@@ -4632,13 +4632,13 @@ def build_add_conn_phase[GS](
     # net is served. A global top-M can concentrate on one level and starve a
     # bucket, letting sparsity drift down; per-level is the fix. It is
     # levels-based, hence topological only.
-    # Proposal growth (ProposeAddConn) replaces the grid as the candidate
+    # Proposal growth (ProposeAddConnPolicy) replaces the grid as the candidate
     # source: each proposing site emits `proposals_per_proposer` (src, dst,
     # score) triples and everything downstream -- routing, window, selection,
     # slot claim, init -- is shared with the grid path.
     if growth not in ("auto", "xla", "triton"):
         raise ValueError(f"build_add_conn_phase: unknown growth engine {growth!r}")
-    use_propose = isinstance(ac, ProposeAddConn)
+    use_propose = isinstance(ac, ProposeAddConnPolicy)
     # Both strategies share the two opt-in dedupe stages (default False:
     # parallel edges and within-step repeats are allowed by design).
     ded_live = bool(getattr(ac, "dedupe_live", False))
@@ -4659,7 +4659,9 @@ def build_add_conn_phase[GS](
     when_fn = getattr(ac, "when", None)
     on_overflow = str(getattr(ac, "on_overflow", "flag"))
     proposer = str(getattr(ac, "proposer", "per_unit")) if use_propose else ""
-    num_proposals = ac.proposals_per_proposer if isinstance(ac, ProposeAddConn) else 0
+    num_proposals = (
+        ac.proposals_per_proposer if isinstance(ac, ProposeAddConnPolicy) else 0
+    )
     total_conn_slots = sum(static.level_capacities)
 
     candidates_kind = (
@@ -4735,7 +4737,7 @@ def build_add_conn_phase[GS](
         # (small) top-M grid and goes unused, dead-code-eliminated -- never the
         # num_units^2 full grid.
         imp = ranked_importance() if use_per_level else None
-        if isinstance(ac, ProposeAddConn):
+        if isinstance(ac, ProposeAddConnPolicy):
             # The proposals are this step's global candidate list: computed
             # once, filtered per bucket in the loop. The flat layout is the
             # total order's candidate index (i*P+j / r*P+j / j), and every
@@ -4785,7 +4787,7 @@ def build_add_conn_phase[GS](
             global_src, global_dst = candidates_grid(num_units)
 
         def scored(s: jax.Array, d: jax.Array, ok: jax.Array) -> jax.Array:
-            assert isinstance(ac, ScoreAddConn)  # the score path only
+            assert isinstance(ac, ScoreAddConnPolicy)  # the score path only
             raw = ac.score(u_view, UnitIdx(s), UnitIdx(d), g)
             return jnp.where(ok, raw.astype(jnp.float32), jnp.float32(-jnp.inf))
 

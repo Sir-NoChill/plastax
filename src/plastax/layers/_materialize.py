@@ -24,8 +24,8 @@ from plastax.builder import NetworkBuilder
 from plastax.init import Fans
 from plastax.layers._module import BuildError
 from plastax.layers._record import ConnBlock, Record
+from plastax.network import Network
 from plastax.state import NetworkState, NetworkStatic
-from plastax.traits import Network
 
 
 def _name(block: ConnBlock) -> str:

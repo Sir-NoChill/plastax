@@ -28,9 +28,9 @@ from plastax._types import (
     ShardSpec,
 )
 from plastax.distributed import _addressable_window, _place, _shardings_for_spec
+from plastax.network import Network, reject_sharded_unit_lifecycle
 from plastax.state import Columns, NetworkState, NetworkStatic
 from plastax.topology import Topology
-from plastax.traits import Network, reject_sharded_unit_lifecycle
 
 # Values a caller may pass into add_unit/add_conn **kwargs, widened with the
 # numpy-scalar FieldSpec.default that fills in unset fields (kept private to

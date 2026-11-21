@@ -31,11 +31,11 @@ _VELOCITY: FieldSpec[np.float32] = FieldSpec.float32("opt/v")
 
 @dataclasses.dataclass(frozen=True)
 class _MomentumUpdateConn:
-    """UpdateConn applying one momentum-SGD step per connection.
+    """UpdateConnPolicy applying one momentum-SGD step per connection.
 
     Reads and rewrites the velocity column alongside the weight, both from the
     destination's perspective, so ``outgoing`` is a no-op. ``g`` is typed
-    ``object`` so one instance satisfies ``UpdateConn[GS]`` for every ``GS``.
+    ``object`` so one instance satisfies ``UpdateConnPolicy[GS]`` for every ``GS``.
 
     Attributes:
         lr: the learning rate.
@@ -188,10 +188,10 @@ class Momentum:
     needs_step_counter: bool = False
 
     def update_conn(self) -> _MomentumUpdateConn:
-        """Build the UpdateConn that applies this momentum rule.
+        """Build the UpdateConnPolicy that applies this momentum rule.
 
         Returns:
-            An UpdateConn advancing each connection's velocity and weight.
+            An UpdateConnPolicy advancing each connection's velocity and weight.
         """
         return _MomentumUpdateConn(self.lr, self.momentum, self.grad_field, _VELOCITY)
 

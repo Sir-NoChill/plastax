@@ -1,6 +1,6 @@
 """plastax: declarative plastic-network traits for JAX."""
 
-from plastax import init, layers, monoid, optim, rng, topology
+from plastax import init, layers, monoid, optim, policies, rng, topology
 from plastax._types import (
     ACTIVATION,
     DEAD,
@@ -18,6 +18,7 @@ from plastax._types import (
 from plastax.builder import NetworkBuilder
 from plastax.distributed import distribute_state, scheme_a_mesh
 from plastax.driver import Driver, RunResult
+from plastax.network import Network
 from plastax.phases import (
     ShortlistCoverage,
     StepInputs,
@@ -26,63 +27,26 @@ from plastax.phases import (
 )
 from plastax.state import NetworkState, NetworkStatic, make_empty_state
 from plastax.step import StepResult, make_step
-from plastax.traits import (
-    AddUnit,
-    BackwardPass,
-    BatchReduction,
-    FieldReductions,
-    ForwardPass,
-    Loss,
-    MeanFloatFirstRest,
-    Network,
-    Proposal,
-    ProposeAddConn,
-    PruneConn,
-    PruneUnit,
-    Reduction,
-    ResetGlobal,
-    ScoreAddConn,
-    SoftmaxCrossEntropyLoss,
-    UpdateConn,
-    UpdateUnit,
-    predicate_add_conn,
-)
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 __all__ = [
     "ACTIVATION",
-    "AddUnit",
-    "ScoreAddConn",
-    "BackwardPass",
-    "BatchReduction",
     "ConnIdx",
     "ConnView",
     "ConnWrite",
     "DEAD",
     "Driver",
     "FROM_ID",
-    "FieldReductions",
     "FieldSpec",
-    "ForwardPass",
     "LEVEL",
-    "Loss",
-    "MeanFloatFirstRest",
     "Network",
     "NetworkBuilder",
     "NetworkState",
     "NetworkStatic",
     "Propagation",
     "PRUNED",
-    "Proposal",
-    "ProposeAddConn",
-    "predicate_add_conn",
-    "PruneConn",
-    "PruneUnit",
-    "Reduction",
-    "ResetGlobal",
     "ShardSpec",
     "ShortlistCoverage",
-    "SoftmaxCrossEntropyLoss",
     "RunResult",
     "StepInputs",
     "StepResult",
@@ -90,8 +54,6 @@ __all__ = [
     "UnitIdx",
     "UnitView",
     "UnitWrite",
-    "UpdateConn",
-    "UpdateUnit",
     "WEIGHT",
     "distribute_state",
     "init",
@@ -100,6 +62,7 @@ __all__ = [
     "make_step",
     "monoid",
     "optim",
+    "policies",
     "rng",
     "recommended_shortlist",
     "scheme_a_mesh",

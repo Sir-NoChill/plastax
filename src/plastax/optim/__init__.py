@@ -1,7 +1,7 @@
 """Reusable optimizer bundles for plastax weight updates.
 
 An optimizer in plastax is a *bundle*, not just a weight-update rule: an
-UpdateConn policy that computes the step, the extra per-connection fields its
+UpdateConnPolicy policy that computes the step, the extra per-connection fields its
 state needs (e.g. Adam's first/second moments), and -- when the rule needs the
 global step count for bias correction -- a step-counter carried in the
 network's globals. Because that optimizer state lives as per-connection SOA
@@ -28,7 +28,7 @@ from plastax.optim._adam import Adam, adam, adamw
 from plastax.optim._momentum import Momentum, momentum
 from plastax.optim._rmsprop import RMSProp, rmsprop
 from plastax.optim._sgd import SGD, sgd
-from plastax.traits import UpdateConn
+from plastax.policies import UpdateConnPolicy
 
 __all__ = [
     "SGD",
@@ -46,7 +46,7 @@ __all__ = [
 
 @runtime_checkable
 class Optimizer(Protocol):
-    """A weight-optimizer bundle: an UpdateConn policy plus its state needs.
+    """A weight-optimizer bundle: an UpdateConnPolicy policy plus its state needs.
 
     Attributes:
         state_fields: Extra per-connection FieldSpecs (any numpy dtype) the
@@ -55,8 +55,8 @@ class Optimizer(Protocol):
             extra_conn_fields. Each FieldSpec's ``default`` is also the value a
             regrown connection's state initializes to: the add_conn phase resets
             a new edge's untouched fields to their default, so a stateful
-            optimizer wired with a growth policy (ScoreAddConn or
-            ProposeAddConn) zeroes its moments on
+            optimizer wired with a growth policy (ScoreAddConnPolicy or
+            ProposeAddConnPolicy) zeroes its moments on
             regrow automatically (RigL behaviour). Growth policies write WEIGHT
             and their own fields only, never optimizer columns.
         needs_step_counter: Whether the rule needs a step counter in the
@@ -68,10 +68,10 @@ class Optimizer(Protocol):
     state_fields: tuple[FieldSpec[np.generic], ...]
     needs_step_counter: bool
 
-    def update_conn(self) -> UpdateConn[object]:
-        """Build the UpdateConn trait implementing one optimizer step.
+    def update_conn(self) -> UpdateConnPolicy[object]:
+        """Build the UpdateConnPolicy trait implementing one optimizer step.
 
         Returns:
-            The UpdateConn policy applying this optimizer's weight update.
+            The UpdateConnPolicy policy applying this optimizer's weight update.
         """
         ...

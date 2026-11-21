@@ -11,6 +11,16 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** the policy traits moved to the new `plastax.policies`
+  package and are no longer exported at the top level. Each gained the
+  `Policy` suffix: `Loss` is `policies.LossPolicy`, `UpdateConn` is
+  `policies.UpdateConnPolicy`, and likewise `UpdateUnit`, `PruneConn`,
+  `PruneUnit`, `AddUnit`, `ScoreAddConn`, `ProposeAddConn`, `ResetGlobal`,
+  `BatchReduction` and `SoftmaxCrossEntropyLoss`. `ForwardPass`,
+  `BackwardPass`, `Proposal`, `Reduction`, `FieldReductions`,
+  `MeanFloatFirstRest` and `predicate_add_conn` moved without a rename. No
+  old name is kept. `plastax.traits` is gone; `Network` is defined in
+  `plastax.network` and is still `plastax.Network`.
 - **Breaking:** `Driver.scan` returns a `RunResult` and no longer the stacked
   records. The per-step losses are `result.loss`, and what a `record`
   function kept is `result.records` (None when no `record` is given, where

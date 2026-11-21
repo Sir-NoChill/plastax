@@ -28,11 +28,11 @@ _MEAN_SQ: FieldSpec[np.float32] = FieldSpec.float32("opt/v")
 
 @dataclasses.dataclass(frozen=True)
 class _RMSPropUpdateConn:
-    """UpdateConn applying one RMSProp step per connection.
+    """UpdateConnPolicy applying one RMSProp step per connection.
 
     Reads and rewrites the mean-square column alongside the weight, both from
     the destination's perspective, so ``outgoing`` is a no-op. ``g`` is typed
-    ``object`` so one instance satisfies ``UpdateConn[GS]`` for every ``GS``.
+    ``object`` so one instance satisfies ``UpdateConnPolicy[GS]`` for every ``GS``.
 
     Attributes:
         lr: the learning rate.
@@ -190,10 +190,10 @@ class RMSProp:
     needs_step_counter: bool = False
 
     def update_conn(self) -> _RMSPropUpdateConn:
-        """Build the UpdateConn that applies this RMSProp rule.
+        """Build the UpdateConnPolicy that applies this RMSProp rule.
 
         Returns:
-            An UpdateConn advancing each connection's mean square and weight.
+            An UpdateConnPolicy advancing each connection's mean square and weight.
         """
         return _RMSPropUpdateConn(
             self.lr, self.decay, self.eps, self.grad_field, _MEAN_SQ

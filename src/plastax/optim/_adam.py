@@ -42,11 +42,11 @@ _T: FieldSpec[np.float32] = FieldSpec.float32("opt/t")
 
 @dataclasses.dataclass(frozen=True)
 class _AdamUpdateConn:
-    """UpdateConn applying one Adam(W) step per connection.
+    """UpdateConnPolicy applying one Adam(W) step per connection.
 
     Reads and rewrites the three state columns alongside the weight, all from
     the destination's perspective, so ``outgoing`` is a no-op. ``g`` is typed
-    ``object`` so one instance satisfies ``UpdateConn[GS]`` for every ``GS``.
+    ``object`` so one instance satisfies ``UpdateConnPolicy[GS]`` for every ``GS``.
 
     Attributes:
         lr: the learning rate.
@@ -228,10 +228,10 @@ class Adam:
     needs_step_counter: bool = False
 
     def update_conn(self) -> _AdamUpdateConn:
-        """Build the UpdateConn that applies this Adam(W) rule.
+        """Build the UpdateConnPolicy that applies this Adam(W) rule.
 
         Returns:
-            An UpdateConn advancing each connection's moments, step, and weight.
+            An UpdateConnPolicy advancing each connection's moments, step, and weight.
         """
         return _AdamUpdateConn(
             self.lr,

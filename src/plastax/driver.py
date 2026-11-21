@@ -12,7 +12,7 @@ no slot it may claim -- its TOPOLOGICAL level's bucket is full, or the
 PIPELINE bucket's never-used tail is -- which the driver fixes inside the same
 step: it grows the full buckets and claims the dropped candidates, re-running
 nothing but the growth phase's claim.
-Unit overflow (`NetworkState.unit_overflow`, an AddUnit spawn that found no
+Unit overflow (`NetworkState.unit_overflow`, an AddUnitPolicy spawn that found no
 free unit slot) is not a retrace event: `Network.unit_capacity` is fixed, so
 the dropped spawn stays dropped and the flag is the caller's to read.
 
@@ -54,10 +54,10 @@ from jaxtyping import Array, Float
 
 from plastax import topo
 from plastax._types import Propagation
+from plastax.network import Network
 from plastax.phases import GrowthRemainder, StepInputs
 from plastax.state import NetworkState, NetworkStatic, grow_bucket, live_conn_count
 from plastax.step import StepFn, StepResult, make_growth_retry, make_step
-from plastax.traits import Network
 
 
 @dataclasses.dataclass(frozen=True)

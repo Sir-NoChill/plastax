@@ -2,7 +2,7 @@
 
 SGD is the minimal instance of the optimizer protocol (see the package
 docstring): no per-connection state, no globals step counter, the whole rule
-living in the `UpdateConn` it builds. The per-edge weight gradient is formed
+living in the `UpdateConnPolicy` it builds. The per-edge weight gradient is formed
 by the delta rule ``dL/dw = dL/dz[dst] * activation[src]`` -- the gradient of
 a weighted-sum layer's loss with respect to one edge weight -- which is exact
 for any such layer, dense or the unrolled convolution of `topology.conv2d`.
@@ -23,11 +23,11 @@ from plastax.views import ConnView, ConnWrite, UnitView
 
 @dataclasses.dataclass(frozen=True)
 class _SGDUpdateConn:
-    """UpdateConn applying one SGD step to each connection.
+    """UpdateConnPolicy applying one SGD step to each connection.
 
     The whole update happens in the incoming pass, so `outgoing` is a genuine
     no-op (mirroring `examples/mlp_xor.py`'s `SgdUpdateConn`). `g` is typed
-    `object` so a single instance satisfies `UpdateConn[GS]` for every `GS`.
+    `object` so a single instance satisfies `UpdateConnPolicy[GS]` for every `GS`.
 
     Attributes:
         lr: the learning rate.
@@ -176,10 +176,10 @@ class SGD:
     needs_step_counter: bool = False
 
     def update_conn(self) -> _SGDUpdateConn:
-        """Build the UpdateConn that applies this SGD rule.
+        """Build the UpdateConnPolicy that applies this SGD rule.
 
         Returns:
-            An UpdateConn subtracting ``lr * gradient`` from each weight.
+            An UpdateConnPolicy subtracting ``lr * gradient`` from each weight.
         """
         return _SGDUpdateConn(self.lr, self.grad_field)
 

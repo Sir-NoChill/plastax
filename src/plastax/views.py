@@ -44,7 +44,7 @@ class UnitView:
     ) -> Shaped[Array, " n"]:
         """Return a field's values at several units, in the order of `ids`.
 
-        Whole-output rules (`Loss.calculate_loss`) read every output at once
+        Whole-output rules (`LossPolicy.calculate_loss`) read every output at once
         through this.
 
         Args:

@@ -320,8 +320,8 @@ def resort[GS](
     highest level ever used as a source is max(levels) - 1" derivation --
     unlike construction, a resort's bucket count can move in EITHER
     direction versus the old static: growth can deepen the graph (more
-    buckets) and PruneConn or PruneUnit can orphan a formerly-deep subtree
-    (fewer). A unit AddUnit spawned holds a provisional level until here,
+    buckets) and PruneConnPolicy or PruneUnitPolicy can orphan a formerly-deep subtree
+    (fewer). A unit AddUnitPolicy spawned holds a provisional level until here,
     where its live edges decide it.
 
     Redistribution is two device-side passes per new bucket, both reusing

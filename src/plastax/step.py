@@ -20,6 +20,7 @@ from jaxtyping import Array, Bool, Float
 
 from plastax._types import ACTIVATION, Propagation
 from plastax.distributed import scheme_a_mesh
+from plastax.network import Network
 from plastax.phases import (
     GrowthRemainder,
     Phase,
@@ -34,8 +35,8 @@ from plastax.phases import (
     plan_prune_fusion,
     reduce_batch_units,
 )
+from plastax.policies import batch_written_reduction
 from plastax.state import NetworkState, NetworkStatic
-from plastax.traits import Network, batch_written_reduction
 
 # Module-scoped (not PEP 695) so it stays free inside the StepFn alias below;
 # StepResult/make_step below shadow it with their own PEP 695 [GS] locally.
@@ -103,7 +104,7 @@ def make_step[GS](
     holds; and `StepResult.loss` is the batch mean.
 
     How the per-sample unit columns reduce to one state is the network's
-    `batch_reduction` policy (`traits.BatchReduction`), which a batched step
+    `batch_reduction` policy (`policies.BatchReductionPolicy`), which a batched step
     requires: there is no implicit average. When the step is first traced it
     finds the columns its per-sample phases write (the input scatter's
     `ACTIVATION`, the loss's seed field and every column a forward, backward or
@@ -158,7 +159,7 @@ def make_step[GS](
     Scheme-A sharding, where jax_triton is not validated) uses "xla".
 
     In a batched step a non-floating connection column written by an
-    UpdateConn without the exact pair is stored from sample 0: such columns
+    UpdateConnPolicy without the exact pair is stored from sample 0: such columns
     should agree across the batch. With layout "csr", call the step
     directly: the cuSPARSE lowering is scoped to its own calls, so wrapping
     it in an outer jit or scan lowers it outside that scope, onto the
@@ -221,7 +222,7 @@ def make_step[GS](
             raise ValueError(
                 f"make_step: a batched step needs {net.__name__}.batch_reduction, "
                 "the policy combining the per-sample unit columns (see "
-                "plastax.BatchReduction); set batch_reduction = "
+                "plastax.policies.BatchReductionPolicy); set batch_reduction = "
                 "MeanFloatFirstRest() for the batch mean of every floating "
                 "column and sample 0 of every other one"
             )

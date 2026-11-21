@@ -44,8 +44,8 @@ from jaxtyping import Array, Bool
 
 from plastax._types import DEAD, FROM_ID, TO_ID, ConnIdx, FieldSpec, UnitIdx
 from plastax.monoid import Monoid, MonoidTree
+from plastax.policies import BackwardPass, ForwardPass
 from plastax.state import Columns, live_unit_mask
-from plastax.traits import BackwardPass, ForwardPass
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 # Module-scoped (not PEP 695) so it stays free inside the type aliases below;

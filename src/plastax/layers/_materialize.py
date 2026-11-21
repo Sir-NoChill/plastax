@@ -11,6 +11,7 @@ Plan: `plans/20261119T201041Z-step6-materialize.md` at the workspace root.
 
 from __future__ import annotations
 
+import dataclasses
 import zlib
 
 import jax
@@ -167,10 +168,13 @@ def materialize[GS](
 ) -> tuple[NetworkStatic, NetworkState[GS]]:
     """Turn a traced topology into a state that `px.make_step` can run.
 
-    Record ids are the state's unit ids, unchanged. A step's `inputs` holds the
-    record's inputs flattened in row-major order, one after another in the order
-    they were given to `trace`; its outputs are the handles the topology returned,
-    flattened and joined the same way.
+    Record ids are the state's unit ids, unchanged. A record with one input declares
+    that input's shape as `static.input_shape`, and a step's `inputs` are given in
+    it; likewise one returned handle and `static.output_shape`, for a step's
+    `targets` and outputs. With several inputs, a step's `inputs` is one flat vector:
+    the inputs flattened in row-major order, one after another in the order they
+    were given to `trace`. Several returned handles are flattened and joined the
+    same way.
 
     A constant unit starts at its value and keeps it, because nothing feeds it. That
     holds under topological propagation only.
@@ -224,7 +228,7 @@ def materialize[GS](
 
     inputs = [ids.reshape(-1) for ids in record.inputs.values()]
     outputs = [ids.reshape(-1) for ids in record.outputs]
-    return NetworkBuilder.from_edges(
+    static, state = NetworkBuilder.from_edges(
         net,
         record.num_units,
         src,
@@ -236,3 +240,11 @@ def materialize[GS](
         extra_unit_columns={ACTIVATION.name: activation},
         capacity_headroom=capacity_headroom,
     )
+    shapes = [ids.shape for ids in record.inputs.values()]
+    returned = [ids.shape for ids in record.outputs]
+    static = dataclasses.replace(
+        static,
+        input_shape=shapes[0] if len(shapes) == 1 else None,
+        output_shape=returned[0] if len(returned) == 1 else None,
+    )
+    return static, state

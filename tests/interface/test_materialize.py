@@ -8,6 +8,7 @@ policies of examples/mlp_xor.py.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import sys
 from collections.abc import Callable
@@ -85,7 +86,11 @@ def stepped(
 ) -> tuple[px.NetworkState[None], np.ndarray]:
     """Run one step; return the new state and the activations of the outputs."""
     step = px.make_step(Linear, static)
-    inputs = px.StepInputs(inputs=jnp.asarray(x, jnp.float32).reshape(-1), targets=None)
+    # In the declared shape when the record has one input, one flat vector otherwise.
+    shape = (-1,) if static.input_shape is None else static.input_shape
+    inputs = px.StepInputs(
+        inputs=jnp.asarray(x, jnp.float32).reshape(shape), targets=None
+    )
     state = step(state, inputs).state
     return state, np.asarray(state.units["activation"])[list(static.output_ids)]
 
@@ -182,7 +187,10 @@ def test_the_same_network_as_todays_builder_makes() -> None:
         Linear, sequential, jax.random.key(0), globals_=None
     )
 
-    assert static == old_static  # units, inputs, outputs, capacities, fields
+    # A topology declares its shapes; the builder's network has none.
+    assert (static.input_shape, static.output_shape) == ((3,), (1,))
+    flat = dataclasses.replace(static, input_shape=None, output_shape=None)
+    assert flat == old_static  # units, inputs, outputs, capacities, fields
     assert [r[:2] for r in rows(state)] == [r[:2] for r in rows(old_state)]
     np.testing.assert_array_equal(state.units["level"], old_state.units["level"])
 

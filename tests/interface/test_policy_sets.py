@@ -1,176 +1,142 @@
-"""Policy sets: network defaults, overrides on layers and handles, frozen sets.
+"""The two policy sets on a network: `conn_policy` and `unit_policy`.
 
-Design document sections 2.6, 3.1 and 3.9.
+Plan `plans/20261121T123437Z-policy-sets.md` (workspace root). A pass is cut in
+two: the connection set supplies `map`, the unit set `combine` and `apply`, and
+the two are chosen independently.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Float
+import pytest
 
 import plastax as px
+import plastax.init as init
+import plastax.layers as pxl
+from plastax.layers import Dense, Units
 
-from . import support
-
-Scalar = Float[Array, ""]
-
-X = np.array([1.0, -2.0, 3.0, 0.5], np.float32)
-T = np.array([0.5, -1.0], np.float32)
-W1 = (np.arange(12, dtype=np.float32).reshape(3, 4) - 5.0) / 10.0
-W2 = np.array([[0.5, -1.0, 2.0], [1.5, 0.25, -0.75]], np.float32)
+f32 = np.float32
+KEY = jax.random.key(0)
+W = np.array([[1.0, -2.0, 3.0], [0.5, 4.0, -1.0]], f32)
 
 
-@px.policy
-class Doubling(px.ForwardUnitPolicy[Scalar, px.Globals]):
-    """A unit that outputs twice the sum of its inputs."""
+class WeightedSum(px.policies.ForwardConnPolicy):
+    linear_input = px.ACTIVATION
 
-    combine = px.monoid.sum_
-
-    def apply(self, u: px.UnitView, i: px.UnitIdx, g: px.Globals, acc: Scalar) -> Any:
-        return px.UnitWrite.of((px.ACTIVATION, 2.0 * acc))
-
-
-def two_layers(**overrides: Any) -> tuple[Any, Any, Any]:
-    """(fc1, fc2, model) for x -> fc1 -> fc2, with keyword overrides per layer."""
-    fc1 = px.layers.Dense(
-        3, bias=False, init=px.init.array(W1), **overrides.get("fc1", {})
-    )
-    fc2 = px.layers.Dense(
-        2, bias=False, init=px.init.array(W2), **overrides.get("fc2", {})
-    )
-    model = support.topology(lambda m, x: m.fc2(m.fc1(x)), fc1=fc1, fc2=fc2)
-    return fc1, fc2, model
+    def map(
+        self,
+        u: px.UnitView,
+        dst: px.UnitIdx,
+        src: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: Any,
+    ) -> jax.Array:
+        return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
 
-def changed(r: support.Runner, layer: Any, before: np.ndarray) -> bool:
-    return not np.allclose(r.weights(layer), before)
+class Reduced(px.policies.ForwardUnitPolicy):
+    """A unit's activation is whatever `combine` leaves."""
+
+    def __init__(self, combine: Any) -> None:
+        self.combine = combine
+
+    def apply(
+        self, u: px.UnitView, i: px.UnitIdx, g: Any, acc: jax.Array
+    ) -> px.UnitWrite:
+        return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
-# --------------------------------------------------------------------------- #
-# Connection policy sets
-# --------------------------------------------------------------------------- #
-def test_network_policy_is_the_default_for_every_layer() -> None:
-    fc1, fc2, model = two_layers()
-    r = support.Runner(support.network(model, input_shape=(4,)))
-    r.step(X, T)
-
-    assert changed(r, fc1, W1)
-    assert changed(r, fc2, W2)
-
-
-def test_layer_policy_overrides_the_default() -> None:
-    fc1, fc2, model = two_layers(fc1={"conn_policy": support.fixed()})
-    r = support.Runner(support.network(model, input_shape=(4,)))
-    r.step(X, T)
-
-    support.close(r.weights(fc1), W1)
-    assert changed(r, fc2, W2)
+class GradBackwardConn(px.policies.BackwardConnPolicy):
+    def map(
+        self,
+        u: px.UnitView,
+        src: px.UnitIdx,
+        dst: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: Any,
+    ) -> jax.Array:
+        return c[px.WEIGHT, cid] * u[px.ACTIVATION, dst]
 
 
-def test_frozen_set_still_carries_the_forward_and_backward_pass() -> None:
-    """A frozen layer between two trained ones passes values down and gradient up."""
-    fc1, fc2, model = two_layers(fc2={"conn_policy": support.fixed()})
-    r = support.Runner(
-        support.network(model, input_shape=(4,), conn_policy=support.learned(0.1))
-    )
-    result = r.step(X, T)
+class OneLayer(pxl.Module):
+    def setup(self) -> None:
+        self.fc = Dense(2, bias=False, init=init.array(W))
 
-    seed = W2 @ W1 @ X - T
-    support.close(result.outputs, W2 @ W1 @ X)
-    support.close(r.weights(fc2), W2)
-    support.close(r.weights(fc1), W1 - 0.1 * np.outer(W2.T @ seed, X))
+    def __call__(self, x: Units) -> Units:
+        return self.fc(x)
 
 
-def test_none_as_the_default_is_satisfied_when_every_layer_supplies_a_set() -> None:
-    fc1, fc2, model = two_layers(
-        fc1={"conn_policy": support.learned()}, fc2={"conn_policy": support.fixed()}
-    )
-    r = support.Runner(support.network(model, input_shape=(4,), conn_policy=None))
-    r.step(X, T)
-
-    assert changed(r, fc1, W1)
-    support.close(r.weights(fc2), W2)
+def outputs_of(net: type[px.Network[None]], x: np.ndarray) -> np.ndarray:
+    inputs = px.StepInputs(inputs=jnp.asarray(x), targets=None)
+    return np.asarray(net.init(KEY).step(inputs, outputs=True).outputs)
 
 
-# --------------------------------------------------------------------------- #
-# Unit policy sets
-# --------------------------------------------------------------------------- #
-def test_units_without_an_activation_use_the_identity() -> None:
-    _, _, model = two_layers()
-    r = support.Runner(support.network(model, input_shape=(4,)))
+def test_one_map_serves_two_unit_policies_that_reduce_differently() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
 
-    support.close(r.predict(X).outputs, W2 @ W1 @ X)
+        class SumNet(px.Network[None]):
+            topology = OneLayer()
+            input_shape = (3,)
+            conn_policy = px.policies.Conn(forward=WeightedSum())
+            unit_policy = px.policies.Unit(forward=Reduced(px.monoid.sum_))
 
+        class MaxNet(px.Network[None]):
+            topology = OneLayer()
+            input_shape = (3,)
+            conn_policy = px.policies.Conn(forward=WeightedSum())
+            unit_policy = px.policies.Unit(forward=Reduced(px.monoid.max_))
 
-def test_activation_on_a_handle_sets_the_units_policy() -> None:
-    relu = px.activations.relu
-    fc1 = px.layers.Dense(3, bias=False, init=px.init.array(W1))
-    fc2 = px.layers.Dense(2, bias=False, init=px.init.array(W2))
-    model = support.topology(lambda m, x: m.fc2(relu(m.fc1(x))), fc1=fc1, fc2=fc2)
-    r = support.Runner(support.network(model, input_shape=(4,)))
+    x = np.array([1.0, 2.0, 3.0], f32)
 
-    support.close(r.predict(X).outputs, W2 @ np.maximum(W1 @ X, 0.0))
-
-
-def test_with_policy_gives_a_handle_its_own_unit_policy() -> None:
-    doubling = px.policies.Unit(
-        forward=Doubling(), backward=px.policies.PassThroughBackward()
-    )
-    fc1 = px.layers.Dense(3, bias=False, init=px.init.array(W1))
-    fc2 = px.layers.Dense(2, bias=False, init=px.init.array(W2))
-    model = support.topology(
-        lambda m, x: m.fc2(m.fc1(x).with_policy(doubling)), fc1=fc1, fc2=fc2
-    )
-    r = support.Runner(support.network(model, input_shape=(4,)))
-
-    support.close(r.predict(X).outputs, W2 @ (2.0 * (W1 @ X)))
+    np.testing.assert_allclose(outputs_of(SumNet, x), (W * x).sum(axis=1), rtol=1e-6)
+    np.testing.assert_allclose(outputs_of(MaxNet, x), (W * x).max(axis=1), rtol=1e-6)
 
 
-def test_layer_unit_policy_overrides_the_default() -> None:
-    doubling = px.policies.Unit(
-        forward=Doubling(), backward=px.policies.PassThroughBackward()
-    )
-    fc = px.layers.Dense(3, bias=False, init=px.init.array(W1), unit_policy=doubling)
-    model = support.topology(lambda m, x: m.fc(x), fc=fc)
-    r = support.Runner(support.network(model, input_shape=(4,)))
+def test_linear_input_without_a_semiring_the_engine_has_warns() -> None:
+    with pytest.warns(UserWarning, match=r"linear_input.*\(\+, \*\)"):
 
-    support.close(r.predict(X).outputs, 2.0 * (W1 @ X))
+        class MaxNet(px.Network[None]):
+            conn_policy = px.policies.Conn(forward=WeightedSum())
+            unit_policy = px.policies.Unit(forward=Reduced(px.monoid.max_))
 
 
-def test_network_unit_policy_may_be_a_set_or_a_function_of_the_activation() -> None:
-    relu = px.activations.relu
-    fc = px.layers.Dense(3, bias=False, init=px.init.array(W1))
+def test_linear_input_with_a_sum_does_not_warn() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
 
-    as_function = support.network(
-        support.topology(lambda m, x: relu(m.fc(x)), fc=fc),
-        input_shape=(4,),
-        unit_policy=px.policies.summing,
-    )
-    support.close(support.Runner(as_function).predict(X).outputs, np.maximum(W1 @ X, 0))
-
-    fc = px.layers.Dense(3, bias=False, init=px.init.array(W1))
-    as_set = support.network(
-        support.topology(lambda m, x: m.fc(x), fc=fc),
-        input_shape=(4,),
-        unit_policy=px.policies.summing(px.activations.relu),
-    )
-    support.close(support.Runner(as_set).predict(X).outputs, np.maximum(W1 @ X, 0))
+        class SumNet(px.Network[None]):
+            conn_policy = px.policies.Conn(forward=WeightedSum())
+            unit_policy = px.policies.Unit(forward=Reduced(px.monoid.sum_))
 
 
-# --------------------------------------------------------------------------- #
-# Loss override
-# --------------------------------------------------------------------------- #
-def test_loss_on_a_handle_overrides_the_network_loss() -> None:
-    identity = px.activations.identity
-    cross_entropy = px.SoftmaxCrossEntropyLossPolicy(seed=px.policies.SEED)
-    fc = px.layers.Dense(3, bias=False, init=px.init.array(W1))
-    model = support.topology(lambda m, x: identity(m.fc(x), loss=cross_entropy), fc=fc)
-    r = support.Runner(support.network(model, input_shape=(4,)))
-    target = np.array([0.0, 1.0, 0.0], np.float32)
-    result = r.step(X, target)
+def test_a_network_without_both_sets_is_refused() -> None:
+    with pytest.raises(TypeError, match="unit_policy is required"):
 
-    logits = W1 @ X
-    log_softmax = logits - np.log(np.sum(np.exp(logits)))
-    support.close(result.loss, -np.sum(target * log_softmax))
+        class NoUnits(px.Network[None]):
+            conn_policy = px.policies.Conn(forward=WeightedSum())
+
+
+def test_a_backward_half_on_one_set_only_is_refused() -> None:
+    with pytest.raises(TypeError, match=r"conn_policy\.backward is set"):
+
+        class HalfBackward(px.Network[None]):
+            conn_policy = px.policies.Conn(
+                forward=WeightedSum(), backward=GradBackwardConn()
+            )
+            unit_policy = px.policies.Unit(forward=Reduced(px.monoid.sum_))
+
+
+def test_a_unit_policy_in_a_connection_slot_is_refused() -> None:
+    with pytest.raises(TypeError, match=r"conn_policy\.forward must satisfy"):
+
+        class Swapped(px.Network[None]):
+            conn_policy = px.policies.Conn(forward=Reduced(px.monoid.sum_))  # type: ignore[arg-type]
+            unit_policy = px.policies.Unit(forward=Reduced(px.monoid.sum_))

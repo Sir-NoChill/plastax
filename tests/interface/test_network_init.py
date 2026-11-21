@@ -28,10 +28,8 @@ RNG = np.random.default_rng(0)
 KEY = jax.random.key(0)
 
 
-class WeightedSum(px.ForwardPass):
+class WeightedSum(px.policies.ForwardConnPolicy):
     """A unit's activation is the sum of weight times source activation."""
-
-    combine = px.monoid.sum_
 
     def map(
         self,
@@ -43,6 +41,12 @@ class WeightedSum(px.ForwardPass):
         g: Any,
     ) -> jax.Array:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
+
+
+class Summed(px.policies.ForwardUnitPolicy):
+    """A unit's activation is the sum of what its connections map."""
+
+    combine = px.monoid.sum_
 
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: Any, acc: jax.Array
@@ -68,7 +72,8 @@ class TwoLayers(pxl.Module):
 class Linear(px.Network[None]):
     topology = TwoLayers()
     input_shape = (3,)
-    forward_pass = WeightedSum()
+    conn_policy = px.policies.Conn(forward=WeightedSum())
+    unit_policy = px.policies.Unit(forward=Summed())
 
 
 def inputs_of(x: Any, targets: Any = None) -> px.StepInputs:
@@ -118,7 +123,8 @@ class Image(pxl.Module):
 class ImageNet(px.Network[None]):
     topology = Image()
     input_shape = (4, 4, 3)
-    forward_pass = WeightedSum()
+    conn_policy = px.policies.Conn(forward=WeightedSum())
+    unit_policy = px.policies.Unit(forward=Summed())
 
 
 def test_inputs_and_outputs_keep_the_shapes_the_topology_declared() -> None:
@@ -152,7 +158,7 @@ def test_targets_of_another_shape_are_refused_naming_the_declared_shape() -> Non
 # --------------------------------------------------------------------------- #
 # Outputs are the forward pass's
 # --------------------------------------------------------------------------- #
-class Overwrite(px.UpdateUnit):
+class Overwrite(px.policies.UpdateUnitPolicy):
     """Every unit's activation is replaced after the forward pass."""
 
     def update(self, u: px.UnitView, i: px.UnitIdx, g: Any) -> px.UnitWrite:
@@ -162,8 +168,8 @@ class Overwrite(px.UpdateUnit):
 class Overwritten(px.Network[None]):
     topology = TwoLayers()
     input_shape = (3,)
-    forward_pass = WeightedSum()
-    update_unit = Overwrite()
+    conn_policy = px.policies.Conn(forward=WeightedSum())
+    unit_policy = px.policies.Unit(forward=Summed(), update=Overwrite())
 
 
 def test_outputs_are_read_before_a_later_phase_rewrites_the_units() -> None:
@@ -187,10 +193,8 @@ def test_outputs_of_a_batched_step_are_not_available_yet() -> None:
 # --------------------------------------------------------------------------- #
 # Globals
 # --------------------------------------------------------------------------- #
-class Scaled(px.ForwardPass):
-    """A weighted sum multiplied by the global `scale`."""
-
-    combine = px.monoid.sum_
+class Scaled(px.policies.ForwardConnPolicy):
+    """Weight times source activation, multiplied by the global `scale`."""
 
     def map(
         self,
@@ -202,11 +206,6 @@ class Scaled(px.ForwardPass):
         g: dict[str, jax.Array],
     ) -> jax.Array:
         return g["scale"] * c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
-
-    def apply(
-        self, u: px.UnitView, i: px.UnitIdx, g: dict[str, jax.Array], acc: jax.Array
-    ) -> px.UnitWrite:
-        return px.UnitWrite.of((px.ACTIVATION, acc))
 
 
 class OneWeight(pxl.Module):
@@ -221,7 +220,8 @@ class ScaledNet(px.Network[dict[str, Any]]):
     topology = OneWeight()
     input_shape = (1,)
     globals = {"scale": f32(2.0)}
-    forward_pass = Scaled()
+    conn_policy = px.policies.Conn(forward=Scaled())
+    unit_policy = px.policies.Unit(forward=Summed())
 
 
 def test_the_class_field_is_the_value_the_globals_start_from() -> None:
@@ -238,7 +238,7 @@ def test_globals_given_to_init_replace_the_class_field_for_that_network() -> Non
     np.testing.assert_allclose(result.outputs, [15.0])
 
 
-class Increment(px.ResetGlobal):
+class Increment(px.policies.ResetGlobalPolicy):
     def reset(self, g: dict[str, jax.Array]) -> dict[str, jax.Array]:
         return {"scale": g["scale"] + 1.0}
 
@@ -345,7 +345,8 @@ def test_scan_needs_a_chunk_axis_in_front_of_the_declared_shape() -> None:
 # --------------------------------------------------------------------------- #
 def test_a_network_without_a_topology_cannot_be_built_this_way() -> None:
     class Bare(px.Network[None]):
-        forward_pass = WeightedSum()
+        conn_policy = px.policies.Conn(forward=WeightedSum())
+        unit_policy = px.policies.Unit(forward=Summed())
 
     with pytest.raises(BuildError, match="has no topology"):
         Bare.build(KEY)
@@ -354,7 +355,8 @@ def test_a_network_without_a_topology_cannot_be_built_this_way() -> None:
 def test_a_topology_needs_an_input_shape() -> None:
     class Shapeless(px.Network[None]):
         topology = TwoLayers()
-        forward_pass = WeightedSum()
+        conn_policy = px.policies.Conn(forward=WeightedSum())
+        unit_policy = px.policies.Unit(forward=Summed())
 
     with pytest.raises(BuildError, match="input_shape"):
         Shapeless.init(KEY)
@@ -368,7 +370,8 @@ def test_a_topology_with_two_inputs_is_not_supported_yet() -> None:
     class TwoInputs(px.Network[None]):
         topology = Two()
         input_shape = (3,)
-        forward_pass = WeightedSum()
+        conn_policy = px.policies.Conn(forward=WeightedSum())
+        unit_policy = px.policies.Unit(forward=Summed())
 
     with pytest.raises(BuildError, match="takes 2 arguments"):
         TwoInputs.build(KEY)
@@ -386,7 +389,8 @@ def test_a_topology_returning_two_handles_is_not_supported_yet() -> None:
     class TwoOutputs(px.Network[None]):
         topology = Both()
         input_shape = (3,)
-        forward_pass = WeightedSum()
+        conn_policy = px.policies.Conn(forward=WeightedSum())
+        unit_policy = px.policies.Unit(forward=Summed())
 
     with pytest.raises(NotImplementedError, match="returns 2 handles"):
         TwoOutputs.build(KEY)
@@ -397,7 +401,8 @@ def test_globals_that_are_not_numbers_and_arrays_are_refused() -> None:
         topology = TwoLayers()
         input_shape = (3,)
         globals = object()
-        forward_pass = WeightedSum()
+        conn_policy = px.policies.Conn(forward=WeightedSum())
+        unit_policy = px.policies.Unit(forward=Summed())
 
     with pytest.raises(BuildError, match="not a pytree of numbers and arrays"):
         Odd.build(KEY)

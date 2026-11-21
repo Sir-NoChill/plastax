@@ -28,10 +28,8 @@ from plastax.layers import BuildError, CreateConnections, CreateUnits, Dense, Un
 f32 = np.float32
 
 
-class WeightedSum(px.ForwardPass):
+class WeightedSum(px.policies.ForwardConnPolicy):
     """A unit's activation is the sum of weight times source activation."""
-
-    combine = px.monoid.sum_
 
     def map(
         self,
@@ -44,6 +42,12 @@ class WeightedSum(px.ForwardPass):
     ) -> jax.Array:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
+
+class Summed(px.policies.ForwardUnitPolicy):
+    """A unit's activation is the sum of what its connections map."""
+
+    combine = px.monoid.sum_
+
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jax.Array
     ) -> px.UnitWrite:
@@ -51,12 +55,14 @@ class WeightedSum(px.ForwardPass):
 
 
 class Linear(px.Network[None]):
-    forward_pass = WeightedSum()
+    conn_policy = px.policies.Conn(forward=WeightedSum())
+    unit_policy = px.policies.Unit(forward=Summed())
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class Recurrent(px.Network[None]):
-    forward_pass = WeightedSum()
+    conn_policy = px.policies.Conn(forward=WeightedSum())
+    unit_policy = px.policies.Unit(forward=Summed())
     propagation = px.Propagation.PIPELINE
 
 

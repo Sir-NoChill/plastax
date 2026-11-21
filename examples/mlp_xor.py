@@ -43,13 +43,12 @@ _XOR_INPUTS: tuple[tuple[float, float], ...] = (
 _XOR_TARGETS: tuple[float, ...] = (0.0, 1.0, 1.0, 0.0)
 
 
-class SigmoidForward(px.ForwardPass):
-    """map = weight*activation[src]; apply = sigmoid(acc) (mlp_xor.cpp's
-    SigmoidForwardPass)."""
+class WeightedSum(px.policies.ForwardConnPolicy):
+    """map = weight*activation[src] (the map of mlp_xor.cpp's
+    SigmoidForwardPass). It serves any activation."""
 
-    combine = px.monoid.sum_
-    # map is exactly WEIGHT * activation[src]: the CSR layout may run it as a
-    # sparse product (make_step's layout).
+    # map is exactly WEIGHT * activation[src]: with a summing unit policy the
+    # CSR layout may run it as a sparse product (make_step's layout).
     linear_input = px.ACTIVATION
 
     def map(
@@ -63,30 +62,25 @@ class SigmoidForward(px.ForwardPass):
     ) -> jnp.ndarray:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
+
+class SigmoidForward(px.policies.ForwardUnitPolicy):
+    """apply = sigmoid(sum of what arrives) (the apply of mlp_xor.cpp's
+    SigmoidForwardPass)."""
+
+    combine = px.monoid.sum_
+
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray
     ) -> px.UnitWrite:
         return px.UnitWrite.of((px.ACTIVATION, jax.nn.sigmoid(acc)))
 
 
-class SigmoidBackward(px.BackwardPass):
-    """Direction-reversed accumulate (mlp_xor.cpp's SigmoidBackwardPass):
-    map reads the destination's ALREADY-finalized dL/dz (grad_pre_act,
-    the reverse level walk guarantees it is written before an earlier
-    level's map reads it), combine sums weight*grad_pre_act[dst] into the
-    source's dL/da, apply converts dL/da -> dL/dz via the sigmoid
-    derivative a*(1-a) and stores into grad_pre_act for a still-earlier
-    level to read next.
+class WeightedSumBackward(px.policies.BackwardConnPolicy):
+    """Direction-reversed map (mlp_xor.cpp's SigmoidBackwardPass): it reads
+    the destination's ALREADY-finalized dL/dz (grad_pre_act; the reverse level
+    walk guarantees it is written before an earlier level's map reads it), and
+    the unit policy sums weight*grad_pre_act[dst] into the source's dL/da."""
 
-    `acc` is the real backward-accumulated dL/da for every unit except the
-    output level (dispatch_cpu.hpp:328-333: no edge sources from the
-    deepest level, so the output unit's own `acc` here is always the fresh
-    identity 0.0); `u[LossGrad, i]` is 0.0 for every unit except the
-    output_ids MSELoss seeded this step. Summing them reproduces
-    the oracle's single BackwardAcc value (module docstring, LossGrad).
-    """
-
-    combine = px.monoid.sum_
     # map is exactly WEIGHT * grad_pre_act[dst] (see make_step's layout).
     linear_input = GradPreAct
 
@@ -101,6 +95,21 @@ class SigmoidBackward(px.BackwardPass):
     ) -> jnp.ndarray:
         return c[px.WEIGHT, cid] * u[GradPreAct, dst]
 
+
+class SigmoidBackward(px.policies.BackwardUnitPolicy):
+    """apply converts dL/da -> dL/dz via the sigmoid derivative a*(1-a) and
+    stores it into grad_pre_act for a still-earlier level to read next.
+
+    `acc` is the real backward-accumulated dL/da for every unit except the
+    output level (dispatch_cpu.hpp:328-333: no edge sources from the
+    deepest level, so the output unit's own `acc` here is always the fresh
+    identity 0.0); `u[LossGrad, i]` is 0.0 for every unit except the
+    output_ids MSELoss seeded this step. Summing them reproduces
+    the oracle's single BackwardAcc value (module docstring, LossGrad).
+    """
+
+    combine = px.monoid.sum_
+
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray
     ) -> px.UnitWrite:
@@ -109,7 +118,7 @@ class SigmoidBackward(px.BackwardPass):
         return px.UnitWrite.of((GradPreAct, grad_pre_act))
 
 
-class MSELoss(px.Loss):
+class MSELoss(px.policies.LossPolicy):
     """0.5*sum((pred-target)**2) over the outputs (mlp_xor.cpp's
     plastax::MSELoss); seeds dL/dActivation = pred-target into LossGrad
     for SigmoidBackward.apply to pick up at the output level."""
@@ -128,7 +137,7 @@ def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[N
     """Build the XOR MLP Network class wired to `optimizer`.
 
     The forward/backward/loss traits are identical across optimizers; only
-    `update_conn` and the `extra_conn_fields` it needs differ. `train=False`
+    the connection update and the `extra_conn_fields` it needs differ. `train=False`
     returns a forward-only sibling sharing the same field layout, so it drives
     the same (static, state) for read-only inference (phase elision;
     mirrors mlp_xor.cpp's Net.DoForwardPass vs Net.DoStep).
@@ -143,10 +152,15 @@ def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[N
     if train:
 
         class _XorNet(px.Network[None]):
-            forward_pass = SigmoidForward()
-            backward_pass = SigmoidBackward()
+            conn_policy = px.policies.Conn(
+                forward=WeightedSum(),
+                backward=WeightedSumBackward(),
+                update=optimizer.update_conn(),
+            )
+            unit_policy = px.policies.Unit(
+                forward=SigmoidForward(), backward=SigmoidBackward()
+            )
             loss = MSELoss()
-            update_conn = optimizer.update_conn()
             extra_unit_fields = (GradPreAct, LossGrad)
             extra_conn_fields = optimizer.state_fields
             propagation = px.Propagation.TOPOLOGICAL
@@ -154,7 +168,8 @@ def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[N
         return _XorNet
 
     class _XorNetEval(px.Network[None]):
-        forward_pass = SigmoidForward()
+        conn_policy = px.policies.Conn(forward=WeightedSum())
+        unit_policy = px.policies.Unit(forward=SigmoidForward())
         extra_unit_fields = (GradPreAct, LossGrad)
         extra_conn_fields = optimizer.state_fields
         propagation = px.Propagation.TOPOLOGICAL

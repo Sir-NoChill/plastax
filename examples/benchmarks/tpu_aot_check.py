@@ -108,9 +108,8 @@ def main() -> None:
         forward = mlp_xor.SigmoidForward()
         backward = mlp_xor.SigmoidBackward()
         loss = mlp_xor.MSELoss()
-        update = px.policies.Update(conn=opt.update().conn)
+        optimizer = opt
         extra_unit_fields = (mlp_xor.GradPreAct, mlp_xor.LossGrad)
-        extra_conn_fields = opt.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
         batch_reduction = px.policies.MeanFloatFirstRest()
 

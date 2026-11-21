@@ -285,14 +285,14 @@ def make_net(
     if method not in _GROWTH:
         raise ValueError(f"make_net: unknown method {method!r} (set|rigl)")
     if mode == "train":
+        _optimizer = optimizer
 
         class _Train(px.Network[None]):
             forward = XmcForward()
             backward = XmcBackward()
             loss = BCEWithLogitsLoss(pos_weight)
-            update = px.policies.Update(conn=optimizer.update().conn)
+            optimizer = _optimizer
             extra_unit_fields = _UNIT_FIELDS
-            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train

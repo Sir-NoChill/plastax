@@ -51,14 +51,14 @@ def make_convnet(
     """Build the convnet trait class; train adds backward/loss/update, eval is
     forward-only over the same field layout (so both share one static/state)."""
     if train:
+        _optimizer = optimizer
 
         class _Train(px.Network[None]):
             forward = SigmoidForward()
             backward = SigmoidBackward()
             loss = MSELoss()
-            update = px.policies.Update(conn=optimizer.update().conn)
+            optimizer = _optimizer
             extra_unit_fields = (GradPreAct, LossGrad)
-            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train

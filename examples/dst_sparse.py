@@ -368,14 +368,14 @@ def make_net(
     if method not in _METHODS:
         raise ValueError(f"make_net: unknown method {method!r} (set|set_propose|rigl)")
     if mode == "train":
+        _optimizer = optimizer
 
         class _Train(px.Network[None]):
             forward = SigmoidForward()
             backward = SigmoidBackward()
             loss = MSELoss()
-            update = px.policies.Update(conn=optimizer.update().conn)
+            optimizer = _optimizer
             extra_unit_fields = _EXTRA_UNIT_FIELDS
-            extra_conn_fields = optimizer.conn_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train

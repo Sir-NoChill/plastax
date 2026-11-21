@@ -6,9 +6,8 @@ plastax runs online (one sample per step,
 host-driven) and is much slower than the batched jax reference; the point is
 that the weight updates agree and both learn, not throughput.
 
-Data: ``torchvision.datasets.MNIST`` (a dev dependency) reads/downloads MNIST
-under ``$root`` (default /tmp/data) on first use -- only its dataset reader is
-used, no torch compute.
+Data: ``torchvision.datasets.MNIST`` reads/downloads MNIST
+under ``$root`` (default /tmp/data) on first use
 
 Run:  uv run python examples/mnist_sgd.py --steps 4000
 """
@@ -22,6 +21,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+
+# NOTE: this should not be imported from the
+#  mlp_xor example.
 from mlp_xor import GradPreAct, LossGrad, MSELoss, SigmoidBackward, SigmoidForward
 
 import plastax as px
@@ -87,17 +89,17 @@ def _mlp_class(lr: float, *, train: bool) -> type[px.Network[None]]:
     if train:
 
         class _Train(px.Network[None]):
-            forward_pass = SigmoidForward()
-            backward_pass = SigmoidBackward()
+            forward = SigmoidForward()
+            backward = SigmoidBackward()
             loss = MSELoss()
-            update_conn = px.optim.sgd(lr, GradPreAct).update_conn()
+            optimizer = px.optim.sgd(lr, GradPreAct)
             extra_unit_fields = (GradPreAct, LossGrad)
             propagation = px.Propagation.TOPOLOGICAL
 
         return _Train
 
     class _Eval(px.Network[None]):
-        forward_pass = SigmoidForward()
+        forward = SigmoidForward()
         extra_unit_fields = (GradPreAct, LossGrad)
         propagation = px.Propagation.TOPOLOGICAL
 

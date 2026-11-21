@@ -10,11 +10,12 @@ import dataclasses
 import enum
 import inspect
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
 
+import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import Array, Bool, Float, Int32
+from jaxtyping import Array, Bool, Float, Int32, PRNGKeyArray
 
 from plastax._types import (
     ACTIVATION,
@@ -33,6 +34,11 @@ from plastax._types import (
 from plastax.monoid import Monoid, MonoidTree
 from plastax.rng import Rng
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
+
+if TYPE_CHECKING:
+    from plastax.driver import Driver
+    from plastax.layers import Module
+    from plastax.state import NetworkState, NetworkStatic
 
 
 @runtime_checkable
@@ -880,7 +886,20 @@ class Network[GS]:
     Type Args:
         GS: the global state type threaded through the network.
 
+    A subclass may name its initial structure as `topology`, with `input_shape`;
+    `build` then gives the `(static, state)` pair and `init` a `Driver` that runs
+    it. A subclass without a topology is built with `NetworkBuilder`.
+
     Attributes:
+        topology: the network's initial structure, a `plastax.layers.Module`
+            taking one handle, or None for a network built with
+            `NetworkBuilder`.
+        input_shape: the shape of the topology's input units. A step's inputs
+            have this shape.
+        globals: the value the global state starts from, or None. A pytree of
+            Python numbers or numpy arrays. Every network built from the class
+            starts from it, so it must not be mutated; `build` copies it onto
+            the device.
         forward_pass: the forward propagation policy.
         backward_pass: the backward propagation policy, or None to elide it.
         loss: the loss policy, or None to elide it.
@@ -922,6 +941,10 @@ class Network[GS]:
             step ignores it.
     """
 
+    topology: Module | None = None
+    input_shape: tuple[int, ...] | None = None
+    globals: GS | None = None
+
     forward_pass: ForwardPass[object, GS]
     backward_pass: BackwardPass[object, GS] | None = None
     loss: Loss[GS] | None = None
@@ -947,6 +970,105 @@ class Network[GS]:
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""
         _validate_traits(cls)
+
+    @classmethod
+    def build(
+        cls, key: PRNGKeyArray, *, globals: GS | None = None
+    ) -> tuple[NetworkStatic, NetworkState[GS]]:
+        """Trace the class's topology and materialize it into a state.
+
+        The entry point of the functional layer: the pair is what `make_step`
+        and `Driver` take. `init` is the usual way to run a network.
+
+        The topology is traced with `input_shape` given to the sole argument of
+        its `__call__`, and the record is materialized with
+        `plastax.layers.materialize`: the weights are drawn from `key`, each
+        block from a key derived from its path.
+
+        Args:
+            key: the key the weights are drawn from.
+            globals: the value the global state starts from, in place of the
+                class's `globals`. None uses the class's.
+
+        Returns:
+            The `(static, state)` pair. `static.input_shape` and
+            `static.output_shape` hold the shapes a step's inputs and targets
+            are given in.
+
+        Raises:
+            BuildError: if the class has no `topology` or no `input_shape`, if
+                the topology does not take exactly one handle, or if the
+                globals are not a pytree of numbers and arrays. Also whatever
+                `trace` and `materialize` raise.
+            NotImplementedError: if the topology returns more than one handle.
+        """
+        # Imported here: plastax.layers imports this module.
+        from plastax.layers import BuildError, materialize, trace
+
+        name = cls.__name__
+        if cls.topology is None:
+            raise BuildError(
+                f"{name} has no topology to build from; set `topology` and "
+                f"`input_shape` on the class, or build the network with "
+                f"NetworkBuilder"
+            )
+        if cls.input_shape is None:
+            raise BuildError(
+                f"{name} has a topology and no `input_shape`; the shape of the "
+                f"input units is needed to trace it"
+            )
+        parameters = (
+            list(inspect.signature(cls.topology.__call__).parameters)
+            if callable(cls.topology)
+            else []
+        )
+        if len(parameters) != 1:
+            raise BuildError(
+                f"{name}.input_shape describes one input, and the topology "
+                f"{type(cls.topology).__name__}.__call__ takes {len(parameters)} "
+                f"arguments {parameters}; a topology with several inputs is not "
+                f"supported yet"
+            )
+        shape = tuple(int(n) for n in cls.input_shape)
+        record = trace(cls.topology, {parameters[0]: shape})
+        if len(record.outputs) != 1:
+            raise NotImplementedError(
+                f"the topology of {name} returns {len(record.outputs)} handles; "
+                f"only one is supported so far"
+            )
+
+        value = cls.globals if globals is None else globals
+        try:
+            on_device = jax.tree_util.tree_map(jnp.asarray, value)
+        except TypeError as error:
+            raise BuildError(
+                f"the globals of {name} are not a pytree of numbers and arrays: "
+                f"{error}. A dataclass is made one with "
+                f"jax.tree_util.register_dataclass"
+            ) from error
+        return materialize(record, cls, key, globals_=on_device)
+
+    @classmethod
+    def init(cls, key: PRNGKeyArray, *, globals: GS | None = None) -> Driver[GS]:
+        """Build the network and return the `Driver` that runs it.
+
+        The driver owns the network's state and static configuration, and runs
+        it one step at a time (`Driver.step`) or a chunk of steps on the device
+        (`Driver.scan`), regrowing and resorting as the network needs.
+
+        Args:
+            key: the key the weights are drawn from.
+            globals: the value the global state starts from, in place of the
+                class's `globals`. None uses the class's.
+
+        Returns:
+            A driver holding the built network.
+        """
+        # Imported here: plastax.driver imports this module.
+        from plastax.driver import Driver
+
+        static, state = cls.build(key, globals=globals)
+        return Driver(cls, static, state)
 
 
 _RESERVED_FIELD_NAMES = frozenset(

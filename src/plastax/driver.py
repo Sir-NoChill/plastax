@@ -43,12 +43,14 @@ whatever growth left it and is the caller's to read.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jaxtyping import Array, Float
 
 from plastax import topo
 from plastax._types import Propagation
@@ -58,9 +60,27 @@ from plastax.step import StepFn, StepResult, make_growth_retry, make_step
 from plastax.traits import Network
 
 
-def _loss_record(result: StepResult[Any]) -> jax.Array:
-    """The default `Driver.scan` record: the step's loss."""
-    return result.loss
+@dataclasses.dataclass(frozen=True)
+class RunResult:
+    """What `Driver.step` and `Driver.scan` return.
+
+    From `step` each field is one step's value. From `scan` each field has a
+    leading axis, one entry per step of the chunk. The arrays stay on the
+    device until they are read.
+
+    Attributes:
+        loss: The scalar the loss policy returned for the step; 0.0 when the
+            network has no loss phase.
+        outputs: The output units' activation right after the forward phase,
+            in the network's declared output shape. None unless it was asked
+            for with `outputs=True`.
+        records: What the `record` function given to `scan` returned for each
+            step. None when no `record` was given, and from `step`.
+    """
+
+    loss: Float[Array, "*steps"]
+    outputs: Float[Array, "*shape"] | None = None
+    records: Any | None = None
 
 
 class Driver[GS]:
@@ -79,6 +99,10 @@ class Driver[GS]:
     `scan` runs a chunk of steps as one device-side loop with the same
     semantics as `step`, reading back to the host once per chunk instead of
     once per step; it is the way to run a small, launch-bound net.
+
+    Both return a `RunResult`. `Network.init` builds a network from its
+    topology and returns its Driver; a network built some other way is given
+    to the constructor as `(net, static, state)`.
 
     With `check_every=N > 1` the Driver reads the flags back only every N
     steps, keeping the host from blocking on the device in between. The
@@ -125,13 +149,20 @@ class Driver[GS]:
         self._growth: Literal["auto", "xla", "triton"] = growth
         self._resorts = net.propagation is Propagation.TOPOLOGICAL
         self._step: StepFn[GS] = self._make_step()
+        # The step that also returns the forward pass's outputs, made when it is
+        # first asked for and again after the static configuration changes.
+        self._outputs_step: StepFn[GS] | None = None
+        self._outputs_static: NetworkStatic | None = None
         self._check_every = check_every
         self._since_check = 0
         self._overflowed = jnp.bool_(False)
         # One compiled chunk loop per (static configuration, record callable).
         self._scan_fns: dict[tuple[NetworkStatic, Callable[..., Any]], Any] = {}
+        # One record callable per (outputs, the user's record), so that the
+        # loops above are found again on the next chunk.
+        self._record_fns: dict[tuple[bool, Callable[..., Any] | None], Any] = {}
 
-    def step(self, inputs: StepInputs) -> None:
+    def step(self, inputs: StepInputs, *, outputs: bool = False) -> RunResult:
         """Run one step, completing an overflowing growth, then resort.
 
         The step runs once, as one fused jitted call. If its growth overflowed,
@@ -158,43 +189,53 @@ class Driver[GS]:
         always among them.
 
         Args:
-            inputs: The external inputs for this step.
+            inputs: The external inputs for this step, in the network's
+                declared shapes when it has them.
+            outputs: Whether to return the forward pass's outputs. Not
+                available for a batched step.
+
+        Returns:
+            The step's loss, and its outputs when they were asked for.
         """
         if self._check_every > 1:
-            self._deferred_step(inputs)
-            return
-        result = self._step(self._state, inputs)
-        state = self._complete_growth(result.state, result.growth_remainder)
-        self._state = self._resort_if_due(state)
+            result = self._deferred_step(inputs, outputs)
+        else:
+            result = self._step_fn(outputs)(self._state, inputs)
+            state = self._complete_growth(result.state, result.growth_remainder)
+            self._state = self._resort_if_due(state)
+        return RunResult(loss=result.loss, outputs=result.outputs)
 
     def scan(
         self,
         inputs: StepInputs,
         *,
+        outputs: bool = False,
         record: Callable[[StepResult[GS]], Any] | None = None,
         steps: int | None = None,
-    ) -> Any:
+    ) -> RunResult:
         """Run a chunk of steps as one device-side loop; exact, like `step`.
 
-        `inputs` holds the chunk along a leading axis: `(K, num_inputs)`
-        inputs and `(K, num_outputs)` targets (`(K, B, ...)` for a batched
-        step). One jitted call runs the step K times in a `lax.while_loop`,
-        with the state donated and resident on the device: no dispatch and
-        no flag read-back per step. The loop stops itself right after a step
-        that overflowed (or, in a TOPOLOGICAL network, that needs a resort);
-        the host then completes that step exactly as `step` does (regrow and
-        claim the dropped candidates, resort), rebuilds the loop for the new
-        static configuration, and re-enters it at the next step of the same
-        chunk. A chunk therefore costs one host round trip plus one per
-        regrow or resort, and the result is step for step what K calls of
+        `inputs` holds the chunk along a leading axis: `(K, num_inputs)` inputs
+        and `(K, num_outputs)` targets (`(K, B, ...)` for a batched step), or
+        `(K, *input_shape)` and `(K, *output_shape)` for a network that
+        declares its shapes. One jitted call runs the step K times in a
+        `lax.while_loop`, with the state donated and resident on the device: no
+        dispatch and no flag read-back per step. The loop stops itself right
+        after a step that overflowed (or, in a TOPOLOGICAL network, that needs
+        a resort); the host then completes that step exactly as `step` does
+        (regrow and claim the dropped candidates, resort), rebuilds the loop
+        for the new static configuration, and re-enters it at the next step of
+        the same chunk. A chunk therefore costs one host round trip plus one
+        per regrow or resort, and the result is step for step what K calls of
         `step` produce, whatever `check_every` is.
 
-        `record` is evaluated on every step's `StepResult` on the device and
-        the results come back stacked along the chunk axis, which is how a
-        per-step signal (a prediction, the loss) leaves the device without a
-        sync per step. The default records the loss. The compiled loop is
-        cached per (static configuration, `record`), so pass the same
-        callable object every time rather than a fresh lambda. A step that
+        Every step's loss comes back stacked along the chunk axis, and with
+        `outputs=True` so do its outputs. `record` is for any other per-step
+        signal: it is evaluated on every step's `StepResult` on the device and
+        the results come back stacked as `RunResult.records`, without a sync
+        per step. The compiled loop is cached per (static configuration,
+        `outputs`, `record`), so pass the same callable object every time
+        rather than a fresh lambda. A step that
         overflowed is re-recorded once its growth is complete. Each distinct
         chunk length compiles its own loop, so pad the last chunk to the
         common length and pass `steps` for the number to run.
@@ -205,21 +246,27 @@ class Driver[GS]:
 
         Args:
             inputs: The chunk's inputs, each leaf with the chunk axis first.
-            record: What to keep from each step, as a function of its
-                `StepResult`; None records the loss.
+            outputs: Whether to return each step's forward-pass outputs. Not
+                available for a batched step.
+            record: What else to keep from each step, as a function of its
+                `StepResult`; None keeps nothing more.
             steps: How many leading steps of the chunk to run; None runs
                 them all.
 
         Returns:
-            The per-step records, stacked along a leading axis of length K;
-            entries at or beyond `steps` are zero.
+            The per-step losses, outputs and records, each stacked along a
+            leading axis of length K; entries at or beyond `steps` are zero.
 
         Raises:
             ValueError: If `inputs` has no chunk axis, its leaves disagree on
                 the chunk length, or `steps` is outside `[0, K]`.
         """
-        rec = _loss_record if record is None else record
-        if inputs.inputs.ndim < 2:
+        rec = self._record_fn(outputs, record)
+        declared = self._static.input_shape
+        one_step = (1 if declared is None else len(declared)) + (
+            0 if self._batch_size is None else 1
+        )
+        if inputs.inputs.ndim < max(2, one_step + 1):
             raise ValueError(
                 "Driver.scan: inputs need a leading chunk axis, got shape "
                 f"{inputs.inputs.shape}"
@@ -238,7 +285,7 @@ class Driver[GS]:
         start = 0
         out: Any = None
         while True:
-            loop = self._scan_fn(rec)
+            loop = self._scan_fn(rec, outputs)
             state, status, remainder, loss, records = loop(
                 self._state, inputs, jnp.int32(start), jnp.int32(count)
             )
@@ -251,21 +298,54 @@ class Driver[GS]:
                 # Finish step `done - 1` on the host, then re-record it.
                 state = self._complete_growth(state, remainder)
                 self._state = self._resort_if_due(state)
+                # The forward pass's outputs are not changed by finishing the
+                # growth; they are taken from what the loop recorded.
+                kept = None if out[1] is None else out[1][done - 1]
                 completed = StepResult(
-                    state=self._state, overflow=jnp.bool_(False), loss=loss
+                    state=self._state,
+                    overflow=jnp.bool_(False),
+                    loss=loss,
+                    outputs=kept,
                 )
                 out = _set_at(out, done - 1, rec(completed))
             if done >= count:
-                return out
+                return RunResult(loss=out[0], outputs=out[1], records=out[2])
             start = done
 
-    def _scan_fn(self, record: Callable[[StepResult[GS]], Any]) -> Any:
+    def _record_fn(
+        self, outputs: bool, record: Callable[[StepResult[GS]], Any] | None
+    ) -> Callable[[StepResult[GS]], Any]:
+        """What a chunk loop keeps of each step: loss, outputs, user's record."""
+        key = (outputs, record)
+        fn = self._record_fns.get(key)
+        if fn is None:
+
+            def fn(result: StepResult[GS]) -> tuple[Any, Any, Any]:
+                return (
+                    result.loss,
+                    result.outputs if outputs else None,
+                    None if record is None else record(result),
+                )
+
+            self._record_fns[key] = fn
+        return fn
+
+    def _step_fn(self, outputs: bool) -> StepFn[GS]:
+        """The step for the current static config, with or without outputs."""
+        if not outputs:
+            return self._step
+        if self._outputs_step is None or self._outputs_static is not self._static:
+            self._outputs_step = self._make_step(outputs=True)
+            self._outputs_static = self._static
+        return self._outputs_step
+
+    def _scan_fn(self, record: Callable[[StepResult[GS]], Any], outputs: bool) -> Any:
         """The jitted chunk loop for the current static config and `record`."""
         key = (self._static, record)
         loop = self._scan_fns.get(key)
         if loop is not None:
             return loop
-        step = self._step
+        step = self._step_fn(outputs)
         resorts = self._resorts
 
         def run(
@@ -337,15 +417,15 @@ class Driver[GS]:
             self._step = self._make_step()
         return state
 
-    def _deferred_step(self, inputs: StepInputs) -> None:
+    def _deferred_step(self, inputs: StepInputs, outputs: bool) -> StepResult[GS]:
         """One `check_every > 1` step: no host read-back except every N steps."""
-        result = self._step(self._state, inputs)
+        result = self._step_fn(outputs)(self._state, inputs)
         self._state = result.state
         # Dispatched, not synced: the OR runs on device.
         self._overflowed = self._overflowed | result.overflow
         self._since_check += 1
         if self._since_check < self._check_every:
-            return
+            return result
         self._since_check = 0
         if bool(self._overflowed):
             self._overflowed = jnp.bool_(False)
@@ -358,8 +438,9 @@ class Driver[GS]:
             self._state = state
             self._step = self._make_step()
         self._state = self._resort_if_due(self._state)
+        return result
 
-    def _make_step(self) -> StepFn[GS]:
+    def _make_step(self, *, outputs: bool = False) -> StepFn[GS]:
         """The step for the current static configuration."""
         return make_step(
             self._net,
@@ -368,6 +449,7 @@ class Driver[GS]:
             layout=self._layout,
             fuse_prune=self._fuse_prune,
             growth=self._growth,
+            outputs=outputs,
         )
 
     def _free_slots(self, state: NetworkState[GS], level: int) -> int:

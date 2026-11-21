@@ -907,7 +907,7 @@ def run(
                 record=predicted,
                 steps=n,
             )
-            prediction[start : start + n] = np.asarray(got)[:n]
+            prediction[start : start + n] = np.asarray(got.records)[:n]
             if start == 0:
                 # The first chunk compiles the loop: timed separately.
                 warm_steps, t_warm = n, time.perf_counter()

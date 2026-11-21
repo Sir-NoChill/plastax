@@ -9,8 +9,27 @@ change the API. The first release is iterated as `0.1.0rcN` candidates. Versions
 
 Fused Triton kernels for the streaming churn step, plus release preparation.
 
+### Changed
+
+- **Breaking:** `Driver.scan` returns a `RunResult` and no longer the stacked
+  records. The per-step losses are `result.loss`, and what a `record`
+  function kept is `result.records` (None when no `record` is given, where
+  the losses used to be returned). `Driver.step` returns a `RunResult` too,
+  where it returned None.
+
 ### Added
 
+- A network may name its initial structure: `topology` (a
+  `plastax.layers.Module`), `input_shape` and `globals` as class fields of a
+  `Network` subclass. `Network.build(key)` traces and materializes it into
+  `(static, state)`, and `Network.init(key)` returns the `Driver` that runs it.
+- Declared shapes: `NetworkStatic.input_shape` and `output_shape`, set for a
+  network built from a topology. `StepInputs.inputs` and `targets` are then
+  given in those shapes and the step flattens them.
+- `make_step(..., outputs=True)`, `Driver.step(..., outputs=True)` and
+  `Driver.scan(..., outputs=True)`: the output units' activation right after
+  the forward phase, as `StepResult.outputs` and `RunResult.outputs`. Not
+  available for a batched step.
 - `Driver.scan(inputs, record=..., steps=...)`: a chunk of K steps as one
   device-side `lax.while_loop` over the jitted step, the state donated and
   resident, a per-step `record(StepResult)` stacked as the result. The loop

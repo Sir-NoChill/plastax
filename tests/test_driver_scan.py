@@ -62,7 +62,7 @@ def test_scan_equals_steps_through_an_overflow(batch_size: int | None) -> None:
 
     static, state = _build_retry(5)
     scanned = px.Driver(_RetryNet, static, state, batch_size=batch_size)
-    got = scanned.scan(_repeat(one, k), record=_grown)
+    got = scanned.scan(_repeat(one, k), record=_grown).records
 
     assert scanned.static == by_step.static
     assert scanned.static.level_capacities[0] > 5, "the full bucket regrew"
@@ -107,7 +107,8 @@ def test_scan_equals_steps_through_growth_and_resort(
     scanned = px.Driver(_GrowingNet, static, state)
     got = []
     for _ in range(chunks):
-        got.append(np.asarray(scanned.scan(_repeat(one, chunk), record=_activation)))
+        result = scanned.scan(_repeat(one, chunk), record=_activation)
+        got.append(np.asarray(result.records))
 
     assert calls == step_calls, "the same structural events, in the same steps"
     assert scanned.static == by_step.static
@@ -118,7 +119,7 @@ def test_scan_equals_steps_through_growth_and_resort(
 def test_scan_runs_only_the_first_steps_of_a_padded_chunk() -> None:
     static, state = _build_retry(5)
     driver = px.Driver(_RetryNet, static, state)
-    got = driver.scan(_repeat(_STEP, 6), record=_grown, steps=4)
+    got = driver.scan(_repeat(_STEP, 6), record=_grown, steps=4).records
     assert int(driver.state.step) == 4
     assert int(driver.state.globals_) == 4
     np.testing.assert_array_equal(np.asarray(got[4:]), 0)
@@ -126,7 +127,7 @@ def test_scan_runs_only_the_first_steps_of_a_padded_chunk() -> None:
 
     static, state = _build_retry(5)
     nothing = px.Driver(_RetryNet, static, state)
-    assert np.all(np.asarray(nothing.scan(_repeat(_STEP, 3), steps=0)) == 0)
+    assert np.all(np.asarray(nothing.scan(_repeat(_STEP, 3), steps=0).loss) == 0)
     assert int(nothing.state.step) == 0
 
 
@@ -134,8 +135,10 @@ def test_scan_default_record_is_the_loss_and_the_state_is_donated() -> None:
     static, state = _build_retry(5)
     driver = px.Driver(_RetryNet, static, state)
     before = driver.state
-    out = driver.scan(_repeat(_STEP, 3))
+    result = driver.scan(_repeat(_STEP, 3))
+    out = result.loss
     assert out.shape == (3,) and out.dtype == jnp.float32
+    assert result.outputs is None and result.records is None
     assert all(leaf.is_deleted() for leaf in jax.tree_util.tree_leaves(before))
 
 

@@ -28,7 +28,7 @@ from typing import Any, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxtyping import ArrayLike, PRNGKeyArray
+from jaxtyping import Array, ArrayLike, PRNGKeyArray
 
 
 @dataclass(frozen=True, eq=False)
@@ -257,19 +257,24 @@ class VarianceScaling:
             fan = (fan_in + fan_out) / 2
         stddev = np.sqrt(self.scale / fan).astype(np.float32)
 
+        # `stddev` is a numpy array, which mypy reads as Any here, and so the
+        # products below; the annotation says what they are.
+        drawn: Array
         if self.distribution is Distribution.UNIFORM:
-            return (
+            drawn = (
                 np.sqrt(np.float32(3.0))
                 * stddev
                 * jax.random.uniform(
                     key, fans.shape, jnp.float32, minval=-1.0, maxval=1.0
                 )
             )
-        if self.distribution is Distribution.NORMAL:
-            return stddev * jax.random.normal(key, fans.shape, jnp.float32)
-        return (stddev / np.float32(_TRUNCATED_STDDEV)) * jax.random.truncated_normal(
-            key, -2.0, 2.0, fans.shape, jnp.float32
-        )
+        elif self.distribution is Distribution.NORMAL:
+            drawn = stddev * jax.random.normal(key, fans.shape, jnp.float32)
+        else:
+            drawn = (
+                stddev / np.float32(_TRUNCATED_STDDEV)
+            ) * jax.random.truncated_normal(key, -2.0, 2.0, fans.shape, jnp.float32)
+        return drawn
 
 
 def constant(value: float | int) -> Initializer:

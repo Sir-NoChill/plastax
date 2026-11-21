@@ -55,14 +55,12 @@ class Summed(px.policies.ForwardUnitPolicy):
 
 
 class Linear(px.Network[None]):
-    conn_policy = px.policies.Conn(forward=WeightedSum())
-    unit_policy = px.policies.Unit(forward=Summed())
+    forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
     propagation = px.Propagation.TOPOLOGICAL
 
 
 class Recurrent(px.Network[None]):
-    conn_policy = px.policies.Conn(forward=WeightedSum())
-    unit_policy = px.policies.Unit(forward=Summed())
+    forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
     propagation = px.Propagation.PIPELINE
 
 

@@ -4,7 +4,7 @@ Canonical backprop trait example and the first oracle target: topological mode,
 all four differentiable phases, no dynamics. The forward/backward/loss traits
 are fixed; only the optimizer changes. `main` showcases that every optimizer in
 `plastax.optim` -- sgd, momentum, adam, adamw, rmsprop -- learns XOR through the
-same traits, wired in via `update_conn` + `extra_conn_fields`.
+same traits, with only the `optimizer` field changing.
 """
 
 from __future__ import annotations
@@ -43,12 +43,13 @@ _XOR_INPUTS: tuple[tuple[float, float], ...] = (
 _XOR_TARGETS: tuple[float, ...] = (0.0, 1.0, 1.0, 0.0)
 
 
-class WeightedSum(px.policies.ForwardConnPolicy):
-    """map = weight*activation[src] (the map of mlp_xor.cpp's
-    SigmoidForwardPass). It serves any activation."""
+class SigmoidForward(px.policies.ForwardConnPolicy, px.policies.ForwardUnitPolicy):
+    """map = weight*activation[src]; apply = sigmoid(acc) (mlp_xor.cpp's
+    SigmoidForwardPass)."""
 
-    # map is exactly WEIGHT * activation[src]: with a summing unit policy the
-    # CSR layout may run it as a sparse product (make_step's layout).
+    combine = px.monoid.sum_
+    # map is exactly WEIGHT * activation[src]: the CSR layout may run it as a
+    # sparse product (make_step's layout).
     linear_input = px.ACTIVATION
 
     def map(
@@ -62,25 +63,30 @@ class WeightedSum(px.policies.ForwardConnPolicy):
     ) -> jnp.ndarray:
         return c[px.WEIGHT, cid] * u[px.ACTIVATION, src]
 
-
-class SigmoidForward(px.policies.ForwardUnitPolicy):
-    """apply = sigmoid(sum of what arrives) (the apply of mlp_xor.cpp's
-    SigmoidForwardPass)."""
-
-    combine = px.monoid.sum_
-
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray
     ) -> px.UnitWrite:
         return px.UnitWrite.of((px.ACTIVATION, jax.nn.sigmoid(acc)))
 
 
-class WeightedSumBackward(px.policies.BackwardConnPolicy):
-    """Direction-reversed map (mlp_xor.cpp's SigmoidBackwardPass): it reads
-    the destination's ALREADY-finalized dL/dz (grad_pre_act; the reverse level
-    walk guarantees it is written before an earlier level's map reads it), and
-    the unit policy sums weight*grad_pre_act[dst] into the source's dL/da."""
+class SigmoidBackward(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
+    """Direction-reversed accumulate (mlp_xor.cpp's SigmoidBackwardPass):
+    map reads the destination's ALREADY-finalized dL/dz (grad_pre_act,
+    the reverse level walk guarantees it is written before an earlier
+    level's map reads it), combine sums weight*grad_pre_act[dst] into the
+    source's dL/da, apply converts dL/da -> dL/dz via the sigmoid
+    derivative a*(1-a) and stores into grad_pre_act for a still-earlier
+    level to read next.
 
+    `acc` is the real backward-accumulated dL/da for every unit except the
+    output level (dispatch_cpu.hpp:328-333: no edge sources from the
+    deepest level, so the output unit's own `acc` here is always the fresh
+    identity 0.0); `u[LossGrad, i]` is 0.0 for every unit except the
+    output_ids MSELoss seeded this step. Summing them reproduces
+    the oracle's single BackwardAcc value (module docstring, LossGrad).
+    """
+
+    combine = px.monoid.sum_
     # map is exactly WEIGHT * grad_pre_act[dst] (see make_step's layout).
     linear_input = GradPreAct
 
@@ -94,21 +100,6 @@ class WeightedSumBackward(px.policies.BackwardConnPolicy):
         g: None,
     ) -> jnp.ndarray:
         return c[px.WEIGHT, cid] * u[GradPreAct, dst]
-
-
-class SigmoidBackward(px.policies.BackwardUnitPolicy):
-    """apply converts dL/da -> dL/dz via the sigmoid derivative a*(1-a) and
-    stores it into grad_pre_act for a still-earlier level to read next.
-
-    `acc` is the real backward-accumulated dL/da for every unit except the
-    output level (dispatch_cpu.hpp:328-333: no edge sources from the
-    deepest level, so the output unit's own `acc` here is always the fresh
-    identity 0.0); `u[LossGrad, i]` is 0.0 for every unit except the
-    output_ids MSELoss seeded this step. Summing them reproduces
-    the oracle's single BackwardAcc value (module docstring, LossGrad).
-    """
-
-    combine = px.monoid.sum_
 
     def apply(
         self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jnp.ndarray
@@ -137,41 +128,37 @@ def make_net(optimizer: px.optim.Optimizer, *, train: bool) -> type[px.Network[N
     """Build the XOR MLP Network class wired to `optimizer`.
 
     The forward/backward/loss traits are identical across optimizers; only
-    the connection update and the `extra_conn_fields` it needs differ. `train=False`
+    the `optimizer` differs. `train=False`
     returns a forward-only sibling sharing the same field layout, so it drives
     the same (static, state) for read-only inference (phase elision;
     mirrors mlp_xor.cpp's Net.DoForwardPass vs Net.DoStep).
 
     Args:
-        optimizer: the plastax.optim bundle supplying update_conn/state_fields.
+        optimizer: the plastax.optim bundle supplying the update and its state fields.
         train: whether to include the backward/loss/update phases.
 
     Returns:
         A Network subclass for the given optimizer.
     """
+    # A class body cannot read a name it also assigns, so the argument is
+    # renamed for `optimizer = ...` below.
+    _optimizer = optimizer
     if train:
 
         class _XorNet(px.Network[None]):
-            conn_policy = px.policies.Conn(
-                forward=WeightedSum(),
-                backward=WeightedSumBackward(),
-                update=optimizer.update_conn(),
-            )
-            unit_policy = px.policies.Unit(
-                forward=SigmoidForward(), backward=SigmoidBackward()
-            )
+            forward = SigmoidForward()
+            backward = SigmoidBackward()
             loss = MSELoss()
+            optimizer = _optimizer
             extra_unit_fields = (GradPreAct, LossGrad)
-            extra_conn_fields = optimizer.state_fields
             propagation = px.Propagation.TOPOLOGICAL
 
         return _XorNet
 
     class _XorNetEval(px.Network[None]):
-        conn_policy = px.policies.Conn(forward=WeightedSum())
-        unit_policy = px.policies.Unit(forward=SigmoidForward())
+        forward = SigmoidForward()
         extra_unit_fields = (GradPreAct, LossGrad)
-        extra_conn_fields = optimizer.state_fields
+        extra_conn_fields = _optimizer.conn_fields
         propagation = px.Propagation.TOPOLOGICAL
 
     return _XorNetEval

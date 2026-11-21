@@ -72,8 +72,7 @@ class TwoLayers(pxl.Module):
 class Linear(px.Network[None]):
     topology = TwoLayers()
     input_shape = (3,)
-    conn_policy = px.policies.Conn(forward=WeightedSum())
-    unit_policy = px.policies.Unit(forward=Summed())
+    forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
 
 def inputs_of(x: Any, targets: Any = None) -> px.StepInputs:
@@ -123,8 +122,7 @@ class Image(pxl.Module):
 class ImageNet(px.Network[None]):
     topology = Image()
     input_shape = (4, 4, 3)
-    conn_policy = px.policies.Conn(forward=WeightedSum())
-    unit_policy = px.policies.Unit(forward=Summed())
+    forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
 
 def test_inputs_and_outputs_keep_the_shapes_the_topology_declared() -> None:
@@ -168,8 +166,8 @@ class Overwrite(px.policies.UpdateUnitPolicy):
 class Overwritten(px.Network[None]):
     topology = TwoLayers()
     input_shape = (3,)
-    conn_policy = px.policies.Conn(forward=WeightedSum())
-    unit_policy = px.policies.Unit(forward=Summed(), update=Overwrite())
+    forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
+    update = px.policies.Update(unit=Overwrite())
 
 
 def test_outputs_are_read_before_a_later_phase_rewrites_the_units() -> None:
@@ -220,8 +218,7 @@ class ScaledNet(px.Network[dict[str, Any]]):
     topology = OneWeight()
     input_shape = (1,)
     globals = {"scale": f32(2.0)}
-    conn_policy = px.policies.Conn(forward=Scaled())
-    unit_policy = px.policies.Unit(forward=Summed())
+    forward = px.policies.Forward(conn=Scaled(), unit=Summed())
 
 
 def test_the_class_field_is_the_value_the_globals_start_from() -> None:
@@ -345,8 +342,7 @@ def test_scan_needs_a_chunk_axis_in_front_of_the_declared_shape() -> None:
 # --------------------------------------------------------------------------- #
 def test_a_network_without_a_topology_cannot_be_built_this_way() -> None:
     class Bare(px.Network[None]):
-        conn_policy = px.policies.Conn(forward=WeightedSum())
-        unit_policy = px.policies.Unit(forward=Summed())
+        forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
     with pytest.raises(BuildError, match="has no topology"):
         Bare.build(KEY)
@@ -355,8 +351,7 @@ def test_a_network_without_a_topology_cannot_be_built_this_way() -> None:
 def test_a_topology_needs_an_input_shape() -> None:
     class Shapeless(px.Network[None]):
         topology = TwoLayers()
-        conn_policy = px.policies.Conn(forward=WeightedSum())
-        unit_policy = px.policies.Unit(forward=Summed())
+        forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
     with pytest.raises(BuildError, match="input_shape"):
         Shapeless.init(KEY)
@@ -370,8 +365,7 @@ def test_a_topology_with_two_inputs_is_not_supported_yet() -> None:
     class TwoInputs(px.Network[None]):
         topology = Two()
         input_shape = (3,)
-        conn_policy = px.policies.Conn(forward=WeightedSum())
-        unit_policy = px.policies.Unit(forward=Summed())
+        forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
     with pytest.raises(BuildError, match="takes 2 arguments"):
         TwoInputs.build(KEY)
@@ -389,8 +383,7 @@ def test_a_topology_returning_two_handles_is_not_supported_yet() -> None:
     class TwoOutputs(px.Network[None]):
         topology = Both()
         input_shape = (3,)
-        conn_policy = px.policies.Conn(forward=WeightedSum())
-        unit_policy = px.policies.Unit(forward=Summed())
+        forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
     with pytest.raises(NotImplementedError, match="returns 2 handles"):
         TwoOutputs.build(KEY)
@@ -401,8 +394,7 @@ def test_globals_that_are_not_numbers_and_arrays_are_refused() -> None:
         topology = TwoLayers()
         input_shape = (3,)
         globals = object()
-        conn_policy = px.policies.Conn(forward=WeightedSum())
-        unit_policy = px.policies.Unit(forward=Summed())
+        forward = px.policies.Forward(conn=WeightedSum(), unit=Summed())
 
     with pytest.raises(BuildError, match="not a pytree of numbers and arrays"):
         Odd.build(KEY)

@@ -15,6 +15,9 @@ from plastax.policies._batch import (
     batch_written_reduction,
 )
 from plastax.policies._conn import (
+    BackwardConnPolicy,
+    Conn,
+    ForwardConnPolicy,
     Proposal,
     ProposeAddConnPolicy,
     PruneConnPolicy,
@@ -24,15 +27,24 @@ from plastax.policies._conn import (
 )
 from plastax.policies._globals import ResetGlobalPolicy
 from plastax.policies._loss import LossPolicy, SoftmaxCrossEntropyLossPolicy
-from plastax.policies._passes import BackwardPass, ForwardPass
-from plastax.policies._unit import AddUnitPolicy, PruneUnitPolicy, UpdateUnitPolicy
+from plastax.policies._unit import (
+    AddUnitPolicy,
+    BackwardUnitPolicy,
+    ForwardUnitPolicy,
+    PruneUnitPolicy,
+    Unit,
+    UpdateUnitPolicy,
+)
 
 __all__ = [
     "AddUnitPolicy",
-    "BackwardPass",
+    "BackwardConnPolicy",
+    "BackwardUnitPolicy",
+    "Conn",
     "BatchReductionPolicy",
     "FieldReductions",
-    "ForwardPass",
+    "ForwardConnPolicy",
+    "ForwardUnitPolicy",
     "LossPolicy",
     "MeanFloatFirstRest",
     "Proposal",
@@ -43,6 +55,7 @@ __all__ = [
     "ResetGlobalPolicy",
     "ScoreAddConnPolicy",
     "SoftmaxCrossEntropyLossPolicy",
+    "Unit",
     "UpdateConnPolicy",
     "UpdateUnitPolicy",
     "batch_written_reduction",

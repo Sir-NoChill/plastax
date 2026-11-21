@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Protocol, runtime_checkable
 
 from jaxtyping import Array, Bool, Int32
@@ -9,7 +10,72 @@ from jaxtyping import Array, Bool, Int32
 from plastax._types import (
     UnitIdx,
 )
+from plastax.monoid import MonoidTree
 from plastax.views import UnitView, UnitWrite
+
+
+@runtime_checkable
+class ForwardUnitPolicy[Acc, GS](Protocol):
+    """The unit half of the forward pass: reduce what arrives, write the unit.
+
+    `combine` reduces the values the incoming connections' `ForwardConnPolicy`
+    maps, and `apply` turns the reduced value into one write.
+
+    Type Args:
+        Acc: the accumulator type reduced by `combine`.
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        combine: the monoid tree used to reduce the per-connection values.
+    """
+
+    combine: MonoidTree
+
+    def apply(self, u: UnitView, i: UnitIdx, g: GS, acc: Acc) -> UnitWrite:
+        """Turn the reduced accumulator into a write for one unit.
+
+        Args:
+            u: the unit view.
+            i: index of the unit.
+            g: the global state.
+            acc: the reduced accumulator for this unit.
+
+        Returns:
+            The UnitWrite for that unit.
+        """
+        ...
+
+
+@runtime_checkable
+class BackwardUnitPolicy[Acc, GS](Protocol):
+    """The unit half of the backward pass: reduce what arrives, write the unit.
+
+    `combine` reduces the values the OUTGOING connections' `BackwardConnPolicy`
+    maps, and `apply` turns the reduced value into one write.
+
+    Type Args:
+        Acc: the accumulator type reduced by `combine`.
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        combine: the monoid tree used to reduce the per-connection values.
+    """
+
+    combine: MonoidTree
+
+    def apply(self, u: UnitView, i: UnitIdx, g: GS, acc: Acc) -> UnitWrite:
+        """Turn the reduced accumulator into a write for one unit.
+
+        Args:
+            u: the unit view.
+            i: index of the unit.
+            g: the global state.
+            acc: the reduced accumulator for this unit.
+
+        Returns:
+            The UnitWrite for that unit.
+        """
+        ...
 
 
 @runtime_checkable
@@ -128,3 +194,25 @@ class AddUnitPolicy[GS](Protocol):
             The child's fields; unwritten fields keep their defaults.
         """
         ...
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Unit[GS]:
+    """The behaviour of one kind of unit: a policy per phase.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        forward: the unit half of the forward pass.
+        backward: the unit half of the backward pass, or None. Set together
+            with the connection set's `backward`.
+        update: the unit update policy, or None to elide it.
+        prune: the unit pruning policy, or None to elide it. Requires
+            `Network.unit_capacity`.
+    """
+
+    forward: ForwardUnitPolicy[object, GS]
+    backward: BackwardUnitPolicy[object, GS] | None = None
+    update: UpdateUnitPolicy[GS] | None = None
+    prune: PruneUnitPolicy[GS] | None = None

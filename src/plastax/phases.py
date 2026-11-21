@@ -164,15 +164,15 @@ def build_phases[GS](
         phases = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
-    if net.backward_pass is not None:
+    if net.unit_policy.backward is not None:
         phases.append(_build_backward_phase(net, static))
-    if net.update_unit is not None:
+    if net.unit_policy.update is not None:
         phases.append(build_update_unit_phase(net, static))
-    if net.update_conn is not None:
+    if net.conn_policy.update is not None:
         phases.append(build_update_conn_phase(net, static))
-    if net.prune_unit is not None:
+    if net.unit_policy.prune is not None:
         phases.append(build_prune_unit_phase(net, static))
-    if net.prune_conn is not None:
+    if net.conn_policy.prune is not None:
         phases.append(
             build_prune_merge_phase(dead_sink)
             if fused
@@ -259,27 +259,34 @@ def build_batched_phases[GS](
     forward = _build_forward_phase(net, static)
     loss = _build_loss_phase(net, static) if net.loss is not None else None
     backward = (
-        _build_backward_phase(net, static) if net.backward_pass is not None else None
+        _build_backward_phase(net, static)
+        if net.unit_policy.backward is not None
+        else None
     )
     update_unit = (
-        build_update_unit_phase(net, static) if net.update_unit is not None else None
+        build_update_unit_phase(net, static)
+        if net.unit_policy.update is not None
+        else None
     )
     csr_forward = (
         build_csr_forward(net, static, engine=engine)
-        if engine is not None and linear_input_field(net.forward_pass) is not None
+        if engine is not None
+        and linear_input_field(net.conn_policy.forward, net.unit_policy.forward)
+        is not None
         else None
     )
     csr_backward = (
         build_csr_backward(net, static, engine=engine)
         if engine is not None
-        and net.backward_pass is not None
-        and linear_input_field(net.backward_pass) is not None
+        and net.unit_policy.backward is not None
+        and linear_input_field(net.conn_policy.backward, net.unit_policy.backward)
+        is not None
         else None
     )
     structural: list[Phase[GS]] = []
-    if net.prune_unit is not None:
+    if net.unit_policy.prune is not None:
         structural.append(build_prune_unit_phase(net, static))
-    if net.prune_conn is not None:
+    if net.conn_policy.prune is not None:
         structural.append(build_prune_conn_phase(net, static))
     if net.add_unit is not None:
         structural.append(build_add_unit_phase(net, static))
@@ -296,7 +303,9 @@ def build_batched_phases[GS](
     if net.reset_global is not None:
         structural.append(_build_reset_global_phase(net))
     update = (
-        build_batched_update_conn(net, static) if net.update_conn is not None else None
+        build_batched_update_conn(net, static)
+        if net.conn_policy.update is not None
+        else None
     )
     return BatchedPhases(
         forward,
@@ -378,9 +387,9 @@ def per_sample_written_fields[GS](
     ]
     if net.loss is not None:
         phases.append(("loss", _build_loss_phase(net, static)))
-    if net.backward_pass is not None:
+    if net.unit_policy.backward is not None:
         phases.append(("backward_pass", _build_backward_phase(net, static)))
-    if net.update_unit is not None:
+    if net.unit_policy.update is not None:
         phases.append(("update_unit", build_update_unit_phase(net, static)))
     written: dict[str, str] = {ACTIVATION.name: "the input scatter"}
 
@@ -434,7 +443,7 @@ def build_batched_update_conn[GS](
     Returns:
         `(state, batched_units) -> state` with updated connections.
     """
-    uc = net.update_conn
+    uc = net.conn_policy.update
     assert uc is not None  # only built when set
     policy = net.batch_reduction
     assert policy is not None  # make_step requires one for a batched step
@@ -547,26 +556,30 @@ def build_batched_update_conn[GS](
     return mean_of_writes
 
 
-def linear_input_field(pass_: object) -> FieldSpec[Any] | None:
-    """The unit field a pass declares itself linear in, or None.
+def linear_input_field(conn_half: object, unit_half: object) -> FieldSpec[Any] | None:
+    """The unit field a pass is linear in, or None.
 
-    A ForwardPass or BackwardPass may declare, structurally, `linear_input`:
-    a FieldSpec F such that its `map` is exactly `WEIGHT * u[F, other]` (the
-    source unit for forward, the destination for backward) and its `combine`
-    is the plain `monoid.sum_`. Such a pass's accumulation is a sparse matrix
+    A ForwardConnPolicy or BackwardConnPolicy may declare, structurally,
+    `linear_input`: a FieldSpec F such that its `map` is exactly
+    `WEIGHT * u[F, other]` (the source unit for forward, the destination for
+    backward). When the unit half's `combine` is the monoid of one of
+    `monoid.LINEAR_SEMIRINGS`, the pass's accumulation is a sparse matrix
     product, which the CSR layout computes with cuSPARSE instead of the
-    per-edge map; `apply` is unchanged. The declaration is trusted -- `map` is
-    not consulted on the CSR path -- so it must be true.
+    per-connection map; `apply` is unchanged. The declaration is trusted --
+    `map` is not consulted on the CSR path -- so it must be true.
 
     Args:
-        pass_: A forward or backward pass policy.
+        conn_half: The connection half of a forward or backward pass.
+        unit_half: The unit half of the same pass.
 
     Returns:
-        The declared FieldSpec when the pass qualifies, else None.
+        The declared FieldSpec when the pair qualifies, else None.
     """
-    field = getattr(pass_, "linear_input", None)
-    combine = getattr(pass_, "combine", None)
-    if isinstance(field, FieldSpec) and combine is monoid.sum_:
+    field = getattr(conn_half, "linear_input", None)
+    combine = getattr(unit_half, "combine", None)
+    if isinstance(field, FieldSpec) and any(
+        combine is m for m in monoid.LINEAR_SEMIRINGS.values()
+    ):
         return field
     return None
 
@@ -875,11 +888,12 @@ def build_csr_forward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the forward.
     """
-    fp = net.forward_pass
-    field = linear_input_field(fp)
+    fc = net.conn_policy.forward
+    fu = net.unit_policy.forward
+    field = linear_input_field(fc, fu)
     assert field is not None  # only built for a linear forward
     num_units = static.num_units
-    apply = build_forward_apply(fp, num_units=num_units)
+    apply = build_forward_apply(fu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
     reduce_shards = _shard_sum(static)
     product = bucket_product(engine, num_units)
@@ -920,12 +934,15 @@ def build_csr_backward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the backward.
     """
-    bp = net.backward_pass
-    field = linear_input_field(bp)
-    assert bp is not None and field is not None  # only built when linear
+    bc = net.conn_policy.backward
+    bu = net.unit_policy.backward
+    field = linear_input_field(bc, bu)
+    assert (
+        bc is not None and bu is not None and field is not None
+    )  # only built when linear
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    apply = build_backward_apply(bp, num_units=num_units)
+    apply = build_backward_apply(bu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
     vapply = jax.vmap(apply, in_axes=(0, 0, None, None))
     reduce_shards = _shard_sum(static)
@@ -965,7 +982,8 @@ def _build_forward_phase[GS](
         # slot) would break any order anyway; a violated hint is undefined
         # in XLA.
         sweep = build_forward_sweep(
-            net.forward_pass,
+            net.conn_policy.forward,
+            net.unit_policy.forward,
             num_units=static.num_units,
             indices_are_sorted=False,
             input_ids=static.input_ids,
@@ -1003,15 +1021,17 @@ def _build_forward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    fp = net.forward_pass
+    fc = net.conn_policy.forward
+    fu = net.unit_policy.forward
     # Not indices_are_sorted, for the same reason as the pipeline forward.
     accumulate = build_forward_accumulate(
-        fp,
+        fc,
+        fu,
         num_units=num_units,
         indices_are_sorted=False,
         shard_axis=_shard_axis(static),
     )
-    apply = build_forward_apply(fp, num_units=num_units)
+    apply = build_forward_apply(fu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
 
     def forward_phase(
@@ -1020,7 +1040,7 @@ def _build_forward_topological_phase[GS](
         del inputs
         units = state.units
         unit_level = units[LEVEL.name]
-        acc = identity_accumulator(fp.combine, num_units)
+        acc = identity_accumulator(fu.combine, num_units)
         for level_idx in range(num_levels):
             acc = accumulate(units, state.conns[level_idx], acc, state.globals_)
             finalize = (unit_level == level_idx + 1) & not_input
@@ -1033,8 +1053,9 @@ def _build_forward_topological_phase[GS](
 def _build_backward_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
-    bp = net.backward_pass
-    assert bp is not None  # build_phases only calls this when set
+    bc = net.conn_policy.backward
+    bu = net.unit_policy.backward
+    assert bc is not None and bu is not None  # build_phases only calls this when set
 
     if net.propagation is Propagation.PIPELINE:
         # No level structure, one flat bucket, every unit Applied
@@ -1043,7 +1064,8 @@ def _build_backward_phase[GS](
         # segments by FROM_ID, and although buckets start source-major,
         # dead slots' null targets and in-place adds break that order.
         sweep = build_backward_sweep(
-            bp,
+            bc,
+            bu,
             num_units=static.num_units,
             indices_are_sorted=False,
             shard_axis=_shard_axis(static),
@@ -1090,15 +1112,17 @@ def _build_backward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    bp = net.backward_pass
-    assert bp is not None  # build_phases only calls this when set
+    bc = net.conn_policy.backward
+    bu = net.unit_policy.backward
+    assert bc is not None and bu is not None  # build_phases only calls this when set
     accumulate = build_backward_accumulate(
-        bp,
+        bc,
+        bu,
         num_units=num_units,
         indices_are_sorted=False,
         shard_axis=_shard_axis(static),
     )
-    apply = build_backward_apply(bp, num_units=num_units)
+    apply = build_backward_apply(bu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
 
     def backward_phase(
@@ -1107,7 +1131,7 @@ def _build_backward_topological_phase[GS](
         del inputs
         units = state.units
         unit_level = units[LEVEL.name]
-        acc = identity_accumulator(bp.combine, num_units)
+        acc = identity_accumulator(bu.combine, num_units)
         finalize = (unit_level == num_levels) & not_input
         units, acc = apply(units, acc, state.globals_, finalize)
         for level_idx in range(num_levels - 1, 0, -1):
@@ -1180,7 +1204,7 @@ def build_update_unit_phase[GS](
     Returns:
         The update_unit phase function.
     """
-    uu = net.update_unit
+    uu = net.unit_policy.update
     assert uu is not None  # build_phases only calls this when set
     num_units = static.num_units
 
@@ -1239,7 +1263,7 @@ def build_update_conn_phase[GS](
     Returns:
         The update_conn phase function.
     """
-    uc = net.update_conn
+    uc = net.conn_policy.update
     assert uc is not None  # build_phases only calls this when set
     incoming = build_incoming_conn_update(uc.incoming)
     outgoing = build_outgoing_conn_update(uc.outgoing)
@@ -1283,7 +1307,7 @@ def build_prune_unit_phase[GS](
     Returns:
         The prune_unit phase function.
     """
-    pu = net.prune_unit
+    pu = net.unit_policy.prune
     assert pu is not None  # build_phases only calls this when set
     num_units = static.num_units
     exempt = unit_id_mask(static.input_ids + static.output_ids, num_units)
@@ -1484,7 +1508,7 @@ def build_prune_conn_phase[GS](
     Returns:
         The prune_conn phase function.
     """
-    pc = net.prune_conn
+    pc = net.conn_policy.prune
     assert pc is not None  # build_phases only calls this when set
 
     def prune_conn_phase(
@@ -1692,14 +1716,15 @@ def plan_prune_fusion[GS](
     Raises:
         ValueError: If `engine` is not "auto", "triton" or "xla".
     """
-    pc = net.prune_conn
+    pc = net.conn_policy.prune
     if pc is None:
         return PruneFusionPlan(False, "no prune_conn")
-    if net.prune_unit is not None:
+    if net.unit_policy.prune is not None:
         # The fused forward's tombstones replace the dead masks at the
         # prune_conn slot, which would revive the edges prune_unit killed.
         return PruneFusionPlan(False, "prune_unit tombstones edges before prune_conn")
-    fp = net.forward_pass
+    fc = net.conn_policy.forward
+    fu = net.unit_policy.forward
     n = static.num_units
     units = {s.name: _sds((n,), np.dtype(s.dtype)) for s in static.unit_fields}
 
@@ -1709,13 +1734,13 @@ def plan_prune_fusion[GS](
     conns0 = conns_at(static.level_capacities[0])
     g = _abstract(globals_)
     scalar_i = _sds((), np.dtype(np.int32))
-    acc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), fp.combine)
+    acc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), fu.combine)
 
     def predicate(u: Columns, c: Columns, cid: jax.Array, g_: Any) -> jax.Array:
         return jnp.asarray(pc.predicate(UnitView(u), ConnView(c), ConnIdx(cid), g_))
 
     def forward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> dict[str, Any]:
-        return dict(fp.apply(UnitView(u), UnitIdx(i), g_, a).fields)
+        return dict(fu.apply(UnitView(u), UnitIdx(i), g_, a).fields)
 
     try:
         pred_args = (units, conns0, scalar_i, g)
@@ -1736,19 +1761,19 @@ def plan_prune_fusion[GS](
         if net.loss is not None:
             # The loss writes exactly its declared seed column.
             between.add(("unit", net.loss.seed_field.name))
-        if net.backward_pass is not None:
-            bp = net.backward_pass
+        if net.unit_policy.backward is not None:
+            bu = net.unit_policy.backward
 
             def backward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> Any:
-                return dict(bp.apply(UnitView(u), UnitIdx(i), g_, a).fields)
+                return dict(bu.apply(UnitView(u), UnitIdx(i), g_, a).fields)
 
-            bacc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), bp.combine)
+            bacc = jax.tree.map(lambda _: _sds((), np.dtype(np.float32)), bu.combine)
             between |= {
                 ("unit", k)
                 for k in _write_keys(backward_apply, units, scalar_i, g, bacc)
             }
-        if net.update_unit is not None:
-            uu = net.update_unit
+        if net.unit_policy.update is not None:
+            uu = net.unit_policy.update
 
             def unit_update(u: Columns, i: jax.Array, g_: Any) -> Any:
                 return dict(uu.update(UnitView(u), UnitIdx(i), g_).fields)
@@ -1756,8 +1781,8 @@ def plan_prune_fusion[GS](
             between |= {
                 ("unit", k) for k in _write_keys(unit_update, units, scalar_i, g)
             }
-        if net.update_conn is not None:
-            uc = net.update_conn
+        if net.conn_policy.update is not None:
+            uc = net.conn_policy.update
             for rule in (uc.incoming, uc.outgoing):
 
                 def conn_write(
@@ -1840,7 +1865,7 @@ def plan_prune_fusion[GS](
         return without_triton("jax_triton is not validated inside shard_map")
     if not nvidia_triton_available():
         return without_triton("no NVIDIA GPU with jax_triton")
-    field = linear_input_field(fp)
+    field = linear_input_field(fc, fu)
     if (
         field is None
         or np.dtype(field.dtype) != np.float32
@@ -2367,21 +2392,23 @@ def build_fused_forward_prune_phase[GS](
     Returns:
         The fused forward phase.
     """
-    pc = net.prune_conn
+    pc = net.conn_policy.prune
     assert pc is not None and plan.fused
-    fp = net.forward_pass
+    fc = net.conn_policy.forward
+    fu = net.unit_policy.forward
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     pipeline = net.propagation is Propagation.PIPELINE
     accumulate = build_forward_accumulate(
-        fp,
+        fc,
+        fu,
         num_units=num_units,
         indices_are_sorted=False,
         shard_axis=_shard_axis(static),
     )
-    apply = build_forward_apply(fp, num_units=num_units)
+    apply = build_forward_apply(fu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
-    field = linear_input_field(fp)
+    field = linear_input_field(fc, fu)
     forwarded = plan.forwarded
 
     def forwarded_units(units: Columns, g: GS) -> Columns:
@@ -2395,11 +2422,11 @@ def build_fused_forward_prune_phase[GS](
         live = live_unit_mask(units)
         if live is not None:
             finalized = finalized & live
-        acc0 = identity_accumulator(fp.combine, num_units)
+        acc0 = identity_accumulator(fu.combine, num_units)
         u_view = UnitView(units)
 
         def one(i: jax.Array, a: Any) -> dict[str, jax.Array]:
-            fields = fp.apply(u_view, UnitIdx(i), g, a).fields
+            fields = fu.apply(u_view, UnitIdx(i), g, a).fields
             return {k: fields[k] for k in forwarded}
 
         writes = jax.vmap(one)(jnp.arange(num_units), acc0)
@@ -2424,7 +2451,7 @@ def build_fused_forward_prune_phase[GS](
         g = state.globals_
         units = state.units
         pred_units = forwarded_units(units, g)
-        acc = identity_accumulator(fp.combine, num_units)
+        acc = identity_accumulator(fu.combine, num_units)
         for level_idx in range(num_levels):
             bucket = state.conns[level_idx]
             if plan.engine == "triton":

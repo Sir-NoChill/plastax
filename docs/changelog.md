@@ -11,14 +11,26 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
+- **Breaking:** a network declares its behaviour as two policy sets,
+  `conn_policy = plastax.policies.Conn(forward, backward, update, prune)` and
+  `unit_policy = plastax.policies.Unit(forward, backward, update, prune)`,
+  in place of the class fields `forward_pass`, `backward_pass`,
+  `update_conn`, `update_unit`, `prune_conn` and `prune_unit`. `ForwardPass`
+  and `BackwardPass` are each cut in two: `ForwardConnPolicy` and
+  `BackwardConnPolicy` hold `map` (and `linear_input`), `ForwardUnitPolicy`
+  and `BackwardUnitPolicy` hold `combine` and `apply`. Both sets are
+  required, and a backward pass needs both halves.
+- A `linear_input` whose unit half does not combine with the monoid of one
+  of `plastax.monoid.LINEAR_SEMIRINGS` (today `(+, *)` only) now warns when
+  the class is defined; it was ignored silently.
 - **Breaking:** the policy traits moved to the new `plastax.policies`
   package and are no longer exported at the top level. Each gained the
   `Policy` suffix: `Loss` is `policies.LossPolicy`, `UpdateConn` is
   `policies.UpdateConnPolicy`, and likewise `UpdateUnit`, `PruneConn`,
   `PruneUnit`, `AddUnit`, `ScoreAddConn`, `ProposeAddConn`, `ResetGlobal`,
-  `BatchReduction` and `SoftmaxCrossEntropyLoss`. `ForwardPass`,
-  `BackwardPass`, `Proposal`, `Reduction`, `FieldReductions`,
-  `MeanFloatFirstRest` and `predicate_add_conn` moved without a rename. No
+  `BatchReduction` and `SoftmaxCrossEntropyLoss`. `Proposal`, `Reduction`,
+  `FieldReductions`, `MeanFloatFirstRest` and `predicate_add_conn` moved
+  without a rename. No
   old name is kept. `plastax.traits` is gone; `Network` is defined in
   `plastax.network` and is still `plastax.Network`.
 - **Breaking:** `Driver.scan` returns a `RunResult` and no longer the stacked

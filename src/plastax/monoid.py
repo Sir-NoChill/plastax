@@ -209,6 +209,13 @@ prod: Monoid[Array] = Monoid(_Named.PROD)
 max_: Monoid[Array] = Monoid(_Named.MAX)
 min_: Monoid[Array] = Monoid(_Named.MIN)
 
+# The semirings the engine has a sparse matrix product for, each named by its
+# (reduce, multiply) pair and keyed to the monoid that reduces. A connection
+# policy that declares `linear_input` supplies the multiply, WEIGHT times a unit
+# field; the product is used only when the unit policy's `combine` is the
+# monoid of one of these. Today there is one, ordinary matrix multiplication.
+LINEAR_SEMIRINGS: dict[str, Monoid[Array]] = {"(+, *)": sum_}
+
 # Acc pytrees pair with monoid pytrees of identical structure. PEP 695 `type`
 # aliases are lazily evaluated, so the recursive reference needs no string.
 type MonoidTree = Monoid[Array] | dict[str, MonoidTree] | tuple[MonoidTree, ...]

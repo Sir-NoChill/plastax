@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -22,13 +23,16 @@ from plastax._types import (
     Propagation,
     ShardSpec,
 )
-from plastax.monoid import Monoid
+from plastax.monoid import LINEAR_SEMIRINGS, Monoid
 from plastax.policies import (
     AddUnitPolicy,
-    BackwardPass,
+    BackwardConnPolicy,
+    BackwardUnitPolicy,
     BatchReductionPolicy,
+    Conn,
     FieldReductions,
-    ForwardPass,
+    ForwardConnPolicy,
+    ForwardUnitPolicy,
     LossPolicy,
     ProposeAddConnPolicy,
     PruneConnPolicy,
@@ -36,6 +40,7 @@ from plastax.policies import (
     Reduction,
     ResetGlobalPolicy,
     ScoreAddConnPolicy,
+    Unit,
     UpdateConnPolicy,
     UpdateUnitPolicy,
     batch_written_reduction,
@@ -71,14 +76,15 @@ class Network[GS]:
             Python numbers or numpy arrays. Every network built from the class
             starts from it, so it must not be mutated; `build` copies it onto
             the device.
-        forward_pass: the forward propagation policy.
-        backward_pass: the backward propagation policy, or None to elide it.
-        loss: the loss policy, or None to elide it.
-        update_unit: the unit update policy, or None to elide it.
-        update_conn: the connection update policy, or None to elide it.
-        prune_unit: the unit pruning policy, or None to elide it. Requires
+        conn_policy: the behaviour of the network's connections, a
+            `plastax.policies.Conn`: the connection halves of the forward and
+            backward passes, the update and the prune. A slot left None is
+            elided.
+        unit_policy: the behaviour of the network's units, a
+            `plastax.policies.Unit`: the unit halves of the forward and
+            backward passes, the update and the prune. Its `prune` requires
             `unit_capacity`.
-        prune_conn: the connection pruning policy, or None to elide it.
+        loss: the loss policy, or None to elide it.
         add_unit: the unit addition policy, or None to elide it. Requires
             `unit_capacity`.
         add_conn: the connection growth policy, or None to elide it.
@@ -116,13 +122,9 @@ class Network[GS]:
     input_shape: tuple[int, ...] | None = None
     globals: GS | None = None
 
-    forward_pass: ForwardPass[object, GS]
-    backward_pass: BackwardPass[object, GS] | None = None
+    conn_policy: Conn[GS]
+    unit_policy: Unit[GS]
     loss: LossPolicy[GS] | None = None
-    update_unit: UpdateUnitPolicy[GS] | None = None
-    update_conn: UpdateConnPolicy[GS] | None = None
-    prune_unit: PruneUnitPolicy[GS] | None = None
-    prune_conn: PruneConnPolicy[GS] | None = None
     add_unit: AddUnitPolicy[GS] | None = None
     add_conn: ScoreAddConnPolicy[GS] | ProposeAddConnPolicy[GS] | None = None
     reset_global: ResetGlobalPolicy[GS] | None = None
@@ -296,6 +298,32 @@ def _validate_monoid_tree(
     )
 
 
+def _warn_unused_linear_input(
+    cls: type[Network[Any]], which: str, conn_half: object, unit_half: object
+) -> None:
+    """Warn when a connection half's `linear_input` cannot be used.
+
+    Args:
+        cls: the Network subclass being validated, for the message.
+        which: "forward" or "backward".
+        conn_half: the connection half of the pass.
+        unit_half: the unit half of the same pass.
+    """
+    if getattr(conn_half, "linear_input", None) is None:
+        return
+    combine = getattr(unit_half, "combine", None)
+    if any(combine is m for m in LINEAR_SEMIRINGS.values()):
+        return
+    warnings.warn(
+        f"{cls.__name__}.conn_policy.{which} declares linear_input, and "
+        f"unit_policy.{which}.combine is {combine!r}, which is not the monoid of "
+        f"a semiring the engine has a sparse product for "
+        f"({', '.join(LINEAR_SEMIRINGS)}); the declaration is ignored and the "
+        f"pass runs per connection",
+        stacklevel=4,
+    )
+
+
 def _validate_loss(cls: type[Network[Any]], loss: object) -> None:
     """Check the loss policy's shape and its declared seed field.
 
@@ -373,8 +401,9 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         cls: the Network subclass to validate.
 
     Raises:
-        TypeError: if forward_pass is missing, or a configured trait does
-            not satisfy its protocol.
+        TypeError: if `conn_policy` or `unit_policy` is missing, a configured
+            policy does not satisfy its protocol, or only one half of the
+            backward pass is set.
         ValueError: if a delegated check fails -- a malformed combine
             MonoidTree, or a field-name collision or duplicate.
     """
@@ -384,54 +413,55 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
             "the growth window moved onto the growth rule. Set "
             "`max_level_gap` (int, default 1) on the add_conn policy instead."
         )
-    forward_pass = getattr(cls, "forward_pass", None)
-    if forward_pass is None:
-        raise TypeError(f"{cls.__name__}.forward_pass is required and was not set")
-    if not isinstance(forward_pass, ForwardPass):
+    conn = getattr(cls, "conn_policy", None)
+    unit = getattr(cls, "unit_policy", None)
+    if not isinstance(conn, Conn):
         raise TypeError(
-            f"{cls.__name__}.forward_pass must satisfy ForwardPass "
-            f"(combine, map, apply); got {forward_pass!r}"
+            f"{cls.__name__}.conn_policy is required and must be a "
+            f"plastax.policies.Conn; got {conn!r}"
         )
-    _validate_monoid_tree(forward_pass.combine, cls, "forward_pass")
-
-    if cls.backward_pass is not None:
-        if not isinstance(cls.backward_pass, BackwardPass):
+    if not isinstance(unit, Unit):
+        raise TypeError(
+            f"{cls.__name__}.unit_policy is required and must be a "
+            f"plastax.policies.Unit; got {unit!r}"
+        )
+    slots: tuple[tuple[str, object, type, str], ...] = (
+        ("conn_policy.forward", conn.forward, ForwardConnPolicy, "map"),
+        ("unit_policy.forward", unit.forward, ForwardUnitPolicy, "combine, apply"),
+        ("conn_policy.backward", conn.backward, BackwardConnPolicy, "map"),
+        ("unit_policy.backward", unit.backward, BackwardUnitPolicy, "combine, apply"),
+        ("conn_policy.update", conn.update, UpdateConnPolicy, "incoming, outgoing"),
+        ("unit_policy.update", unit.update, UpdateUnitPolicy, "update"),
+        ("conn_policy.prune", conn.prune, PruneConnPolicy, "predicate"),
+        ("unit_policy.prune", unit.prune, PruneUnitPolicy, "predicate"),
+    )
+    for where, policy, trait, members in slots:
+        if policy is None and not where.endswith(".forward"):
+            continue
+        if not isinstance(policy, trait):
             raise TypeError(
-                f"{cls.__name__}.backward_pass must satisfy BackwardPass "
-                f"(combine, map, apply); got {cls.backward_pass!r}"
+                f"{cls.__name__}.{where} must satisfy {trait.__name__} "
+                f"({members}); got {policy!r}"
             )
-        _validate_monoid_tree(cls.backward_pass.combine, cls, "backward_pass")
+    if (conn.backward is None) != (unit.backward is None):
+        present, absent = (
+            ("conn_policy", "unit_policy")
+            if unit.backward is None
+            else ("unit_policy", "conn_policy")
+        )
+        raise TypeError(
+            f"{cls.__name__}.{present}.backward is set and {absent}.backward is "
+            f"not; a backward pass needs both halves, the connection's map and "
+            f"the unit's combine and apply"
+        )
+    _validate_monoid_tree(unit.forward.combine, cls, "unit_policy.forward")
+    _warn_unused_linear_input(cls, "forward", conn.forward, unit.forward)
+    if unit.backward is not None:
+        _validate_monoid_tree(unit.backward.combine, cls, "unit_policy.backward")
+        _warn_unused_linear_input(cls, "backward", conn.backward, unit.backward)
 
     if cls.loss is not None:
         _validate_loss(cls, cls.loss)
-
-    if cls.update_unit is not None and not isinstance(
-        cls.update_unit, UpdateUnitPolicy
-    ):
-        raise TypeError(
-            f"{cls.__name__}.update_unit must satisfy UpdateUnitPolicy (update); "
-            f"got {cls.update_unit!r}"
-        )
-
-    if cls.update_conn is not None and not isinstance(
-        cls.update_conn, UpdateConnPolicy
-    ):
-        raise TypeError(
-            f"{cls.__name__}.update_conn must satisfy UpdateConnPolicy; "
-            f"got {cls.update_conn!r}"
-        )
-
-    if cls.prune_unit is not None and not isinstance(cls.prune_unit, PruneUnitPolicy):
-        raise TypeError(
-            f"{cls.__name__}.prune_unit must satisfy PruneUnitPolicy (predicate); "
-            f"got {cls.prune_unit!r}"
-        )
-
-    if cls.prune_conn is not None and not isinstance(cls.prune_conn, PruneConnPolicy):
-        raise TypeError(
-            f"{cls.__name__}.prune_conn must satisfy PruneConnPolicy; "
-            f"got {cls.prune_conn!r}"
-        )
 
     if cls.add_unit is not None and not isinstance(cls.add_unit, AddUnitPolicy):
         raise TypeError(
@@ -562,7 +592,7 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
 
     Raises:
         TypeError: if `unit_capacity` is neither None nor an int >= 1,
-            `max_levels` is not an int >= 2, or `prune_unit` or `add_unit` is
+            `max_levels` is not an int >= 2, or `unit_policy.prune` or `add_unit` is
             declared without a `unit_capacity`.
     """
     capacity: object = getattr(cls, "unit_capacity", None)
@@ -573,9 +603,9 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.unit_capacity must be None or an int >= 1; "
             f"got {capacity!r}"
         )
-    if cls.prune_unit is not None and capacity is None:
+    if cls.unit_policy.prune is not None and capacity is None:
         raise TypeError(
-            f"{cls.__name__}.prune_unit requires a unit_capacity: the `PRUNED` "
+            f"{cls.__name__}.unit_policy.prune requires a unit_capacity: the `PRUNED` "
             "column that marks pruned units exists only with one"
         )
     if cls.add_unit is not None and capacity is None:
@@ -615,7 +645,7 @@ def reject_sharded_unit_lifecycle(
     """
     if sharding is None:
         return
-    if net.prune_unit is not None:
+    if net.unit_policy.prune is not None:
         raise NotImplementedError(
             f"{net.__name__}: unit pruning under sharding is not supported yet"
         )

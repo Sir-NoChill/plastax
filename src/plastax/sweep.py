@@ -44,7 +44,12 @@ from jaxtyping import Array, Bool
 
 from plastax._types import DEAD, FROM_ID, TO_ID, ConnIdx, FieldSpec, UnitIdx
 from plastax.monoid import Monoid, MonoidTree
-from plastax.policies import BackwardPass, ForwardPass
+from plastax.policies import (
+    BackwardConnPolicy,
+    BackwardUnitPolicy,
+    ForwardConnPolicy,
+    ForwardUnitPolicy,
+)
 from plastax.state import Columns, live_unit_mask
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
@@ -171,7 +176,7 @@ def _accumulate_into[GS](
             return monoid.combine_pairwise(prev, bucket_reduced)
 
         # combine (Monoid leaves), acc, and per_edge_acc (Array leaves) share
-        # tree structure by the ForwardPass/BackwardPass contract, so
+        # tree structure by the forward and backward unit policies' contract, so
         # tree_map zips them leaf-by-leaf; a bare (non-container) Monoid is
         # itself the sole leaf, so this also covers the common scalar-Acc
         # case.
@@ -231,7 +236,8 @@ def _apply_masked[GS](
 
 
 def build_forward_accumulate[GS](
-    fp: ForwardPass[object, GS],
+    fc: ForwardConnPolicy[object, GS],
+    fu: ForwardUnitPolicy[object, GS],
     *,
     num_units: int,
     indices_are_sorted: bool,
@@ -243,7 +249,8 @@ def build_forward_accumulate[GS](
         GS: Global-state type threaded through the pass.
 
     Args:
-        fp: Forward pass defining the map function and accumulator monoid.
+        fc: The connection half of the forward pass, defining the map.
+        fu: The unit half, defining the accumulator monoid.
         num_units: Total number of units.
         indices_are_sorted: Whether TO_ID is sorted within the bucket, to
             speed up segment_reduce.
@@ -255,8 +262,8 @@ def build_forward_accumulate[GS](
         per-unit accumulator indexed by destination unit.
     """
     return _accumulate_into(
-        fp.map,
-        fp.combine,
+        fc.map,
+        fu.combine,
         num_units=num_units,
         indices_are_sorted=indices_are_sorted,
         target_col=TO_ID,
@@ -266,7 +273,7 @@ def build_forward_accumulate[GS](
 
 
 def build_forward_apply[GS](
-    fp: ForwardPass[object, GS], *, num_units: int
+    fu: ForwardUnitPolicy[object, GS], *, num_units: int
 ) -> ApplyFn[GS]:
     """Build a vmapped apply step over destination units.
 
@@ -274,18 +281,20 @@ def build_forward_apply[GS](
         GS: Global-state type threaded through the pass.
 
     Args:
-        fp: Forward pass defining the apply function and accumulator monoid.
+        fu: The unit half of the forward pass, defining the apply function
+            and the accumulator monoid.
         num_units: Total number of units.
 
     Returns:
         Apply function merging finalized units' writes and resetting their
         accumulator to identity.
     """
-    return _apply_masked(fp.apply, fp.combine, num_units=num_units)
+    return _apply_masked(fu.apply, fu.combine, num_units=num_units)
 
 
 def build_forward_sweep[GS](
-    fp: ForwardPass[object, GS],
+    fc: ForwardConnPolicy[object, GS],
+    fu: ForwardUnitPolicy[object, GS],
     *,
     num_units: int,
     indices_are_sorted: bool,
@@ -311,7 +320,8 @@ def build_forward_sweep[GS](
         GS: Global-state type threaded through the pass.
 
     Args:
-        fp: Forward pass defining map, apply, and accumulator monoid.
+        fc: The connection half of the forward pass, defining the map.
+        fu: The unit half, defining apply and the accumulator monoid.
         num_units: Total number of units.
         indices_are_sorted: Whether TO_ID is sorted within the bucket, to
             speed up segment_reduce.
@@ -323,16 +333,17 @@ def build_forward_sweep[GS](
         Sweep function computing one bucket's forward update.
     """
     accumulate = build_forward_accumulate(
-        fp,
+        fc,
+        fu,
         num_units=num_units,
         indices_are_sorted=indices_are_sorted,
         shard_axis=shard_axis,
     )
-    apply = build_forward_apply(fp, num_units=num_units)
+    apply = build_forward_apply(fu, num_units=num_units)
     is_input = unit_id_mask(input_ids, num_units)
 
     def sweep(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
-        acc = identity_accumulator(fp.combine, num_units)
+        acc = identity_accumulator(fu.combine, num_units)
         acc = accumulate(units, bucket_conns, acc, g)
         new_units, _ = apply(units, acc, g, ~is_input)
         return new_units
@@ -341,7 +352,8 @@ def build_forward_sweep[GS](
 
 
 def build_backward_accumulate[GS](
-    bp: BackwardPass[object, GS],
+    bc: BackwardConnPolicy[object, GS],
+    bu: BackwardUnitPolicy[object, GS],
     *,
     num_units: int,
     indices_are_sorted: bool,
@@ -357,7 +369,8 @@ def build_backward_accumulate[GS](
         GS: Global-state type threaded through the pass.
 
     Args:
-        bp: Backward pass defining the map function and accumulator monoid.
+        bc: The connection half of the backward pass, defining the map.
+        bu: The unit half, defining the accumulator monoid.
         num_units: Total number of units.
         indices_are_sorted: Whether FROM_ID is sorted within the bucket,
             to speed up segment_reduce.
@@ -369,8 +382,8 @@ def build_backward_accumulate[GS](
         per-unit accumulator indexed by source unit.
     """
     return _accumulate_into(
-        bp.map,
-        bp.combine,
+        bc.map,
+        bu.combine,
         num_units=num_units,
         indices_are_sorted=indices_are_sorted,
         target_col=FROM_ID,
@@ -380,7 +393,7 @@ def build_backward_accumulate[GS](
 
 
 def build_backward_apply[GS](
-    bp: BackwardPass[object, GS], *, num_units: int
+    bu: BackwardUnitPolicy[object, GS], *, num_units: int
 ) -> ApplyFn[GS]:
     """Build a vmapped apply step over source units.
 
@@ -388,19 +401,20 @@ def build_backward_apply[GS](
         GS: Global-state type threaded through the pass.
 
     Args:
-        bp: Backward pass defining the apply function and accumulator
-            monoid.
+        bu: The unit half of the backward pass, defining the apply function
+            and the accumulator monoid.
         num_units: Total number of units.
 
     Returns:
         Apply function merging finalized units' writes and resetting their
         accumulator to identity.
     """
-    return _apply_masked(bp.apply, bp.combine, num_units=num_units)
+    return _apply_masked(bu.apply, bu.combine, num_units=num_units)
 
 
 def build_backward_sweep[GS](
-    bp: BackwardPass[object, GS],
+    bc: BackwardConnPolicy[object, GS],
+    bu: BackwardUnitPolicy[object, GS],
     *,
     num_units: int,
     indices_are_sorted: bool,
@@ -421,7 +435,8 @@ def build_backward_sweep[GS](
         GS: Global-state type threaded through the pass.
 
     Args:
-        bp: Backward pass defining map, apply, and accumulator monoid.
+        bc: The connection half of the backward pass, defining the map.
+        bu: The unit half, defining apply and the accumulator monoid.
         num_units: Total number of units.
         indices_are_sorted: Whether FROM_ID is sorted within the bucket,
             to speed up segment_reduce.
@@ -432,15 +447,16 @@ def build_backward_sweep[GS](
         Sweep function computing one bucket's backward update.
     """
     accumulate = build_backward_accumulate(
-        bp,
+        bc,
+        bu,
         num_units=num_units,
         indices_are_sorted=indices_are_sorted,
         shard_axis=shard_axis,
     )
-    apply = build_backward_apply(bp, num_units=num_units)
+    apply = build_backward_apply(bu, num_units=num_units)
 
     def sweep(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
-        acc = identity_accumulator(bp.combine, num_units)
+        acc = identity_accumulator(bu.combine, num_units)
         acc = accumulate(units, bucket_conns, acc, g)
         finalize_all = jnp.ones((num_units,), dtype=jnp.bool_)
         new_units, _ = apply(units, acc, g, finalize_all)

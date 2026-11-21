@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -14,6 +15,97 @@ from plastax._types import (
 )
 from plastax.rng import Rng
 from plastax.views import ConnView, ConnWrite, UnitView
+
+
+@runtime_checkable
+class ForwardConnPolicy[Acc, GS](Protocol):
+    """The connection half of the forward pass: one value per connection.
+
+    The values arriving at a unit are reduced by the `combine` of that unit's
+    `ForwardUnitPolicy`, whose `apply` then writes the unit. `map` must return
+    what that `combine` reduces.
+
+    A policy may declare, structurally (read with getattr, not part of this
+    Protocol), `linear_input`: a FieldSpec F such that `map` is exactly
+    `WEIGHT * u[F, src]`. Paired with a unit half whose `combine` is one of
+    `plastax.monoid.LINEAR_SEMIRINGS`, the accumulation is a sparse matrix
+    product and the engine may compute it as one, without calling `map`. The
+    declaration is trusted, so it must be true.
+
+    Type Args:
+        Acc: the per-connection value, reduced by the unit half's `combine`.
+        GS: the global state type threaded through the network.
+    """
+
+    def map(
+        self,
+        u: UnitView,
+        dst: UnitIdx,
+        src: UnitIdx,
+        c: ConnView,
+        cid: ConnIdx,
+        g: GS,
+    ) -> Acc:
+        """Compute the accumulator contribution of one incoming connection.
+
+        Args:
+            u: the unit view.
+            dst: index of the destination unit.
+            src: index of the source unit.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            The per-connection accumulator contribution.
+        """
+        ...
+
+
+@runtime_checkable
+class BackwardConnPolicy[Acc, GS](Protocol):
+    """The connection half of the backward pass: one value per connection.
+
+    The values are reduced at the connection's SOURCE by the `combine` of that
+    unit's `BackwardUnitPolicy`. `linear_input` may be declared as on
+    `ForwardConnPolicy`, with `map` exactly `WEIGHT * u[F, dst]`.
+
+    Type Args:
+        Acc: the per-connection value, reduced by the unit half's `combine`.
+        GS: the global state type threaded through the network.
+    """
+
+    def map(
+        self,
+        u: UnitView,
+        src: UnitIdx,
+        dst: UnitIdx,
+        c: ConnView,
+        cid: ConnIdx,
+        g: GS,
+    ) -> Acc:
+        """Compute the accumulator contribution of one outgoing connection.
+
+        The first unit-id argument is the ACCUMULATOR TARGET, as in
+        `ForwardConnPolicy.map` -- but backward accumulates into the
+        connection's SOURCE, so it is `src` here where forward has `dst`. The
+        argument ORDER is the same in both directions (target first); only
+        which endpoint that is differs. `dst` is the connection's destination,
+        whose value the reverse level walk has already finalized, and is
+        therefore the one a backward map reads.
+
+        Args:
+            u: the unit view.
+            src: index of the source unit -- this pass's accumulator target.
+            dst: index of the destination unit, already finalized.
+            c: the connection view.
+            cid: index of the connection.
+            g: the global state.
+
+        Returns:
+            The per-connection accumulator contribution.
+        """
+        ...
 
 
 @runtime_checkable
@@ -376,3 +468,24 @@ def predicate_add_conn[GS](
         setattr(_PredicateRule, key, value)
     _PredicateRule.__name__ = "PredicateAddConn"
     return _PredicateRule()
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Conn[GS]:
+    """The behaviour of one kind of connection: a policy per phase.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        forward: the connection half of the forward pass.
+        backward: the connection half of the backward pass, or None. Set
+            together with the unit set's `backward`.
+        update: the connection update policy, or None to elide it.
+        prune: the connection pruning policy, or None to elide it.
+    """
+
+    forward: ForwardConnPolicy[object, GS]
+    backward: BackwardConnPolicy[object, GS] | None = None
+    update: UpdateConnPolicy[GS] | None = None
+    prune: PruneConnPolicy[GS] | None = None

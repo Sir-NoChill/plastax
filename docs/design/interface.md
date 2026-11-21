@@ -5,8 +5,13 @@ orphan: true
 # Interface design
 
 Status: draft for review. This document states the interface as agreed in discussion and in the
-four sketches under `sketches/`, which are written against it and do not run. Nothing here is
-implemented.
+four sketches under `sketches/`, which are written against it and do not run.
+
+Implemented so far (2026-11-21), all in `plastax.layers` and `plastax.init`: modules and tracing
+(section 2.1), the two primitives and `Dense` with private weights (2.2), relabelling and
+indexing of handles (2.3), weight initializers (2.8), and running a network that names its
+topology, with one set of today's policies for the whole network (section 5). Nothing else
+here is implemented.
 
 - Names prefixed `px.` are proposals unless they exist in plastax today.
 - A line beginning **Open:** is undecided. A line beginning **Proposed:** is a suggestion that
@@ -23,6 +28,7 @@ A user specifies three things:
 
 `px.Network` is the union of the three and is the framework's interface.
 
+<!-- fmt: off -->
 ```python
 class Mnist(px.Network):
     topology = MnistCNN()                 # 1
@@ -32,9 +38,10 @@ class Mnist(px.Network):
     loss = px.SoftmaxCrossEntropyLossPolicy(seed=SEED)
     config = px.Config(...)               # 3
 
-state = Mnist.init(key)
-step = px.make_step(Mnist)
+driver = Mnist.init(key)
+result = driver.step(px.StepInputs(inputs=image, targets=label))
 ```
+<!-- fmt: on -->
 
 **First principle.** The topology is the initial state, never a fixed structure. Units and
 connections are created and destroyed at run time by policies. When a network is materialized,
@@ -70,32 +77,94 @@ class MnistCNN(px.layers.Module):
 
 Every layer call and every handle operation is shape-checked at the line that wrote it.
 
+Calling a topology computes nothing. `px.layers.trace(module, {"x": (28, 28, 1)})` creates the
+input units, calls the module with one handle per input, matched to the arguments of
+`__call__` by name, and returns a `px.layers.Record`: the blocks of units and of connections
+the topology wrote down, as plain numpy. A record holds no weights and is the same every time
+the topology is traced. `Network.init` (section 5) traces the topology and materializes the
+record into a state.
+
+- `setup` runs once, the first time the module is traced. A layer assigned to an attribute in
+  `setup`, or held in a list or tuple assigned there, is registered under that name. Nested
+  modules give a path, `("block1", "conv")` or `("blocks", "0", "attention")`, which names the
+  layer in errors.
+- A module takes its own arguments (`MnistCNN(width=16)`) in a plain `__init__` that only
+  stores them.
+- A layer is called once per trace. A second call raises `NotImplementedError` until shared
+  weights give it a meaning.
+
 Units are their index. There are no named populations, and a new unit is appended to the unit
 arena if storage format allows.
 
 ### 2.2 Layers
 
-A layer's arguments carry structure and hints:
+A topology places units and connections. There are two primitives, one for each, and every
+other layer is written with them.
+
+<!-- fmt: off -->
+```python
+px.layers.CreateUnits(*, constant=None)      # called with a handle, or with shape=
+px.layers.CreateConnections(*, init=None)    # called with (src, dst); returns nothing
+```
+<!-- fmt: on -->
+
+- `CreateUnits` creates units and returns a handle to them. It creates no connections.
+  `self.units(x)` creates as many units as `x` has, in its shape; `self.units(shape=(8,))`
+  creates a group that stands on its own. `constant=1.0` makes units that always hold that
+  value.
+- `CreateConnections` connects units that exist. It creates no units. The two handles are
+  broadcast against each other as arrays are, and each element of `src` is connected to the
+  element of `dst` at the same place. Arranging the handles is how the wiring is chosen:
+
+  <!-- fmt: off -->
+  ```python
+  self.skip(a, b)                                 # one to one, same shape
+  self.full(a[None, :], b[:, None])               # every unit of a to every unit of b
+  self.weight(x[..., None, :], y[..., :, None])   # the same along the last axis
+  self.bias_weight(one, y)                        # one unit to every unit of y
+  ```
+  <!-- fmt: on -->
+
+- Each call creates a **block**: a run of consecutive units, or a run of connections in
+  row-major order over the broadcast shape. A block is named by the path of the primitive that
+  made it, and it is what an initializer, a policy set, a capacity and a hint attach to.
+- Two calls may connect the same pair of units, as two connections with two weights. The same
+  pair twice within one call is an error.
+
+Wiring that is not all-to-all is the same rule over handles indexed with integer arrays
+(section 2.3). There is no `connectivity=` argument and no wiring-rule object:
+
+<!-- fmt: off -->
+```python
+hidden = np.arange(N_HIDDEN)
+self.readout(h[hidden], logits[hidden // GROUP])    # each hidden unit to one logit
+```
+<!-- fmt: on -->
+
+`px.layers.Dense(features, *, bias=True, init=None, bias_init=None)` is a helper written with
+the primitives. It acts on the last axis of its handle, once per position along the leading
+axes, and every connection has its own weight. A bias is one unit that is always 1 and a
+learned connection from it to each new unit, in a block of its own. A grid is flattened
+explicitly before a dense layer that should read all of it: `self.head(p.flatten())`.
+
+Further arguments carry structure and hints. None of these is built:
 
 | Argument | Meaning |
 |---|---|
 | `shared=True` | positions use the same weights (section 3.8) |
-| stride, padding, `bias=` | as in any array library; a bias is a learned connection from a unit that is always 1 |
-| `init=` | the weight initializer (section 2.8) |
-| `connectivity=` | sparse or explicit initial wiring (below) |
+| stride, padding | as in any array library |
 | `conn_policy=`, `unit_policy=` | the policy sets for this layer, overriding the network's |
 | `hint=` | a `px.Hint` (section 4) |
 
-Initial wiring that is not all-to-all is structure:
+**Open:** which of these the primitives take, and which only the helpers.
 
-- `px.layers.sparse(density=...)` or `px.layers.sparse(fan_in=...)`: random wiring.
-- `px.layers.pairs(src=..., dst=...)`: explicit wiring from numpy index arrays.
-- `capacity=px.Capacity.INITIAL` on either: the layer has exactly as many connection slots as
-  it starts with connections (section 3.10).
+**Open:** random initial wiring (`px.layers.sparse(density=...)`, `fan_in=...` in the
+sketches). A topology is traced without a key. Either `trace` takes one, or a block holds a
+description of its wiring that is resolved when the network is materialized, or random wiring
+is numpy with a seeded generator and a helper that returns indices.
 
-A dense layer acts on the last axis of its handle, once per position along the leading axes.
-`shared=True` makes the positions use the same weights. A grid is flattened explicitly before a
-dense layer that should read all of it: `self.head(p.flatten())`.
+**Open:** where `capacity=px.Capacity.INITIAL` is written (section 3.10). It was an argument
+of the wiring rules, which no longer exist. Most likely `CreateConnections`.
 
 `px.layers.ReduceAll(n)` connects every feature unit to its `n` units, now and whenever a unit
 is created. A connection of it that is pruned is never restored.
@@ -121,6 +190,8 @@ The topology may be written with array notation on handles.
   frozen connections whose weight is 1, `1/n` or `scale`.
 - `h[:, None, :]`, `h.reshape(...)`, `h.flatten()`: a relabelling of the handle's shape, in
   row-major order. They create nothing.
+- `h[index]` with an integer array selects the listed units, as numpy does, and creates
+  nothing. Integers for every axis, `h[0]`, select a single unit as a handle with no axes.
 - Operands broadcast as arrays do.
 
 The topology sets the weights of the connections these create. Their policy sets ship with
@@ -147,6 +218,7 @@ ordinary unit: it sits in the unit arena, has a policy set, and can be a source 
 like any other. It differs in one way: its activation is written from the step's input data,
 not by a forward policy.
 
+<!-- fmt: off -->
 ```python
 OBS = px.Input("obs")
 GAMMA = px.Input("gamma")
@@ -156,6 +228,7 @@ class Learner(px.Network):
 
 step(state, px.StepInputs(inputs={OBS: frame, GAMMA: 0.99}))   # data is fed under it
 ```
+<!-- fmt: on -->
 
 The topology's `__call__` receives one handle per declared input, matched by name:
 `px.Input("obs")` arrives as the argument `obs`. A network with one input may write
@@ -220,15 +293,40 @@ format:
 
 ### 2.8 Initial values
 
-The topology sets a connection's initial weight: the layer's initializer
-(`px.layers.Dense(300, init=...)`), which knows the fan-in, draws it. A connection policy set's
-`init` fills in the other fields, either as fixed values or as a function. The function is
-handed the globals and the drawn weight, for a field that depends on a hyperparameter or on the
-weight. It is traced code.
+The topology sets a connection's initial weight. A block of connections has an initializer
+(`px.layers.Dense(300, init=px.init.he_normal())`). The record stores it, and it is called
+once per block when the network is materialized.
+
+- An initializer is any function `(key, fans) -> weights`. `px.init.Fans` carries the block's
+  shape and, for every connection of the block, the fan-in of its destination and the fan-out
+  of its source. The weights returned have the block's shape.
+- The fans are counted from the wiring, over the whole record: the fan-in of a connection is
+  the number of connections into its destination from every block. A layer with 4 inputs per
+  unit is therefore drawn with a fan-in of 4, whatever its shape. The fan-in leaves out
+  connections from constant units, so a bias does not count; the fan-out counts every
+  connection. A fan of 0 is read as 1.
+- Every shipped initializer is called where it is written: `px.init.zeros()`,
+  `px.init.lecun_uniform()`, `px.init.constant(0.25)`, `px.init.array(W)` with `W` in the
+  block's shape. Shipped: `constant`, `array`, `zeros`, `ones`, `normal`, `truncated_normal`,
+  `uniform(low, high)`, `variance_scaling(scale, mode, distribution)` and the LeCun, Glorot
+  and He initializers written with it. `orthogonal`, `delta_orthogonal` and `from_jax` are
+  declared and raise `NotImplementedError`.
+- A block with no initializer is drawn with `px.init.lecun_normal()`. A `Dense` bias starts
+  at `px.init.zeros()`.
+- Each block's key is derived from the key given to `init` and the block's path. The same key
+  and the same topology give the same weights, and adding a layer does not change the weights
+  of the others.
+
+A connection policy set's `init` fills in the other fields, either as fixed values or as a
+function. The function is handed the globals and the drawn weight, for a field that depends on
+a hyperparameter or on the weight. It is traced code.
 
 A layer that creates connections at run time (`ReduceAll`) uses its initializer for those too.
 A connection created by a growth policy has no layer initializer; its values come from that
 policy's `init`.
+
+**Open:** how an initializer is called for connections created at run time, inside the
+compiled step, and what the fan of a shared weight is.
 
 A policy set never sets the weight. Frozen identity connections get their weight from whatever
 creates them: the `MaxPool` layer and the handle operations in the topology, the growth
@@ -247,10 +345,17 @@ A policy set is an ordinary Python object grouping the policies of one kind of c
 one kind of unit.
 
 ```python
-learned = px.policies.Conn(forward=WeightedSum(), backward=WeightedSumBackward(),
-                           update=px.optim.adam(lr=1e-3, grad=GRAD))
-feature = px.policies.Unit(forward=FeatureForward(), backward=MirrorReaders(),
-                           update=RollLagged(), prune=OrphanPrune())
+learned = px.policies.Conn(
+    forward=WeightedSum(),
+    backward=WeightedSumBackward(),
+    update=px.optim.adam(lr=1e-3, grad=GRAD),
+)
+feature = px.policies.Unit(
+    forward=FeatureForward(),
+    backward=MirrorReaders(),
+    update=RollLagged(),
+    prune=OrphanPrune(),
+)
 ```
 
 - A policy declared on the `Network` is the default. A layer (`conn_policy=`) or a handle
@@ -299,6 +404,7 @@ scopes, rather than on layer scope).
 
 The forward and backward passes are each split into a per-connection half and a per-unit half.
 
+<!-- fmt: off -->
 ```python
 class ForwardConnPolicy[Acc, G](Protocol):
     def map(self, u, dst, src, c, cid, g) -> Acc: ...        # one connection's contribution
@@ -313,16 +419,19 @@ class BackwardUnitPolicy[Acc, G](Protocol):
     combine: Monoid
     def apply(self, u, i, g, acc: Acc) -> px.UnitWrite: ...
 ```
+<!-- fmt: on -->
 
 The connection update is split for every weight into a contribution per use, a combine, and one
 step. A private weight is the case of one use.
 
+<!-- fmt: off -->
 ```python
 class UpdateConnPolicy[Total, G](Protocol):
     combine: Monoid = sum_
     def contribution(self, u, dst, src, c, cid, g) -> Total: ...   # per use of the weight
     def step(self, c, cid, g, total: Total) -> px.ConnWrite: ...   # once per weight
 ```
+<!-- fmt: on -->
 
 `step` returns a write and not a new weight, because an update may change many fields of its
 connection.
@@ -385,11 +494,13 @@ get the same stream from the same starting point.
 
 A policy that needs randomness asks for it:
 
+<!-- fmt: off -->
 ```python
 def step(self, c, cid, g, total) -> px.ConnWrite:
     rng = self.rng(g, cid)          # this policy's stream, for this connection and this step
     noise = rng.normal()
 ```
+<!-- fmt: on -->
 
 - `self.rng(g, element)` is a method every policy has. `element` is the index the method was
   called for: a unit, a connection, or a proposal number.
@@ -426,12 +537,14 @@ distinct classes, and it cannot see connections created at run time.
 
 An activation is a function and its derivative.
 
+<!-- fmt: off -->
 ```python
 class Activation(Protocol):
     def __call__(self, h, **unit_overrides): ...   # on a handle: sets the units' activation
     def fn(self, x): ...
     def derivative(self, x, y): ...                # from pre-activation x and output y
 ```
+<!-- fmt: on -->
 
 Each shipped activation has an analytical derivative; a hand-written one may fall back to
 `jax.grad`. The derivative need not be the true one (LTU: a step forward, a sigmoid derivative
@@ -482,8 +595,9 @@ connection is one whose set has no update, prune or growth policy. A frozen set 
 explicitly, overriding the network's defaults with `None`:
 
 ```python
-pool_conn = px.policies.Conn(forward=WeightedSum(), backward=MaxPoolBackward(),
-                             update=None, prune=None, add=None)
+pool_conn = px.policies.Conn(
+    forward=WeightedSum(), backward=MaxPoolBackward(), update=None, prune=None, add=None
+)
 ```
 
 An algorithm that needs to freeze and unfreeze implements that within its own policy.
@@ -544,6 +658,7 @@ puts the intended units in each group; that depends on how the layer before was 
 
 ## 4. Hints and configuration
 
+<!-- fmt: off -->
 ```python
 px.Hint(format=px.Format.DENSE)                 # on a layer
 px.Config(format=px.Format.AUTO,                # on the network: the defaults
@@ -551,6 +666,7 @@ px.Config(format=px.Format.AUTO,                # on the network: the defaults
           representation_optimization=False,
           unit_capacity=4096, seed=0)
 ```
+<!-- fmt: on -->
 
 - `px.Format` is `AUTO`, `COO`, `CSR` or `DENSE`. A format on a layer is a prediction by the
   user of what will run best; the network's is the default.
@@ -573,15 +689,89 @@ the compiled step.
 
 ## 5. Running a network
 
+<!-- fmt: off -->
 ```python
-state = Learner.init(jax.random.PRNGKey(0), globals=Globals(hp=Params()))
-step = px.make_step(Learner)
-result = step(state, px.StepInputs(inputs=..., targets=...))     # .state, .loss, .outputs
-```
+class Learner(px.Network[Globals]):
+    topology = Imprinting()
+    input_shape = (num_obs,)
+    globals = Globals(hp=Params())            # the value the global state starts from
+    ...
 
-- `init` materializes the network: the topology becomes units and connections with their
-  policies attached, references resolve, and the build-time checks run.
-- `make_step` composes the policies in phase order into one compiled function.
+driver = Learner.init(jax.random.key(0))
+result = driver.step(px.StepInputs(inputs=frame, targets=reward))     # result.loss
+result = driver.scan(px.StepInputs(inputs=frames, targets=rewards))   # result.loss: (K,)
+```
+<!-- fmt: on -->
+
+- `init` materializes the network: the topology becomes units and connections, references
+  resolve, and the build-time checks run. It returns a `px.Driver`.
+- The driver owns the network's state and its static configuration, and the iteration is
+  the framework's. A network that changes its structure outgrows its storage and has to be
+  resorted; both replace the static configuration and recompile the step. The driver does
+  this, so the user's loop never sees it.
+- `driver.step` runs one step. The loop around it is the user's. Each call costs a dispatch
+  and a read of two flags back from the device.
+- `driver.scan` runs a chunk of `K` steps in one loop on the device, exactly as `K` calls of
+  `step` would, and comes back once per chunk. It is the way to run a small network. The
+  chunk is given along a leading axis.
+- Both return a `px.RunResult` with `loss`, `outputs` and `records`. From `step` each is one
+  step's value; from `scan` each has a leading axis of length `K`.
+
+**Inputs and targets** are given in their declared shapes: `inputs` in `input_shape`,
+`targets` in the shape the topology returned. The step flattens them in row-major order.
+Both travel in a `px.StepInputs`. A wrong shape is an error naming the declared one.
+
+**Open:** `StepInputs` as an alias for whatever the network requires, in the manner of an
+associated type. With named inputs (section 2.4) a step's inputs are a mapping, so their
+type depends on the network.
+
+**Outputs are returned only when asked for**, with `outputs=True` on `step` or `scan`. They
+are read right after the forward phase: what the forward policies computed for this input,
+before the loss, the backward pass, any update and any structural change. What an output
+unit holds at the end of a step is not that in general, in a network that modifies itself
+least of all. Not asked for, the step contains no trace of the read. A batched step cannot
+return them yet.
+
+`scan(..., record=fn)` keeps any other per-step signal: `fn` is evaluated on the device for
+every step and its values come back as `result.records`. The same function object has to be
+passed every time, since the compiled loop is kept per function.
+
+**Globals.** The value the global state starts from is a class field, `globals`. It is made
+of Python numbers or numpy arrays, and it is never mutated, since every network of the
+class starts from it; `init` copies it onto the device. `Learner.init(key, globals=...)`
+replaces it for one network, for a sweep. `reset_global` (section 3.5) rewrites the value
+held in the state and never the class field.
+
+**The functional layer** stays public, for whoever needs `vmap` or an outer `jit`:
+
+<!-- fmt: off -->
+```python
+static, state = Learner.build(jax.random.key(0))
+step = px.make_step(Learner, static, outputs=True)
+result = step(state, px.StepInputs(inputs=frame, targets=reward))   # a px.StepResult
+```
+<!-- fmt: on -->
+
+- `build` is what `init` calls; `init` is `px.Driver(Learner, *Learner.build(key))`.
+- The step consumes the state it is given: the state is donated, and the old value cannot
+  be read afterwards.
+- The caller reads `result.overflow` and `state.needs_resort` and rebuilds the step after
+  a regrow or a resort, with `grow_bucket`, `topo.resort` and `make_growth_retry`. A flag
+  that is ignored raises nothing: growth candidates are dropped, and in the sorted mode a
+  connection that breaks the level order may be skipped by the forward pass.
+
+Limits of what is built (2026-11-21):
+
+- One set of today's policies applies to every unit and every connection.
+- One input (`input_shape`) and one returned handle. Named inputs and several outputs are
+  not built.
+- The topologically sorted mode only: a constant unit keeps its value because a unit that
+  is not an input and has no incoming connection is never written there.
+- A cycle, or a connection into a constant unit, is a `BuildError` naming the block.
+- The engine options (`batch_size`, `layout`, `fuse_prune`, `growth`, `check_every`) are
+  arguments of `px.Driver`'s constructor and `init` passes none. They move to `px.Config`.
+
+`px.layers.trace` and `px.layers.materialize` remain public, for a record traced by hand.
 
 Today's `NetworkBuilder`, `Block` and `sequential` are removed outright. Modules and layers
 replace them and are built anew.
@@ -645,3 +835,9 @@ A warning, not an error: `reset_global` is set.
    (section 2.3). To be measured in the feasibility benchmark.
 2. **The error types, and what each message names** (section 6).
 3. **Deferred items** (section 7).
+4. **Which arguments the primitives take** (`conn_policy=`, `unit_policy=`, `hint=`,
+   `shared=`), and which only the helpers (section 2.2).
+5. **Random initial wiring**, and where its key comes from (section 2.2).
+6. **Where a block's capacity is written** (section 2.2).
+7. **Initializers for connections created at run time, and the fan of a shared weight**
+   (section 2.8).

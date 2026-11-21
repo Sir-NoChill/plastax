@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -24,23 +25,27 @@ from plastax._types import (
     ShardSpec,
 )
 from plastax.monoid import LINEAR_SEMIRINGS, Monoid
+from plastax.optim import Optimizer
 from plastax.policies import (
     AddUnitPolicy,
+    Backward,
     BackwardConnPolicy,
     BackwardUnitPolicy,
     BatchReductionPolicy,
-    Conn,
     FieldReductions,
+    Forward,
     ForwardConnPolicy,
     ForwardUnitPolicy,
+    Grow,
     LossPolicy,
     ProposeAddConnPolicy,
+    Prune,
     PruneConnPolicy,
     PruneUnitPolicy,
     Reduction,
     ResetGlobalPolicy,
     ScoreAddConnPolicy,
-    Unit,
+    Update,
     UpdateConnPolicy,
     UpdateUnitPolicy,
     batch_written_reduction,
@@ -51,6 +56,35 @@ if TYPE_CHECKING:
     from plastax.driver import Driver
     from plastax.layers import Module
     from plastax.state import NetworkState, NetworkStatic
+
+
+@dataclasses.dataclass(frozen=True)
+class Resolved[GS]:
+    """A network's optional policies and fields, one attribute per cell.
+
+    Type Args:
+        GS: the global state type threaded through the network.
+
+    Attributes:
+        update_conn: the connection update, from `update` or the optimizer.
+        update_unit: the unit update, from `update` or the optimizer.
+        prune_conn: the connection pruning policy.
+        prune_unit: the unit pruning policy.
+        grow_conn: the connection growth policy.
+        grow_unit: the unit addition policy.
+        unit_fields: the unit fields beyond the builtin ones: the network's
+            `extra_unit_fields`, then the optimizer's.
+        conn_fields: the connection fields beyond the builtin ones, likewise.
+    """
+
+    update_conn: UpdateConnPolicy[GS] | None
+    update_unit: UpdateUnitPolicy[GS] | None
+    prune_conn: PruneConnPolicy[GS] | None
+    prune_unit: PruneUnitPolicy[GS] | None
+    grow_conn: ScoreAddConnPolicy[GS] | ProposeAddConnPolicy[GS] | None
+    grow_unit: AddUnitPolicy[GS] | None
+    unit_fields: tuple[FieldSpec[np.generic], ...]
+    conn_fields: tuple[FieldSpec[np.generic], ...]
 
 
 class Network[GS]:
@@ -76,21 +110,29 @@ class Network[GS]:
             Python numbers or numpy arrays. Every network built from the class
             starts from it, so it must not be mutated; `build` copies it onto
             the device.
-        conn_policy: the behaviour of the network's connections, a
-            `plastax.policies.Conn`: the connection halves of the forward and
-            backward passes, the update and the prune. A slot left None is
-            elided.
-        unit_policy: the behaviour of the network's units, a
-            `plastax.policies.Unit`: the unit halves of the forward and
-            backward passes, the update and the prune. Its `prune` requires
-            `unit_capacity`.
+        forward: the forward pass, a `plastax.policies.Forward` pair of a
+            connection half and a unit half. One object that has `map`,
+            `combine` and `apply` may be given instead; when the class is
+            defined it is replaced by the pair with that object in both
+            halves, so `forward.conn` and `forward.unit` always exist.
+        backward: the backward pass, a `plastax.policies.Backward` given the
+            same way, or None to elide it.
         loss: the loss policy, or None to elide it.
-        add_unit: the unit addition policy, or None to elide it. Requires
-            `unit_capacity`.
-        add_conn: the connection growth policy, or None to elide it.
+        update: the update phase, a `plastax.policies.Update` with a
+            connection half, a unit half or both, or None.
+        optimizer: an optimizer bundle (`plastax.optim.Optimizer`), or None.
+            Its `conn_fields` and `unit_fields` are added to the network's
+            columns, and its `update()` fills the update phase: a half it
+            supplies must not also be set in `update`.
+        prune: the pruning policies, a `plastax.policies.Prune`, or None. Its
+            `unit` half requires `unit_capacity`.
+        grow: the growth policies, a `plastax.policies.Grow`, or None. Its
+            `unit` half requires `unit_capacity`.
         reset_global: the global-state reset policy, or None to elide it.
-        extra_unit_fields: extra per-unit fields beyond the builtin ones.
-        extra_conn_fields: extra per-connection fields beyond the builtin ones.
+        extra_unit_fields: the network's own per-unit fields beyond the
+            builtin ones. An optimizer's are not listed here.
+        extra_conn_fields: the network's own per-connection fields beyond the
+            builtin ones.
         propagation: the propagation strategy used to schedule updates.
         kahn_max_depth: max depth for Kahn-order propagation, or None if unbounded.
         sharding: Scheme-A sharding config, or None for a single device.
@@ -122,11 +164,13 @@ class Network[GS]:
     input_shape: tuple[int, ...] | None = None
     globals: GS | None = None
 
-    conn_policy: Conn[GS]
-    unit_policy: Unit[GS]
+    forward: Forward[GS]
+    backward: Backward[GS] | None = None
     loss: LossPolicy[GS] | None = None
-    add_unit: AddUnitPolicy[GS] | None = None
-    add_conn: ScoreAddConnPolicy[GS] | ProposeAddConnPolicy[GS] | None = None
+    update: Update[GS] | None = None
+    optimizer: Optimizer | None = None
+    prune: Prune[GS] | None = None
+    grow: Grow[GS] | None = None
     reset_global: ResetGlobalPolicy[GS] | None = None
 
     extra_unit_fields: tuple[FieldSpec[np.generic], ...] = ()
@@ -143,6 +187,55 @@ class Network[GS]:
     def __init_subclass__(cls) -> None:
         """Validate the trait slots when a Network subclass is defined."""
         _validate_traits(cls)
+
+    @classmethod
+    def resolved(cls) -> Resolved[GS]:
+        """The optional policies and the fields, as the engine reads them.
+
+        `update`, `prune` and `grow` are pairs that may be absent or half set,
+        and the optimizer adds to the update and to the fields. This gives
+        every cell, None where nothing is declared.
+
+        Returns:
+            The resolved policies and field lists.
+
+        Raises:
+            TypeError: if `optimizer` and `update` both supply the same half.
+        """
+        opt = cls.optimizer
+        from_opt = None if opt is None else opt.update()
+        halves: dict[str, Any] = {"conn": None, "unit": None}
+        for pair in (from_opt, cls.update):
+            if pair is None:
+                continue
+            for half in ("conn", "unit"):
+                policy = getattr(pair, half)
+                if policy is None:
+                    continue
+                if halves[half] is not None:
+                    raise TypeError(
+                        f"{cls.__name__}: the {half} update is given by both "
+                        f"`optimizer` and `update`; a network has one {half} "
+                        f"update"
+                    )
+                halves[half] = policy
+        prune, grow = cls.prune, cls.grow
+        return Resolved(
+            update_conn=halves["conn"],
+            update_unit=halves["unit"],
+            prune_conn=None if prune is None else prune.conn,
+            prune_unit=None if prune is None else prune.unit,
+            grow_conn=None if grow is None else grow.conn,
+            grow_unit=None if grow is None else grow.unit,
+            unit_fields=(
+                *cls.extra_unit_fields,
+                *(() if opt is None else opt.unit_fields),
+            ),
+            conn_fields=(
+                *cls.extra_conn_fields,
+                *(() if opt is None else opt.conn_fields),
+            ),
+        )
 
     @classmethod
     def build(
@@ -298,6 +391,53 @@ def _validate_monoid_tree(
     )
 
 
+def _as_pair(
+    cls: type[Network[Any]],
+    name: str,
+    pair_type: type,
+    conn_trait: type,
+    unit_trait: type,
+) -> Any:
+    """Read a pass field as its pair, or None when it is not set.
+
+    Args:
+        cls: the Network subclass being validated.
+        name: "forward" or "backward".
+        pair_type: `Forward` or `Backward`.
+        conn_trait: the connection half's protocol.
+        unit_trait: the unit half's protocol.
+
+    Returns:
+        The pair: the field itself, or the pair with the field's one object in
+        both halves. None when the field is not set.
+
+    Raises:
+        TypeError: if the field is neither a pair nor one object with both
+            halves, or a half of the pair does not satisfy its protocol.
+    """
+    value = getattr(cls, name, None)
+    if value is None:
+        return None
+    if not isinstance(value, pair_type):
+        if isinstance(value, conn_trait) and isinstance(value, unit_trait):
+            return pair_type(conn=value, unit=value)
+        raise TypeError(
+            f"{cls.__name__}.{name} must be a plastax.policies."
+            f"{pair_type.__name__}(conn=, unit=), or one object with map, "
+            f"combine and apply; got {value!r}"
+        )
+    for half, trait, members in (
+        ("conn", conn_trait, "map"),
+        ("unit", unit_trait, "combine, apply"),
+    ):
+        if not isinstance(getattr(value, half), trait):
+            raise TypeError(
+                f"{cls.__name__}.{name}.{half} must satisfy {trait.__name__} "
+                f"({members}); got {getattr(value, half)!r}"
+            )
+    return value
+
+
 def _warn_unused_linear_input(
     cls: type[Network[Any]], which: str, conn_half: object, unit_half: object
 ) -> None:
@@ -312,14 +452,14 @@ def _warn_unused_linear_input(
     if getattr(conn_half, "linear_input", None) is None:
         return
     combine = getattr(unit_half, "combine", None)
-    if any(combine is m for m in LINEAR_SEMIRINGS.values()):
+    if any(combine is semiring.add for semiring in LINEAR_SEMIRINGS):
         return
     warnings.warn(
-        f"{cls.__name__}.conn_policy.{which} declares linear_input, and "
-        f"unit_policy.{which}.combine is {combine!r}, which is not the monoid of "
-        f"a semiring the engine has a sparse product for "
-        f"({', '.join(LINEAR_SEMIRINGS)}); the declaration is ignored and the "
-        f"pass runs per connection",
+        f"{cls.__name__}.{which}.conn declares linear_input, and "
+        f"{which}.unit.combine is {combine!r}, which is not the additive monoid "
+        f"of a semiring the engine has a sparse product for "
+        f"({', '.join(str(s) for s in LINEAR_SEMIRINGS)}, as (add, mul)); the "
+        f"declaration is ignored and the pass runs per connection",
         stacklevel=4,
     )
 
@@ -349,11 +489,12 @@ def _validate_loss(cls: type[Network[Any]], loss: object) -> None:
             f"calculate_loss); got {loss!r}"
         )
     seed: object = loss.seed_field
-    unit_fields = (ACTIVATION, *cls.extra_unit_fields)
+    unit_fields = (ACTIVATION, *cls.resolved().unit_fields)
     if not isinstance(seed, FieldSpec) or seed not in unit_fields:
         raise TypeError(
             f"{cls.__name__}.loss.seed_field must be one of the network's unit "
-            f"columns (ACTIVATION or an extra_unit_fields entry); got {seed!r}"
+            f"columns (ACTIVATION, an extra_unit_fields entry or an optimizer "
+            f"field); got {seed!r}"
         )
     if not np.issubdtype(seed.dtype, np.floating):
         raise TypeError(
@@ -375,7 +516,8 @@ def _validate_field_names(cls: type[Network[Any]]) -> None:
         ValueError: if an extra field name collides with a reserved builtin
             name, or if two extra field names collide with each other.
     """
-    all_extra = (*cls.extra_unit_fields, *cls.extra_conn_fields)
+    resolved = cls.resolved()
+    all_extra = (*resolved.unit_fields, *resolved.conn_fields)
     seen: set[str] = set()
     for spec in all_extra:
         if spec.name in _RESERVED_FIELD_NAMES:
@@ -401,9 +543,9 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         cls: the Network subclass to validate.
 
     Raises:
-        TypeError: if `conn_policy` or `unit_policy` is missing, a configured
-            policy does not satisfy its protocol, or only one half of the
-            backward pass is set.
+        TypeError: if `forward` is missing, a pass is neither a pair nor one
+            object with both halves, a configured policy does not satisfy its
+            protocol, or `optimizer` and `update` supply the same half.
         ValueError: if a delegated check fails -- a malformed combine
             MonoidTree, or a field-name collision or duplicate.
     """
@@ -411,63 +553,51 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
         raise TypeError(
             f"{cls.__name__}.neighbourhood is no longer a Network attribute: "
             "the growth window moved onto the growth rule. Set "
-            "`max_level_gap` (int, default 1) on the add_conn policy instead."
+            "`max_level_gap` (int, default 1) on the grow.conn policy instead."
         )
-    conn = getattr(cls, "conn_policy", None)
-    unit = getattr(cls, "unit_policy", None)
-    if not isinstance(conn, Conn):
+    forward = _as_pair(cls, "forward", Forward, ForwardConnPolicy, ForwardUnitPolicy)
+    if forward is None:
+        raise TypeError(f"{cls.__name__}.forward is required and was not set")
+    cls.forward = forward
+    _validate_monoid_tree(forward.unit.combine, cls, "forward.unit")
+    _warn_unused_linear_input(cls, "forward", forward.conn, forward.unit)
+    backward = _as_pair(
+        cls, "backward", Backward, BackwardConnPolicy, BackwardUnitPolicy
+    )
+    cls.backward = backward
+    if backward is not None:
+        _validate_monoid_tree(backward.unit.combine, cls, "backward.unit")
+        _warn_unused_linear_input(cls, "backward", backward.conn, backward.unit)
+
+    for name, pair_type in (("update", Update), ("prune", Prune), ("grow", Grow)):
+        pair = getattr(cls, name)
+        if pair is not None and not isinstance(pair, pair_type):
+            raise TypeError(
+                f"{cls.__name__}.{name} must be a plastax.policies."
+                f"{pair_type.__name__} or None; got {pair!r}"
+            )
+    if cls.optimizer is not None and not isinstance(cls.optimizer, Optimizer):
         raise TypeError(
-            f"{cls.__name__}.conn_policy is required and must be a "
-            f"plastax.policies.Conn; got {conn!r}"
+            f"{cls.__name__}.optimizer must satisfy plastax.optim.Optimizer "
+            f"(conn_fields, unit_fields, update); got {cls.optimizer!r}"
         )
-    if not isinstance(unit, Unit):
-        raise TypeError(
-            f"{cls.__name__}.unit_policy is required and must be a "
-            f"plastax.policies.Unit; got {unit!r}"
-        )
+    resolved = cls.resolved()
     slots: tuple[tuple[str, object, type, str], ...] = (
-        ("conn_policy.forward", conn.forward, ForwardConnPolicy, "map"),
-        ("unit_policy.forward", unit.forward, ForwardUnitPolicy, "combine, apply"),
-        ("conn_policy.backward", conn.backward, BackwardConnPolicy, "map"),
-        ("unit_policy.backward", unit.backward, BackwardUnitPolicy, "combine, apply"),
-        ("conn_policy.update", conn.update, UpdateConnPolicy, "incoming, outgoing"),
-        ("unit_policy.update", unit.update, UpdateUnitPolicy, "update"),
-        ("conn_policy.prune", conn.prune, PruneConnPolicy, "predicate"),
-        ("unit_policy.prune", unit.prune, PruneUnitPolicy, "predicate"),
+        ("update conn", resolved.update_conn, UpdateConnPolicy, "incoming, outgoing"),
+        ("update unit", resolved.update_unit, UpdateUnitPolicy, "update"),
+        ("prune.conn", resolved.prune_conn, PruneConnPolicy, "predicate"),
+        ("prune.unit", resolved.prune_unit, PruneUnitPolicy, "predicate"),
+        ("grow.unit", resolved.grow_unit, AddUnitPolicy, "spawn, init"),
     )
     for where, policy, trait, members in slots:
-        if policy is None and not where.endswith(".forward"):
-            continue
-        if not isinstance(policy, trait):
+        if policy is not None and not isinstance(policy, trait):
             raise TypeError(
-                f"{cls.__name__}.{where} must satisfy {trait.__name__} "
-                f"({members}); got {policy!r}"
+                f"{cls.__name__}: the {where} policy must satisfy "
+                f"{trait.__name__} ({members}); got {policy!r}"
             )
-    if (conn.backward is None) != (unit.backward is None):
-        present, absent = (
-            ("conn_policy", "unit_policy")
-            if unit.backward is None
-            else ("unit_policy", "conn_policy")
-        )
-        raise TypeError(
-            f"{cls.__name__}.{present}.backward is set and {absent}.backward is "
-            f"not; a backward pass needs both halves, the connection's map and "
-            f"the unit's combine and apply"
-        )
-    _validate_monoid_tree(unit.forward.combine, cls, "unit_policy.forward")
-    _warn_unused_linear_input(cls, "forward", conn.forward, unit.forward)
-    if unit.backward is not None:
-        _validate_monoid_tree(unit.backward.combine, cls, "unit_policy.backward")
-        _warn_unused_linear_input(cls, "backward", conn.backward, unit.backward)
 
     if cls.loss is not None:
         _validate_loss(cls, cls.loss)
-
-    if cls.add_unit is not None and not isinstance(cls.add_unit, AddUnitPolicy):
-        raise TypeError(
-            f"{cls.__name__}.add_unit must satisfy AddUnitPolicy (spawn, init); "
-            f"got {cls.add_unit!r}"
-        )
 
     interval: object = getattr(cls, "structural_interval", 1)
     if not isinstance(interval, int) or isinstance(interval, bool) or interval < 1:
@@ -477,20 +607,21 @@ def _validate_traits(cls: type[Network[Any]]) -> None:
 
     _validate_unit_slots(cls)
 
-    if cls.add_conn is not None:
-        grid = isinstance(cls.add_conn, ScoreAddConnPolicy)
-        proposed = isinstance(cls.add_conn, ProposeAddConnPolicy)
+    grow_conn = resolved.grow_conn
+    if grow_conn is not None:
+        grid = isinstance(grow_conn, ScoreAddConnPolicy)
+        proposed = isinstance(grow_conn, ProposeAddConnPolicy)
         if grid == proposed:
             raise TypeError(
-                f"{cls.__name__}.add_conn must satisfy exactly one of "
+                f"{cls.__name__}.grow.conn must satisfy exactly one of "
                 f"ScoreAddConnPolicy (score) or ProposeAddConnPolicy (propose); "
-                f"got {cls.add_conn!r}"
+                f"got {grow_conn!r}"
             )
-        if isinstance(cls.add_conn, ProposeAddConnPolicy):
-            _validate_propose_rule(cls, cls.add_conn)
+        if isinstance(grow_conn, ProposeAddConnPolicy):
+            _validate_propose_rule(cls, grow_conn)
         else:
-            _validate_score_rule(cls, cls.add_conn)
-        _validate_growth_knobs(cls, cls.add_conn)
+            _validate_score_rule(cls, grow_conn)
+        _validate_growth_knobs(cls, grow_conn)
 
     if cls.reset_global is not None and not isinstance(
         cls.reset_global, ResetGlobalPolicy
@@ -592,7 +723,7 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
 
     Raises:
         TypeError: if `unit_capacity` is neither None nor an int >= 1,
-            `max_levels` is not an int >= 2, or `unit_policy.prune` or `add_unit` is
+            `max_levels` is not an int >= 2, or `prune.unit` or `grow.unit` is
             declared without a `unit_capacity`.
     """
     capacity: object = getattr(cls, "unit_capacity", None)
@@ -603,14 +734,14 @@ def _validate_unit_slots(cls: type[Network[Any]]) -> None:
             f"{cls.__name__}.unit_capacity must be None or an int >= 1; "
             f"got {capacity!r}"
         )
-    if cls.unit_policy.prune is not None and capacity is None:
+    if cls.resolved().prune_unit is not None and capacity is None:
         raise TypeError(
-            f"{cls.__name__}.unit_policy.prune requires a unit_capacity: the `PRUNED` "
+            f"{cls.__name__}.prune.unit requires a unit_capacity: the `PRUNED` "
             "column that marks pruned units exists only with one"
         )
-    if cls.add_unit is not None and capacity is None:
+    if cls.resolved().grow_unit is not None and capacity is None:
         raise TypeError(
-            f"{cls.__name__}.add_unit requires a unit_capacity: children are "
+            f"{cls.__name__}.grow.unit requires a unit_capacity: children are "
             "placed in the free unit slots, which exist only with one"
         )
     reject_sharded_unit_lifecycle(cls, cls.sharding)
@@ -640,16 +771,16 @@ def reject_sharded_unit_lifecycle(
         sharding: the sharding the network is defined or built with.
 
     Raises:
-        NotImplementedError: if `net` declares `prune_unit` or `add_unit` and
+        NotImplementedError: if `net` prunes or adds units and
             `sharding` is set.
     """
     if sharding is None:
         return
-    if net.unit_policy.prune is not None:
+    if net.resolved().prune_unit is not None:
         raise NotImplementedError(
             f"{net.__name__}: unit pruning under sharding is not supported yet"
         )
-    if net.add_unit is not None:
+    if net.resolved().grow_unit is not None:
         raise NotImplementedError(
             f"{net.__name__}: unit addition under sharding is not supported yet"
         )
@@ -679,19 +810,19 @@ def _validate_propose_rule(
     """
     if hasattr(ac, "num_proposals"):
         raise TypeError(
-            f"{cls.__name__}.add_conn.num_proposals was renamed: declare "
+            f"{cls.__name__}.grow.conn.num_proposals was renamed: declare "
             "`proposals_per_proposer` (int >= 1) on the propose rule instead."
         )
     n: object = getattr(ac, "proposals_per_proposer", None)
     if not isinstance(n, int) or isinstance(n, bool) or n < 1:
         raise TypeError(
-            f"{cls.__name__}.add_conn.proposals_per_proposer must be an "
+            f"{cls.__name__}.grow.conn.proposals_per_proposer must be an "
             f"int >= 1; got {n!r}"
         )
     proposer = getattr(ac, "proposer", "per_unit")
     if not isinstance(proposer, str) or proposer not in _PROPOSE_ARITY:
         raise TypeError(
-            f"{cls.__name__}.add_conn.proposer must be one of "
+            f"{cls.__name__}.grow.conn.proposer must be one of "
             f"{sorted(_PROPOSE_ARITY)}; got {proposer!r}"
         )
     want, shape = _PROPOSE_ARITY[proposer]
@@ -708,7 +839,7 @@ def _validate_propose_rule(
     )
     if got != want:
         raise TypeError(
-            f"{cls.__name__}.add_conn: a {proposer!r} proposer's propose "
+            f"{cls.__name__}.grow.conn: a {proposer!r} proposer's propose "
             f"takes {want} arguments after self -- expected `{shape}`, got {got}."
         )
 
@@ -742,31 +873,31 @@ def _validate_growth_knobs(cls: type[Network[Any]], ac: object) -> None:
     ):
         if hasattr(ac, removed):
             raise TypeError(
-                f"{cls.__name__}.add_conn.{removed} was removed: {repl} "
+                f"{cls.__name__}.grow.conn.{removed} was removed: {repl} "
                 "on the growth rule instead."
             )
     selection = getattr(ac, "selection", "top_k")
     if selection not in _SELECTIONS:
         raise TypeError(
-            f"{cls.__name__}.add_conn.selection must be one of "
+            f"{cls.__name__}.grow.conn.selection must be one of "
             f"{_SELECTIONS}; got {selection!r}"
         )
     mnpl: object = getattr(ac, "max_new_per_level", None)
     if selection != "all" or mnpl is not None:
         if not isinstance(mnpl, int) or isinstance(mnpl, bool) or mnpl < 1:
             raise TypeError(
-                f"{cls.__name__}.add_conn.max_new_per_level must be an "
+                f"{cls.__name__}.grow.conn.max_new_per_level must be an "
                 f'int >= 1 (required unless selection = "all"); got {mnpl!r}'
             )
     if selection == "threshold" and not callable(getattr(ac, "threshold", None)):
         raise TypeError(
-            f'{cls.__name__}.add_conn: selection = "threshold" requires a '
+            f'{cls.__name__}.grow.conn: selection = "threshold" requires a '
             "`threshold(g)` method on the rule."
         )
     scope = getattr(ac, "level_cap_scope", "source_level")
     if scope not in _LEVEL_CAP_SCOPES:
         raise TypeError(
-            f"{cls.__name__}.add_conn.level_cap_scope must be one of "
+            f"{cls.__name__}.grow.conn.level_cap_scope must be one of "
             f"{_LEVEL_CAP_SCOPES}; got {scope!r}"
         )
     mnps: object = getattr(ac, "max_new_per_step", None)
@@ -774,13 +905,13 @@ def _validate_growth_knobs(cls: type[Network[Any]], ac: object) -> None:
         not isinstance(mnps, int) or isinstance(mnps, bool) or mnps < 1
     ):
         raise TypeError(
-            f"{cls.__name__}.add_conn.max_new_per_step must be an int >= 1 "
+            f"{cls.__name__}.grow.conn.max_new_per_step must be an int >= 1 "
             f"or None; got {mnps!r}"
         )
     direction = getattr(ac, "direction", "any")
     if direction not in _DIRECTIONS:
         raise TypeError(
-            f"{cls.__name__}.add_conn.direction must be one of "
+            f"{cls.__name__}.grow.conn.direction must be one of "
             f"{_DIRECTIONS}; got {direction!r}"
         )
     trigger: object = getattr(ac, "trigger", "every_step")
@@ -794,24 +925,26 @@ def _validate_growth_knobs(cls: type[Network[Any]], ac: object) -> None:
     )
     if not ok:
         raise TypeError(
-            f"{cls.__name__}.add_conn.trigger must be 'every_step', "
+            f"{cls.__name__}.grow.conn.trigger must be 'every_step', "
             f"('every', n >= 1), 'on_units_added' or 'when'; got {trigger!r}"
         )
     if trigger == "when" and not callable(getattr(ac, "when", None)):
         raise TypeError(
-            f"{cls.__name__}.add_conn: trigger = 'when' requires a "
+            f"{cls.__name__}.grow.conn: trigger = 'when' requires a "
             "`when(g)` method on the rule."
         )
     on_overflow = getattr(ac, "on_overflow", "flag")
     if on_overflow not in ("flag", "error"):
         raise TypeError(
-            f"{cls.__name__}.add_conn.on_overflow must be 'flag' or "
+            f"{cls.__name__}.grow.conn.on_overflow must be 'flag' or "
             f"'error'; got {on_overflow!r}"
         )
     for flag in ("dedupe_live", "dedupe_step", "allow_self_loops"):
         v = getattr(ac, flag, False)
         if not isinstance(v, bool):
-            raise TypeError(f"{cls.__name__}.add_conn.{flag} must be a bool; got {v!r}")
+            raise TypeError(
+                f"{cls.__name__}.grow.conn.{flag} must be a bool; got {v!r}"
+            )
 
 
 def _validate_score_rule(cls: type[Network[Any]], ac: ScoreAddConnPolicy[Any]) -> None:
@@ -829,18 +962,18 @@ def _validate_score_rule(cls: type[Network[Any]], ac: ScoreAddConnPolicy[Any]) -
     candidates = getattr(ac, "candidates", "exhaustive")
     if candidates not in _CANDIDATES:
         raise TypeError(
-            f"{cls.__name__}.add_conn.candidates must be one of "
+            f"{cls.__name__}.grow.conn.candidates must be one of "
             f"{_CANDIDATES}; got {candidates!r}"
         )
     if candidates != "exhaustive":
         size: object = getattr(ac, "shortlist_size", None)
         if not isinstance(size, int) or isinstance(size, bool) or size < 1:
             raise TypeError(
-                f"{cls.__name__}.add_conn.shortlist_size must be an int >= 1 "
+                f"{cls.__name__}.grow.conn.shortlist_size must be an int >= 1 "
                 f"for candidates = {candidates!r}; got {size!r}"
             )
         if not callable(getattr(ac, "importance", None)):
             raise TypeError(
-                f"{cls.__name__}.add_conn: candidates = {candidates!r} "
+                f"{cls.__name__}.grow.conn: candidates = {candidates!r} "
                 "requires an `importance(u, i, g)` method on the rule."
             )

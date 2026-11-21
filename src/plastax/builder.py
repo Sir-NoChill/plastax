@@ -96,14 +96,14 @@ class NetworkBuilder[GS]:
             ACTIVATION,
             LEVEL,
             *((PRUNED,) if net.unit_capacity is not None else ()),
-            *net.extra_unit_fields,
+            *net.resolved().unit_fields,
         )
         self._conn_fields: tuple[FieldSpec[np.generic], ...] = (
             FROM_ID,
             TO_ID,
             DEAD,
             WEIGHT,
-            *net.extra_conn_fields,
+            *net.resolved().conn_fields,
         )
         # level is derived at finalize() time (topo.initial_levels) and
         # pruned from the unit capacity, never user-settable; from_id/to_id/
@@ -587,7 +587,7 @@ class NetworkBuilder[GS]:
             # with add_conn declared the deepest level gets its own bucket.
             bucket_of_conn = levels[src_arr]
             max_level = int(levels.max()) if levels.size else 0
-            deepest_grows = self.net.add_conn is not None
+            deepest_grows = self.net.resolved().grow_conn is not None
             num_buckets = max(max_level + (1 if deepest_grows else 0), 1)
 
         conns: list[Columns] = []

@@ -11,18 +11,25 @@ Fused Triton kernels for the streaming churn step, plus release preparation.
 
 ### Changed
 
-- **Breaking:** a network declares its behaviour as two policy sets,
-  `conn_policy = plastax.policies.Conn(forward, backward, update, prune)` and
-  `unit_policy = plastax.policies.Unit(forward, backward, update, prune)`,
-  in place of the class fields `forward_pass`, `backward_pass`,
-  `update_conn`, `update_unit`, `prune_conn` and `prune_unit`. `ForwardPass`
-  and `BackwardPass` are each cut in two: `ForwardConnPolicy` and
-  `BackwardConnPolicy` hold `map` (and `linear_input`), `ForwardUnitPolicy`
-  and `BackwardUnitPolicy` hold `combine` and `apply`. Both sets are
-  required, and a backward pass needs both halves.
-- A `linear_input` whose unit half does not combine with the monoid of one
-  of `plastax.monoid.LINEAR_SEMIRINGS` (today `(+, *)` only) now warns when
-  the class is defined; it was ignored silently.
+- **Breaking:** a network declares its behaviour by phase, each phase a pair
+  with a `conn` half and a `unit` half: `forward = policies.Forward(conn=,
+  unit=)`, `backward = policies.Backward(...)`, `update = policies.Update(...)`,
+  `prune = policies.Prune(...)` and `grow = policies.Grow(...)`. These replace
+  the class fields `forward_pass`, `backward_pass`, `update_conn`,
+  `update_unit`, `prune_conn`, `prune_unit`, `add_conn` and `add_unit`.
+  `ForwardPass` and `BackwardPass` are each cut in two: `ForwardConnPolicy` and
+  `BackwardConnPolicy` hold `map` (and `linear_input`), `ForwardUnitPolicy` and
+  `BackwardUnitPolicy` hold `combine` and `apply`. One object with all three
+  may still be given as `forward` or `backward`.
+- **Breaking:** a network names its optimizer as `optimizer`. An optimizer's
+  `state_fields` is `conn_fields`, it gains `unit_fields`, and `update_conn()`
+  is `update()`, returning a `policies.Update`. The network collects the
+  optimizer's fields, so `extra_conn_fields = optimizer.state_fields` is no
+  longer written.
+- A `linear_input` whose unit half does not combine with the additive monoid of
+  one of `plastax.monoid.LINEAR_SEMIRINGS` (today `plus_times` only) now warns
+  when the class is defined; it was ignored silently. A semiring is a
+  `monoid.LinearSemiring(add=, mul=)`.
 - **Breaking:** the policy traits moved to the new `plastax.policies`
   package and are no longer exported at the top level. Each gained the
   `Policy` suffix: `Loss` is `policies.LossPolicy`, `UpdateConn` is

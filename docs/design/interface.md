@@ -33,9 +33,10 @@ A user specifies three things:
 class Mnist(px.Network):
     topology = MnistCNN()                 # 1
     input_shape = (28, 28, 1)
-    conn_policy = learned                 # 2: defaults, overridden on layers and handles
-    unit_policy = summing
-    loss = px.SoftmaxCrossEntropyLossPolicy(seed=SEED)
+    forward = SigmoidForward()            # 2: defaults, overridden on layers
+    backward = SigmoidBackward(grad=GRAD, seed=SEED)
+    optimizer = px.optim.adam(lr=1e-3, grad=GRAD)
+    loss = px.policies.SoftmaxCrossEntropyLossPolicy(seed=SEED)
     config = px.Config(...)               # 3
 
 driver = Mnist.init(key)
@@ -339,39 +340,50 @@ provided by pytorch and JAX.
 
 ## 3. Behaviour
 
-### 3.1 Policy sets and defaults
+### 3.1 Phases, pairs and defaults
 
-A policy set is an ordinary Python object grouping the policies of one kind of connection or
-one kind of unit.
+Behaviour is a grid of phase by element: for each phase, a policy written for one connection
+and a policy written for one unit. A network declares it by phase. Each phase is a pair with a
+`conn` half and a `unit` half (owner, 2026-11-21; this replaces the policy sets
+`px.policies.Conn` and `px.policies.Unit`, which grouped the same grid by element).
 
+<!-- fmt: off -->
 ```python
-learned = px.policies.Conn(
-    forward=WeightedSum(),
-    backward=WeightedSumBackward(),
-    update=px.optim.adam(lr=1e-3, grad=GRAD),
-)
-feature = px.policies.Unit(
-    forward=FeatureForward(),
-    backward=MirrorReaders(),
-    update=RollLagged(),
-    prune=OrphanPrune(),
-)
+class Net(px.Network[Globals]):
+    forward = px.policies.Forward(conn=WeightedSum(), unit=SigmoidForward())
+    backward = px.policies.Backward(conn=WeightedSumBackward(), unit=SigmoidBackward())
+    loss = MSELoss()
+    optimizer = px.optim.adam(lr=1e-3, grad=GRAD)          # its update and its state fields
+    update = px.policies.Update(unit=RollLagged())         # the half the optimizer leaves
+    prune = px.policies.Prune(conn=OlderThan(AGE, 1000), unit=OrphanPrune())
+    grow = px.policies.Grow(conn=RandomProposals(), unit=SplitSaturated())
+    reset_global = CountSteps()
 ```
+<!-- fmt: on -->
 
-- A policy declared on the `Network` is the default. A layer (`conn_policy=`) or a handle
-  (`with_policy`, an activation, `loss=`) overrides it.
-- Setting a network policy to `None` asserts that every layer or handle supplies its own. For a
-  loss, "every" means every unit the topology returns. This is checked when the network is
-  built.
-- The network's unit policy may be a function of the activation (`summing(relu)`), so the
-  forward and backward policies of a unit are built together.
-- An element keeps the policy set it was created with.
+- `Forward` and `Backward` require both halves. `Update`, `Prune` and `Grow` take either half
+  or both, and one with neither is refused. Every field but `forward` may be `None`, which
+  elides the phase.
+- One object that has `map`, `combine` and `apply` may be given as `forward` or `backward`.
+  When the class is defined the field is replaced by the pair with that object in both halves,
+  so `Net.forward.conn` and `Net.forward.unit` always exist.
+- An optimizer is a bundle: `conn_fields` and `unit_fields`, the state only it reads, and
+  `update()`, an `Update` pair. The network adds the fields to its columns and takes the
+  update. A half the optimizer supplies cannot also be set in `update`: a network has one
+  connection update and one unit update. The network's own state is listed in
+  `extra_unit_fields` and `extra_conn_fields` until typed fields (section 3.4) replace them.
+- What a network declares is the default. A layer is given policies the same way a network
+  is, inherits the network's, and may override them. This is not built, and its sections
+  (2.2, 2.6, 3.6, 3.9) are still written for policy sets. Open: a layer's `backward.conn` is
+  reduced at the previous layer's units, so the two layers need a contract on the
+  accumulator, ideally one that types can check.
 
-Dispatch between the policy sets present in one sweep is a switch: every case is computed for
+Dispatch between the policies present in one sweep is a switch: every case is computed for
 every element and one is selected. Laying elements out by policy is a later optimization.
 
-Packages: `plastax/policies/` (the shipped policies), `plastax/activations/`,
-`plastax/layers/`. Every trait name ends in `Policy`.
+Packages: `plastax/policies/` (every policy trait, the pairs and the shipped policies; none is
+exported at the top level), `plastax/activations/`, `plastax/layers/`. Every trait name ends
+in `Policy`.
 
 ### 3.2 Policy methods
 
@@ -529,6 +541,14 @@ at run time are covered by the same error, because a growth rule states what it 
   layer's sources to the layer's destinations.
 - Network-level growth names the connection policy set it creates and the unit policy set it
   may connect into: `ImprintWiring(creates=imprint, into=feature)`.
+
+A connection half may declare `linear_input = F`: its `map` is exactly the weight times the
+unit field `F` at the other end. Paired with a unit half whose `combine` is the additive
+monoid of a semiring the engine has a sparse product for, the pass is computed as one sparse
+matrix product. A semiring is `px.monoid.LinearSemiring(add=, mul=)`, named by its additive
+and multiplicative monoids; the engine's are `px.monoid.LINEAR_SEMIRINGS`, today
+`plus_times` (`add=sum_`, `mul=prod`) only. Any other pairing warns when the class is
+defined and runs per connection.
 
 Static type checking of the pairing may be added later. It would need the accumulators to be
 distinct classes, and it cannot see connections created at run time.

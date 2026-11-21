@@ -1,8 +1,9 @@
 """The policy traits, the shipped policies, and the policy sets.
 
 A policy is written for one element: `_conn` holds those written for a
-connection, `_unit` those written for a unit. The rest are network-wide: the
-loss, the globals, and the reduction of a batched step.
+connection, `_unit` those written for a unit. A network declares a phase as a
+pair of the two (`_pairs`). The rest are network-wide: the loss, the globals,
+and the reduction of a batched step.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ from plastax.policies._batch import (
 )
 from plastax.policies._conn import (
     BackwardConnPolicy,
-    Conn,
     ForwardConnPolicy,
     Proposal,
     ProposeAddConnPolicy,
@@ -27,20 +27,24 @@ from plastax.policies._conn import (
 )
 from plastax.policies._globals import ResetGlobalPolicy
 from plastax.policies._loss import LossPolicy, SoftmaxCrossEntropyLossPolicy
+from plastax.policies._pairs import Backward, Forward, Grow, Prune, Update
 from plastax.policies._unit import (
     AddUnitPolicy,
     BackwardUnitPolicy,
     ForwardUnitPolicy,
     PruneUnitPolicy,
-    Unit,
     UpdateUnitPolicy,
 )
 
 __all__ = [
+    "Backward",
+    "Forward",
+    "Grow",
+    "Prune",
+    "Update",
     "AddUnitPolicy",
     "BackwardConnPolicy",
     "BackwardUnitPolicy",
-    "Conn",
     "BatchReductionPolicy",
     "FieldReductions",
     "ForwardConnPolicy",
@@ -55,7 +59,6 @@ __all__ = [
     "ResetGlobalPolicy",
     "ScoreAddConnPolicy",
     "SoftmaxCrossEntropyLossPolicy",
-    "Unit",
     "UpdateConnPolicy",
     "UpdateUnitPolicy",
     "batch_written_reduction",

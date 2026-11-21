@@ -209,12 +209,49 @@ prod: Monoid[Array] = Monoid(_Named.PROD)
 max_: Monoid[Array] = Monoid(_Named.MAX)
 min_: Monoid[Array] = Monoid(_Named.MIN)
 
-# The semirings the engine has a sparse matrix product for, each named by its
-# (reduce, multiply) pair and keyed to the monoid that reduces. A connection
-# policy that declares `linear_input` supplies the multiply, WEIGHT times a unit
-# field; the product is used only when the unit policy's `combine` is the
-# monoid of one of these. Today there is one, ordinary matrix multiplication.
-LINEAR_SEMIRINGS: dict[str, Monoid[Array]] = {"(+, *)": sum_}
+
+@dataclasses.dataclass(frozen=True)
+class LinearSemiring:
+    """A semiring, as its additive and multiplicative monoids.
+
+    The names are the algebraic ones, whatever the operations are: `add` is the
+    monoid that reduces, `mul` the one that combines a weight with a value, and
+    `mul` distributes over `add`. In the max-plus semiring `add` is `max_` and
+    `mul` is `sum_`.
+
+    A pass is a product over a semiring when its unit half's `combine` is `add`
+    and its connection half's `map` is exactly `mul` of WEIGHT and a unit field
+    (see `ForwardConnPolicy`, `linear_input`).
+
+    Attributes:
+        add: the additive monoid, which reduces the values arriving at a unit.
+        mul: the multiplicative monoid, which combines the weight with the
+            unit field.
+    """
+
+    add: Monoid[Array]
+    mul: Monoid[Array]
+
+    def __str__(self) -> str:
+        """Name the semiring by its two monoids, additive first.
+
+        Returns:
+            For example ``(sum, prod)``.
+        """
+        names = [
+            m.named.name.lower() if m.named is not None else repr(m)
+            for m in (self.add, self.mul)
+        ]
+        return f"({names[0]}, {names[1]})"
+
+
+# Ordinary matrix multiplication: sum of products.
+plus_times = LinearSemiring(add=sum_, mul=prod)
+
+# The semirings the engine has a sparse matrix product for. A `linear_input`
+# declares the multiply of `plus_times`; another multiply cannot be declared
+# until a second semiring is here.
+LINEAR_SEMIRINGS: tuple[LinearSemiring, ...] = (plus_times,)
 
 # Acc pytrees pair with monoid pytrees of identical structure. PEP 695 `type`
 # aliases are lazily evaluated, so the recursive reference needs no string.

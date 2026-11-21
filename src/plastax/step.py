@@ -632,7 +632,7 @@ def _cached_make_step(
     outputs: bool = False,
 ) -> StepFn[Any]:
     # overflow_sink (see build_phases): a length-1 out-parameter
-    # build_add_conn_phase (when net.add_conn is set) overwrites on every
+    # build_add_conn_phase (when net.resolved().grow_conn is set) overwrites on every
     # call; stays [False] otherwise. Created once here (mirrors `phases`
     # itself), mutated once at trace time, read below into StepResult --
     # jax.jit traces step's body exactly once, so this is an ordinary data

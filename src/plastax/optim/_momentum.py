@@ -1,7 +1,7 @@
 """SGD with classical (heavy-ball) momentum as a plastax optimizer bundle.
 
 The first stateful optimizer: it carries one per-connection velocity column
-(``opt/v``), exercising the state_fields -> extra_conn_fields contract and the
+(``opt/v``), exercising the optimizer's conn_fields contract and the
 multi-field ConnWrite (weight and velocity written together). The velocity
 trace matches ``optax.sgd(momentum=...)`` (non-Nesterov):
 
@@ -21,6 +21,7 @@ import numpy as np
 from jaxtyping import Array, Float
 
 from plastax._types import ACTIVATION, WEIGHT, ConnIdx, FieldSpec, UnitIdx
+from plastax.policies import Update
 from plastax.views import ConnView, ConnWrite, UnitView
 
 # Per-connection optimizer state. The "opt/" prefix namespaces optimizer columns
@@ -168,7 +169,7 @@ class _MomentumUpdateConn:
 class Momentum:
     """Heavy-ball momentum SGD bundle: ``v <- mu*v + dL/dw``, ``w <- w - lr*v``.
 
-    Stateful: it declares one per-connection velocity column in `state_fields`,
+    Stateful: it declares one per-connection velocity column in `conn_fields`,
     which the owning Network merges into its `extra_conn_fields`. No step
     counter is needed. The gradient is the delta rule ``dL/dw = grad[dst] *
     activation[src]``, read after the backward pass writes ``grad_field``.
@@ -177,23 +178,28 @@ class Momentum:
         lr: the learning rate.
         momentum: the velocity decay factor (e.g. 0.9).
         grad_field: the unit field a Network's backward pass writes dL/dz into.
-        state_fields: the per-connection velocity column (``opt/v``).
+        conn_fields: the per-connection velocity column (``opt/v``).
+        unit_fields: empty -- no state is kept on units.
         needs_step_counter: False -- momentum needs no globals step counter.
     """
 
     lr: float
     momentum: float
     grad_field: FieldSpec[np.float32]
-    state_fields: tuple[FieldSpec[np.generic], ...] = (_VELOCITY,)
+    conn_fields: tuple[FieldSpec[np.generic], ...] = (_VELOCITY,)
+    unit_fields: tuple[FieldSpec[np.generic], ...] = ()
     needs_step_counter: bool = False
 
-    def update_conn(self) -> _MomentumUpdateConn:
-        """Build the UpdateConnPolicy that applies this momentum rule.
+    def update(self) -> Update[object]:
+        """Build the update pair whose connection half applies this momentum rule.
 
         Returns:
-            An UpdateConnPolicy advancing each connection's velocity and weight.
+            An `Update` whose `conn` half is the UpdateConnPolicy
+            advancing each connection's velocity and weight.
         """
-        return _MomentumUpdateConn(self.lr, self.momentum, self.grad_field, _VELOCITY)
+        return Update(
+            conn=_MomentumUpdateConn(self.lr, self.momentum, self.grad_field, _VELOCITY)
+        )
 
 
 def momentum(lr: float, momentum: float, grad_field: FieldSpec[np.float32]) -> Momentum:

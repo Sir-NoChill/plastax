@@ -30,6 +30,7 @@ import numpy as np
 from jaxtyping import Array, Float
 
 from plastax._types import ACTIVATION, WEIGHT, ConnIdx, FieldSpec, UnitIdx
+from plastax.policies import Update
 from plastax.views import ConnView, ConnWrite, UnitView
 
 # Per-connection optimizer state (the "opt/" prefix namespaces optimizer columns
@@ -202,8 +203,8 @@ class Adam:
     """Adam(W) optimizer bundle with per-connection moments and step counter.
 
     Stateful: it declares three per-connection columns (``opt/m``, ``opt/v``,
-    ``opt/t``) in `state_fields`, which the owning Network merges into its
-    `extra_conn_fields`. No globals step counter is used (`needs_step_counter`
+    ``opt/t``) in `conn_fields`, which the owning Network collects from its
+    `optimizer`. No globals step counter is used (`needs_step_counter`
     is False); the step count is the per-connection ``opt/t`` column. A non-zero
     `weight_decay` gives AdamW (decoupled decay); use the `adamw` factory.
 
@@ -214,7 +215,8 @@ class Adam:
         b2: second-moment decay (beta2).
         eps: denominator epsilon, added outside the sqrt.
         weight_decay: decoupled weight decay (0 for plain Adam).
-        state_fields: the moment and step-count columns.
+        conn_fields: the moment and step-count columns.
+        unit_fields: empty -- no state is kept on units.
         needs_step_counter: False -- the step count lives in ``opt/t``.
     """
 
@@ -224,25 +226,29 @@ class Adam:
     b2: float = 0.999
     eps: float = 1e-8
     weight_decay: float = 0.0
-    state_fields: tuple[FieldSpec[np.generic], ...] = (_M, _V, _T)
+    conn_fields: tuple[FieldSpec[np.generic], ...] = (_M, _V, _T)
+    unit_fields: tuple[FieldSpec[np.generic], ...] = ()
     needs_step_counter: bool = False
 
-    def update_conn(self) -> _AdamUpdateConn:
-        """Build the UpdateConnPolicy that applies this Adam(W) rule.
+    def update(self) -> Update[object]:
+        """Build the update pair whose connection half applies this Adam(W) rule.
 
         Returns:
-            An UpdateConnPolicy advancing each connection's moments, step, and weight.
+            An `Update` whose `conn` half is the UpdateConnPolicy
+            advancing each connection's moments, step, and weight.
         """
-        return _AdamUpdateConn(
-            self.lr,
-            self.b1,
-            self.b2,
-            self.eps,
-            self.weight_decay,
-            self.grad_field,
-            _M,
-            _V,
-            _T,
+        return Update(
+            conn=_AdamUpdateConn(
+                self.lr,
+                self.b1,
+                self.b2,
+                self.eps,
+                self.weight_decay,
+                self.grad_field,
+                _M,
+                _V,
+                _T,
+            )
         )
 
 

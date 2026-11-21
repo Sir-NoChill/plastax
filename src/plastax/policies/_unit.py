@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Protocol, runtime_checkable
 
 from jaxtyping import Array, Bool, Int32
@@ -194,25 +193,3 @@ class AddUnitPolicy[GS](Protocol):
             The child's fields; unwritten fields keep their defaults.
         """
         ...
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class Unit[GS]:
-    """The behaviour of one kind of unit: a policy per phase.
-
-    Type Args:
-        GS: the global state type threaded through the network.
-
-    Attributes:
-        forward: the unit half of the forward pass.
-        backward: the unit half of the backward pass, or None. Set together
-            with the connection set's `backward`.
-        update: the unit update policy, or None to elide it.
-        prune: the unit pruning policy, or None to elide it. Requires
-            `Network.unit_capacity`.
-    """
-
-    forward: ForwardUnitPolicy[object, GS]
-    backward: BackwardUnitPolicy[object, GS] | None = None
-    update: UpdateUnitPolicy[GS] | None = None
-    prune: PruneUnitPolicy[GS] | None = None

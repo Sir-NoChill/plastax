@@ -18,6 +18,7 @@ import numpy as np
 from jaxtyping import Array, Float
 
 from plastax._types import ACTIVATION, WEIGHT, ConnIdx, FieldSpec, UnitIdx
+from plastax.policies import Update
 from plastax.views import ConnView, ConnWrite, UnitView
 
 
@@ -155,7 +156,7 @@ class _SGDUpdateConn:
 class SGD:
     """Stateless SGD optimizer bundle: ``w <- w - lr * dL/dw``.
 
-    Because SGD keeps no state, `state_fields` is empty and
+    Because SGD keeps no state, `conn_fields` is empty and
     `needs_step_counter` is False: a Network wiring this optimizer adds nothing
     to its `extra_conn_fields`. The gradient is read from the destination's
     back-propagated dL/dz and the source activation, so the Network's backward
@@ -166,22 +167,25 @@ class SGD:
         lr: the learning rate.
         grad_field: the unit field a Network's backward pass writes dL/dz into
             (e.g. `mlp_xor`'s ``grad_pre_act``); read at the destination unit.
-        state_fields: empty -- SGD is stateless.
+        conn_fields: empty -- SGD is stateless.
+        unit_fields: empty -- no state is kept on units.
         needs_step_counter: False -- SGD needs no globals step counter.
     """
 
     lr: float
     grad_field: FieldSpec[np.float32]
-    state_fields: tuple[FieldSpec[np.generic], ...] = ()
+    conn_fields: tuple[FieldSpec[np.generic], ...] = ()
+    unit_fields: tuple[FieldSpec[np.generic], ...] = ()
     needs_step_counter: bool = False
 
-    def update_conn(self) -> _SGDUpdateConn:
-        """Build the UpdateConnPolicy that applies this SGD rule.
+    def update(self) -> Update[object]:
+        """Build the update pair whose connection half applies this SGD rule.
 
         Returns:
-            An UpdateConnPolicy subtracting ``lr * gradient`` from each weight.
+            An `Update` whose `conn` half is the UpdateConnPolicy
+            subtracting ``lr * gradient`` from each weight.
         """
-        return _SGDUpdateConn(self.lr, self.grad_field)
+        return Update(conn=_SGDUpdateConn(self.lr, self.grad_field))
 
 
 def sgd(lr: float, grad_field: FieldSpec[np.float32]) -> SGD:

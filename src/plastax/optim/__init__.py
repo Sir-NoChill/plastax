@@ -14,7 +14,7 @@ dependency.
 
 Status: sgd, momentum, adam, adamw, and rmsprop implemented. Stateful
 optimizers keep their per-connection state (moments and, for Adam, a step-count
-column) in `extra_conn_fields`; optimizer columns use the ``opt/`` prefix.
+column) in their `conn_fields`; optimizer columns use the ``opt/`` prefix.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from plastax.optim._adam import Adam, adam, adamw
 from plastax.optim._momentum import Momentum, momentum
 from plastax.optim._rmsprop import RMSProp, rmsprop
 from plastax.optim._sgd import SGD, sgd
-from plastax.policies import UpdateConnPolicy
+from plastax.policies import Update
 
 __all__ = [
     "SGD",
@@ -46,32 +46,39 @@ __all__ = [
 
 @runtime_checkable
 class Optimizer(Protocol):
-    """A weight-optimizer bundle: an UpdateConnPolicy policy plus its state needs.
+    """An optimizer bundle: its update policies and the state they keep.
+
+    A network names one as `optimizer`. The optimizer's fields are added to the
+    network's columns and its update fills the network's update phase; nothing
+    outside the optimizer needs to name its state.
 
     Attributes:
-        state_fields: Extra per-connection FieldSpecs (any numpy dtype) the
+        conn_fields: The per-connection FieldSpecs (any numpy dtype) the
             optimizer reads and writes for its own state (empty for a stateless
-            rule like SGD). The owning Network merges these into its
-            extra_conn_fields. Each FieldSpec's ``default`` is also the value a
+            rule like SGD). Each FieldSpec's ``default`` is also the value a
             regrown connection's state initializes to: the add_conn phase resets
             a new edge's untouched fields to their default, so a stateful
             optimizer wired with a growth policy (ScoreAddConnPolicy or
             ProposeAddConnPolicy) zeroes its moments on
             regrow automatically (RigL behaviour). Growth policies write WEIGHT
             and their own fields only, never optimizer columns.
+        unit_fields: The per-unit FieldSpecs the optimizer keeps for its own
+            state (empty for every shipped optimizer). An optimizer with unit
+            state supplies the `unit` half of its update to write it.
         needs_step_counter: Whether the rule needs a step counter in the
             network's globals. The shipped optimizers keep any step count as a
             per-connection column instead (Adam's ``opt/t``), so this is False
             for all of them; it is reserved for a future globals-based counter.
     """
 
-    state_fields: tuple[FieldSpec[np.generic], ...]
+    conn_fields: tuple[FieldSpec[np.generic], ...]
+    unit_fields: tuple[FieldSpec[np.generic], ...]
     needs_step_counter: bool
 
-    def update_conn(self) -> UpdateConnPolicy[object]:
-        """Build the UpdateConnPolicy trait implementing one optimizer step.
+    def update(self) -> Update[object]:
+        """Build the update policies implementing one optimizer step.
 
         Returns:
-            The UpdateConnPolicy policy applying this optimizer's weight update.
+            The update pair. The shipped optimizers set only its `conn` half.
         """
         ...

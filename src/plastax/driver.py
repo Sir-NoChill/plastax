@@ -429,7 +429,7 @@ class Driver[GS]:
         self._since_check = 0
         if bool(self._overflowed):
             self._overflowed = jnp.bool_(False)
-            ac = self._net.add_conn
+            ac = self._net.resolved().grow_conn
             want = getattr(ac, "max_new_per_level", None) or 1 if ac is not None else 1
             state = self._state
             for level in range(len(self._static.level_capacities)):

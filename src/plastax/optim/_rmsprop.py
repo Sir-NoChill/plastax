@@ -19,6 +19,7 @@ import numpy as np
 from jaxtyping import Array, Float
 
 from plastax._types import ACTIVATION, WEIGHT, ConnIdx, FieldSpec, UnitIdx
+from plastax.policies import Update
 from plastax.views import ConnView, ConnWrite, UnitView
 
 # Per-connection running mean square of the gradient; default 0.0 (optax's
@@ -170,15 +171,16 @@ class RMSProp:
     """RMSProp optimizer bundle with a per-connection running mean square.
 
     Stateful: it declares one per-connection column (``opt/v``) in
-    `state_fields`, which the owning Network merges into its
-    `extra_conn_fields`. No step counter (`needs_step_counter` is False).
+    `conn_fields`, which the owning Network collects from its
+    `optimizer`. No step counter (`needs_step_counter` is False).
 
     Attributes:
         lr: the learning rate.
         grad_field: the unit field a Network's backward pass writes dL/dz into.
         decay: the mean-square decay (rho); defaults to 0.9.
         eps: the denominator epsilon, added inside the sqrt.
-        state_fields: the mean-square column.
+        conn_fields: the mean-square column.
+        unit_fields: empty -- no state is kept on units.
         needs_step_counter: False -- RMSProp keeps no step counter.
     """
 
@@ -186,17 +188,21 @@ class RMSProp:
     grad_field: FieldSpec[np.float32]
     decay: float = 0.9
     eps: float = 1e-8
-    state_fields: tuple[FieldSpec[np.generic], ...] = (_MEAN_SQ,)
+    conn_fields: tuple[FieldSpec[np.generic], ...] = (_MEAN_SQ,)
+    unit_fields: tuple[FieldSpec[np.generic], ...] = ()
     needs_step_counter: bool = False
 
-    def update_conn(self) -> _RMSPropUpdateConn:
-        """Build the UpdateConnPolicy that applies this RMSProp rule.
+    def update(self) -> Update[object]:
+        """Build the update pair whose connection half applies this RMSProp rule.
 
         Returns:
-            An UpdateConnPolicy advancing each connection's mean square and weight.
+            An `Update` whose `conn` half is the UpdateConnPolicy
+            advancing each connection's mean square and weight.
         """
-        return _RMSPropUpdateConn(
-            self.lr, self.decay, self.eps, self.grad_field, _MEAN_SQ
+        return Update(
+            conn=_RMSPropUpdateConn(
+                self.lr, self.decay, self.eps, self.grad_field, _MEAN_SQ
+            )
         )
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Callable
 from typing import Any, NamedTuple, Protocol, runtime_checkable
 
@@ -468,24 +467,3 @@ def predicate_add_conn[GS](
         setattr(_PredicateRule, key, value)
     _PredicateRule.__name__ = "PredicateAddConn"
     return _PredicateRule()
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class Conn[GS]:
-    """The behaviour of one kind of connection: a policy per phase.
-
-    Type Args:
-        GS: the global state type threaded through the network.
-
-    Attributes:
-        forward: the connection half of the forward pass.
-        backward: the connection half of the backward pass, or None. Set
-            together with the unit set's `backward`.
-        update: the connection update policy, or None to elide it.
-        prune: the connection pruning policy, or None to elide it.
-    """
-
-    forward: ForwardConnPolicy[object, GS]
-    backward: BackwardConnPolicy[object, GS] | None = None
-    update: UpdateConnPolicy[GS] | None = None
-    prune: PruneConnPolicy[GS] | None = None

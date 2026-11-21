@@ -147,7 +147,8 @@ def build_phases[GS](
         # reads them: 256-slot blocks for the Triton claim, 1024 for XLA's.
         count_block = (
             TRITON_CLAIM_BLOCK
-            if net.add_conn is not None and triton_claim_applies(static, growth)
+            if net.resolved().grow_conn is not None
+            and triton_claim_applies(static, growth)
             else _FREE_BLOCK
         )
         phases: list[Phase[GS]] = [
@@ -164,23 +165,23 @@ def build_phases[GS](
         phases = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
-    if net.unit_policy.backward is not None:
+    if net.backward is not None:
         phases.append(_build_backward_phase(net, static))
-    if net.unit_policy.update is not None:
+    if net.resolved().update_unit is not None:
         phases.append(build_update_unit_phase(net, static))
-    if net.conn_policy.update is not None:
+    if net.resolved().update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
-    if net.unit_policy.prune is not None:
+    if net.resolved().prune_unit is not None:
         phases.append(build_prune_unit_phase(net, static))
-    if net.conn_policy.prune is not None:
+    if net.resolved().prune_conn is not None:
         phases.append(
             build_prune_merge_phase(dead_sink)
             if fused
             else build_prune_conn_phase(net, static)
         )
-    if net.add_unit is not None:
+    if net.resolved().grow_unit is not None:
         phases.append(build_add_unit_phase(net, static))
-    if net.add_conn is not None:
+    if net.resolved().grow_conn is not None:
         # build_add_conn_phase folds the interval into its own trigger gate.
         phases.append(
             build_add_conn_phase(
@@ -258,39 +259,33 @@ def build_batched_phases[GS](
     """
     forward = _build_forward_phase(net, static)
     loss = _build_loss_phase(net, static) if net.loss is not None else None
-    backward = (
-        _build_backward_phase(net, static)
-        if net.unit_policy.backward is not None
-        else None
-    )
+    backward = _build_backward_phase(net, static) if net.backward is not None else None
     update_unit = (
         build_update_unit_phase(net, static)
-        if net.unit_policy.update is not None
+        if net.resolved().update_unit is not None
         else None
     )
     csr_forward = (
         build_csr_forward(net, static, engine=engine)
         if engine is not None
-        and linear_input_field(net.conn_policy.forward, net.unit_policy.forward)
-        is not None
+        and linear_input_field(net.forward.conn, net.forward.unit) is not None
         else None
     )
     csr_backward = (
         build_csr_backward(net, static, engine=engine)
         if engine is not None
-        and net.unit_policy.backward is not None
-        and linear_input_field(net.conn_policy.backward, net.unit_policy.backward)
-        is not None
+        and net.backward is not None
+        and linear_input_field(net.backward.conn, net.backward.unit) is not None
         else None
     )
     structural: list[Phase[GS]] = []
-    if net.unit_policy.prune is not None:
+    if net.resolved().prune_unit is not None:
         structural.append(build_prune_unit_phase(net, static))
-    if net.conn_policy.prune is not None:
+    if net.resolved().prune_conn is not None:
         structural.append(build_prune_conn_phase(net, static))
-    if net.add_unit is not None:
+    if net.resolved().grow_unit is not None:
         structural.append(build_add_unit_phase(net, static))
-    if net.add_conn is not None:
+    if net.resolved().grow_conn is not None:
         structural.append(
             build_add_conn_phase(
                 net,
@@ -304,7 +299,7 @@ def build_batched_phases[GS](
         structural.append(_build_reset_global_phase(net))
     update = (
         build_batched_update_conn(net, static)
-        if net.conn_policy.update is not None
+        if net.resolved().update_conn is not None
         else None
     )
     return BatchedPhases(
@@ -387,9 +382,9 @@ def per_sample_written_fields[GS](
     ]
     if net.loss is not None:
         phases.append(("loss", _build_loss_phase(net, static)))
-    if net.unit_policy.backward is not None:
+    if net.backward is not None:
         phases.append(("backward_pass", _build_backward_phase(net, static)))
-    if net.unit_policy.update is not None:
+    if net.resolved().update_unit is not None:
         phases.append(("update_unit", build_update_unit_phase(net, static)))
     written: dict[str, str] = {ACTIVATION.name: "the input scatter"}
 
@@ -443,7 +438,7 @@ def build_batched_update_conn[GS](
     Returns:
         `(state, batched_units) -> state` with updated connections.
     """
-    uc = net.conn_policy.update
+    uc = net.resolved().update_conn
     assert uc is not None  # only built when set
     policy = net.batch_reduction
     assert policy is not None  # make_step requires one for a batched step
@@ -562,7 +557,7 @@ def linear_input_field(conn_half: object, unit_half: object) -> FieldSpec[Any] |
     A ForwardConnPolicy or BackwardConnPolicy may declare, structurally,
     `linear_input`: a FieldSpec F such that its `map` is exactly
     `WEIGHT * u[F, other]` (the source unit for forward, the destination for
-    backward). When the unit half's `combine` is the monoid of one of
+    backward). When the unit half's `combine` is the additive monoid of one of
     `monoid.LINEAR_SEMIRINGS`, the pass's accumulation is a sparse matrix
     product, which the CSR layout computes with cuSPARSE instead of the
     per-connection map; `apply` is unchanged. The declaration is trusted --
@@ -578,7 +573,7 @@ def linear_input_field(conn_half: object, unit_half: object) -> FieldSpec[Any] |
     field = getattr(conn_half, "linear_input", None)
     combine = getattr(unit_half, "combine", None)
     if isinstance(field, FieldSpec) and any(
-        combine is m for m in monoid.LINEAR_SEMIRINGS.values()
+        combine is semiring.add for semiring in monoid.LINEAR_SEMIRINGS
     ):
         return field
     return None
@@ -888,8 +883,8 @@ def build_csr_forward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the forward.
     """
-    fc = net.conn_policy.forward
-    fu = net.unit_policy.forward
+    fc = net.forward.conn
+    fu = net.forward.unit
     field = linear_input_field(fc, fu)
     assert field is not None  # only built for a linear forward
     num_units = static.num_units
@@ -934,8 +929,9 @@ def build_csr_backward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the backward.
     """
-    bc = net.conn_policy.backward
-    bu = net.unit_policy.backward
+    backward = net.backward
+    assert backward is not None  # only built when the net has one
+    bc, bu = backward.conn, backward.unit
     field = linear_input_field(bc, bu)
     assert (
         bc is not None and bu is not None and field is not None
@@ -982,8 +978,8 @@ def _build_forward_phase[GS](
         # slot) would break any order anyway; a violated hint is undefined
         # in XLA.
         sweep = build_forward_sweep(
-            net.conn_policy.forward,
-            net.unit_policy.forward,
+            net.forward.conn,
+            net.forward.unit,
             num_units=static.num_units,
             indices_are_sorted=False,
             input_ids=static.input_ids,
@@ -1021,8 +1017,8 @@ def _build_forward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    fc = net.conn_policy.forward
-    fu = net.unit_policy.forward
+    fc = net.forward.conn
+    fu = net.forward.unit
     # Not indices_are_sorted, for the same reason as the pipeline forward.
     accumulate = build_forward_accumulate(
         fc,
@@ -1053,9 +1049,9 @@ def _build_forward_topological_phase[GS](
 def _build_backward_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
-    bc = net.conn_policy.backward
-    bu = net.unit_policy.backward
-    assert bc is not None and bu is not None  # build_phases only calls this when set
+    backward = net.backward
+    assert backward is not None  # only built when the net has one
+    bc, bu = backward.conn, backward.unit
 
     if net.propagation is Propagation.PIPELINE:
         # No level structure, one flat bucket, every unit Applied
@@ -1112,9 +1108,9 @@ def _build_backward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    bc = net.conn_policy.backward
-    bu = net.unit_policy.backward
-    assert bc is not None and bu is not None  # build_phases only calls this when set
+    backward = net.backward
+    assert backward is not None  # only built when the net has one
+    bc, bu = backward.conn, backward.unit
     accumulate = build_backward_accumulate(
         bc,
         bu,
@@ -1204,7 +1200,7 @@ def build_update_unit_phase[GS](
     Returns:
         The update_unit phase function.
     """
-    uu = net.unit_policy.update
+    uu = net.resolved().update_unit
     assert uu is not None  # build_phases only calls this when set
     num_units = static.num_units
 
@@ -1263,7 +1259,7 @@ def build_update_conn_phase[GS](
     Returns:
         The update_conn phase function.
     """
-    uc = net.conn_policy.update
+    uc = net.resolved().update_conn
     assert uc is not None  # build_phases only calls this when set
     incoming = build_incoming_conn_update(uc.incoming)
     outgoing = build_outgoing_conn_update(uc.outgoing)
@@ -1307,7 +1303,7 @@ def build_prune_unit_phase[GS](
     Returns:
         The prune_unit phase function.
     """
-    pu = net.unit_policy.prune
+    pu = net.resolved().prune_unit
     assert pu is not None  # build_phases only calls this when set
     num_units = static.num_units
     exempt = unit_id_mask(static.input_ids + static.output_ids, num_units)
@@ -1382,7 +1378,7 @@ def build_add_unit_phase[GS](
     Returns:
         The add_unit phase function.
     """
-    au = net.add_unit
+    au = net.resolved().grow_unit
     assert au is not None  # build_phases only calls this when set
     num_units = static.num_units
     max_level = int(net.max_levels) - 1
@@ -1508,7 +1504,7 @@ def build_prune_conn_phase[GS](
     Returns:
         The prune_conn phase function.
     """
-    pc = net.conn_policy.prune
+    pc = net.resolved().prune_conn
     assert pc is not None  # build_phases only calls this when set
 
     def prune_conn_phase(
@@ -1716,15 +1712,15 @@ def plan_prune_fusion[GS](
     Raises:
         ValueError: If `engine` is not "auto", "triton" or "xla".
     """
-    pc = net.conn_policy.prune
+    pc = net.resolved().prune_conn
     if pc is None:
         return PruneFusionPlan(False, "no prune_conn")
-    if net.unit_policy.prune is not None:
+    if net.resolved().prune_unit is not None:
         # The fused forward's tombstones replace the dead masks at the
         # prune_conn slot, which would revive the edges prune_unit killed.
         return PruneFusionPlan(False, "prune_unit tombstones edges before prune_conn")
-    fc = net.conn_policy.forward
-    fu = net.unit_policy.forward
+    fc = net.forward.conn
+    fu = net.forward.unit
     n = static.num_units
     units = {s.name: _sds((n,), np.dtype(s.dtype)) for s in static.unit_fields}
 
@@ -1761,8 +1757,10 @@ def plan_prune_fusion[GS](
         if net.loss is not None:
             # The loss writes exactly its declared seed column.
             between.add(("unit", net.loss.seed_field.name))
-        if net.unit_policy.backward is not None:
-            bu = net.unit_policy.backward
+        if net.backward is not None:
+            backward = net.backward
+            assert backward is not None
+            bu = backward.unit
 
             def backward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> Any:
                 return dict(bu.apply(UnitView(u), UnitIdx(i), g_, a).fields)
@@ -1772,8 +1770,8 @@ def plan_prune_fusion[GS](
                 ("unit", k)
                 for k in _write_keys(backward_apply, units, scalar_i, g, bacc)
             }
-        if net.unit_policy.update is not None:
-            uu = net.unit_policy.update
+        uu = net.resolved().update_unit
+        if uu is not None:
 
             def unit_update(u: Columns, i: jax.Array, g_: Any) -> Any:
                 return dict(uu.update(UnitView(u), UnitIdx(i), g_).fields)
@@ -1781,8 +1779,8 @@ def plan_prune_fusion[GS](
             between |= {
                 ("unit", k) for k in _write_keys(unit_update, units, scalar_i, g)
             }
-        if net.conn_policy.update is not None:
-            uc = net.conn_policy.update
+        uc = net.resolved().update_conn
+        if uc is not None:
             for rule in (uc.incoming, uc.outgoing):
 
                 def conn_write(
@@ -2392,10 +2390,10 @@ def build_fused_forward_prune_phase[GS](
     Returns:
         The fused forward phase.
     """
-    pc = net.conn_policy.prune
+    pc = net.resolved().prune_conn
     assert pc is not None and plan.fused
-    fc = net.conn_policy.forward
-    fu = net.unit_policy.forward
+    fc = net.forward.conn
+    fu = net.forward.unit
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     pipeline = net.propagation is Propagation.PIPELINE
@@ -3623,7 +3621,7 @@ def shortlist_coverage[GS](
         One ShortlistCoverage per bucket, empty when the net declares no
         shortlist (the exhaustive grid always covers everything).
     """
-    add_conn = net.add_conn
+    add_conn = net.resolved().grow_conn
     kind = str(getattr(add_conn, "candidates", "exhaustive"))
     max_candidate_units: int | None = (
         getattr(add_conn, "shortlist_size", None) if kind != "exhaustive" else None
@@ -4632,7 +4630,7 @@ def build_add_conn_phase[GS](
     Raises:
         ValueError: If `growth` is not one of the engines.
     """
-    ac = net.add_conn
+    ac = net.resolved().grow_conn
     assert ac is not None  # build_phases only calls this when set
     num_units = static.num_units
     num_buckets = len(static.level_capacities)

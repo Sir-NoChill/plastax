@@ -17,7 +17,7 @@ from plastax._types import (
 )
 from plastax.builder import NetworkBuilder
 from plastax.distributed import distribute_state, scheme_a_mesh
-from plastax.driver import Driver
+from plastax.driver import Driver, RunResult
 from plastax.phases import (
     ShortlistCoverage,
     StepInputs,
@@ -83,6 +83,7 @@ __all__ = [
     "ShardSpec",
     "ShortlistCoverage",
     "SoftmaxCrossEntropyLoss",
+    "RunResult",
     "StepInputs",
     "StepResult",
     "TO_ID",

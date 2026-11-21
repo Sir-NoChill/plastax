@@ -128,6 +128,7 @@ Accumulator pytree structure must exactly match the `MonoidTree` (`combine`) —
 A `Network[GS]` subclass declares its algorithm as **class attributes holding
 policy instances** — no methods to override:
 
+<!-- fmt: off -->
 ```python
 class Net(px.Network[None]):
     forward_pass = SigmoidForward()      # required
@@ -137,6 +138,7 @@ class Net(px.Network[None]):
     extra_conn_fields = px.optim.adam(1e-3, Delta).state_fields
     propagation = px.Propagation.TOPOLOGICAL
 ```
+<!-- fmt: on -->
 
 `__init_subclass__` (`traits.py:362`) runs `_validate_traits` **once at
 class-definition time**: `forward_pass` must be present; every configured slot
@@ -375,8 +377,11 @@ flags it returns — the **retrace protocol**:
 
 `Driver.scan(inputs, record=..., steps=...)` runs a chunk of K steps (inputs
 with a leading chunk axis) as one jitted `lax.while_loop` over the same
-step, state donated and device-resident, `record(StepResult)` stacked per
-step as the return value. The loop stops itself after a step that overflowed
+step, state donated and device-resident. It returns a `RunResult`: the
+per-step losses, the forward pass's outputs when asked for (`outputs=True`),
+and `record(StepResult)` stacked per step as `records`. `Driver.step` returns
+a `RunResult` for its one step. `Network.init(key)` builds a network from its
+`topology` class field and returns its Driver. The loop stops itself after a step that overflowed
 (or needs a resort, TOPOLOGICAL), the host completes that step exactly as
 `step` does (regrow + `make_growth_retry`, resort), rebuilds the loop for
 the new static (one compiled loop per `(static, record)`), re-records the

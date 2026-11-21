@@ -43,8 +43,15 @@ from jaxtyping import Array, Float
 
 import plastax as px
 from plastax.layers import Units
-from plastax.policies import GRAD, SEED, PassThroughBackward, WeightedSum, WeightedSumBackward
-from plastax.policies import summing
+from plastax.policies import (
+    GRAD,
+    SEED,
+    ActivationBackward,
+    PassThroughBackward,
+    SumThenActivate,
+    WeightedSum,
+    WeightedSumBackward,
+)
 
 relu = px.activations.relu
 exp = px.activations.exp  # derivative: y
@@ -74,7 +81,7 @@ Factors = tuple[Scalar, Scalar]
 
 
 @px.policy
-class ProductUnit(px.ForwardUnitPolicy[Factors, px.Globals]):
+class ProductUnit(px.policies.ForwardUnitPolicy[Factors, px.Globals]):
     """Outputs left * right, and keeps both for the backward pass."""
 
     combine = (px.monoid.prod, px.monoid.prod)
@@ -91,7 +98,7 @@ class ProductUnit(px.ForwardUnitPolicy[Factors, px.Globals]):
 
 
 @px.policy
-class Factor(px.ForwardConnPolicy[Factors, px.Globals]):
+class Factor(px.policies.ForwardConnPolicy[Factors, px.Globals]):
     """One of the two inputs of a product unit. The connection's weight is not used."""
 
     is_left: bool  # static: which side this connection fills
@@ -111,7 +118,7 @@ class Factor(px.ForwardConnPolicy[Factors, px.Globals]):
 
 
 @px.policy
-class FactorBackward(px.BackwardConnPolicy[Scalar, px.Globals]):
+class FactorBackward(px.policies.BackwardConnPolicy[Scalar, px.Globals]):
     """d(left * right) / d(this side) is the other side, which the product unit kept."""
 
     other: px.UnitField[f32]  # the product unit's field for the opposite side, passed in
@@ -129,32 +136,38 @@ class FactorBackward(px.BackwardConnPolicy[Scalar, px.Globals]):
 
 
 _product = ProductUnit()
-product_unit = px.policies.Unit(forward=_product, backward=PassThroughBackward())
-left_factor = px.policies.Conn(
-    forward=Factor(is_left=True),
-    backward=FactorBackward(other=_product.right),
-    update=None,  # frozen: nothing may change, create or remove these connections
-    prune=None,
-    add=None,
-)
-right_factor = px.policies.Conn(
-    forward=Factor(is_left=False),
-    backward=FactorBackward(other=_product.left),
-    update=None,
-    prune=None,
-    add=None,
-)
+# Frozen: nothing may change, create or remove these. `None` says so; leaving a keyword out
+# would inherit the network's.
+frozen = dict(update=None, prune=None, grow=None)
+
+
+def multiply(a: Units, b: Units) -> Units:
+    """What `a * b` on two handles does, written with the two primitives.
+
+    A primitive creates one kind of element, so it takes that half of each phase directly:
+    unit halves for `CreateUnits`, connection halves for `CreateConnections`.
+    """
+    a, b = px.layers.broadcast(a, b)
+    out = px.layers.CreateUnits(forward=_product, backward=PassThroughBackward(), **frozen)(a)
+    px.layers.CreateConnections(
+        forward=Factor(is_left=True), backward=FactorBackward(other=_product.right), **frozen
+    )(a, out)
+    px.layers.CreateConnections(
+        forward=Factor(is_left=False), backward=FactorBackward(other=_product.left), **frozen
+    )(b, out)
+    return out
+
 
 # `a * b` on two handles broadcasts the two shapes, creates one product unit per element,
-# and connects each to its element of `a` with `left_factor` and of `b` with `right_factor`.
-# These three sets would ship with plastax, as pooling's do.
+# and connects each to its element of `a` as its left factor and of `b` as its right.
+# `multiply` and its policies would ship with plastax, as pooling's do.
 #
 # The product unit is in the standard monoid form: its accumulator is a pair, each side
 # combined by the `prod` monoid plastax already has, and a struct of monoids is a monoid.
 #
 # Product units have a different forward accumulator (`Factors`) from every other unit here
 # (`Scalar`). The framework handles that with one more monoid: the network's accumulator is
-# the product of its policy sets' accumulators, here (sum, (prod, prod)). A connection fills
+# the product of its policies' accumulators, here (sum, (prod, prod)). A connection fills
 # its own part and leaves the identity in the rest; a unit reads its own part.
 #
 # GAP: the alternative to the product unit is a connection whose weight is a reference to a
@@ -265,13 +278,7 @@ class Transformer(px.layers.Module):
 # --------------------------------------------------------------------------- #
 # The network
 # --------------------------------------------------------------------------- #
-learned = px.policies.Conn(
-    forward=WeightedSum(),
-    backward=WeightedSumBackward(),
-    # A shared weight is used once per position. The update sums the per-use contributions
-    # (GRAD[dst] * ACTIVATION[src]) and takes one Adam step.
-    update=px.optim.adam(lr=1e-3, grad=GRAD),
-)
+_sum = SumThenActivate()
 
 
 class Reverser(px.Network):
@@ -279,12 +286,17 @@ class Reverser(px.Network):
     input_shape = (SEQ_LEN, VOCAB)
 
     # The defaults: every layer's connections are learned, every unit sums and applies its
-    # activation. The handle operations (`*`, `+`, `-`, `.sum`, `.mean`) override these
-    # with their own frozen sets.
-    conn_policy = learned
-    unit_policy = summing
+    # activation. The handle operations (`*`, `+`, `-`, `.sum`, `.mean`) create their
+    # elements frozen, with their own policies.
+    forward = px.policies.Forward(conn=WeightedSum(), unit=_sum)
+    backward = px.policies.Backward(
+        conn=WeightedSumBackward(), unit=ActivationBackward(pre=_sum.pre)
+    )
+    # A shared weight is used once per position. The optimizer's update sums the per-use
+    # contributions (GRAD[dst] * ACTIVATION[src]) and takes one Adam step.
+    optimizer = px.optim.adam(lr=1e-3, grad=GRAD)
     # The logits are (position, token): one softmax per position, summed over positions.
-    loss = px.SoftmaxCrossEntropyLossPolicy(seed=SEED, axis=-1)
+    loss = px.policies.SoftmaxCrossEntropyLossPolicy(seed=SEED, axis=-1)
 
     config = px.Config(
         format=px.Format.AUTO,  # nothing here changes structure: a candidate for dense

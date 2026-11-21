@@ -68,8 +68,7 @@ class MnistCNN(px.layers.Module):
         self.conv2 = px.layers.Conv(16, 3, padding="same", shared=True)
         # Pooling ships with its own policies, applied as a layer-wide override of the
         # network defaults: frozen identity-weight connections, and units that reduce by
-        # max and send the gradient back to the input that won (`pool_conn`, `pool_unit`
-        # below).
+        # max and send the gradient back to the input that won (`max_pool` below).
         self.pool = px.layers.MaxPool(2)
         # A hint: predict that the head is best run as a dense matmul.
         self.head = px.layers.Dense(10, hint=px.Hint(format=px.Format.DENSE))
@@ -78,7 +77,7 @@ class MnistCNN(px.layers.Module):
         # `x` is a handle to the input units, shape (28, 28, 1). Handles carry shapes, not data.
         h1 = relu(self.conv1(x))  # (28, 28, 16)
         # `a + b` means new summing units fed by identity connections: weight 1 (set here,
-        # by the topology), in a frozen policy set, so no update touches them. Here conv2's
+        # by the topology), created with `update=None`, so no update touches them. Here conv2's
         # units have no other reader and no activation, so the builder merges the sum into
         # their reduce: no new units in the built network, one relu over the sum.
         h2 = relu(self.conv2(h1) + h1)  # (28, 28, 16)
@@ -98,7 +97,7 @@ SEED = px.UnitField[np.float32]("loss_seed", default=0.0)  # dL/d(activation), f
 
 
 @px.policy
-class WeightedSum(px.ForwardConnPolicy[Scalar, px.Globals]):
+class WeightedSum(px.policies.ForwardConnPolicy[Scalar, px.Globals]):
     """One connection's contribution to its destination."""
 
     def map(
@@ -115,12 +114,12 @@ class WeightedSum(px.ForwardConnPolicy[Scalar, px.Globals]):
 
 
 @px.policy
-class SumThenActivate(px.ForwardUnitPolicy[Scalar, px.Globals]):
+class SumThenActivate(px.policies.ForwardUnitPolicy[Scalar, px.Globals]):
     """A unit sums its incoming contributions and applies its activation."""
 
     combine = px.monoid.sum_
     # Set per unit by calling an activation on a handle: `relu(h)` is this policy with
-    # `activation=relu`. Units with no activation applied keep the identity.
+    # `activation=relu`, and the backward half below with the same.
     activation: px.Activation = px.activations.identity
     # Declared here, so namespaced to this policy: no clash with another policy's `pre`.
     pre: px.UnitField[np.float32] = 0.0
@@ -130,7 +129,7 @@ class SumThenActivate(px.ForwardUnitPolicy[Scalar, px.Globals]):
 
 
 @px.policy
-class WeightedSumBackward(px.BackwardConnPolicy[Scalar, px.Globals]):
+class WeightedSumBackward(px.policies.BackwardConnPolicy[Scalar, px.Globals]):
     """One connection's contribution to its source's gradient."""
 
     def map(
@@ -146,39 +145,26 @@ class WeightedSumBackward(px.BackwardConnPolicy[Scalar, px.Globals]):
 
 
 @px.policy
-class ActivationBackward(px.BackwardUnitPolicy[Scalar, px.Globals]):
+class ActivationBackward(px.policies.BackwardUnitPolicy[Scalar, px.Globals]):
     """dL/da -> dL/dz through the unit's own activation derivative."""
 
     combine = px.monoid.sum_
-    # The forward policy of the same units, passed in so the type checker can see `pre` and
-    # `activation`. The two policies depend on each other; that is accepted, and wiring
-    # them together is done by hand below.
-    forward: SumThenActivate
+    # The forward half's field, passed in, as any field one policy reads from another is.
+    pre: px.UnitField[np.float32]
+    # Set by the same call that sets the forward half's: `relu(h)` replaces the field named
+    # `activation` in both unit halves of h's units, so the two always agree.
+    activation: px.Activation = px.activations.identity
 
     def apply(self, u: px.UnitView, i: px.UnitIdx, g: px.Globals, acc: Scalar) -> px.UnitWrite:
-        fwd = self.forward
-        d = fwd.activation.derivative(u[fwd.pre, i], u[px.ACTIVATION, i])
+        d = self.activation.derivative(u[self.pre, i], u[px.ACTIVATION, i])
         return px.UnitWrite.of((GRAD, (acc + u[SEED, i]) * d))
 
 
-# Policy sets are ordinary Python objects.
-learned = px.policies.Conn(
-    forward=WeightedSum(),
-    backward=WeightedSumBackward(),
-    # The optimizer supplies the update policy: a per-use contribution
-    # (GRAD[dst] * ACTIVATION[src]), summed over the uses of a weight, then one Adam step.
-    update=px.optim.adam(lr=1e-3, grad=GRAD),
-)
-
-
-def summing(activation: px.Activation = px.activations.identity) -> px.policies.Unit:
-    forward = SumThenActivate(activation=activation)
-    return px.policies.Unit(forward=forward, backward=ActivationBackward(forward=forward))
-
-
-# The unit policy is a function of the activation: `relu(h)` calls `summing(relu)` for h's
-# units, which builds the forward and backward policies together, so the backward policy's
-# reference to the forward one is always to the policy of the same units.
+# An activation is applied to a handle: `relu(h)`. It replaces the field named `activation` in
+# the forward and the backward unit half of h's units, and is refused if either half has no
+# such field. Units with no activation applied keep the identity.
+#
+# PROPOSED (plans/20261121T191023Z-layer-policies.md, Q3): the field name is the contract.
 
 
 # Max pooling, as `px.layers.MaxPool` ships it. Written out here to show the standard: no
@@ -186,7 +172,7 @@ def summing(activation: px.Activation = px.activations.identity) -> px.policies.
 # connection recomputes whether its source won by comparing activations. Tied inputs each
 # receive the full gradient.
 @px.policy
-class MaxReduce(px.ForwardUnitPolicy[Scalar, px.Globals]):
+class MaxReduce(px.policies.ForwardUnitPolicy[Scalar, px.Globals]):
     combine = px.monoid.max_
 
     def apply(self, u: px.UnitView, i: px.UnitIdx, g: px.Globals, acc: Scalar) -> px.UnitWrite:
@@ -194,7 +180,7 @@ class MaxReduce(px.ForwardUnitPolicy[Scalar, px.Globals]):
 
 
 @px.policy
-class MaxPoolBackward(px.BackwardConnPolicy[Scalar, px.Globals]):
+class MaxPoolBackward(px.policies.BackwardConnPolicy[Scalar, px.Globals]):
     def map(
         self,
         u: px.UnitView,
@@ -209,7 +195,7 @@ class MaxPoolBackward(px.BackwardConnPolicy[Scalar, px.Globals]):
 
 
 @px.policy
-class PassThroughBackward(px.BackwardUnitPolicy[Scalar, px.Globals]):
+class PassThroughBackward(px.policies.BackwardUnitPolicy[Scalar, px.Globals]):
     """No activation, so dL/dz is dL/da."""
 
     combine = px.monoid.sum_
@@ -218,18 +204,30 @@ class PassThroughBackward(px.BackwardUnitPolicy[Scalar, px.Globals]):
         return px.UnitWrite.of((GRAD, acc + u[SEED, i]))
 
 
-# Pooling connections are frozen. There is no flag for that: the set says explicitly that
-# it has no update, prune or growth policy. Their weight of 1 is set by the topology (the
-# `MaxPool` layer creates them with it), so `WeightedSum` passes the source's activation
-# through unchanged.
-pool_conn = px.policies.Conn(
-    forward=WeightedSum(),
-    backward=MaxPoolBackward(),
+# What `px.layers.MaxPool` passes for its own connections and units, overriding the network.
+# A layer takes the network's keywords. Its `forward` pair is self-contained: the `conn` half
+# maps the pooling connections and the `unit` half reduces them at the pooled units.
+#
+# Its `backward` pair is not. The `conn` half is the map of the pooling connections, and what
+# it returns is reduced at their sources, the convolution's units, by the convolution's
+# backward unit half. The `unit` half reduces what the layer after the pool sends back. Both
+# pairings are checked when the network is built (Q5).
+#
+# Pooling connections are frozen. There is no flag for that: `None` says this layer has no
+# update, prune or growth, where leaving the keyword out would inherit the network's. Their
+# weight of 1 is set by the topology (the `MaxPool` layer creates them with it), so
+# `WeightedSum` passes the source's activation through unchanged.
+max_pool = dict(
+    forward=px.policies.Forward(conn=WeightedSum(), unit=MaxReduce()),
+    backward=px.policies.Backward(conn=MaxPoolBackward(), unit=PassThroughBackward()),
     update=None,  # frozen: nothing may change, create or remove these connections
     prune=None,
-    add=None,
+    grow=None,
 )
-pool_unit = px.policies.Unit(forward=MaxReduce(), backward=PassThroughBackward())
+# A group of keywords reused across layers is a dict: `SomeLayer(..., **max_pool)`.
+
+
+_sum = SumThenActivate()
 
 
 # --------------------------------------------------------------------------- #
@@ -239,11 +237,17 @@ class Mnist(px.Network):
     topology = MnistCNN()
     input_shape = (28, 28, 1)
 
-    # Global policies: the default for every connection and unit unless overridden on a layer
-    # (`conn_policy=`) or on a handle (`relu(h, loss=...)`).
-    conn_policy = learned
-    unit_policy = summing  # called with the activation applied to each handle
-    loss = px.SoftmaxCrossEntropyLossPolicy(seed=SEED)  # over the output units
+    # The network's policies, by phase: the default for every connection and unit unless a
+    # layer or a handle is given its own under the same keyword.
+    forward = px.policies.Forward(conn=WeightedSum(), unit=_sum)
+    backward = px.policies.Backward(
+        conn=WeightedSumBackward(), unit=ActivationBackward(pre=_sum.pre)
+    )
+    # The optimizer supplies the connection update and the state only it reads: a per-use
+    # contribution (GRAD[dst] * ACTIVATION[src]), summed over the uses of a weight, then one
+    # Adam step.
+    optimizer = px.optim.adam(lr=1e-3, grad=GRAD)
+    loss = px.policies.SoftmaxCrossEntropyLossPolicy(seed=SEED)  # over the output units
 
     config = px.Config(
         format=px.Format.AUTO,  # per-layer hints override this

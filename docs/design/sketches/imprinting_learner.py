@@ -4,7 +4,7 @@ on top of `examples/swifttd.py`; this follows it rule for rule.
 
 What changes in the telling. Today the learner is one policy per phase for the whole network,
 and every rule begins by asking what kind of unit it is looking at (`jnp.where(is_out, ...)`).
-Here each kind of unit and each kind of connection has its own policy set, so a rule only
+Here each kind of unit and each kind of connection has its own policies, so a rule only
 contains its own arithmetic:
 
     units        observation   an input bit
@@ -18,6 +18,13 @@ contains its own arithmetic:
 
 The topology is three lines: the inputs and a readout that reduces over every feature. Every
 other unit and connection is created and destroyed at run time by the policies.
+
+Where each kind gets its policies. Nearly everything in this network is created at run time by
+the network's own growth, and a new element has the policies of the place whose `grow` created
+it. So the network's policies are the generated kinds, `feature` and `imprint`, and the three
+kinds that exist at the start (`observation`, `control`, `readout` with its `prediction`
+connections) are given their own in the topology, under the same keywords.
+PROPOSED: plans/20261121T191023Z-layer-policies.md, Q4.
 
 Left out: the optional `unique_patterns` rule (no two pattern features on the same eligible
 set), which is off by default in the running example. Everything else is here.
@@ -34,7 +41,6 @@ import math
 import jax
 import jax.numpy as jnp
 import numpy as np
-
 from jaxtyping import Array, Bool, Float, Int32
 
 import plastax as px
@@ -46,7 +52,8 @@ import plastax as px
 @dataclasses.dataclass(frozen=True)
 class Params:
     """Numeric hyperparameters. Held in global state: read-only to every policy as `g.hp`,
-    and run-time values, so changing one does not recompile."""
+    and run-time values, so changing one does not recompile.
+    """
 
     # SwiftTD
     lambda_: float = 0.95
@@ -76,7 +83,8 @@ UNIT_CAPACITY = 4096
 @px.globals
 class Globals:
     """Global state: immutable, readable by every policy. `step` and `seed` are supplied
-    by the framework."""
+    by the framework.
+    """
 
     hp: Params
 
@@ -163,7 +171,7 @@ def eligible(u: px.UnitView, i: px.UnitIdx, g: Globals) -> Flag:
 # Connection policies
 # --------------------------------------------------------------------------- #
 @px.policy
-class PredictionForward(px.ForwardConnPolicy[ReadoutAcc, Globals]):
+class PredictionForward(px.policies.ForwardConnPolicy[ReadoutAcc, Globals]):
     """A feature's contribution to the readout: the prediction and SwiftTD's lagged sums.
 
     SwiftTD needs three sums over the features between the two halves of its update. They are
@@ -195,7 +203,7 @@ class PredictionForward(px.ForwardConnPolicy[ReadoutAcc, Globals]):
 
 
 @px.policy
-class PredictionBackward(px.BackwardConnPolicy[ReaderAcc, Globals]):
+class PredictionBackward(px.policies.BackwardConnPolicy[ReaderAcc, Globals]):
     """Mirror the prediction weight onto the feature, and count this reader."""
 
     def map(
@@ -211,7 +219,7 @@ class PredictionBackward(px.BackwardConnPolicy[ReaderAcc, Globals]):
 
 
 @px.policy
-class SwiftTDUpdate(px.UpdateConnPolicy[Lagged, Globals]):
+class SwiftTDUpdate(px.policies.UpdateConnPolicy[Lagged, Globals]):
     """The fused SwiftTD update: the second loop of step t-1, then the first loop of step t.
 
     On top of it, the sparse algorithm's eligible set: a feature enters when active and leaves,
@@ -256,7 +264,12 @@ class SwiftTDUpdate(px.UpdateConnPolicy[Lagged, Globals]):
         hp = g.hp
         gl = gamma_t * hp.lambda_
         w, z, beta = c[px.WEIGHT, cid], c[Z, cid], c[BETA, cid]
-        h, h_old, zbar, p = c[self.h, cid], c[self.h_old, cid], c[self.zbar, cid], c[self.p, cid]
+        h, h_old, zbar, p = (
+            c[self.h, cid],
+            c[self.h_old, cid],
+            c[self.zbar, cid],
+            c[self.p, cid],
+        )
 
         # Second loop of step t-1.
         mult = jnp.where(tau > hp.eta, hp.eta / tau, 1.0)
@@ -291,7 +304,7 @@ class SwiftTDUpdate(px.UpdateConnPolicy[Lagged, Globals]):
 
 
 @px.policy
-class IdleFeaturePrune(px.PruneConnPolicy):
+class IdleFeaturePrune(px.policies.PruneConnPolicy):
     """Remove a feature from the prediction when it is idle as its trace fades.
 
     Only the prediction connection goes. If other features still read the unit it stays, as a
@@ -309,7 +322,7 @@ class IdleFeaturePrune(px.PruneConnPolicy):
 
 
 @px.policy
-class ImprintForward(px.ForwardConnPolicy[ImprintAcc, Globals]):
+class ImprintForward(px.policies.ForwardConnPolicy[ImprintAcc, Globals]):
     """A generated feature reads its inputs' previous activations, and counts its inputs."""
 
     def map(
@@ -325,7 +338,7 @@ class ImprintForward(px.ForwardConnPolicy[ImprintAcc, Globals]):
 
 
 @px.policy
-class ImprintBackward(px.BackwardConnPolicy[ReaderAcc, Globals]):
+class ImprintBackward(px.policies.BackwardConnPolicy[ReaderAcc, Globals]):
     """No prediction weight to mirror; still one reader."""
 
     def map(
@@ -350,46 +363,25 @@ def prediction_init(g: Globals, w: Scalar) -> dict[px.FieldSpec, Scalar]:
 
 
 _swifttd = SwiftTDUpdate(gamma=GAMMA)
-prediction = px.policies.Conn(
-    forward=PredictionForward(),
-    backward=PredictionBackward(),
-    update=_swifttd,
-    prune=IdleFeaturePrune(dropped=_swifttd.dropped),
-    # A function of the globals, because the initial step size is a hyperparameter. It is
-    # also called for the connections the readout layer creates inside the compiled step
-    # (one per new feature), so it is traced code.
-    init=prediction_init,
-)
-
-
-# An imprint connection is frozen. There is no flag for that: a connection keeps the policy
-# set it was created with, and this set says explicitly that it has no update, prune or
-# growth policy. Its identity weight is set by whatever creates it (`ImprintWiring.init`),
-# since a policy set does not set weights.
-imprint = px.policies.Conn(
-    forward=ImprintForward(),
-    backward=ImprintBackward(),
-    update=None,  # frozen: nothing may change, create or remove these connections
-    prune=None,
-    add=None,
-)
+# The two kinds of connection are not objects. `prediction` is what the readout layer is given
+# in the topology below; `imprint` is the network's default, declared on `Learner`.
 
 
 # --------------------------------------------------------------------------- #
 # Unit policies
 # --------------------------------------------------------------------------- #
 @px.policy
-class MirrorReaders(px.BackwardUnitPolicy[ReaderAcc, Globals]):
+class MirrorReaders(px.policies.BackwardUnitPolicy[ReaderAcc, Globals]):
     """Every feature learns its own prediction weight and how many connections read it."""
 
-    combine = (px.monoid.sum_, px.monoid.sum_) # why do we need two of these?
+    combine = (px.monoid.sum_, px.monoid.sum_)  # why do we need two of these?
 
     def apply(self, u: px.UnitView, i: px.UnitIdx, g: Globals, acc: ReaderAcc) -> px.UnitWrite:
         return px.UnitWrite.of((W_OUT, acc[0]), (OUT_DEG, acc[1]))
 
 
 @px.policy
-class RollFresh(px.UpdateUnitPolicy):
+class RollFresh(px.policies.UpdateUnitPolicy):
     """An observation is scattered fresh each step, so the readout saw this step's value."""
 
     def update(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> px.UnitWrite:
@@ -398,7 +390,7 @@ class RollFresh(px.UpdateUnitPolicy):
 
 
 @px.policy
-class RollLagged(px.UpdateUnitPolicy):
+class RollLagged(px.policies.UpdateUnitPolicy):
     """A generated feature is recomputed by the sweep, so the readout saw the previous value."""
 
     def update(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> px.UnitWrite:
@@ -410,7 +402,7 @@ class RollLagged(px.UpdateUnitPolicy):
 
 
 @px.policy
-class FeatureForward(px.ForwardUnitPolicy[ImprintAcc, Globals]):
+class FeatureForward(px.policies.ForwardUnitPolicy[ImprintAcc, Globals]):
     """A generated feature: a pattern or a memory, chosen once when the unit is spawned.
 
     One policy holds both behaviours and selects by the unit's `is_mem` field. Unit fields
@@ -437,13 +429,16 @@ class FeatureForward(px.ForwardUnitPolicy[ImprintAcc, Globals]):
         reload = jnp.where(active > 0.0, u[self.pulse_pattern, i], np.uint32(0))
 
         return px.UnitWrite.of(
-            (px.ACTIVATION, jnp.where(is_mem, (pulse & 1).astype(f32), fires.astype(f32))),
+            (
+                px.ACTIVATION,
+                jnp.where(is_mem, (pulse & 1).astype(f32), fires.astype(f32)),
+            ),
             (self.pulse, jnp.where(is_mem, (pulse >> 1) | reload, pulse)),
         )
 
 
 @px.policy
-class OrphanPrune(px.PruneUnitPolicy):
+class OrphanPrune(px.policies.PruneUnitPolicy):
     """Delete a generated unit nothing reads any more (but not one created this step)."""
 
     def predicate(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> Flag:
@@ -451,7 +446,7 @@ class OrphanPrune(px.PruneUnitPolicy):
 
 
 @px.policy
-class ReadoutForward(px.ForwardUnitPolicy[ReadoutAcc, Globals]):
+class ReadoutForward(px.policies.ForwardUnitPolicy[ReadoutAcc, Globals]):
     """The prediction, and the sums the next step's update needs."""
 
     combine = (px.monoid.sum_,) * 6
@@ -465,13 +460,13 @@ class ReadoutForward(px.ForwardUnitPolicy[ReadoutAcc, Globals]):
 
 
 @px.policy
-class RememberPrediction(px.UpdateUnitPolicy):
+class RememberPrediction(px.policies.UpdateUnitPolicy):
     def update(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> px.UnitWrite:
         return px.UnitWrite.of((V_OLD, u[px.ACTIVATION, i]))
 
 
 @px.policy
-class TDErrorLoss(px.LossPolicy):
+class TDErrorLoss(px.policies.LossPolicy):
     """delta' = r + gamma_t v - v_old, written to the readout for the connection update."""
 
     gamma: px.UnitRef
@@ -491,31 +486,28 @@ class TDErrorLoss(px.LossPolicy):
         return jnp.sum(0.5 * delta * delta), delta  # second value is written to DELTA
 
 
-observation = px.policies.Unit(backward=MirrorReaders(), update=RollFresh())
-control = px.policies.Unit()  # an input and nothing else
-feature = px.policies.Unit(
-    forward=FeatureForward(), backward=MirrorReaders(), update=RollLagged(), prune=OrphanPrune()
-)
-readout = px.policies.Unit(forward=ReadoutForward(), update=RememberPrediction())
+_feature = FeatureForward()
 
-# A connection policy's `map` must return what its destination unit's `combine` expects: six
-# sums into the readout, two into a feature. Each policy states its accumulator as a type
-# parameter (`ReadoutAcc`, `ImprintAcc`, `ReaderAcc`). The framework combines the different
-# accumulators into one, their product, in which a connection fills its own part. A
-# connection attached to a unit that reads a different part is an error raised when the
-# network is built.
+# A connection's `map` must return what the unit at its other end combines. Going forward that
+# unit is its destination: six sums into the readout, two into a feature. Going backward it is
+# its source: every connection that leaves a feature or an observation returns a `ReaderAcc`,
+# whether it is a prediction or an imprint connection, because `MirrorReaders` reduces both.
+# Each policy states its accumulator as a type parameter (`ReadoutAcc`, `ImprintAcc`,
+# `ReaderAcc`). The framework combines the different accumulators into one, their product, in
+# which a connection fills its own part.
 #
-# A mismatch is always an error, never something the framework lets through (owner). For
-# connections created at run time, the growth rule therefore declares what it creates and
-# what it connects into (`ImprintWiring` below), so the pairing is checked when the network
-# is built.
+# A mismatch is always an error, never something the framework lets through (owner). It is
+# raised when the network is built, for every block of connections against the units it ends in
+# and the units it starts from. A connection the network's `grow` creates has the network's
+# connection policies, so a proposal into a unit that reduces something else (the readout) is
+# not created and is reported.
 
 
 # --------------------------------------------------------------------------- #
 # Growth: creating units and wiring them
 # --------------------------------------------------------------------------- #
 @px.policy
-class ImprintSpawn(px.AddUnitPolicy):
+class ImprintSpawn(px.policies.AddUnitPolicy):
     """Feature generation: an active tenured feature spawns a pattern or memory child.
 
     The step's budget is at most `k_mem + k_pat` features, and only while the correction ratio
@@ -524,10 +516,10 @@ class ImprintSpawn(px.AddUnitPolicy):
     """
 
     out: px.UnitRef  # the readout
-    # The policy set of every unit this rule creates, named statically. A grown unit cannot
-    # inherit from its parent here: the parent may be an observation unit.
-    child: px.policies.Unit
-    features: FeatureForward  # the child's forward policy, for its fields
+    # Every unit this rule creates has the network's unit policies, because this rule is the
+    # network's `grow`. A grown unit does not inherit from its parent: the parent may be an
+    # observation unit.
+    features: FeatureForward  # the child's forward half, for its fields
 
     # A policy that needs randomness asks for it: `self.rng(g, parent)` is this policy's
     # stream for this parent and this step. `spawn` and `init` are methods of one policy,
@@ -554,7 +546,7 @@ class ImprintSpawn(px.AddUnitPolicy):
         # A pattern feature is active on creation; a memory feature is triggered on creation
         # and becomes active once its delay has passed.
         act = jnp.where(is_mem, 0.0, 1.0)
-        # Pattern or memory is a field of the one `feature` policy, not a choice of policy.
+        # Pattern or memory is a field of the one feature policy, not a choice of policy.
         ft = self.features
         return px.UnitWrite.of(
             (px.ACTIVATION, act), (ACT_PREV, act), (ACT_USED, act),
@@ -566,7 +558,7 @@ class ImprintSpawn(px.AddUnitPolicy):
 
 
 @px.policy
-class ImprintWiring(px.ScoreAddConnPolicy):
+class ImprintWiring(px.policies.ScoreAddConnPolicy):
     """Wire this step's new units to what they imprint on.
 
     Every eligible feature into a new pattern unit; the chosen input into a new memory unit.
@@ -577,12 +569,9 @@ class ImprintWiring(px.ScoreAddConnPolicy):
     trigger = px.Trigger.ON_UNITS_ADDED
     shortlist_size = SHORTLIST_SIZE
     is_mem: px.UnitField[np.bool_]  # the feature policy's field, passed in
-    # What this rule creates and what it may connect into, named statically, as
-    # `ImprintSpawn.child` is. The accumulators of the two are checked against each other
-    # when the network is built. At run time the rule may only connect into units with the
-    # `into` policy set.
-    creates: px.policies.Conn
-    into: px.policies.Unit
+    # Every connection this rule creates has the network's connection policies (imprint). It
+    # may connect any two units; one into a unit that does not reduce an `ImprintAcc` is
+    # refused at run time and reported.
 
     def importance(self, u: px.UnitView, i: px.UnitIdx, g: Globals) -> Scalar:
         new = u[BORN, i] == g.step
@@ -595,11 +584,8 @@ class ImprintWiring(px.ScoreAddConnPolicy):
         to_memory = new & is_mem & (src == u[MEM_SRC, dst])
         return jnp.where(to_pattern | to_memory, 0.0, -jnp.inf)
 
-    def init(
-        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Globals
-    ) -> px.ConnWrite:
-        # Every connection this rule creates has the `creates` policy set (imprint). Its
-        # identity weight is set here.
+    def init(self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Globals) -> px.ConnWrite:
+        # Its identity weight is set here.
         return px.ConnWrite.of((px.WEIGHT, 1.0))
 
 
@@ -611,8 +597,24 @@ class Imprinting(px.layers.Module):
         # A connection from every feature unit to the readout, now and whenever a feature is
         # created. Pruning one of those connections leaves a ghost and is never undone, as
         # the thesis specifies.
+        #
+        # The layer is given its policies under the network's keywords. Its `conn` halves go
+        # to the prediction connections and its `unit` halves to the readout. `None` is said
+        # where the readout must not take the network's default: nothing leaves the readout,
+        # so it has no backward half, and it must never be pruned as an orphan feature.
         self.readout = px.layers.ReduceAll(
-            1, init=px.init.zeros, conn_policy=prediction, unit_policy=readout
+            1,
+            init=px.init.zeros(),
+            forward=px.policies.Forward(conn=PredictionForward(), unit=ReadoutForward()),
+            backward=px.policies.Backward(conn=PredictionBackward(), unit=None),
+            update=px.policies.Update(conn=_swifttd, unit=RememberPrediction()),
+            prune=px.policies.Prune(conn=IdleFeaturePrune(dropped=_swifttd.dropped), unit=None),
+            grow=None,
+            # GAP: the other fields of a prediction connection the layer creates inside the
+            # compiled step (one per new feature). A function of the globals, because the
+            # initial step size is a hyperparameter. It was `init=` on the connection set;
+            # where it is written now is not settled.
+            field_init=prediction_init,
         )
 
     def __call__(self, obs: px.layers.Units, gamma: px.layers.Units) -> px.layers.Units:
@@ -625,10 +627,12 @@ class Imprinting(px.layers.Module):
         # for each; it does not know the names or the shapes. Accepted as a limit of
         # Python's type system.
         #
-        # There is no global default policy in this network, so every initial unit is given
-        # its policy set here, with `with_policy`. The handle it returns is typed by the set.
-        obs = obs.with_policy(observation)
-        gamma.with_policy(control)
+        # The network's unit policies are a generated feature's, so the inputs say where they
+        # differ. An input runs no forward half. An observation keeps the network's backward
+        # half (`MirrorReaders`), rolls its own way and is never pruned. The control unit is
+        # an input and nothing else.
+        obs = obs.with_policies(update=RollFresh(), prune=None)
+        gamma.with_policies(backward=None, update=None, prune=None)
         return self.readout(obs).bind(READOUT)
 
 
@@ -640,15 +644,20 @@ def make_learner(num_obs: int) -> type[px.Network]:
         topology = Imprinting()
         inputs = {OBS: (num_obs,), GAMMA: ()}  # the shape of each declared input
 
-        # No global unit or connection default: every unit and connection in this network has
-        # a specific kind, so each is given its policies where it is created.
-        unit_policy = None
-        conn_policy = None
+        # The network's policies are those of what its growth creates: a generated feature
+        # and an imprint connection.
+        forward = px.policies.Forward(conn=ImprintForward(), unit=_feature)
+        backward = px.policies.Backward(conn=ImprintBackward(), unit=MirrorReaders())
+        # An imprint connection is frozen: no `conn` half here or in `prune`.
+        update = px.policies.Update(unit=RollLagged())
+        prune = px.policies.Prune(unit=OrphanPrune())
+        # Network-level growth, free to connect any two units. What it creates has the
+        # policies above.
+        grow = px.policies.Grow(
+            unit=ImprintSpawn(out=READOUT, features=_feature),
+            conn=ImprintWiring(is_mem=_feature.is_mem),
+        )
         loss = TDErrorLoss(gamma=GAMMA)
-        # Network-level growth: the default, free to connect any two units. No layer here
-        # carries growth of its own.
-        add_unit = ImprintSpawn(out=READOUT, child=feature, features=feature.forward)
-        add_conn = ImprintWiring(is_mem=feature.forward.is_mem, creates=imprint, into=feature)
 
         config = px.Config(
             propagation=px.Propagation.PIPELINE,  # every feature reads the previous step

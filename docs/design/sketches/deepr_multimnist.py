@@ -41,9 +41,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Float
+from plastax.policies import (
+    GRAD,
+    SEED,
+    ActivationBackward,
+    SumThenActivate,
+    WeightedSum,
+    WeightedSumBackward,
+)
 
 import plastax as px
-from plastax.policies import GRAD, SEED, WeightedSum, WeightedSumBackward, summing
 
 Scalar = Float[Array, ""]
 Flag = Bool[Array, ""]
@@ -117,7 +124,7 @@ class Globals:
 # Behaviour: the DeepR connection
 # --------------------------------------------------------------------------- #
 @px.policy
-class DeepRUpdate(px.UpdateConnPolicy[Scalar, Globals]):
+class DeepRUpdate(px.policies.UpdateConnPolicy[Scalar, Globals]):
     """w <- w - lr * (dL/dw + l1 * sign(w)) + sqrt(2 * lr * T) * noise.
 
     Records whether the step carried the weight across zero. Whether that removes the
@@ -151,7 +158,7 @@ class DeepRUpdate(px.UpdateConnPolicy[Scalar, Globals]):
 
 
 @px.policy
-class SignCrossPrune(px.PruneConnPolicy[Globals]):
+class SignCrossPrune(px.policies.PruneConnPolicy[Globals]):
     """Remove a connection whose weight has just changed sign."""
 
     crossed: px.ConnField[np.bool_]  # the update's field, passed in
@@ -161,7 +168,7 @@ class SignCrossPrune(px.PruneConnPolicy[Globals]):
 
 
 @px.policy
-class RandomRegrow(px.ProposeAddConnPolicy[Globals]):
+class RandomRegrow(px.policies.ProposeAddConnPolicy[Globals]):
     """Refill the layer with connections at random places, starting at zero."""
 
     proposer = px.Proposer.PER_LAYER
@@ -170,11 +177,11 @@ class RandomRegrow(px.ProposeAddConnPolicy[Globals]):
     dedupe_step = True
     on_overflow = px.Overflow.DROP  # the layer is full: surplus proposals are discarded
 
-    # Growth has two forms (owner). The network's `add_conn` is the default and may connect
-    # any two units, as in the imprinting learner. A connection policy set may carry its own
-    # (`add=` below), which overrides the default for the layer the set is attached to:
-    # a new connection then goes from that layer's sources to that layer's destinations,
-    # belongs to that set, and counts against that layer's slots.
+    # Growth has two forms (owner). The network's `grow` is the default and may connect any
+    # two units, as in the imprinting learner. A layer may be given its own (`grow=` below),
+    # which overrides the default for that layer: a new connection then goes from that
+    # layer's sources to that layer's destinations, has that layer's policies, and counts
+    # against that layer's slots.
     #
     # `layer` is a view of the layer's population: its sources and its destinations, the
     # unit indices the layer connected when it was built.
@@ -184,41 +191,22 @@ class RandomRegrow(px.ProposeAddConnPolicy[Globals]):
         layer: px.LayerView,
         j: px.ProposalIdx,
         g: Globals,
-    ) -> px.Proposal:
+    ) -> px.policies.Proposal:
         rng = self.rng(g, j)  # this policy's stream for proposal j of this step
-        return px.Proposal(
+        return px.policies.Proposal(
             src=layer.random_source(rng),
             dst=layer.random_destination(rng),
             score=rng.uniform(),  # every candidate is as good as any other
         )
 
-    def init(
-        self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Globals
-    ) -> px.ConnWrite:
+    def init(self, u: px.UnitView, src: px.UnitIdx, dst: px.UnitIdx, g: Globals) -> px.ConnWrite:
         # A connection created at run time has no layer initializer: its values come from
         # here.
         return px.ConnWrite.of((px.WEIGHT, 0.0))
 
 
 _update = DeepRUpdate()
-
-# The input layer: updated, pruned on a sign change, refilled.
-rewired = px.policies.Conn(
-    forward=WeightedSum(),
-    backward=WeightedSumBackward(),
-    update=_update,
-    prune=SignCrossPrune(crossed=_update.crossed),
-    add=RandomRegrow(),
-)
-
-# The output layer: the same update, structure fixed.
-fixed = px.policies.Conn(
-    forward=WeightedSum(),
-    backward=WeightedSumBackward(),
-    update=_update,
-    prune=None,
-    add=None,
-)
+_sum = SumThenActivate()
 
 
 # --------------------------------------------------------------------------- #
@@ -235,9 +223,13 @@ class ParallelMLP(px.layers.Module):
         self.hidden = px.layers.Dense(
             N_HIDDEN,
             connectivity=px.layers.sparse(fan_in=INPUT_FANIN, capacity=px.Capacity.INITIAL),
-            init=px.init.lecun_uniform,  # the topology sets the initial weights
+            init=px.init.lecun_uniform(),  # the topology sets the initial weights
             bias=False,
-            conn_policy=rewired,
+            # The input layer adds to what it inherits: it is pruned on a sign change and
+            # refilled. Only the `conn` half of each pair is given, so the units' half is
+            # still the network's (here, none).
+            prune=px.policies.Prune(conn=SignCrossPrune(crossed=_update.crossed)),
+            grow=px.policies.Grow(conn=RandomRegrow()),
             hint=px.Hint(format=px.Format.COO),
         )
         # Explicit initial wiring: hidden unit i feeds logit i // (N_HIDDEN // N_OUTPUTS).
@@ -246,9 +238,10 @@ class ParallelMLP(px.layers.Module):
         self.logits = px.layers.Dense(
             N_OUTPUTS,
             connectivity=px.layers.pairs(src=hidden, dst=hidden // (N_HIDDEN // N_OUTPUTS)),
-            init=px.init.lecun_uniform,
+            init=px.init.lecun_uniform(),
             bias=False,
-            conn_policy=fixed,
+            # The output layer gives no policies: it takes the network's. Same update,
+            # and its structure never changes because the network has no prune or grow.
             hint=px.Hint(format=px.Format.COO),
         )
 
@@ -271,11 +264,17 @@ class DeepR(px.Network):
     topology = ParallelMLP()
     input_shape = (N_INPUTS,)
 
-    conn_policy = None  # asserts that every layer names its own set
-    add_conn = None  # no network-wide growth: only the input layer's own
-    unit_policy = summing
+    # The defaults, by phase. Every weight in both layers takes the DeepR update.
+    forward = px.policies.Forward(conn=WeightedSum(), unit=_sum)
+    backward = px.policies.Backward(
+        conn=WeightedSumBackward(), unit=ActivationBackward(pre=_sum.pre)
+    )
+    update = px.policies.Update(conn=_update)
+    # No network-wide pruning or growth: only the input layer's own.
+    prune = None
+    grow = None
     # One softmax cross-entropy per task, summed over the tasks.
-    loss = px.SoftmaxCrossEntropyLossPolicy(seed=SEED, axis=-1)
+    loss = px.policies.SoftmaxCrossEntropyLossPolicy(seed=SEED, axis=-1)
 
     config = px.Config(
         # Growth stays inside a layer, so the levels never change.

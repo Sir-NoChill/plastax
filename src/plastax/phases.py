@@ -79,15 +79,24 @@ type Phase[GS] = Callable[
 class StepInputs:
     """Clamped inputs + targets for one step; fixed pytree structure.
 
+    A network that declares its shapes (`NetworkStatic.input_shape` and
+    `output_shape`, set when it is built from a topology) is given both in
+    those shapes, and the step flattens them. Any other network takes the
+    flat vectors.
+
     Attributes:
-        inputs: the (num_inputs,) values scattered to input unit ids, or
-            (B, num_inputs) for a batched step (make_step's batch_size).
-        targets: the (num_outputs,) loss targets -- (B, num_outputs) when
-            batched -- or None when the net has no loss phase.
+        inputs: the (num_inputs,) values scattered to input unit ids, or the
+            values in the declared input shape; with a leading (B,) axis for a
+            batched step (make_step's batch_size).
+        targets: the (num_outputs,) loss targets, or the targets in the
+            declared output shape -- with a leading (B,) axis when batched --
+            or None when the net has no loss phase.
     """
 
-    inputs: Float[Array, "*batch num_inputs"]
-    targets: Float[Array, "*batch num_outputs"] | None
+    # The two shapes are named apart: with declared shapes the leading axes of
+    # the inputs and of the targets are not the same.
+    inputs: Float[Array, "*input_shape"]
+    targets: Float[Array, "*output_shape"] | None
 
 
 def build_phases[GS](

@@ -16,6 +16,42 @@ from jaxtyping import Array, Bool, Int32
 
 from plastax._types import PRUNED, FieldSpec, Propagation, ShardSpec
 
+# A run of consecutive slots or unit ids, `[start, stop)`.
+type Span = tuple[int, int]
+
+
+def cut(column: Array, span: Span) -> Array:
+    """The part of a column a span covers.
+
+    Args:
+        column: a column, `(n,)`.
+        span: the slots `[start, stop)`.
+
+    Returns:
+        `column[start:stop]`, or the column itself when the span is all of it,
+        so that a phase over everything traces what it did before spans.
+    """
+    start, stop = span
+    return column if (start, stop) == (0, column.shape[0]) else column[start:stop]
+
+
+def put(column: Array, span: Span, values: Array) -> Array:
+    """A column with the part a span covers replaced.
+
+    Args:
+        column: a column, `(n,)`.
+        span: the slots `[start, stop)`.
+        values: the new values of those slots, `(stop - start,)`.
+
+    Returns:
+        The column with `values` at the span, or `values` itself when the span
+        is all of the column.
+    """
+    start, stop = span
+    if (start, stop) == (0, column.shape[0]):
+        return values
+    return column.at[start:stop].set(values)
+
 
 @dataclasses.dataclass(frozen=True)
 class Run:

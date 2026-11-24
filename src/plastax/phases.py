@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
-from typing import Any, no_type_check
+from typing import TYPE_CHECKING, Any, no_type_check
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +46,15 @@ from plastax.policies import (
     Reduction,
     ScoreAddConnPolicy,
 )
-from plastax.state import Columns, NetworkState, NetworkStatic, live_unit_mask
+from plastax.state import (
+    Columns,
+    NetworkState,
+    NetworkStatic,
+    Span,
+    cut,
+    live_unit_mask,
+    put,
+)
 from plastax.sweep import (
     build_backward_accumulate,
     build_backward_apply,
@@ -60,6 +68,9 @@ from plastax.sweep import (
     unit_id_mask,
 )
 from plastax.views import ConnView, UnitView
+
+if TYPE_CHECKING:
+    from plastax.layers._scope import Scopes
 
 # PEP 695 generic alias: lazily evaluated, so the NetworkState/StepInputs
 # forward references need no quoting. Every phase also returns a scalar loss
@@ -97,6 +108,35 @@ class StepInputs:
     # the inputs and of the targets are not the same.
     inputs: Float[Array, "*input_shape"]
     targets: Float[Array, "*output_shape"] | None
+
+
+def phase_scopes(net: type[Network[Any]], static: NetworkStatic) -> Scopes:
+    """Where each update and prune policy of a network applies.
+
+    A layer may have its own update or pruning, or none, so a phase is built
+    for the one policy of its scope and the runs it applies to, and not for the
+    network's own policy alone. See `plastax.layers._scope.scopes`. Cached: the
+    answer depends only on the class and the static configuration.
+
+    Args:
+        net: the network's trait class.
+        static: static network configuration, holding the layout.
+
+    Returns:
+        The scope of each phase, None for a phase no element has.
+    """
+    # A class is hashable, which mypy does not grant a `type[Network[GS]]`.
+    key: Any = net
+    return _cached_scopes(key, static)
+
+
+@functools.cache
+def _cached_scopes(net: Any, static: NetworkStatic) -> Scopes:
+    # Imported here: plastax.layers imports the builder, which imports this
+    # module's own dependencies.
+    from plastax.layers._scope import scopes
+
+    return scopes(net, static)
 
 
 def build_phases[GS](
@@ -167,13 +207,14 @@ def build_phases[GS](
         phases.append(_build_loss_phase(net, static))
     if net.backward is not None:
         phases.append(_build_backward_phase(net, static))
-    if net.resolved().update_unit is not None:
+    scopes = phase_scopes(net, static)
+    if scopes.update_unit is not None:
         phases.append(build_update_unit_phase(net, static))
-    if net.resolved().update_conn is not None:
+    if scopes.update_conn is not None:
         phases.append(build_update_conn_phase(net, static))
-    if net.resolved().prune_unit is not None:
+    if scopes.prune_unit is not None:
         phases.append(build_prune_unit_phase(net, static))
-    if net.resolved().prune_conn is not None:
+    if scopes.prune_conn is not None:
         phases.append(
             build_prune_merge_phase(dead_sink)
             if fused
@@ -260,10 +301,9 @@ def build_batched_phases[GS](
     forward = _build_forward_phase(net, static)
     loss = _build_loss_phase(net, static) if net.loss is not None else None
     backward = _build_backward_phase(net, static) if net.backward is not None else None
+    scopes = phase_scopes(net, static)
     update_unit = (
-        build_update_unit_phase(net, static)
-        if net.resolved().update_unit is not None
-        else None
+        build_update_unit_phase(net, static) if scopes.update_unit is not None else None
     )
     csr_forward = (
         build_csr_forward(net, static, engine=engine)
@@ -278,9 +318,9 @@ def build_batched_phases[GS](
         else None
     )
     structural: list[Phase[GS]] = []
-    if net.resolved().prune_unit is not None:
+    if scopes.prune_unit is not None:
         structural.append(build_prune_unit_phase(net, static))
-    if net.resolved().prune_conn is not None:
+    if scopes.prune_conn is not None:
         structural.append(build_prune_conn_phase(net, static))
     if net.resolved().grow_unit is not None:
         structural.append(build_add_unit_phase(net, static))
@@ -298,7 +338,7 @@ def build_batched_phases[GS](
         structural.append(_build_reset_global_phase(net))
     update = (
         build_batched_update_conn(net, static)
-        if net.resolved().update_conn is not None
+        if scopes.update_conn is not None
         else None
     )
     return BatchedPhases(
@@ -383,7 +423,7 @@ def per_sample_written_fields[GS](
         phases.append(("loss", _build_loss_phase(net, static)))
     if net.backward is not None:
         phases.append(("backward_pass", _build_backward_phase(net, static)))
-    if net.resolved().update_unit is not None:
+    if phase_scopes(net, static).update_unit is not None:
         phases.append(("update_unit", build_update_unit_phase(net, static)))
     written: dict[str, str] = {ACTIVATION.name: "the input scatter"}
 
@@ -403,6 +443,54 @@ def per_sample_written_fields[GS](
     )
     jax.eval_shape(probe, state, inputs)
     return written
+
+
+def _bucket_spans(
+    spans: tuple[tuple[Span, ...], ...] | None, index: int, bucket: Columns
+) -> tuple[Span, ...]:
+    """The runs of one bucket a connection phase covers.
+
+    Args:
+        spans: the phase's spans for every bucket (`ConnScope.spans`), or None
+            for every slot.
+        index: the bucket.
+        bucket: its columns.
+
+    Returns:
+        The bucket's runs: the whole bucket as one run when `spans` is None,
+        and no run at all for a bucket the phase does not apply in, which then
+        traces nothing.
+    """
+    if spans is None:
+        return ((0, bucket[DEAD.name].shape[0]),)
+    return spans[index]
+
+
+def _swept[GS](
+    sweep: Callable[..., Columns],
+    units: Columns,
+    bucket: Columns,
+    g: GS,
+    spans: tuple[tuple[Span, ...], ...] | None,
+    index: int,
+) -> Columns:
+    """Run a connection-update sweep over the runs of one bucket it covers.
+
+    Args:
+        sweep: a `sweep.ConnUpdateSweep`.
+        units: the unit columns.
+        bucket: the bucket's columns.
+        g: the globals.
+        spans: the phase's spans for every bucket, or None for every slot.
+        index: the bucket.
+
+    Returns:
+        The bucket's columns after the sweep; the same columns, untouched, for
+        a bucket the phase does not apply in.
+    """
+    if spans is None:
+        return sweep(units, bucket, g)
+    return sweep(units, bucket, g, spans[index]) if spans[index] else bucket
 
 
 def build_batched_update_conn[GS](
@@ -437,8 +525,10 @@ def build_batched_update_conn[GS](
     Returns:
         `(state, batched_units) -> state` with updated connections.
     """
-    uc = net.resolved().update_conn
-    assert uc is not None  # only built when set
+    scope = phase_scopes(net, static).update_conn
+    assert scope is not None  # only built when set
+    uc = scope.policy
+    spans = scope.spans
     policy = net.batch_reduction
     assert policy is not None  # make_step requires one for a batched step
     per_sample_fn = getattr(uc, "per_sample", None)
@@ -457,10 +547,12 @@ def build_batched_update_conn[GS](
             policy, static.unit_fields, units_b, state.units
         )
 
-        def bucket_update(bucket: Columns) -> Columns:
+        def span_update(bucket: Columns, out: Columns, span: Span) -> Columns:
+            """One optimizer step for the connections in one run of a bucket."""
             c_view = ConnView(bucket)
-            to_id, from_id = bucket[TO_ID.name], bucket[FROM_ID.name]
-            cids = jnp.arange(to_id.shape[0])
+            to_id = cut(bucket[TO_ID.name], span)
+            from_id = cut(bucket[FROM_ID.name], span)
+            cids = jnp.arange(*span)  # each connection's slot in the bucket
 
             def stat_of(units: Columns) -> Any:
                 u_view = UnitView(units)
@@ -490,14 +582,26 @@ def build_batched_update_conn[GS](
                 return dict(write.fields)
 
             writes = jax.vmap(apply)(to_id, from_id, cids, mean_stat)
-            dead = bucket[DEAD.name]
-            out: Columns = dict(bucket)
+            dead = cut(bucket[DEAD.name], span)
+            out = dict(out)
             for name, written in writes.items():
-                out[name] = jnp.where(dead, bucket[name], written)
+                kept = jnp.where(dead, cut(out[name], span), written)
+                out[name] = put(out[name], span, kept)
             return out
 
-        conns = tuple(bucket_update(bucket) for bucket in state.conns)
-        conns = tuple(outgoing(mean_units, bucket, g) for bucket in conns)
+        def bucket_update(bucket: Columns, index: int) -> Columns:
+            out: Columns = dict(bucket)
+            for span in _bucket_spans(spans, index, bucket):
+                out = span_update(bucket, out, span)
+            return out
+
+        conns = tuple(
+            bucket_update(bucket, index) for index, bucket in enumerate(state.conns)
+        )
+        conns = tuple(
+            _swept(outgoing, mean_units, bucket, g, spans, index)
+            for index, bucket in enumerate(conns)
+        )
         return dataclasses.replace(state, conns=conns)
 
     def mean_of_writes(state: NetworkState[GS], units_b: Columns) -> NetworkState[GS]:
@@ -505,8 +609,14 @@ def build_batched_update_conn[GS](
         g = state.globals_
 
         def one_sample(units: Columns) -> tuple[Columns, ...]:
-            conns = tuple(incoming(units, bucket, g) for bucket in state.conns)
-            return tuple(outgoing(units, bucket, g) for bucket in conns)
+            conns = tuple(
+                _swept(incoming, units, bucket, g, spans, index)
+                for index, bucket in enumerate(state.conns)
+            )
+            return tuple(
+                _swept(outgoing, units, bucket, g, spans, index)
+                for index, bucket in enumerate(conns)
+            )
 
         # Average each floating column's per-sample *change* and add it back:
         # a column the rule never writes, and every dead slot (keep-old
@@ -1184,6 +1294,9 @@ def build_update_unit_phase[GS](
     each written column is merged back where the slot holds a live unit
     (`state.live_unit_mask`; every slot without a unit capacity).
 
+    When the update applies to some layers only (`phase_scopes`), it is
+    vmapped over those layers' unit ids and nothing is computed for the rest.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -1194,9 +1307,10 @@ def build_update_unit_phase[GS](
     Returns:
         The update_unit phase function.
     """
-    uu = net.resolved().update_unit
-    assert uu is not None  # build_phases only calls this when set
-    num_units = static.num_units
+    scope = phase_scopes(net, static).update_unit
+    assert scope is not None  # build_phases only calls this when set
+    uu = scope.policy
+    spans = ((0, static.num_units),) if scope.spans is None else scope.spans
 
     def update_unit_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -1209,14 +1323,17 @@ def build_update_unit_phase[GS](
             # UnitWrite is not pytree-registered; vmap carries its fields.
             return dict(uu.update(u_view, UnitIdx(i), g).fields)
 
-        writes = jax.vmap(one)(jnp.arange(num_units, dtype=jnp.int32))
         live = live_unit_mask(state.units)
         units = dict(state.units)
-        for name, written in writes.items():
-            written = written.astype(units[name].dtype)
-            units[name] = (
-                written if live is None else jnp.where(live, written, units[name])
-            )
+        for span in spans:
+            writes = jax.vmap(one)(jnp.arange(*span, dtype=jnp.int32))
+            for name, written in writes.items():
+                written = written.astype(units[name].dtype)
+                if live is not None:
+                    written = jnp.where(
+                        cut(live, span), written, cut(units[name], span)
+                    )
+                units[name] = put(units[name], span, written)
         return dataclasses.replace(state, units=units), jnp.float32(0.0)
 
     return update_unit_phase
@@ -1243,6 +1360,10 @@ def build_update_conn_phase[GS](
     guarantee; kept global (all incoming buckets, then all outgoing
     buckets) as the simpler of the two equally-correct orderings.
 
+    When the update applies to some layers only (`phase_scopes`), each pass
+    sweeps those layers' runs of slots: a bucket with none is left alone, and
+    a connection is still given its slot in the bucket.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -1253,8 +1374,10 @@ def build_update_conn_phase[GS](
     Returns:
         The update_conn phase function.
     """
-    uc = net.resolved().update_conn
-    assert uc is not None  # build_phases only calls this when set
+    scope = phase_scopes(net, static).update_conn
+    assert scope is not None  # build_phases only calls this when set
+    uc = scope.policy
+    spans = scope.spans
     incoming = build_incoming_conn_update(uc.incoming)
     outgoing = build_outgoing_conn_update(uc.outgoing)
 
@@ -1262,10 +1385,15 @@ def build_update_conn_phase[GS](
         state: NetworkState[GS], inputs: StepInputs
     ) -> tuple[NetworkState[GS], Float[Array, ""]]:
         del inputs
+        units, g = state.units, state.globals_
         conns = tuple(
-            incoming(state.units, bucket, state.globals_) for bucket in state.conns
+            _swept(incoming, units, bucket, g, spans, index)
+            for index, bucket in enumerate(state.conns)
         )
-        conns = tuple(outgoing(state.units, bucket, state.globals_) for bucket in conns)
+        conns = tuple(
+            _swept(outgoing, units, bucket, g, spans, index)
+            for index, bucket in enumerate(conns)
+        )
         return dataclasses.replace(state, conns=conns), jnp.float32(0.0)
 
     return update_conn_phase
@@ -1286,6 +1414,11 @@ def build_prune_unit_phase[GS](
     edges never breaks the leveling invariant, and the next resort recomputes
     the levels from the live edges.
 
+    When the pruning applies to some layers only (`phase_scopes`), the
+    predicate is evaluated for those layers' units alone. The connections of a
+    pruned unit are still tombstoned in every bucket: they belong to the
+    layers before and after it.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -1297,8 +1430,10 @@ def build_prune_unit_phase[GS](
     Returns:
         The prune_unit phase function.
     """
-    pu = net.resolved().prune_unit
-    assert pu is not None  # build_phases only calls this when set
+    scope = phase_scopes(net, static).prune_unit
+    assert scope is not None  # build_phases only calls this when set
+    pu = scope.policy
+    spans = scope.spans
     num_units = static.num_units
     exempt = unit_id_mask(static.input_ids + static.output_ids, num_units)
     defaults = {
@@ -1317,7 +1452,14 @@ def build_prune_unit_phase[GS](
         def one(i: jax.Array) -> jax.Array:
             return jnp.asarray(pu.predicate(u_view, UnitIdx(i), g), jnp.bool_)
 
-        selected = jax.vmap(one)(jnp.arange(num_units, dtype=jnp.int32))
+        if spans is None:
+            selected = jax.vmap(one)(jnp.arange(num_units, dtype=jnp.int32))
+        else:
+            # Only the units of the layers that prune are tested.
+            selected = jnp.zeros((num_units,), jnp.bool_)
+            for span in spans:
+                tested = jax.vmap(one)(jnp.arange(*span, dtype=jnp.int32))
+                selected = put(selected, span, tested)
         pruned = state.units[PRUNED.name]
         doomed = selected & ~pruned & ~exempt
         units = dict(state.units)
@@ -1487,6 +1629,10 @@ def build_prune_conn_phase[GS](
     evaluating every row unconditionally and OR-merging is equivalent to
     skipping already-dead rows first.
 
+    When the pruning applies to some layers only (`phase_scopes`), the
+    predicate runs over those layers' runs of slots and no other connection
+    is tested.
+
     Type Args:
         GS: the user's global-state pytree, opaque to the framework.
 
@@ -1498,8 +1644,10 @@ def build_prune_conn_phase[GS](
     Returns:
         The prune_conn phase function.
     """
-    pc = net.resolved().prune_conn
-    assert pc is not None  # build_phases only calls this when set
+    scope = phase_scopes(net, static).prune_conn
+    assert scope is not None  # build_phases only calls this when set
+    pc = scope.policy
+    spans = scope.spans
 
     def prune_conn_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -1508,20 +1656,27 @@ def build_prune_conn_phase[GS](
         u_view = UnitView(state.units)
         g = state.globals_
 
-        def prune_bucket(bucket_conns: Columns) -> Columns:
+        def prune_bucket(bucket_conns: Columns, index: int) -> Columns:
+            runs = _bucket_spans(spans, index, bucket_conns)
+            if not runs:
+                return bucket_conns
             c_view = ConnView(bucket_conns)
             dead = bucket_conns[DEAD.name]
-            cids = jnp.arange(dead.shape[0], dtype=jnp.int32)
 
             def per_conn(cid: jax.Array) -> jax.Array:
-                return pc.predicate(u_view, c_view, ConnIdx(cid), g)
+                return jnp.asarray(pc.predicate(u_view, c_view, ConnIdx(cid), g))
 
-            should_die = jax.vmap(per_conn)(cids)
+            for span in runs:
+                # Each connection is given its slot in the bucket.
+                should_die = jax.vmap(per_conn)(jnp.arange(*span, dtype=jnp.int32))
+                dead = put(dead, span, cut(dead, span) | should_die)
             new_bucket: Columns = dict(bucket_conns)
-            new_bucket[DEAD.name] = dead | should_die
+            new_bucket[DEAD.name] = dead
             return new_bucket
 
-        new_conns = tuple(prune_bucket(bucket) for bucket in state.conns)
+        new_conns = tuple(
+            prune_bucket(bucket, index) for index, bucket in enumerate(state.conns)
+        )
         return dataclasses.replace(state, conns=new_conns), jnp.float32(0.0)
 
     return prune_conn_phase
@@ -1706,6 +1861,10 @@ def plan_prune_fusion[GS](
     Raises:
         ValueError: If `engine` is not "auto", "triton" or "xla".
     """
+    if not phase_scopes(net, static).whole:
+        # The plan below reads the network's own policies, and the fused
+        # kernel evaluates the predicate over a whole bucket.
+        return PruneFusionPlan(False, "a policy applies to some layers only")
     pc = net.resolved().prune_conn
     if pc is None:
         return PruneFusionPlan(False, "no prune_conn")

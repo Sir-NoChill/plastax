@@ -50,7 +50,7 @@ from plastax.policies import (
     ForwardConnPolicy,
     ForwardUnitPolicy,
 )
-from plastax.state import Columns, live_unit_mask
+from plastax.state import Columns, Span, cut, live_unit_mask, put
 from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 # Module-scoped (not PEP 695) so it stays free inside the type aliases below;
@@ -67,8 +67,10 @@ type FinalizeMask = Bool[Array, " num_units"]
 ApplyFn = Callable[[Columns, Any, GS, FinalizeMask], tuple[Columns, Any]]
 # (u, first_id, second_id, c, cid, globals) -> that edge's conn field writes
 ConnUpdateFn = Callable[[UnitView, UnitIdx, UnitIdx, ConnView, ConnIdx, GS], ConnWrite]
-# (units, bucket_conns, globals) -> that bucket's conns, live rows updated
-ConnUpdateSweep = Callable[[Columns, Columns, GS], Columns]
+# (units, bucket_conns, globals, spans=None) -> that bucket's conns, with the
+# live rows of the spans updated; None for every row. Written with `...`
+# because the last argument is optional.
+ConnUpdateSweep = Callable[..., Columns]
 
 
 def unit_id_mask(ids: tuple[int, ...], num_units: int) -> Bool[Array, " num_units"]:
@@ -506,7 +508,7 @@ def _build_conn_update[GS](
     *,
     first_col: FieldSpec[Any],
     second_col: FieldSpec[Any],
-) -> ConnUpdateSweep[GS]:
+) -> ConnUpdateSweep:
     """Run one vmapped conn-update pass over a bucket's live edges.
 
     Shared by the incoming direction (first_col=TO_ID, second_col=FROM_ID)
@@ -520,15 +522,25 @@ def _build_conn_update[GS](
     accumulator, unlike `_accumulate_into`), so a dead conn's write is
     dropped by a plain keep-old merge rather than an out-of-bounds
     null-slot scatter -- the degenerate case of the same discipline.
+
+    The returned sweep takes `spans`, the runs of slots it is to update, or
+    None for the whole bucket. `update_fn` is called for the slots of the spans
+    only, with each connection's slot in the bucket as its `cid` and a view of
+    the whole bucket, so a policy is given the same index whether or not its
+    phase covers the bucket.
     """
 
-    def update_bucket(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
+    def update_bucket(
+        units: Columns,
+        bucket_conns: Columns,
+        g: GS,
+        spans: tuple[Span, ...] | None = None,
+    ) -> Columns:
         u_view = UnitView(units)
         c_view = ConnView(bucket_conns)
         first_id = bucket_conns[first_col.name]
         second_id = bucket_conns[second_col.name]
         dead = bucket_conns[DEAD.name]
-        conn_ids = jnp.arange(first_id.shape[0])
 
         def per_edge(
             first: jax.Array, second: jax.Array, cid: jax.Array
@@ -538,11 +550,14 @@ def _build_conn_update[GS](
             )
             return dict(write.fields)
 
-        batched_writes = jax.vmap(per_edge)(first_id, second_id, conn_ids)
-
         new_conns: Columns = dict(bucket_conns)
-        for name, written in batched_writes.items():
-            new_conns[name] = jnp.where(dead, bucket_conns[name], written)
+        for span in ((0, first_id.shape[0]),) if spans is None else spans:
+            batched_writes = jax.vmap(per_edge)(
+                cut(first_id, span), cut(second_id, span), jnp.arange(*span)
+            )
+            for name, written in batched_writes.items():
+                kept = jnp.where(cut(dead, span), cut(new_conns[name], span), written)
+                new_conns[name] = put(new_conns[name], span, kept)
         return new_conns
 
     return update_bucket
@@ -550,7 +565,7 @@ def _build_conn_update[GS](
 
 def build_incoming_conn_update[GS](
     update_fn: ConnUpdateFn[GS],
-) -> ConnUpdateSweep[GS]:
+) -> ConnUpdateSweep:
     """Build one bucket's incoming connection-update pass.
 
     Type Args:
@@ -568,7 +583,7 @@ def build_incoming_conn_update[GS](
 
 def build_outgoing_conn_update[GS](
     update_fn: ConnUpdateFn[GS],
-) -> ConnUpdateSweep[GS]:
+) -> ConnUpdateSweep:
     """Build one bucket's outgoing connection-update pass.
 
     Type Args:

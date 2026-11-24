@@ -280,8 +280,9 @@ class Network[GS]:
         Raises:
             BuildError: if the class has no `topology` or no `input_shape`, if
                 the topology does not take exactly one handle, if the policies
-                have a fault (see `faults`), if a layer is given policies of
-                its own (which the engine cannot run yet), or if the globals
+                have a fault (see `faults`), if a layer differs from the
+                network in a way the engine cannot run yet (two policies in
+                one phase, a pass or growth of its own), or if the globals
                 are not a pytree of numbers and arrays. Also whatever `trace`
                 and `materialize` raise.
             NotImplementedError: if the topology returns more than one handle.
@@ -494,49 +495,106 @@ def _on_network[P](half: P | Inherit | None) -> P | None:
 
 
 def _refuse_layer_policies(cls: type[Network[Any]], table: PolicyTable) -> None:
-    """Refuse to build a network whose layers differ from it in a policy.
+    """Refuse to build a network whose layers differ from it in a way not run yet.
 
-    The engine runs one set of policies for the whole network. Until it runs a
-    policy on the elements of one layer, a network that needs that is refused
-    here, by name, and not run with the wrong policies.
+    A layer may have its own update or pruning, or none, where at most one
+    policy is left in the phase: the engine then runs that policy on the
+    elements that have it. Everything else a layer can say is refused here, by
+    name, and not run with the wrong policies:
+
+    - two different policies in one update or prune phase;
+    - a layer's own forward pass, backward pass or growth;
+    - any layer policy in a network that grows connections of its own;
+    - unit pruning on a layer of a network with no `unit_capacity`.
 
     Args:
         cls: the network class being built.
         table: its resolved policies.
 
     Raises:
-        BuildError: if any block's policy differs from the network's.
+        BuildError: if the network differs from its layers in one of those ways.
     """
     # Imported here: plastax.layers imports this module.
     from plastax.layers import BuildError
     from plastax.layers._module import _show
+    from plastax.layers._scope import SCOPED_PHASES, clashes
 
     overrides = table.overrides()
     if not overrides:
+        return
+    name = cls.__name__
+    waits = {
+        "forward": (
+            "A layer with a forward pass of its own, or with none, is not run "
+            "yet (layer policies, stage 4)."
+        ),
+        "backward": (
+            "A layer with a backward pass of its own, or with none, is not run "
+            "yet (layer policies, stage 3, part 4)."
+        ),
+        "grow": (
+            "Growth that belongs to one layer, or a layer left out of the "
+            "network's growth, is not run yet (layer policies, stages 5 and 6)."
+        ),
+    }
+    groups: list[tuple[list[Any], str]] = [
+        ([o for o in overrides if o.phase == phase], reason)
+        for phase, reason in waits.items()
+    ]
+    groups.append(
+        (
+            clashes(table),
+            "Two different policies in one phase are not run yet (layer policies, "
+            "stage 4). One policy on some layers and none on the others is.",
+        )
+    )
+    grow = cls.resolved().grow_conn
+    if grow is not None:
+        groups.append(
+            (
+                [o for o in overrides if o.phase in SCOPED_PHASES],
+                f"{name} grows connections of its own ({type(grow).__name__}), "
+                f"which may put one in any free slot, so its layers cannot keep "
+                f"policies of their own yet (layer policies, stage 5).",
+            )
+        )
+    if cls.unit_capacity is None:
+        groups.append(
+            (
+                [
+                    o
+                    for o in overrides
+                    if (o.kind, o.phase) == ("units", "prune") and o.policy is not None
+                ],
+                f"Pruning units needs somewhere to mark them: set "
+                f"`{name}.unit_capacity`.",
+            )
+        )
+    refused = [(cells, reason) for cells, reason in groups if cells]
+    if not refused:
         return
 
     def named(policy: object) -> str:
         return "none" if policy is None else type(policy).__name__
 
-    lines: list[str] = []
-    width = max(len(named(o.policy)) for o in overrides)
-    last: tuple[tuple[str, ...], str] | None = None
-    for o in overrides:
-        if (o.path, o.kind) != last:
-            lines.append(f"  {_show(o.path)}  ({o.kind})")
-            last = (o.path, o.kind)
-        lines.append(
-            f"      {o.phase:<9}{named(o.policy):<{width}}   "
-            f"the network has {named(o.network)}"
-        )
-    name = cls.__name__
+    width = max(len(named(o.policy)) for cells, _ in refused for o in cells)
+    parts: list[str] = []
+    for cells, reason in refused:
+        lines: list[str] = []
+        last: tuple[tuple[str, ...], str] | None = None
+        for o in cells:
+            if (o.path, o.kind) != last:
+                lines.append(f"  {_show(o.path)}  ({o.kind})")
+                last = (o.path, o.kind)
+            lines.append(
+                f"      {o.phase:<9}{named(o.policy):<{width}}   "
+                f"the network has {named(o.network)}"
+            )
+        parts.append("\n".join(lines) + "\n\n" + reason)
     raise BuildError(
-        f"{name} cannot be run yet. Its layers are given policies of their "
-        f"own, and the engine runs one set of policies for the whole network "
-        f"(layer policies, stage 3).\n\n"
-        + "\n".join(lines)
-        + f"\n\nThe declaration itself is valid. `print({name}.policy_table())` "
-        f"shows what every layer resolved to."
+        f"{name} cannot be run yet.\n\n"
+        + "\n\n".join(parts)
+        + f"\n\n`print({name}.policy_table())` shows what every layer resolved to."
     )
 
 

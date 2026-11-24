@@ -19,10 +19,11 @@ import numpy as np
 from jaxtyping import PRNGKeyArray
 
 from plastax import init as px_init
-from plastax._types import ACTIVATION
-from plastax.builder import NetworkBuilder
+from plastax import topo
+from plastax._types import ACTIVATION, Capacity, Propagation
+from plastax.builder import BlockSpan, NetworkBuilder
 from plastax.init import Fans
-from plastax.layers._module import BuildError
+from plastax.layers._module import BuildError, _show
 from plastax.layers._record import ConnBlock, Record
 from plastax.network import Network
 from plastax.state import NetworkState, NetworkStatic
@@ -157,6 +158,82 @@ def _weights(
     return drawn.astype(np.float32).reshape(-1)
 
 
+def _spans[GS](
+    record: Record, net: type[Network[GS]], src: np.ndarray, dst: np.ndarray
+) -> list[BlockSpan] | None:
+    """Give the builder the record's blocks, or None when it cannot keep them.
+
+    A network that grows connections of its own puts a new connection in any
+    free slot of its bucket and may re-sort its buckets, so its blocks do not
+    stay where they were put. It is built as one sorted bucket per level, with
+    no layout, and a capacity on one of its layers is refused.
+
+    Args:
+        record: The record.
+        net: The network class.
+        src: The source of every connection, block after block.
+        dst: The destination of every connection, block after block.
+
+    Returns:
+        One span per block of the record, in order, or None.
+
+    Raises:
+        BuildError: If a layer is given a number as its capacity and the network
+            grows connections of its own, the layer has no connections, or its
+            sources are on more than one level.
+    """
+    counted = [b for b in record.blocks if not isinstance(b.capacity, Capacity)]
+    grow = net.resolved().grow_conn
+    if grow is not None:
+        if counted:
+            block = counted[0]
+            raise BuildError(
+                f"{_show(block.path)} is given capacity={block.capacity}, and "
+                f"{net.__name__} grows connections of its own "
+                f"({type(grow).__name__}), which may take any free slot. A layer's "
+                f"own slots beside the network's growth are not supported yet "
+                f"(layer policies, stage 5); leave the capacity out"
+            )
+        return None
+
+    if counted and net.propagation is not Propagation.PIPELINE:
+        # A run of slots is in one bucket, and a bucket holds the connections
+        # whose sources are on one level.
+        levels = topo.initial_levels(
+            record.num_units,
+            np.stack([src, dst], axis=1),
+            allow_cycles=False,
+            input_ids=tuple(
+                int(i) for ids in record.inputs.values() for i in ids.reshape(-1)
+            ),
+        )
+        for block in counted:
+            on = np.unique(levels[block.src])
+            if on.size == 0:
+                raise BuildError(
+                    f"{_show(block.path)} is given capacity={block.capacity} and "
+                    f"creates no connections, so there is no level to put its "
+                    f"slots on; leave the capacity out"
+                )
+            if on.size > 1:
+                raise BuildError(
+                    f"{_show(block.path)} is given capacity={block.capacity}, and "
+                    f"its sources are on {on.size} levels "
+                    f"({', '.join(str(int(level)) for level in on)}). A capacity "
+                    f"is one run of slots, and a layer with sources on several "
+                    f"levels has one run for each; how a capacity is divided "
+                    f"between them is not decided yet. Leave the capacity out, "
+                    f"or give each level's sources a layer of its own"
+                )
+    return [
+        BlockSpan(
+            int(block.src.size),
+            None if isinstance(block.capacity, Capacity) else int(block.capacity),
+        )
+        for block in record.blocks
+    ]
+
+
 def materialize[GS](
     record: Record,
     net: type[Network[GS]],
@@ -165,6 +242,7 @@ def materialize[GS](
     globals_: GS,
     check_cycle: bool = True,
     capacity_headroom: float = 0.0,
+    capacity_align: int | None = None,
 ) -> tuple[NetworkStatic, NetworkState[GS]]:
     """Turn a traced topology into a state that `px.make_step` can run.
 
@@ -189,9 +267,19 @@ def materialize[GS](
     Two connections between the same pair of units, written by two blocks, become two
     connections, each with its own weight.
 
+    The connections are stored block by block. In each bucket (the connections whose
+    sources are on one level) a block has one run of slots, as long as its capacity,
+    with its connections sorted by source and then destination; the runs follow one
+    another in the order the blocks were written, and the rest of the bucket is
+    spare. `static.layout` records the runs of every block, and the unit ids of every
+    block of units. A network that grows connections of its own is the exception: it
+    is stored as one sorted bucket per level and has no layout.
+
     A `BuildError` is raised if a connection leads into a constant unit, if the
-    connections close a cycle and `check_cycle` is on, or if an initializer cannot be
-    called or does not return weights of its block's shape.
+    connections close a cycle and `check_cycle` is on, if an initializer cannot be
+    called or does not return weights of its block's shape, or if a layer is given a
+    number as its capacity and it cannot be honoured: the network grows connections
+    of its own, the layer has no connections, or its sources are on several levels.
 
     Args:
         record: The traced topology.
@@ -202,7 +290,10 @@ def materialize[GS](
             naming the blocks involved. Off, the check is left to the builder, which
             refuses a cycle for a topological network and accepts one for a pipeline
             network.
-        capacity_headroom: Extra room for connections, as `from_edges` takes it.
+        capacity_headroom: Extra room in each bucket, beyond its blocks, as a
+            fraction of them (`from_edges`).
+        capacity_align: What a bucket's capacity is rounded up to a multiple of,
+            or None for the next power of two (`from_edges`).
 
     Returns:
         The `(static, state)` pair, as `NetworkBuilder.from_edges` returns it.
@@ -213,6 +304,7 @@ def materialize[GS](
     else:
         src = dst = np.zeros(0, np.int32)
     _check(record, src, dst, check_cycle)
+    spans = _spans(record, net, src, dst)
 
     activation = np.full(record.num_units, ACTIVATION.default, ACTIVATION.dtype)
     for units in record.unit_blocks:
@@ -239,12 +331,22 @@ def materialize[GS](
         globals_=globals_,
         extra_unit_columns={ACTIVATION.name: activation},
         capacity_headroom=capacity_headroom,
+        capacity_align=capacity_align,
+        blocks=spans,
     )
     shapes = [ids.shape for ids in record.inputs.values()]
     returned = [ids.shape for ids in record.outputs]
+    layout = static.layout
+    if layout is not None:
+        unit_runs = tuple(
+            (units.start, units.start + int(np.prod(units.shape, dtype=np.int64)))
+            for units in record.unit_blocks
+        )
+        layout = dataclasses.replace(layout, unit_runs=unit_runs)
     static = dataclasses.replace(
         static,
         input_shape=shapes[0] if len(shapes) == 1 else None,
         output_shape=returned[0] if len(returned) == 1 else None,
+        layout=layout,
     )
     return static, state

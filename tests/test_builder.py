@@ -510,11 +510,12 @@ def test_window_column_tiles_to_full() -> None:
     dst = rng.integers(0, 100, size=200).astype(np.int32)
     conn_columns = {WEIGHT.name: rng.standard_normal(200).astype(np.float32)}
 
-    full = _window_column(WEIGHT, order, live, 0, capacity, src, dst, conn_columns)
+    # No slots given: the edges are first, at slots 0 .. live - 1.
+    full = _window_column(WEIGHT, order, None, 0, capacity, src, dst, conn_columns)
     step = capacity // shards
     tiles = [
         _window_column(
-            WEIGHT, order, live, g * step, (g + 1) * step, src, dst, conn_columns
+            WEIGHT, order, None, g * step, (g + 1) * step, src, dst, conn_columns
         )
         for g in range(shards)
     ]

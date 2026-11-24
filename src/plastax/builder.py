@@ -6,6 +6,7 @@ connections imperatively, then finalize into (NetworkStatic, NetworkState).
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -29,7 +30,7 @@ from plastax._types import (
 )
 from plastax.distributed import _addressable_window, _place, _shardings_for_spec
 from plastax.network import Network, reject_sharded_unit_lifecycle
-from plastax.state import Columns, NetworkState, NetworkStatic
+from plastax.state import Columns, Layout, NetworkState, NetworkStatic, Run
 from plastax.topology import Topology
 
 # Values a caller may pass into add_unit/add_conn **kwargs, widened with the
@@ -38,10 +39,29 @@ from plastax.topology import Topology
 FieldValue = float | int | bool | np.generic
 
 
+@dataclasses.dataclass(frozen=True)
+class BlockSpan:
+    """One block of connections among the edge arrays given to `from_edges`.
+
+    The blocks are consecutive: the first `size` edges are the first block's,
+    the next block's follow, and so on.
+
+    Attributes:
+        size: How many edges the block has.
+        capacity: How many slots the block is given, or None for exactly as
+            many as it has edges in each bucket. A number is at least `size`,
+            and is only possible for a block whose edges all land in one
+            bucket.
+    """
+
+    size: int
+    capacity: int | None = None
+
+
 def _window_column(
     spec: FieldSpec[np.generic],
     order: np.ndarray,
-    live: int,
+    slots: np.ndarray | None,
     w_lo: int,
     w_hi: int,
     src_arr: np.ndarray,
@@ -50,31 +70,34 @@ def _window_column(
 ) -> np.ndarray:
     """Materialise arena positions ``[w_lo, w_hi)`` of one padded conn column.
 
-    The full column is the ``live`` edges (in the bucket's sorted ``order``)
-    followed by ``capacity - live`` tombstoned slots. This builds only the
-    window: the live positions ``[w_lo, min(w_hi, live))`` gathered through
-    ``order``, then the dead remainder at the field default. ``w_lo == 0`` and
-    ``w_hi == capacity`` reproduce the full column; a per-shard band builds just
-    that shard's slice without ever allocating the whole column.
+    The full column holds the bucket's live edges (in its sorted ``order``),
+    the k-th of them at slot ``slots[k]``, and the field default (a tombstone,
+    for ``dead``) at every other slot. ``slots`` is ascending; None puts the
+    edges first, at slots ``0 .. len(order) - 1``. This builds only the window.
+    ``w_lo == 0`` and ``w_hi == capacity`` reproduce the full column; a
+    per-shard band builds just that shard's slice without ever allocating the
+    whole column.
     """
-    n_live = max(0, min(w_hi, live) - w_lo)
-    n_dead = (w_hi - w_lo) - n_live
-    if n_live > 0:
-        sub = order[w_lo : w_lo + n_live]
+    if slots is None:
+        first, last = min(w_lo, order.size), min(w_hi, order.size)
+        at = np.arange(first, last) - w_lo
+    else:
+        first, last = (int(k) for k in np.searchsorted(slots, (w_lo, w_hi)))
+        at = slots[first:last] - w_lo
+    column = np.full((w_hi - w_lo,), spec.default, dtype=spec.dtype)
+    if last > first:
+        sub = order[first:last]
         vals: np.ndarray
         if spec.name == FROM_ID.name:
             vals = src_arr[sub]
         elif spec.name == TO_ID.name:
             vals = dst_arr[sub]
         elif spec.name == DEAD.name:
-            vals = np.zeros((n_live,), dtype=np.bool_)
+            vals = np.zeros((last - first,), dtype=np.bool_)
         else:
             vals = conn_columns[spec.name][sub]
-        live_part = np.asarray(vals).astype(spec.dtype)
-    else:
-        live_part = np.empty((0,), dtype=spec.dtype)
-    dead_part = np.full((n_dead,), spec.default, dtype=spec.dtype)
-    return np.concatenate([live_part, dead_part])
+        column[at] = np.asarray(vals).astype(spec.dtype)
+    return column
 
 
 class NetworkBuilder[GS]:
@@ -190,6 +213,7 @@ class NetworkBuilder[GS]:
         capacity_headroom: float = 0.0,
         capacity_align: int | None = None,
         sharding: ShardSpec | None = None,
+        blocks: Sequence[BlockSpan] | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Build arenas from whole edge-column arrays, no per-edge Python.
 
@@ -245,6 +269,15 @@ class NetworkBuilder[GS]:
                 band per bucket and assembles a global ``jax.Array`` (conns
                 sharded, units/globals replicated), so no process ever holds the
                 full arena. None builds an ordinary single-device state.
+            blocks: The blocks the edges are made of, in the order of the
+                arrays, or None when they are not in blocks. Given, each
+                bucket is laid out block after block: a block's edges are
+                sorted by source and destination inside its own run of slots,
+                the run is as long as the block's capacity, and what is left
+                of the bucket is spare. ``capacity_headroom`` and the rounding
+                then apply to the sum of a bucket's runs, and
+                ``static.layout`` records the runs. None keeps one sort over
+                the whole bucket and records no layout.
 
         Returns:
             The finalized (NetworkStatic, NetworkState) pair.
@@ -254,7 +287,9 @@ class NetworkBuilder[GS]:
                 an unknown/non-settable ``extra_conn_columns`` or
                 ``extra_unit_columns`` key, a column of the wrong shape, a negative
                 ``capacity_headroom``, a bucket capacity not divisible by the
-                shard count, or a unit capacity below ``num_units``.
+                shard count, a unit capacity below ``num_units``, or ``blocks``
+                that do not add up to the edges or whose capacity cannot be
+                given (see `BlockSpan`).
         """
         builder = cls(net, globals_)
         src_arr = np.asarray(from_ids, dtype=np.int32)
@@ -324,6 +359,7 @@ class NetworkBuilder[GS]:
             capacity_headroom=capacity_headroom,
             capacity_align=capacity_align,
             sharding=sharding,
+            blocks=blocks,
         )
 
     def add_unit(self, **field_values: float | int | bool) -> int:
@@ -453,6 +489,7 @@ class NetworkBuilder[GS]:
         capacity_headroom: float = 0.0,
         capacity_align: int | None = None,
         sharding: ShardSpec | None = None,
+        blocks: Sequence[BlockSpan] | None = None,
     ) -> tuple[NetworkStatic, NetworkState[GS]]:
         """Bucket, sort, and pad whole edge columns into frozen arenas.
 
@@ -486,14 +523,19 @@ class NetworkBuilder[GS]:
             sharding: Scheme-A ShardSpec for per-shard distributed assembly, or
                 None to build a single-device state (falling back to
                 ``net.sharding``).
+            blocks: The blocks the edges are made of (see `from_edges`), or
+                None for one sort over each whole bucket and no layout.
 
         Returns:
             The (NetworkStatic, NetworkState) pair for the built network.
 
         Raises:
             ValueError: A referenced unit id or edge endpoint is out of range,
-                a bucket capacity is not divisible by the shard count, or the
-                unit capacity is below the built unit count.
+                a bucket capacity is not divisible by the shard count, the
+                unit capacity is below the built unit count, the blocks do not
+                add up to the edges, or a block's capacity is below its size
+                or is given to a block whose edges are in several buckets or
+                in none.
             NotImplementedError: The network declares `prune_unit` or
                 `add_unit` and is built sharded.
         """
@@ -590,9 +632,38 @@ class NetworkBuilder[GS]:
             deepest_grows = self.net.resolved().grow_conn is not None
             num_buckets = max(max_level + (1 if deepest_grows else 0), 1)
 
+        # With blocks, `idx` below is in input order and so already grouped by
+        # block; the ends of each block among the edges say where to cut it.
+        block_ends: np.ndarray | None = None
+        if blocks is not None:
+            block_ends = np.cumsum([0, *(span.size for span in blocks)])
+            if int(block_ends[-1]) != src_arr.size:
+                raise ValueError(
+                    f"from_edges: the blocks hold {int(block_ends[-1])} edges and "
+                    f"{src_arr.size} were given"
+                )
+            for b, span in enumerate(blocks):
+                if span.capacity is None:
+                    continue
+                if span.capacity < span.size:
+                    raise ValueError(
+                        f"from_edges: block {b} has {span.size} edges and a "
+                        f"capacity of {span.capacity}"
+                    )
+                of_block = bucket_of_conn[block_ends[b] : block_ends[b + 1]]
+                in_buckets = np.unique(of_block).size
+                if in_buckets != 1:
+                    raise ValueError(
+                        f"from_edges: block {b} is given a capacity and its edges "
+                        f"are in {in_buckets} buckets; a capacity is the size of "
+                        f"one run of slots, so the block must be in exactly one"
+                    )
+        runs: list[list[Run]] = [[] for _ in blocks or ()]
+        spare: list[tuple[int, int]] = []
+
         conns: list[Columns] = []
         level_capacities: list[int] = []
-        live_total = 0
+        used_total = 0
         for level_idx in range(num_buckets):
             idx = np.flatnonzero(bucket_of_conn == level_idx)
             # Source-major order (ties by destination). Consecutive edges then
@@ -603,13 +674,34 @@ class NetworkBuilder[GS]:
             # np.lexsort's two passes at 25M edges; stable keeps parallel
             # edges in insertion order, so the build stays deterministic.
             key = src_arr[idx].astype(np.int64) * num_units + dst_arr[idx]
-            order = idx[np.argsort(key, kind="stable")]
+            slots: np.ndarray | None = None
+            if blocks is None or block_ends is None:
+                order = idx[np.argsort(key, kind="stable")]
+                used = int(order.size)
+            else:
+                # One run per block that has edges here, in block order; the
+                # same sort, inside each run.
+                cuts = np.searchsorted(idx, block_ends)
+                ordered: list[np.ndarray] = []
+                placed: list[np.ndarray] = []
+                used = 0
+                for b, span in enumerate(blocks):
+                    lo, hi = int(cuts[b]), int(cuts[b + 1])
+                    if hi == lo:
+                        continue
+                    length = hi - lo if span.capacity is None else span.capacity
+                    ordered.append(idx[lo:hi][np.argsort(key[lo:hi], kind="stable")])
+                    placed.append(used + np.arange(hi - lo))
+                    runs[b].append(Run(level_idx, used, used + length))
+                    used += length
+                order = np.concatenate([idx[:0], *ordered])
+                slots = np.concatenate([np.zeros(0, np.int64), *placed])
             del key
-            live = int(order.size)
-            live_total += live
+            used_total += used
             capacity = topo.capacity_policy(
-                live, headroom=capacity_headroom, align=capacity_align
+                used, headroom=capacity_headroom, align=capacity_align
             )
+            spare.append((used, capacity))
 
             # Materialise only this process's addressable band when sharded, so
             # no process holds the whole padded column; the full [0, capacity)
@@ -629,7 +721,7 @@ class NetworkBuilder[GS]:
                 window = _window_column(
                     spec,
                     order,
-                    live,
+                    slots,
                     window_lo,
                     window_hi,
                     src_arr,
@@ -644,9 +736,9 @@ class NetworkBuilder[GS]:
             conns.append(cols)
             level_capacities.append(capacity)
 
-        # PIPELINE's single bucket holds every live edge first, so its
-        # never-used tail starts right after them.
-        tail = live_total if self.net.propagation is Propagation.PIPELINE else 0
+        # PIPELINE's single bucket holds every live edge first (or, with
+        # blocks, every run), so its never-used tail starts right after them.
+        tail = used_total if self.net.propagation is Propagation.PIPELINE else 0
         if repl_sharding is None:
             globals_out: GS = self.globals_
             needs_resort = jnp.bool_(False)
@@ -676,6 +768,15 @@ class NetworkBuilder[GS]:
             capacity_align=capacity_align,
             seed=self.net.seed,
             deepest_grows=deepest_grows,
+            layout=(
+                None
+                if blocks is None
+                else Layout(
+                    unit_runs=(),
+                    conn_runs=tuple(tuple(of_block) for of_block in runs),
+                    spare=tuple(spare),
+                )
+            ),
         )
         state = NetworkState(
             units=unit_cols,

@@ -154,6 +154,13 @@ class Network[GS]:
             apply and by connection growth, and keeps its field defaults.
             Input and output units are always built units and are never
             pruned.
+        capacity_headroom: extra room for connections in every bucket of a
+            network built from its topology, beyond what its layers are given,
+            as a fraction of that: 0.0 (the default) for none, 1.0 for as much
+            again. It belongs to no layer.
+        capacity_align: the number of connection slots a bucket's capacity is
+            rounded up to a multiple of, for a network built from its
+            topology. A power of two; 1024 by default.
         max_levels: the unit-level bound: a child unit's level is clamped to
             ``[1, max_levels - 1]``. Default 1024, the C++ library's bound.
         batch_reduction: how a batched step combines the per-sample unit
@@ -183,6 +190,8 @@ class Network[GS]:
     seed: int = 0
     structural_interval: int = 1
     unit_capacity: int | None = None
+    capacity_headroom: float = 0.0
+    capacity_align: int = 1024
     max_levels: int = 1024
     batch_reduction: BatchReductionPolicy | None = None
 
@@ -287,6 +296,30 @@ class Network[GS]:
                 f"the topology of {name} returns {len(record.outputs)} handles; "
                 f"only one is supported so far"
             )
+        # Read as objects: a subclass may have set anything.
+        headroom: object = cls.capacity_headroom
+        align: object = cls.capacity_align
+        if isinstance(headroom, bool) or not isinstance(headroom, int | float):
+            raise BuildError(
+                f"{name}.capacity_headroom is a fraction of extra room, a number "
+                f"of at least 0; got {headroom!r}"
+            )
+        if headroom < 0:
+            raise BuildError(
+                f"{name}.capacity_headroom is a fraction of extra room and cannot "
+                f"be negative; got {headroom!r}"
+            )
+        if (
+            isinstance(align, bool)
+            or not isinstance(align, int)
+            or align < 1
+            or align & (align - 1)
+        ):
+            raise BuildError(
+                f"{name}.capacity_align is the number of slots a bucket is "
+                f"rounded up to a multiple of, a power of two such as 1024; got "
+                f"{align!r}"
+            )
         on_device = cls._globals_on_device(globals)
         table = resolve(cls, record)
         # What can be fixed is reported before what cannot be run yet.
@@ -299,7 +332,14 @@ class Network[GS]:
                 + f"\n\n`{name}.faults()` returns these as a list."
             )
         _refuse_layer_policies(cls, table)
-        return materialize(record, cls, key, globals_=on_device)
+        return materialize(
+            record,
+            cls,
+            key,
+            globals_=on_device,
+            capacity_headroom=float(headroom),
+            capacity_align=align,
+        )
 
     @classmethod
     def faults(cls) -> list[Fault]:

@@ -17,6 +17,48 @@ from jaxtyping import Array, Bool, Int32
 from plastax._types import PRUNED, FieldSpec, Propagation, ShardSpec
 
 
+@dataclasses.dataclass(frozen=True)
+class Run:
+    """The slots one block of connections occupies in one bucket.
+
+    Attributes:
+        bucket: The bucket.
+        start: The first slot of the run.
+        stop: One past its last slot. The run is as long as the block's
+            capacity in this bucket; slots past the block's connections are
+            dead.
+    """
+
+    bucket: int
+    start: int
+    stop: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Layout:
+    """Where each block of a network built from a topology is stored.
+
+    A block of units is a run of consecutive unit ids. A block of connections is
+    one run of slots in each bucket it has sources in, and the runs of a bucket
+    follow one another in the order the blocks were written. What is left of a
+    bucket after its runs is spare and belongs to no block. Whether an element
+    is in a block is then a comparison with two integers that are known when a
+    step is compiled.
+
+    Attributes:
+        unit_runs: For each block of units, in the order of the build record,
+            its unit ids as `(start, stop)`. Input units are in no block.
+        conn_runs: For each block of connections, in the order of the build
+            record, its runs, one per bucket it has sources in, by ascending
+            bucket. Empty for a block with no connections.
+        spare: For each bucket, its spare slots as `(start, stop)`.
+    """
+
+    unit_runs: tuple[tuple[int, int], ...]
+    conn_runs: tuple[tuple[Run, ...], ...]
+    spare: tuple[tuple[int, int], ...]
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class NetworkStatic:
@@ -55,6 +97,10 @@ class NetworkStatic:
         output_shape: the same for a step's targets and for the outputs it
             returns, over `output_ids`. None for the flat
             `(len(output_ids),)` vector.
+        layout: where each block is stored, for a network built from a
+            topology that does not grow connections of its own. None otherwise:
+            a network built from edge arrays has no blocks, and growth between
+            arbitrary units moves connections out of their runs.
     """
 
     num_units: int = dataclasses.field(metadata=dict(static=True))
@@ -86,6 +132,7 @@ class NetworkStatic:
     output_shape: tuple[int, ...] | None = dataclasses.field(
         default=None, metadata=dict(static=True)
     )
+    layout: Layout | None = dataclasses.field(default=None, metadata=dict(static=True))
 
 
 Columns = dict[str, Array]  # keyed by FieldSpec.name; one array per SOA tag

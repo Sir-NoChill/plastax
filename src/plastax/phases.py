@@ -205,9 +205,9 @@ def build_phases[GS](
         phases = [_build_forward_phase(net, static)]
     if net.loss is not None:
         phases.append(_build_loss_phase(net, static))
-    if net.backward is not None:
-        phases.append(_build_backward_phase(net, static))
     scopes = phase_scopes(net, static)
+    if scopes.backward_unit is not None:
+        phases.append(_build_backward_phase(net, static))
     if scopes.update_unit is not None:
         phases.append(build_update_unit_phase(net, static))
     if scopes.update_conn is not None:
@@ -300,21 +300,21 @@ def build_batched_phases[GS](
     """
     forward = _build_forward_phase(net, static)
     loss = _build_loss_phase(net, static) if net.loss is not None else None
-    backward = _build_backward_phase(net, static) if net.backward is not None else None
     scopes = phase_scopes(net, static)
+    backward = (
+        _build_backward_phase(net, static) if scopes.backward_unit is not None else None
+    )
     update_unit = (
         build_update_unit_phase(net, static) if scopes.update_unit is not None else None
     )
     csr_forward = (
         build_csr_forward(net, static, engine=engine)
-        if engine is not None and linear_input_field(*net.forward.halves()) is not None
+        if engine is not None and _linear(scopes.forward_conn, scopes.forward_unit)
         else None
     )
     csr_backward = (
         build_csr_backward(net, static, engine=engine)
-        if engine is not None
-        and net.backward is not None
-        and linear_input_field(*net.backward.halves()) is not None
+        if engine is not None and _linear(scopes.backward_conn, scopes.backward_unit)
         else None
     )
     structural: list[Phase[GS]] = []
@@ -421,7 +421,7 @@ def per_sample_written_fields[GS](
     ]
     if net.loss is not None:
         phases.append(("loss", _build_loss_phase(net, static)))
-    if net.backward is not None:
+    if phase_scopes(net, static).backward_unit is not None:
         phases.append(("backward_pass", _build_backward_phase(net, static)))
     if phase_scopes(net, static).update_unit is not None:
         phases.append(("update_unit", build_update_unit_phase(net, static)))
@@ -941,6 +941,79 @@ def _shard_sum(static: NetworkStatic) -> Callable[[jax.Array], jax.Array]:
     return lambda x: monoid.sum_.collective(x, axis)
 
 
+def _linear(conn: Any, unit: Any) -> bool:
+    """Whether a pass, given as its two scopes, can run as a sparse product.
+
+    Args:
+        conn: the pass's connection scope (`ConnScope`), or None.
+        unit: its unit scope (`UnitScope`), or None.
+
+    Returns:
+        True when both halves exist and declare a linear input.
+    """
+    if conn is None or unit is None:
+        return False
+    return linear_input_field(conn.policy, unit.policy) is not None
+
+
+def _scope_mask(
+    spans: tuple[Span, ...] | None, num_units: int
+) -> Bool[Array, " num_units"] | None:
+    """The units of a unit scope as a mask, or None for every unit.
+
+    Args:
+        spans: the scope's runs of unit ids (`UnitScope.spans`).
+        num_units: total unit count.
+
+    Returns:
+        A static boolean mask, True inside the runs; None when `spans` is None.
+    """
+    if spans is None:
+        return None
+    mask = np.zeros((num_units,), np.bool_)
+    for start, stop in spans:
+        mask[start:stop] = True
+    return jnp.asarray(mask)
+
+
+def _product_over(
+    product: Callable[..., jax.Array],
+    bucket: Columns,
+    x: jax.Array,
+    runs: tuple[Span, ...],
+    *,
+    rows: FieldSpec[Any],
+    cols: FieldSpec[Any],
+) -> jax.Array | None:
+    """A bucket's sparse product over the runs of slots that send.
+
+    The product is linear and gives no policy an index, so a run is handed to
+    it as a smaller bucket: the slice of every column.
+
+    Args:
+        product: a `bucket_product`.
+        bucket: the bucket's columns.
+        x: `(num_units, batch)` input values.
+        runs: the runs of slots (`_bucket_spans`).
+        rows: the accumulation target column.
+        cols: the other endpoint's column.
+
+    Returns:
+        The `(num_units, batch)` product summed over the runs, or None for a
+        bucket with no run, which then traces nothing.
+    """
+    total: jax.Array | None = None
+    for span in runs:
+        part = product(
+            {name: cut(column, span) for name, column in bucket.items()},
+            x,
+            rows=rows,
+            cols=cols,
+        )
+        total = part if total is None else total + part
+    return total
+
+
 def bucket_product(
     engine: str, num_units: int
 ) -> Callable[..., Float[Array, "num_units batch"]]:
@@ -992,12 +1065,18 @@ def build_csr_forward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the forward.
     """
-    fc, fu = net.forward.halves()
+    scopes = phase_scopes(net, static)
+    sends, reduces = scopes.forward_conn, scopes.forward_unit
+    assert sends is not None and reduces is not None  # only built for a linear forward
+    fc, fu = sends.policy, reduces.policy
     field = linear_input_field(fc, fu)
     assert field is not None  # only built for a linear forward
     num_units = static.num_units
     apply = build_forward_apply(fu, num_units=num_units)
-    not_input = ~unit_id_mask(static.input_ids, num_units)
+    written = ~unit_id_mask(static.input_ids, num_units)
+    in_scope = _scope_mask(reduces.spans, num_units)
+    if in_scope is not None:
+        written = written & in_scope
     reduce_shards = _shard_sum(static)
     product = bucket_product(engine, num_units)
 
@@ -1007,8 +1086,17 @@ def build_csr_forward[GS](
         acc = jnp.zeros((batch, num_units), jnp.float32)
         for level_idx, bucket in enumerate(state.conns):
             x = units_b[field.name].T
-            acc = acc + reduce_shards(product(bucket, x, rows=TO_ID, cols=FROM_ID).T)
-            finalize = (level == level_idx + 1) & not_input
+            sent = _product_over(
+                product,
+                bucket,
+                x,
+                _bucket_spans(sends.spans, level_idx, bucket),
+                rows=TO_ID,
+                cols=FROM_ID,
+            )
+            if sent is not None:
+                acc = acc + reduce_shards(sent.T)
+            finalize = (level == level_idx + 1) & written
             units_b, acc = jax.vmap(apply, in_axes=(0, 0, None, None))(
                 units_b, acc, state.globals_, finalize
             )
@@ -1037,15 +1125,19 @@ def build_csr_backward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the backward.
     """
-    declared = net.backward
-    assert declared is not None  # only built when the net has one
-    bc, bu = declared.halves()
+    scopes = phase_scopes(net, static)
+    sends, reduces = scopes.backward_conn, scopes.backward_unit
+    assert sends is not None and reduces is not None  # only built when linear
+    bc, bu = sends.policy, reduces.policy
     field = linear_input_field(bc, bu)
     assert field is not None  # only built when linear
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     apply = build_backward_apply(bu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
+    in_scope = _scope_mask(reduces.spans, num_units)
+    if in_scope is not None:
+        not_input = not_input & in_scope
     vapply = jax.vmap(apply, in_axes=(0, 0, None, None))
     reduce_shards = _shard_sum(static)
     product = bucket_product(engine, num_units)
@@ -1060,7 +1152,16 @@ def build_csr_backward[GS](
         for level_idx in range(num_levels - 1, 0, -1):
             x = units_b[field.name].T
             bucket = state.conns[level_idx]
-            acc = acc + reduce_shards(product(bucket, x, rows=FROM_ID, cols=TO_ID).T)
+            sent = _product_over(
+                product,
+                bucket,
+                x,
+                _bucket_spans(sends.spans, level_idx, bucket),
+                rows=FROM_ID,
+                cols=TO_ID,
+            )
+            if sent is not None:
+                acc = acc + reduce_shards(sent.T)
             finalize = (level == level_idx) & not_input
             units_b, acc = vapply(units_b, acc, state.globals_, finalize)
         return units_b
@@ -1083,19 +1184,27 @@ def _build_forward_phase[GS](
         # prune (a tombstone's null target) and add (a new edge in any dead
         # slot) would break any order anyway; a violated hint is undefined
         # in XLA.
+        scopes = phase_scopes(net, static)
+        sends, reduces = scopes.forward_conn, scopes.forward_unit
+        assert sends is not None and reduces is not None  # a network has both
         sweep = build_forward_sweep(
-            *net.forward.halves(),
+            sends.policy,
+            reduces.policy,
             num_units=static.num_units,
             indices_are_sorted=False,
             input_ids=static.input_ids,
             shard_axis=_shard_axis(static),
         )
+        runs = None if sends.spans is None else sends.spans[0]
+        in_scope = _scope_mask(reduces.spans, static.num_units)
 
         def forward_phase(
             state: NetworkState[GS], inputs: StepInputs
         ) -> tuple[NetworkState[GS], Float[Array, ""]]:
             del inputs
-            new_units = sweep(state.units, state.conns[0], state.globals_)
+            new_units = sweep(
+                state.units, state.conns[0], state.globals_, runs, in_scope
+            )
             return dataclasses.replace(state, units=new_units), jnp.float32(0.0)
 
         return forward_phase
@@ -1122,7 +1231,10 @@ def _build_forward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    fc, fu = net.forward.halves()
+    scopes = phase_scopes(net, static)
+    sends, reduces = scopes.forward_conn, scopes.forward_unit
+    assert sends is not None and reduces is not None  # a network has both
+    fc, fu = sends.policy, reduces.policy
     # Not indices_are_sorted, for the same reason as the pipeline forward.
     accumulate = build_forward_accumulate(
         fc,
@@ -1133,6 +1245,11 @@ def _build_forward_topological_phase[GS](
     )
     apply = build_forward_apply(fu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
+    # A unit with no forward half is never written and keeps its activation.
+    in_scope = _scope_mask(reduces.spans, num_units)
+    if in_scope is not None:
+        not_input = not_input & in_scope
+    spans = sends.spans
 
     def forward_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -1142,7 +1259,14 @@ def _build_forward_topological_phase[GS](
         unit_level = units[LEVEL.name]
         acc = identity_accumulator(fu.combine, num_units)
         for level_idx in range(num_levels):
-            acc = accumulate(units, state.conns[level_idx], acc, state.globals_)
+            bucket = state.conns[level_idx]
+            # Only the runs of the layers that send; a bucket with none is
+            # not read.
+            runs = _bucket_spans(spans, level_idx, bucket)
+            if runs:
+                acc = accumulate(
+                    units, bucket, acc, state.globals_, None if spans is None else runs
+                )
             finalize = (unit_level == level_idx + 1) & not_input
             units, acc = apply(units, acc, state.globals_, finalize)
         return dataclasses.replace(state, units=units), jnp.float32(0.0)
@@ -1153,29 +1277,36 @@ def _build_forward_topological_phase[GS](
 def _build_backward_phase[GS](
     net: type[Network[GS]], static: NetworkStatic
 ) -> Phase[GS]:
-    backward = net.backward
-    assert backward is not None  # only built when the net has one
-    bc, bu = backward.halves()
-
     if net.propagation is Propagation.PIPELINE:
+        scopes = phase_scopes(net, static)
+        sends, reduces = scopes.backward_conn, scopes.backward_unit
+        assert reduces is not None  # only built when some unit has a backward half
+        bu = reduces.policy
         # No level structure, one flat bucket, every unit Applied
         # unconditionally (build_backward_sweep takes no input_ids -- see
         # its docstring). indices_are_sorted=False: backward indexes
         # segments by FROM_ID, and although buckets start source-major,
         # dead slots' null targets and in-place adds break that order.
         sweep = build_backward_sweep(
-            bc,
+            # With no connection that sends back, the map is never called.
+            bu if sends is None else sends.policy,
             bu,
             num_units=static.num_units,
             indices_are_sorted=False,
             shard_axis=_shard_axis(static),
         )
+        runs: tuple[Span, ...] | None = (
+            () if sends is None else None if sends.spans is None else sends.spans[0]
+        )
+        in_scope = _scope_mask(reduces.spans, static.num_units)
 
         def backward_phase(
             state: NetworkState[GS], inputs: StepInputs
         ) -> tuple[NetworkState[GS], Float[Array, ""]]:
             del inputs
-            new_units = sweep(state.units, state.conns[0], state.globals_)
+            new_units = sweep(
+                state.units, state.conns[0], state.globals_, runs, in_scope
+            )
             return dataclasses.replace(state, units=new_units), jnp.float32(0.0)
 
         return backward_phase
@@ -1212,18 +1343,30 @@ def _build_backward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    backward = net.backward
-    assert backward is not None  # only built when the net has one
-    bc, bu = backward.halves()
-    accumulate = build_backward_accumulate(
-        bc,
-        bu,
-        num_units=num_units,
-        indices_are_sorted=False,
-        shard_axis=_shard_axis(static),
+    scopes = phase_scopes(net, static)
+    sends, reduces = scopes.backward_conn, scopes.backward_unit
+    assert reduces is not None  # only built when some unit has a backward half
+    bu = reduces.policy
+    # With no connection that sends back, nothing is accumulated: each unit is
+    # handed the identity of its accumulator.
+    accumulate = (
+        None
+        if sends is None
+        else build_backward_accumulate(
+            sends.policy,
+            bu,
+            num_units=num_units,
+            indices_are_sorted=False,
+            shard_axis=_shard_axis(static),
+        )
     )
     apply = build_backward_apply(bu, num_units=num_units)
     not_input = ~unit_id_mask(static.input_ids, num_units)
+    # A unit with no backward half is never written.
+    in_scope = _scope_mask(reduces.spans, num_units)
+    if in_scope is not None:
+        not_input = not_input & in_scope
+    spans = None if sends is None else sends.spans
 
     def backward_phase(
         state: NetworkState[GS], inputs: StepInputs
@@ -1235,7 +1378,13 @@ def _build_backward_topological_phase[GS](
         finalize = (unit_level == num_levels) & not_input
         units, acc = apply(units, acc, state.globals_, finalize)
         for level_idx in range(num_levels - 1, 0, -1):
-            acc = accumulate(units, state.conns[level_idx], acc, state.globals_)
+            bucket = state.conns[level_idx]
+            # Only the runs of the layers that send back to units that reduce.
+            runs = _bucket_spans(spans, level_idx, bucket)
+            if accumulate is not None and runs:
+                acc = accumulate(
+                    units, bucket, acc, state.globals_, None if spans is None else runs
+                )
             finalize = (unit_level == level_idx) & not_input
             units, acc = apply(units, acc, state.globals_, finalize)
         return dataclasses.replace(state, units=units), jnp.float32(0.0)

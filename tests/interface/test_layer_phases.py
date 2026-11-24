@@ -1,8 +1,8 @@
-"""A phase that applies to some layers only: update and prune.
+"""A phase that applies to some layers only: forward, backward, update and prune.
 
-Plan `plans/20261123T215119Z-layer-policies-stage3.md` (workspace root), part 3. In
-each phase every element has one policy or none; the phase is computed for the
-elements that have it. Each test reads a block's connections or units through
+Plan `plans/20261123T215119Z-layer-policies-stage3.md` (workspace root), parts 3 and
+4. In each phase every element has one policy or none; the phase is computed for
+the elements that have it. Each test reads a block's connections or units through
 `static.layout`, and no test asserts a literal id or slot.
 """
 
@@ -387,31 +387,253 @@ def test_the_same_update_on_the_network_and_on_a_layer_is_one_policy() -> None:
     assert phase_scopes(net, Built(net).static).whole
 
 
-@pytest.mark.parametrize(
-    ("keywords", "reason"),
-    [
-        ({"backward": None}, "backward pass of its own"),
-        ({"forward": None}, "forward pass of its own"),
-    ],
-)
-def test_a_layers_own_pass_is_refused(keywords: dict[str, Any], reason: str) -> None:
-    class Back(px.policies.BackwardConnPolicy, px.policies.BackwardUnitPolicy):
-        combine = px.monoid.sum_
-
-        def map(self, u: Any, src: Any, dst: Any, c: Any, cid: Any, g: Any) -> Any:
-            return c[px.WEIGHT, cid] * u[SEEN, dst]
-
-        def apply(self, u: Any, i: Any, g: Any, acc: Any) -> px.UnitWrite:
-            return px.UnitWrite.of((SEEN, acc))
-
-    net = network(three_layers(**keywords), backward=Back())
-
-    with pytest.raises(BuildError, match=reason):
-        net.build(KEY)
-
-
 def test_unit_pruning_on_a_layer_needs_a_unit_capacity() -> None:
     net = network(three_layers(prune=px.policies.Prune(unit=Every())))
 
     with pytest.raises(BuildError, match=r"(?s)middle\.units.*unit_capacity"):
         net.build(KEY)
+
+
+# --------------------------------------------------------------------------- #
+# The backward pass on some layers
+# --------------------------------------------------------------------------- #
+# A linear network, inputs -> first -> middle -> head, with no bias and squared error.
+# Its gradients are written out below as `jax.grad` gives them.
+GRAD = px.FieldSpec("grad", np.float32, 0.0)
+SEED = px.FieldSpec("seed", np.float32, 0.0)
+W1 = np.random.default_rng(1).normal(size=(4, 5)).astype(np.float32)
+W2 = np.random.default_rng(2).normal(size=(3, 4)).astype(np.float32)
+W3 = np.random.default_rng(3).normal(size=(2, 3)).astype(np.float32)
+TARGET = jnp.asarray([0.5, -1.0], jnp.float32)
+
+
+class LinearForward(WeightedSum):
+    linear_input = px.ACTIVATION  # `map` is weight * activation: one sparse product
+
+
+class SendGrad(px.policies.BackwardConnPolicy):
+    linear_input = GRAD
+
+    def map(
+        self,
+        u: px.UnitView,
+        src: px.UnitIdx,
+        dst: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> jax.Array:
+        return c[px.WEIGHT, cid] * u[GRAD, dst]
+
+
+class KeepGrad(px.policies.BackwardUnitPolicy):
+    combine = px.monoid.sum_
+
+    def apply(
+        self, u: px.UnitView, i: px.UnitIdx, g: None, acc: jax.Array
+    ) -> px.UnitWrite:
+        return px.UnitWrite.of((GRAD, acc + u[SEED, i]))
+
+
+class SquaredError(px.policies.LossPolicy):
+    seed_field = SEED
+
+    def calculate_loss(
+        self, u: px.UnitView, outputs: jax.Array, targets: jax.Array, g: None
+    ) -> tuple[jax.Array, jax.Array]:
+        diff = u.gather(px.ACTIVATION, outputs) - targets
+        return 0.5 * jnp.sum(diff * diff), diff
+
+
+_send, _keep = SendGrad(), KeepGrad()
+BACKWARD = px.policies.Backward(conn=_send, unit=_keep)
+
+
+def linear(network_backward: Any = BACKWARD, **middle: Any) -> type[px.Network[None]]:
+    class Linear(pxl.Module):
+        def setup(self) -> None:
+            self.first = Dense(4, bias=False, init=px.init.array(W1))
+            self.middle = Dense(3, bias=False, init=px.init.array(W2), **middle)
+            self.head = Dense(2, bias=False, init=px.init.array(W3))
+
+        def __call__(self, x: Units) -> Units:
+            return self.head(self.middle(self.first(x)))
+
+    return network(
+        Linear(),
+        forward=px.policies.Forward(conn=LinearForward(), unit=Summed()),
+        backward=network_backward,
+        loss=SquaredError(),
+        extra_unit_fields=(GRAD, SEED, SEEN),
+    )
+
+
+def gradients() -> dict[str, np.ndarray]:
+    """dL/d(activation) of each layer's units, for the whole network trained."""
+
+    def loss(h1: jax.Array, h2: jax.Array, y: jax.Array) -> jax.Array:
+        # Each layer's output with a zero added, so its gradient can be asked for.
+        a1 = W1 @ X + h1
+        a2 = W2 @ a1 + h2
+        return 0.5 * jnp.sum((W3 @ a2 + y - TARGET) ** 2)
+
+    zeros = (jnp.zeros(4), jnp.zeros(3), jnp.zeros(2))
+    g1, g2, g3 = jax.grad(loss, argnums=(0, 1, 2))(*zeros)
+    return {"first": np.asarray(g1), "middle": np.asarray(g2), "head": np.asarray(g3)}
+
+
+def backward_step(
+    net: type[px.Network[None]], batch: int | None, layout: str = "auto"
+) -> Built:
+    built = Built(net)
+    step = px.make_step(net, built.static, batch_size=batch, layout=layout)
+    x = X if batch is None else jnp.stack([X] * batch)
+    t = TARGET if batch is None else jnp.stack([TARGET] * batch)
+    built.state = step(built.state, px.StepInputs(inputs=x, targets=t)).state
+    return built
+
+
+WAYS = [(None, "auto"), (2, "edge_list"), (2, "triton")]  # triton: the XLA product here
+
+
+@pytest.mark.parametrize(("batch", "layout"), WAYS)
+def test_the_whole_network_has_the_gradients_of_jax_grad(
+    batch: int | None, layout: str
+) -> None:
+    built = backward_step(linear(), batch, layout)
+
+    for layer, expected in gradients().items():
+        np.testing.assert_allclose(
+            built.units(layer, "units", column="grad"), expected, rtol=1e-5
+        )
+
+
+@pytest.mark.parametrize(("batch", "layout"), WAYS)
+def test_a_layer_with_no_backward_pass_stops_the_gradient(
+    batch: int | None, layout: str
+) -> None:
+    built = backward_step(linear(backward=None), batch, layout)
+    expected = gradients()
+
+    # The head is trained as before; the middle is written nothing; and the first
+    # layer receives nothing, because the middle's connections send nothing back.
+    np.testing.assert_allclose(
+        built.units("head", "units", column="grad"), expected["head"], rtol=1e-5
+    )
+    np.testing.assert_array_equal(built.units("middle", "units", column="grad"), 0.0)
+    np.testing.assert_array_equal(built.units("first", "units", column="grad"), 0.0)
+
+
+@pytest.mark.parametrize(("batch", "layout"), WAYS)
+def test_a_layer_with_no_update_still_passes_the_gradient_through(
+    batch: int | None, layout: str
+) -> None:
+    built = backward_step(linear(update=None), batch, layout)
+
+    for layer, expected in gradients().items():
+        np.testing.assert_allclose(
+            built.units(layer, "units", column="grad"), expected, rtol=1e-5
+        )
+
+
+def test_connections_into_units_with_no_backward_half_are_left_out() -> None:
+    """The head sends back to the middle's units, which reduce nothing."""
+    net = linear(backward=None)
+    built = Built(net)
+    scope = phase_scopes(net, built.static).backward_conn
+
+    assert scope is not None and scope.spans is not None
+    runs = {
+        (run.bucket, run.start, run.stop)
+        for path in (("first", "weight"),)
+        for run in built.layout.conn_runs[built.table.conn_paths.index(path)]
+    }
+    spans = {
+        (bucket, start, stop)
+        for bucket, of_bucket in enumerate(scope.spans)
+        for start, stop in of_bucket
+    }
+    # Not the middle's own connections (they have no backward half), and not the
+    # head's (their sources are the middle's units).
+    assert spans == runs
+
+
+@pytest.mark.parametrize(("batch", "layout"), WAYS)
+def test_a_backward_pass_given_to_one_layer_alone_writes_its_units_alone(
+    batch: int | None, layout: str
+) -> None:
+    net = linear(network_backward=None, backward=BACKWARD)
+    built = backward_step(net, batch, layout)
+
+    # The middle's units are handed nothing (the head sends nothing back) and have
+    # no seed, so they are written zero; no other unit is written at all.
+    assert phase_scopes(net, built.static).backward_unit is not None
+    np.testing.assert_array_equal(np.asarray(built.state.units["grad"]), 0.0)
+
+
+def test_a_different_backward_pass_on_one_layer_is_refused() -> None:
+    other = px.policies.Backward(conn=SendGrad(), unit=_keep)
+
+    with pytest.raises(BuildError) as refused:
+        linear(backward=other).build(KEY)
+
+    message = str(refused.value)
+    assert "middle.weight  (connections)" in message
+    assert "backward" in message and "the network has SendGrad" in message
+    assert "Two different policies in one phase" in message
+
+
+# --------------------------------------------------------------------------- #
+# The forward pass on some layers
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(("batch", "layout"), WAYS)
+def test_units_with_no_forward_half_keep_their_value(
+    batch: int | None, layout: str
+) -> None:
+    """Units nothing computes: they hold what they were built with, here zero."""
+    net = linear(forward=px.policies.Forward(unit=None))
+    built = backward_step(net, batch, layout)
+
+    np.testing.assert_array_equal(
+        built.units("middle", "units", column="activation"), 0.0
+    )
+    np.testing.assert_allclose(
+        built.units("first", "units", column="activation"), W1 @ X, rtol=1e-5
+    )
+    # The head reads the middle's units as they are.
+    np.testing.assert_array_equal(
+        built.units("head", "units", column="activation"), 0.0
+    )
+
+
+@pytest.mark.parametrize(("batch", "layout"), WAYS)
+def test_connections_with_no_forward_half_send_nothing_forward(
+    batch: int | None, layout: str
+) -> None:
+    """Connections used going backward only, as feedback weights are."""
+    net = linear(forward=px.policies.Forward(conn=None))
+    built = backward_step(net, batch, layout)
+    expected = gradients()
+
+    # Nothing arrives at the middle's units, so they are written the sum of nothing.
+    np.testing.assert_array_equal(
+        built.units("middle", "units", column="activation"), 0.0
+    )
+    # Going backward the same connections still carry the gradient to the first layer.
+    seed = -np.asarray(TARGET)  # the head's output is zero
+    np.testing.assert_allclose(
+        built.units("first", "units", column="grad"), W2.T @ (W3.T @ seed), rtol=1e-5
+    )
+    assert expected["head"].shape == seed.shape
+
+
+def test_connections_into_units_with_no_forward_half_are_left_out() -> None:
+    net = linear(forward=px.policies.Forward(unit=None))
+    built = Built(net)
+    scope = phase_scopes(net, built.static).forward_conn
+    (middle,) = built.layout.conn_runs[
+        built.table.conn_paths.index(("middle", "weight"))
+    ]
+
+    assert scope is not None and scope.spans is not None
+    assert (middle.start, middle.stop) not in scope.spans[middle.bucket]

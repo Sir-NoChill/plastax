@@ -57,10 +57,14 @@ from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 # the builders each shadow it with their own PEP 695 [GS] locally.
 GS = TypeVar("GS")
 
-# (units, bucket_conns, globals) -> updated units
-BucketSweep = Callable[[Columns, Columns, GS], Columns]
-# (units, bucket_conns, acc, globals) -> acc combined with this bucket's edges
-AccumulateFn = Callable[[Columns, Columns, Any, GS], Any]
+# (units, bucket_conns, globals, spans=None, in_scope=None) -> updated units.
+# `spans` are the runs of slots that send, None for the whole bucket; `in_scope`
+# masks the units that are written, None for all. Written with `...` because
+# the last two arguments are optional.
+BucketSweep = Callable[..., Columns]
+# (units, bucket_conns, acc, globals, spans=None) -> acc combined with the
+# edges of this bucket's spans; None for the whole bucket.
+AccumulateFn = Callable[..., Any]
 type FinalizeMask = Bool[Array, " num_units"]
 # (units, acc, globals, finalize_mask) -> (updated units, acc with finalized
 # units reset to identity)
@@ -126,7 +130,7 @@ def _accumulate_into[GS](
     target_col: FieldSpec[Any],
     other_col: FieldSpec[Any],
     shard_axis: str | None = None,
-) -> AccumulateFn[GS]:
+) -> AccumulateFn:
     """Fold one bucket's live edges into a carried-in per-unit accumulator.
 
     Shared by forward (target=TO_ID, other=FROM_ID) and backward
@@ -145,44 +149,65 @@ def _accumulate_into[GS](
     only its own edges; the per-shard partial is all-reduced with the
     monoid's collective before it is folded into the carried accumulator,
     making the result identical to the single-device reduction.
+
+    The returned function takes `spans`, the runs of slots whose edges send,
+    or None for the whole bucket. `map_fn` is called for the slots of the spans
+    only, with each connection's slot in the bucket as its `cid` and a view of
+    the whole bucket; each span is one segment reduction folded into `acc`.
     """
 
-    def accumulate(units: Columns, bucket_conns: Columns, acc: Any, g: GS) -> Any:
+    def accumulate(
+        units: Columns,
+        bucket_conns: Columns,
+        acc: Any,
+        g: GS,
+        spans: tuple[Span, ...] | None = None,
+    ) -> Any:
         u_view = UnitView(units)
         c_view = ConnView(bucket_conns)
         target_id = bucket_conns[target_col.name]
         other_id = bucket_conns[other_col.name]
         dead = bucket_conns[DEAD.name]
-        conn_ids = jnp.arange(target_id.shape[0])
 
         def per_edge(target: jax.Array, other: jax.Array, cid: jax.Array) -> Any:
             return map_fn(
                 u_view, UnitIdx(target), UnitIdx(other), c_view, ConnIdx(cid), g
             )
 
-        per_edge_acc = jax.vmap(per_edge)(target_id, other_id, conn_ids)
-
-        # Null-slot trick: a dead conn's target is pushed to num_units (one
-        # past the end), so segment_reduce's FILL_OR_DROP mode drops its
-        # contribution instead of a shape-changing masked gather.
-        null_target_id = jnp.where(dead, num_units, target_id)
-
-        def combine_leaf(
-            monoid: Monoid[Any], prev: jax.Array, data: jax.Array
-        ) -> jax.Array:
-            bucket_reduced = monoid.segment_reduce(
-                data, null_target_id, num_units, indices_are_sorted=indices_are_sorted
+        for span in ((0, target_id.shape[0]),) if spans is None else spans:
+            targets = cut(target_id, span)
+            per_edge_acc = jax.vmap(per_edge)(
+                targets, cut(other_id, span), jnp.arange(*span)
             )
-            if shard_axis is not None:
-                bucket_reduced = monoid.collective(bucket_reduced, shard_axis)
-            return monoid.combine_pairwise(prev, bucket_reduced)
 
-        # combine (Monoid leaves), acc, and per_edge_acc (Array leaves) share
-        # tree structure by the forward and backward unit policies' contract, so
-        # tree_map zips them leaf-by-leaf; a bare (non-container) Monoid is
-        # itself the sole leaf, so this also covers the common scalar-Acc
-        # case.
-        return jax.tree_util.tree_map(combine_leaf, combine, acc, per_edge_acc)
+            # Null-slot trick: a dead conn's target is pushed to num_units (one
+            # past the end), so segment_reduce's FILL_OR_DROP mode drops its
+            # contribution instead of a shape-changing masked gather.
+            null_target_id = jnp.where(cut(dead, span), num_units, targets)
+
+            def combine_leaf(
+                monoid: Monoid[Any],
+                prev: jax.Array,
+                data: jax.Array,
+                null_target_id: jax.Array = null_target_id,
+            ) -> jax.Array:
+                bucket_reduced = monoid.segment_reduce(
+                    data,
+                    null_target_id,
+                    num_units,
+                    indices_are_sorted=indices_are_sorted,
+                )
+                if shard_axis is not None:
+                    bucket_reduced = monoid.collective(bucket_reduced, shard_axis)
+                return monoid.combine_pairwise(prev, bucket_reduced)
+
+            # combine (Monoid leaves), acc, and per_edge_acc (Array leaves)
+            # share tree structure by the forward and backward unit policies'
+            # contract, so tree_map zips them leaf-by-leaf; a bare
+            # (non-container) Monoid is itself the sole leaf, so this also
+            # covers the common scalar-Acc case.
+            acc = jax.tree_util.tree_map(combine_leaf, combine, acc, per_edge_acc)
+        return acc
 
     return accumulate
 
@@ -244,7 +269,7 @@ def build_forward_accumulate[GS](
     num_units: int,
     indices_are_sorted: bool,
     shard_axis: str | None = None,
-) -> AccumulateFn[GS]:
+) -> AccumulateFn:
     """Build an accumulate step folding one bucket into a TO_ID accumulator.
 
     Type Args:
@@ -302,7 +327,7 @@ def build_forward_sweep[GS](
     indices_are_sorted: bool,
     input_ids: tuple[int, ...],
     shard_axis: str | None = None,
-) -> BucketSweep[GS]:
+) -> BucketSweep:
     """Build a one-shot forward sweep over a single bucket.
 
     Identity accumulator in, every non-input unit finalized -- pipeline
@@ -344,10 +369,17 @@ def build_forward_sweep[GS](
     apply = build_forward_apply(fu, num_units=num_units)
     is_input = unit_id_mask(input_ids, num_units)
 
-    def sweep(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
+    def sweep(
+        units: Columns,
+        bucket_conns: Columns,
+        g: GS,
+        spans: tuple[Span, ...] | None = None,
+        in_scope: jax.Array | None = None,
+    ) -> Columns:
         acc = identity_accumulator(fu.combine, num_units)
-        acc = accumulate(units, bucket_conns, acc, g)
-        new_units, _ = apply(units, acc, g, ~is_input)
+        acc = accumulate(units, bucket_conns, acc, g, spans)
+        finalize = ~is_input if in_scope is None else ~is_input & in_scope
+        new_units, _ = apply(units, acc, g, finalize)
         return new_units
 
     return sweep
@@ -360,7 +392,7 @@ def build_backward_accumulate[GS](
     num_units: int,
     indices_are_sorted: bool,
     shard_axis: str | None = None,
-) -> AccumulateFn[GS]:
+) -> AccumulateFn:
     """Build an accumulate step folding one bucket into a FROM_ID accumulator.
 
     Direction reversal versus forward: the accumulator target is the
@@ -421,7 +453,7 @@ def build_backward_sweep[GS](
     num_units: int,
     indices_are_sorted: bool,
     shard_axis: str | None = None,
-) -> BucketSweep[GS]:
+) -> BucketSweep:
     """Build a one-shot backward sweep over a single bucket.
 
     Accumulates into FROM_ID sources; apply runs on sources, one bucket
@@ -457,11 +489,19 @@ def build_backward_sweep[GS](
     )
     apply = build_backward_apply(bu, num_units=num_units)
 
-    def sweep(units: Columns, bucket_conns: Columns, g: GS) -> Columns:
+    def sweep(
+        units: Columns,
+        bucket_conns: Columns,
+        g: GS,
+        spans: tuple[Span, ...] | None = None,
+        in_scope: jax.Array | None = None,
+    ) -> Columns:
         acc = identity_accumulator(bu.combine, num_units)
-        acc = accumulate(units, bucket_conns, acc, g)
-        finalize_all = jnp.ones((num_units,), dtype=jnp.bool_)
-        new_units, _ = apply(units, acc, g, finalize_all)
+        acc = accumulate(units, bucket_conns, acc, g, spans)
+        finalize = jnp.ones((num_units,), dtype=jnp.bool_)
+        if in_scope is not None:
+            finalize = in_scope
+        new_units, _ = apply(units, acc, g, finalize)
         return new_units
 
     return sweep

@@ -371,12 +371,14 @@ def test_a_fault_is_reported_before_the_engine_refuses_layer_policies() -> None:
     wrong = px.policies.Update(unit=Writes((FLAG, jnp.float32(1.0))))
     sound = px.policies.Update(unit=Writes((FLAG, True)))
 
-    # A layer with no forward pass is something the engine cannot run yet.
+    # Two different unit updates in one network are something the engine cannot
+    # run yet.
+    other = px.policies.Update(unit=Writes((SEEN, 1.0)))
     with pytest.raises(pxl.BuildError, match="1 fault in its policies"):
-        network(two_layers(b={"update": wrong, "forward": None})).init(KEY)
+        network(two_layers(b={"update": wrong}), update=other).init(KEY)
     # With the fault fixed, what is left is that the engine cannot run it yet.
     with pytest.raises(pxl.BuildError, match="cannot be run yet"):
-        network(two_layers(b={"update": sound, "forward": None})).init(KEY)
+        network(two_layers(b={"update": sound}), update=other).init(KEY)
     # And a unit update on one layer alone is run.
     network(two_layers(b={"update": sound})).init(KEY)
 

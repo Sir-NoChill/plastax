@@ -282,7 +282,7 @@ class Network[GS]:
                 the topology does not take exactly one handle, if the policies
                 have a fault (see `faults`), if a layer differs from the
                 network in a way the engine cannot run yet (two policies in
-                one phase, a pass or growth of its own), or if the globals
+                one phase, growth of its own), or if the globals
                 are not a pytree of numbers and arrays. Also whatever `trace`
                 and `materialize` raise.
             NotImplementedError: if the topology returns more than one handle.
@@ -497,13 +497,14 @@ def _on_network[P](half: P | Inherit | None) -> P | None:
 def _refuse_layer_policies(cls: type[Network[Any]], table: PolicyTable) -> None:
     """Refuse to build a network whose layers differ from it in a way not run yet.
 
-    A layer may have its own update or pruning, or none, where at most one
-    policy is left in the phase: the engine then runs that policy on the
-    elements that have it. Everything else a layer can say is refused here, by
-    name, and not run with the wrong policies:
+    A layer may have its own forward pass, backward pass, update or pruning, or
+    none of one, where at most one policy is left in the phase: the engine
+    then runs that policy on the elements that have it. Everything else a
+    layer can say is refused here, by name, and not run with the wrong
+    policies:
 
-    - two different policies in one update or prune phase;
-    - a layer's own forward pass, backward pass or growth;
+    - two different policies in one phase;
+    - a layer's own growth;
     - any layer policy in a network that grows connections of its own;
     - unit pruning on a layer of a network with no `unit_capacity`.
 
@@ -524,14 +525,6 @@ def _refuse_layer_policies(cls: type[Network[Any]], table: PolicyTable) -> None:
         return
     name = cls.__name__
     waits = {
-        "forward": (
-            "A layer with a forward pass of its own, or with none, is not run "
-            "yet (layer policies, stage 4)."
-        ),
-        "backward": (
-            "A layer with a backward pass of its own, or with none, is not run "
-            "yet (layer policies, stage 3, part 4)."
-        ),
         "grow": (
             "Growth that belongs to one layer, or a layer left out of the "
             "network's growth, is not run yet (layer policies, stages 5 and 6)."

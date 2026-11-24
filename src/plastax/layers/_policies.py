@@ -103,7 +103,7 @@ _CONN_TRAITS: dict[str, tuple[tuple[type, ...], str]] = {
         "ScoreAddConnPolicy (score, init) or ProposeAddConnPolicy (propose, init)",
     ),
 }
-_PAIRS: dict[str, type] = {
+_PAIRS: dict[str, type[Any]] = {
     "forward": Forward,
     "backward": Backward,
     "update": Update,

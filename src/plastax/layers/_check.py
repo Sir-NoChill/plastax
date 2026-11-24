@@ -496,7 +496,7 @@ def _written(
     return faults
 
 
-def _describe_write(kind: type) -> Callable[[Any], Any]:
+def _describe_write(kind: type[Any]) -> Callable[[Any], Any]:
     """How a returned write is kept while the trace is open.
 
     Args:
@@ -550,7 +550,9 @@ def _writes(tracer: _Tracer, record: Record, table: PolicyTable) -> list[Fault]:
         where: str,
         policy: Any,
         method: str,
-        call: Callable[[UnitView, ConnView, Any, Any, Any], object],
+        # Called as `call(units, conns, g, index, extra)`. The callers bind the
+        # policy as a default argument, which mypy cannot match to five arguments.
+        call: Callable[..., object],
         kind: type,
         extra: Any = None,
     ) -> None:

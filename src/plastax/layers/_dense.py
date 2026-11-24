@@ -5,13 +5,26 @@ A helper written with the two primitives; it uses nothing a user could not.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from plastax import init as px_init
 from plastax.init import Initializer
 from plastax.layers._module import Module
+from plastax.layers._policies import Given, split_pairs
 from plastax.layers._primitives import CreateConnections, CreateUnits
 from plastax.layers._units import ShapeError, Units
+from plastax.policies import (
+    INHERIT,
+    Backward,
+    BackwardConnPolicy,
+    Forward,
+    ForwardConnPolicy,
+    Grow,
+    Prune,
+    Update,
+)
 
 
 class Dense(Module):
@@ -39,9 +52,24 @@ class Dense(Module):
         init: How the weights get their first values (see `plastax.init`), or None
             for the default.
         bias_init: The same for the bias weights. None starts them at 0.
+        forward: The layer's forward pass, a `plastax.policies.Forward`, or one
+            object with `map`, `combine` and `apply`. Like each of the four below:
+            a half the pair does not give is the network's, None says the layer
+            has none, and not given takes the network's.
+        backward: The layer's backward pass, a `plastax.policies.Backward`, or one
+            object with all three.
+        update: The layer's update, a `plastax.policies.Update`.
+        prune: The layer's pruning, a `plastax.policies.Prune`.
+        grow: The layer's growth, a `plastax.policies.Grow`.
+
+    The layer creates connections and units, so it takes pairs, as a network does.
+    The `conn` half of each goes to `weight` and the `unit` half to `units`. The
+    bias connections take the `conn` halves of `forward`, `backward` and `update`,
+    and are never pruned or regrown.
 
     Raises:
-        TypeError: If `features` is not an integer.
+        TypeError: If `features` is not an integer, or a policy keyword is not a
+            pair of its phase.
         ValueError: If `features` is less than 1.
     """
 
@@ -52,6 +80,11 @@ class Dense(Module):
         bias: bool = True,
         init: Initializer | None = None,
         bias_init: Initializer | None = None,
+        forward: Given[Forward[Any] | ForwardConnPolicy[Any, Any]] = INHERIT,
+        backward: Given[Backward[Any] | BackwardConnPolicy[Any, Any]] = INHERIT,
+        update: Given[Update[Any]] = INHERIT,
+        prune: Given[Prune[Any]] = INHERIT,
+        grow: Given[Grow[Any]] = INHERIT,
     ) -> None:
         if isinstance(features, bool) or not isinstance(features, int | np.integer):
             raise TypeError(
@@ -66,15 +99,47 @@ class Dense(Module):
         self.bias = bias
         self.init = init
         self.bias_init = bias_init
+        self.conn_policies, self.unit_policies = split_pairs(
+            type(self).__name__,
+            forward=forward,
+            backward=backward,
+            update=update,
+            prune=prune,
+            grow=grow,
+        )
 
     def setup(self) -> None:
         """Declare the primitives the layer is made of."""
-        self.units = CreateUnits()
-        self.weight = CreateConnections(init=self.init)
+        conn, unit = self.conn_policies, self.unit_policies
+        self.units = CreateUnits(
+            forward=unit.forward,
+            backward=unit.backward,
+            update=unit.update,
+            prune=unit.prune,
+            grow=unit.grow,
+        )
+        self.weight = CreateConnections(
+            init=self.init,
+            forward=conn.forward,
+            backward=conn.backward,
+            update=conn.update,
+            prune=conn.prune,
+            grow=conn.grow,
+        )
         if self.bias:
+            # The unit that is always 1 takes the network's policies, as it did
+            # before layers could be given any; `constant` is what keeps its value.
             self.one = CreateUnits(constant=1.0)
             bias_init = px_init.zeros() if self.bias_init is None else self.bias_init
-            self.bias_weight = CreateConnections(init=bias_init)
+            # A bias is learned as a weight is, and is never pruned or regrown.
+            self.bias_weight = CreateConnections(
+                init=bias_init,
+                forward=conn.forward,
+                backward=conn.backward,
+                update=conn.update,
+                prune=None,
+                grow=None,
+            )
 
     # `Module` declares `__call__` as an attribute so that each subclass may choose
     # its own arguments; ty reads a method with narrower arguments as an invalid

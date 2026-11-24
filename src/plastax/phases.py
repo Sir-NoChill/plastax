@@ -267,15 +267,14 @@ def build_batched_phases[GS](
     )
     csr_forward = (
         build_csr_forward(net, static, engine=engine)
-        if engine is not None
-        and linear_input_field(net.forward.conn, net.forward.unit) is not None
+        if engine is not None and linear_input_field(*net.forward.halves()) is not None
         else None
     )
     csr_backward = (
         build_csr_backward(net, static, engine=engine)
         if engine is not None
         and net.backward is not None
-        and linear_input_field(net.backward.conn, net.backward.unit) is not None
+        and linear_input_field(*net.backward.halves()) is not None
         else None
     )
     structural: list[Phase[GS]] = []
@@ -883,8 +882,7 @@ def build_csr_forward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the forward.
     """
-    fc = net.forward.conn
-    fu = net.forward.unit
+    fc, fu = net.forward.halves()
     field = linear_input_field(fc, fu)
     assert field is not None  # only built for a linear forward
     num_units = static.num_units
@@ -931,7 +929,7 @@ def build_csr_backward[GS](
     """
     backward = net.backward
     assert backward is not None  # only built when the net has one
-    bc, bu = backward.conn, backward.unit
+    bc, bu = backward.halves()
     field = linear_input_field(bc, bu)
     assert (
         bc is not None and bu is not None and field is not None
@@ -978,8 +976,7 @@ def _build_forward_phase[GS](
         # slot) would break any order anyway; a violated hint is undefined
         # in XLA.
         sweep = build_forward_sweep(
-            net.forward.conn,
-            net.forward.unit,
+            *net.forward.halves(),
             num_units=static.num_units,
             indices_are_sorted=False,
             input_ids=static.input_ids,
@@ -1017,8 +1014,7 @@ def _build_forward_topological_phase[GS](
     """
     num_units = static.num_units
     num_levels = len(static.level_capacities)
-    fc = net.forward.conn
-    fu = net.forward.unit
+    fc, fu = net.forward.halves()
     # Not indices_are_sorted, for the same reason as the pipeline forward.
     accumulate = build_forward_accumulate(
         fc,
@@ -1051,7 +1047,7 @@ def _build_backward_phase[GS](
 ) -> Phase[GS]:
     backward = net.backward
     assert backward is not None  # only built when the net has one
-    bc, bu = backward.conn, backward.unit
+    bc, bu = backward.halves()
 
     if net.propagation is Propagation.PIPELINE:
         # No level structure, one flat bucket, every unit Applied
@@ -1110,7 +1106,7 @@ def _build_backward_topological_phase[GS](
     num_levels = len(static.level_capacities)
     backward = net.backward
     assert backward is not None  # only built when the net has one
-    bc, bu = backward.conn, backward.unit
+    bc, bu = backward.halves()
     accumulate = build_backward_accumulate(
         bc,
         bu,
@@ -1719,8 +1715,7 @@ def plan_prune_fusion[GS](
         # The fused forward's tombstones replace the dead masks at the
         # prune_conn slot, which would revive the edges prune_unit killed.
         return PruneFusionPlan(False, "prune_unit tombstones edges before prune_conn")
-    fc = net.forward.conn
-    fu = net.forward.unit
+    fc, fu = net.forward.halves()
     n = static.num_units
     units = {s.name: _sds((n,), np.dtype(s.dtype)) for s in static.unit_fields}
 
@@ -1760,7 +1755,7 @@ def plan_prune_fusion[GS](
         if net.backward is not None:
             backward = net.backward
             assert backward is not None
-            bu = backward.unit
+            _, bu = backward.halves()
 
             def backward_apply(u: Columns, i: jax.Array, g_: Any, a: Any) -> Any:
                 return dict(bu.apply(UnitView(u), UnitIdx(i), g_, a).fields)
@@ -2392,8 +2387,7 @@ def build_fused_forward_prune_phase[GS](
     """
     pc = net.resolved().prune_conn
     assert pc is not None and plan.fused
-    fc = net.forward.conn
-    fu = net.forward.unit
+    fc, fu = net.forward.halves()
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     pipeline = net.propagation is Propagation.PIPELINE

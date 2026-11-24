@@ -27,6 +27,7 @@ from plastax._types import (
 from plastax.monoid import LINEAR_SEMIRINGS, Monoid
 from plastax.optim import Optimizer
 from plastax.policies import (
+    INHERIT,
     AddUnitPolicy,
     Backward,
     BackwardConnPolicy,
@@ -37,6 +38,7 @@ from plastax.policies import (
     ForwardConnPolicy,
     ForwardUnitPolicy,
     Grow,
+    Inherit,
     LossPolicy,
     ProposeAddConnPolicy,
     Prune,
@@ -54,7 +56,7 @@ from plastax.policies._batch import _STRUCTURAL_UNIT_FIELDS
 
 if TYPE_CHECKING:
     from plastax.driver import Driver
-    from plastax.layers import Module
+    from plastax.layers import Module, PolicyTable, Record
     from plastax.state import NetworkState, NetworkStatic
 
 
@@ -209,7 +211,7 @@ class Network[GS]:
             if pair is None:
                 continue
             for half in ("conn", "unit"):
-                policy = getattr(pair, half)
+                policy = _on_network(getattr(pair, half))
                 if policy is None:
                     continue
                 if halves[half] is not None:
@@ -223,10 +225,10 @@ class Network[GS]:
         return Resolved(
             update_conn=halves["conn"],
             update_unit=halves["unit"],
-            prune_conn=None if prune is None else prune.conn,
-            prune_unit=None if prune is None else prune.unit,
-            grow_conn=None if grow is None else grow.conn,
-            grow_unit=None if grow is None else grow.unit,
+            prune_conn=None if prune is None else _on_network(prune.conn),
+            prune_unit=None if prune is None else _on_network(prune.unit),
+            grow_conn=None if grow is None else _on_network(grow.conn),
+            grow_unit=None if grow is None else _on_network(grow.unit),
             unit_fields=(
                 *cls.extra_unit_fields,
                 *(() if opt is None else opt.unit_fields),
@@ -256,20 +258,98 @@ class Network[GS]:
             globals: the value the global state starts from, in place of the
                 class's `globals`. None uses the class's.
 
+        A `BuildError` is raised if the class has no `topology` or no
+        `input_shape`, if the topology does not take exactly one handle, if a
+        layer is given policies of its own (which the engine cannot run yet),
+        or if the globals are not a pytree of numbers and arrays. Also
+        whatever `trace` and `materialize` raise.
+
         Returns:
             The `(static, state)` pair. `static.input_shape` and
             `static.output_shape` hold the shapes a step's inputs and targets
             are given in.
 
         Raises:
-            BuildError: if the class has no `topology` or no `input_shape`, if
-                the topology does not take exactly one handle, or if the
-                globals are not a pytree of numbers and arrays. Also whatever
-                `trace` and `materialize` raise.
             NotImplementedError: if the topology returns more than one handle.
         """
         # Imported here: plastax.layers imports this module.
-        from plastax.layers import BuildError, materialize, trace
+        from plastax.layers import materialize, resolve
+
+        name = cls.__name__
+        record = cls._trace()
+        if len(record.outputs) != 1:
+            raise NotImplementedError(
+                f"the topology of {name} returns {len(record.outputs)} handles; "
+                f"only one is supported so far"
+            )
+        on_device = cls._globals_on_device(globals)
+        table = resolve(cls, record)
+        _refuse_layer_policies(cls, table)
+        return materialize(record, cls, key, globals_=on_device)
+
+    @classmethod
+    def _globals_on_device(cls, globals: GS | None) -> Any:
+        """The global state a network starts from, as arrays.
+
+        Args:
+            globals: the value to use in place of the class's `globals`, or
+                None for the class's.
+
+        Returns:
+            The value with every leaf an array.
+
+        Raises:
+            BuildError: if the value is not a pytree of numbers and arrays.
+        """
+        # Imported here: plastax.layers imports this module.
+        from plastax.layers import BuildError
+
+        value = cls.globals if globals is None else globals
+        try:
+            return jax.tree_util.tree_map(jnp.asarray, value)
+        except TypeError as error:
+            raise BuildError(
+                f"the globals of {cls.__name__} are not a pytree of numbers and "
+                f"arrays: {error}. A dataclass is made one with "
+                f"jax.tree_util.register_dataclass"
+            ) from error
+
+    @classmethod
+    def policy_table(cls) -> PolicyTable:
+        """The policy of every layer in every phase, as the network resolves it.
+
+        Traces the topology and resolves each block's policies against the
+        network's: a layer's own where it was given one, the network's
+        otherwise. Nothing is materialized, so it needs no key and works for a
+        network the engine cannot run yet. `print(Net.policy_table())` gives a
+        Markdown table.
+
+        A `BuildError` is raised if the class has no `topology` or no
+        `input_shape`, or the topology does not take exactly one handle. Also
+        whatever `trace` raises.
+
+        Returns:
+            The resolved table.
+        """
+        # Imported here: plastax.layers imports this module.
+        from plastax.layers import resolve
+
+        return resolve(cls, cls._trace())
+
+    @classmethod
+    def _trace(cls) -> Record:
+        """Trace the class's topology with its `input_shape`.
+
+        Returns:
+            The build record.
+
+        Raises:
+            BuildError: if the class has no `topology` or no `input_shape`, or
+                the topology does not take exactly one handle. Also whatever
+                `trace` raises.
+        """
+        # Imported here: plastax.layers imports this module.
+        from plastax.layers import BuildError, trace
 
         name = cls.__name__
         if cls.topology is None:
@@ -296,23 +376,7 @@ class Network[GS]:
                 f"supported yet"
             )
         shape = tuple(int(n) for n in cls.input_shape)
-        record = trace(cls.topology, {parameters[0]: shape})
-        if len(record.outputs) != 1:
-            raise NotImplementedError(
-                f"the topology of {name} returns {len(record.outputs)} handles; "
-                f"only one is supported so far"
-            )
-
-        value = cls.globals if globals is None else globals
-        try:
-            on_device = jax.tree_util.tree_map(jnp.asarray, value)
-        except TypeError as error:
-            raise BuildError(
-                f"the globals of {name} are not a pytree of numbers and arrays: "
-                f"{error}. A dataclass is made one with "
-                f"jax.tree_util.register_dataclass"
-            ) from error
-        return materialize(record, cls, key, globals_=on_device)
+        return trace(cls.topology, {parameters[0]: shape})
 
     @classmethod
     def init(cls, key: PRNGKeyArray, *, globals: GS | None = None) -> Driver[GS]:
@@ -335,6 +399,65 @@ class Network[GS]:
 
         static, state = cls.build(key, globals=globals)
         return Driver(cls, static, state)
+
+
+def _on_network[P](half: P | Inherit | None) -> P | None:
+    """Read a half of a network's own pair: nothing to inherit, so none.
+
+    Args:
+        half: the half as the pair holds it.
+
+    Returns:
+        The policy, or None where the half is None or was not given.
+    """
+    return None if isinstance(half, Inherit) else half
+
+
+def _refuse_layer_policies(cls: type[Network[Any]], table: PolicyTable) -> None:
+    """Refuse to build a network whose layers differ from it in a policy.
+
+    The engine runs one set of policies for the whole network. Until it runs a
+    policy on the elements of one layer, a network that needs that is refused
+    here, by name, and not run with the wrong policies.
+
+    Args:
+        cls: the network class being built.
+        table: its resolved policies.
+
+    Raises:
+        BuildError: if any block's policy differs from the network's.
+    """
+    # Imported here: plastax.layers imports this module.
+    from plastax.layers import BuildError
+    from plastax.layers._module import _show
+
+    overrides = table.overrides()
+    if not overrides:
+        return
+
+    def named(policy: object) -> str:
+        return "none" if policy is None else type(policy).__name__
+
+    lines: list[str] = []
+    width = max(len(named(o.policy)) for o in overrides)
+    last: tuple[tuple[str, ...], str] | None = None
+    for o in overrides:
+        if (o.path, o.kind) != last:
+            lines.append(f"  {_show(o.path)}  ({o.kind})")
+            last = (o.path, o.kind)
+        lines.append(
+            f"      {o.phase:<9}{named(o.policy):<{width}}   "
+            f"the network has {named(o.network)}"
+        )
+    name = cls.__name__
+    raise BuildError(
+        f"{name} cannot be run yet. Its layers are given policies of their "
+        f"own, and the engine runs one set of policies for the whole network "
+        f"(layer policies, stage 3).\n\n"
+        + "\n".join(lines)
+        + f"\n\nThe declaration itself is valid. `print({name}.policy_table())` "
+        f"shows what every layer resolved to."
+    )
 
 
 _RESERVED_FIELD_NAMES = frozenset(
@@ -430,6 +553,15 @@ def _as_pair(
         ("conn", conn_trait, "map"),
         ("unit", unit_trait, "combine, apply"),
     ):
+        if getattr(value, half) is INHERIT or getattr(value, half) is None:
+            said = "is None" if getattr(value, half) is None else "was not given"
+            raise TypeError(
+                f"{cls.__name__}.{name} has no `{half}` policy (it {said}). A "
+                f"network's {name} pass needs both halves, conn "
+                f"({conn_trait.__name__}) and unit ({unit_trait.__name__}): a "
+                f"network has nothing to inherit the other from. Only a layer "
+                f"may give one half"
+            )
         if not isinstance(getattr(value, half), trait):
             raise TypeError(
                 f"{cls.__name__}.{name}.{half} must satisfy {trait.__name__} "

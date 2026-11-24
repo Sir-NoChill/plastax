@@ -1,19 +1,39 @@
 """The two primitives a topology is written with: create units, create connections.
 
 Each call creates a block: a run of consecutive units, or a run of connections. A
-block is named by the path of the primitive that made it, and that is what policy
-sets, capacities, hints and initializers attach to. Everything else in
+block is named by the path of the primitive that made it, and that is what
+policies, capacities, hints and initializers attach to. Everything else in
 `plastax.layers` can be written with these two.
+
+A primitive creates one kind of element, so each of its five policy keywords
+takes that kind's policy directly, not a pair.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
 
 from plastax.init import Initializer
 from plastax.layers._module import BuildError, Module
+from plastax.layers._policies import Given, conn_policies, unit_policies
 from plastax.layers._record import ConnBlock
 from plastax.layers._units import ShapeError, Units
+from plastax.policies import (
+    INHERIT,
+    AddUnitPolicy,
+    BackwardConnPolicy,
+    BackwardUnitPolicy,
+    ForwardConnPolicy,
+    ForwardUnitPolicy,
+    ProposeAddConnPolicy,
+    PruneConnPolicy,
+    PruneUnitPolicy,
+    ScoreAddConnPolicy,
+    UpdateConnPolicy,
+    UpdateUnitPolicy,
+)
 
 
 class CreateUnits(Module):
@@ -32,12 +52,30 @@ class CreateUnits(Module):
     Args:
         constant: A value the units always hold, or None for ordinary units. A bias
             reads a unit made with `constant=1.0`.
+        forward: The policy that reduces what arrives at each unit and writes it
+            (a `ForwardUnitPolicy`). Like each of the four below: None for no
+            policy, and not given to take the network's.
+        backward: The same for what is sent back to each unit (a
+            `BackwardUnitPolicy`).
+        update: The unit update (an `UpdateUnitPolicy`).
+        prune: The unit pruning policy (a `PruneUnitPolicy`).
+        grow: The unit addition policy (an `AddUnitPolicy`).
 
     Raises:
-        TypeError: If `constant` is neither a number nor None.
+        TypeError: If `constant` is neither a number nor None, or a policy keyword
+            is not a unit policy of its phase.
     """
 
-    def __init__(self, *, constant: float | int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        constant: float | int | None = None,
+        forward: Given[ForwardUnitPolicy[Any, Any]] = INHERIT,
+        backward: Given[BackwardUnitPolicy[Any, Any]] = INHERIT,
+        update: Given[UpdateUnitPolicy[Any]] = INHERIT,
+        prune: Given[PruneUnitPolicy[Any]] = INHERIT,
+        grow: Given[AddUnitPolicy[Any]] = INHERIT,
+    ) -> None:
         if constant is not None and (
             isinstance(constant, bool)
             or not isinstance(constant, int | float | np.integer | np.floating)
@@ -46,6 +84,14 @@ class CreateUnits(Module):
                 f"a constant is a number or None, got {type(constant).__name__}"
             )
         self.constant = None if constant is None else float(constant)
+        self.policies = unit_policies(
+            type(self).__name__,
+            forward=forward,
+            backward=backward,
+            update=update,
+            prune=prune,
+            grow=grow,
+        )
 
     # `Module` declares `__call__` as an attribute so that each subclass may choose
     # its own arguments; ty reads a method with narrower arguments as an invalid
@@ -86,7 +132,7 @@ class CreateUnits(Module):
             raise BuildError("CreateUnits was given a handle from another trace")
         path = record._claim(self)
         new_shape = like.shape if like is not None else tuple(shape or ())
-        return record._add_unit_block(path, new_shape, self.constant)
+        return record._add_unit_block(path, new_shape, self.constant, self.policies)
 
 
 class CreateConnections(Module):
@@ -111,10 +157,38 @@ class CreateConnections(Module):
         init: How the block's weights get their first values: an initializer of
             `plastax.init`, or any function `(key, fans) -> weights`. None for the
             default.
+        forward: The policy that maps each connection to a value for its
+            destination (a `ForwardConnPolicy`). Like each of the four below: None
+            for no policy, and not given to take the network's.
+        backward: The same for its source (a `BackwardConnPolicy`).
+        update: The connection update (an `UpdateConnPolicy`).
+        prune: The connection pruning policy (a `PruneConnPolicy`).
+        grow: The connection growth policy (a `ScoreAddConnPolicy` or a
+            `ProposeAddConnPolicy`).
+
+    A `TypeError` is raised if a policy keyword is not a connection policy of its
+    phase.
     """
 
-    def __init__(self, *, init: Initializer | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        init: Initializer | None = None,
+        forward: Given[ForwardConnPolicy[Any, Any]] = INHERIT,
+        backward: Given[BackwardConnPolicy[Any, Any]] = INHERIT,
+        update: Given[UpdateConnPolicy[Any]] = INHERIT,
+        prune: Given[PruneConnPolicy[Any]] = INHERIT,
+        grow: Given[ScoreAddConnPolicy[Any] | ProposeAddConnPolicy[Any]] = INHERIT,
+    ) -> None:
         self.init = init
+        self.policies = conn_policies(
+            type(self).__name__,
+            forward=forward,
+            backward=backward,
+            update=update,
+            prune=prune,
+            grow=grow,
+        )
 
     # See the note on `CreateUnits.__call__`.
     def __call__(self, src: Units, dst: Units) -> None:  # ty: ignore[incompatible-mutable-override]
@@ -159,4 +233,6 @@ class CreateConnections(Module):
             )
 
         path = record._claim(self)
-        record._add_block(ConnBlock(path, sources, destinations, shape, self.init))
+        record._add_block(
+            ConnBlock(path, sources, destinations, shape, self.init, self.policies)
+        )

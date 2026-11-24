@@ -15,6 +15,7 @@ import numpy as np
 
 from plastax.init import Initializer
 from plastax.layers._module import BuildError, Module, setup_tree
+from plastax.layers._policies import ConnPolicies, UnitPolicies
 from plastax.layers._units import ShapeError, Units
 
 
@@ -32,12 +33,16 @@ class UnitBlock:
             `start + prod(shape) - 1`.
         shape: The arrangement of the units in the handle the call returned.
         constant: The value the units always hold, or None for ordinary units.
+        policies: The policies the layer was given for these units, as given: a
+            phase the layer did not name is `INHERIT`. Resolving them against a
+            network is `plastax.layers.resolve`.
     """
 
     path: tuple[str, ...]
     start: int
     shape: tuple[int, ...]
     constant: float | None = None
+    policies: UnitPolicies = UnitPolicies()
 
 
 @dataclass(eq=False)
@@ -56,6 +61,8 @@ class ConnBlock:
             sources as the call saw them.
         init: How the block's weights get their first values (see `plastax.init`),
             or None for the default. Stored here and not called while tracing.
+        policies: The policies the layer was given for these connections, as
+            given: a phase the layer did not name is `INHERIT`.
     """
 
     path: tuple[str, ...]
@@ -63,6 +70,7 @@ class ConnBlock:
     dst: np.ndarray
     shape: tuple[int, ...]
     init: Initializer | None = None
+    policies: ConnPolicies = ConnPolicies()
 
 
 @dataclass(eq=False)
@@ -148,7 +156,11 @@ class Record:
         return path
 
     def _add_unit_block(
-        self, path: tuple[str, ...], shape: tuple[int, ...], constant: float | None
+        self,
+        path: tuple[str, ...],
+        shape: tuple[int, ...],
+        constant: float | None,
+        policies: UnitPolicies,
     ) -> Units:
         """Create one block of units and write it down.
 
@@ -156,13 +168,14 @@ class Record:
             path: The path of the layer creating the units.
             shape: The shape of the new handle.
             constant: The value the units always hold, or None.
+            policies: The policies the layer was given for the units.
 
         Returns:
             A handle to the new units.
         """
         start = self.num_units
         units = self._new_units(shape)
-        self.unit_blocks.append(UnitBlock(path, start, units.shape, constant))
+        self.unit_blocks.append(UnitBlock(path, start, units.shape, constant, policies))
         return units
 
     def _add_block(self, block: ConnBlock) -> None:

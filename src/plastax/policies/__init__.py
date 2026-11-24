@@ -27,7 +27,15 @@ from plastax.policies._conn import (
 )
 from plastax.policies._globals import ResetGlobalPolicy
 from plastax.policies._loss import LossPolicy, SoftmaxCrossEntropyLossPolicy
-from plastax.policies._pairs import Backward, Forward, Grow, Prune, Update
+from plastax.policies._pairs import (
+    INHERIT,
+    Backward,
+    Forward,
+    Grow,
+    Inherit,
+    Prune,
+    Update,
+)
 from plastax.policies._unit import (
     AddUnitPolicy,
     BackwardUnitPolicy,
@@ -40,6 +48,8 @@ __all__ = [
     "Backward",
     "Forward",
     "Grow",
+    "INHERIT",
+    "Inherit",
     "Prune",
     "Update",
     "AddUnitPolicy",

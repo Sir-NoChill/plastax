@@ -282,7 +282,7 @@ class Network[GS]:
                 the topology does not take exactly one handle, if the policies
                 have a fault (see `faults`), if a layer differs from the
                 network in a way the engine cannot run yet (two policies in
-                one phase, growth of its own), or if the globals
+                one pass, growth of its own), or if the globals
                 are not a pytree of numbers and arrays. Also whatever `trace`
                 and `materialize` raise.
             NotImplementedError: if the topology returns more than one handle.
@@ -497,13 +497,13 @@ def _on_network[P](half: P | Inherit | None) -> P | None:
 def _refuse_layer_policies(cls: type[Network[Any]], table: PolicyTable) -> None:
     """Refuse to build a network whose layers differ from it in a way not run yet.
 
-    A layer may have its own forward pass, backward pass, update or pruning, or
-    none of one, where at most one policy is left in the phase: the engine
-    then runs that policy on the elements that have it. Everything else a
-    layer can say is refused here, by name, and not run with the wrong
-    policies:
+    A layer may have its own update or pruning, or none, beside the network's
+    and other layers': each policy is run on the elements that have it. It may
+    have its own forward or backward pass, or none of one, where at most one
+    policy is left in the pass. Everything else a layer can say is refused
+    here, by name, and not run with the wrong policies:
 
-    - two different policies in one phase;
+    - two different policies in one forward or backward pass;
     - a layer's own growth;
     - any layer policy in a network that grows connections of its own;
     - unit pruning on a layer of a network with no `unit_capacity`.
@@ -537,8 +537,9 @@ def _refuse_layer_policies(cls: type[Network[Any]], table: PolicyTable) -> None:
     groups.append(
         (
             clashes(table),
-            "Two different policies in one phase are not run yet (layer policies, "
-            "stage 4). One policy on some layers and none on the others is.",
+            "Two different forward passes, or two different backward passes, in "
+            "one network are not run yet (layer policies, stage 4). One on some "
+            "layers and none on the others is.",
         )
     )
     grow = cls.resolved().grow_conn

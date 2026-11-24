@@ -371,14 +371,18 @@ def test_a_fault_is_reported_before_the_engine_refuses_layer_policies() -> None:
     wrong = px.policies.Update(unit=Writes((FLAG, jnp.float32(1.0))))
     sound = px.policies.Update(unit=Writes((FLAG, True)))
 
-    # Two different unit updates in one network are something the engine cannot
-    # run yet.
-    other = px.policies.Update(unit=Writes((SEEN, 1.0)))
+    # Pruning the units of a layer needs a unit capacity, which this network has
+    # not: something the engine cannot run.
+    class Never(px.policies.PruneUnitPolicy):
+        def predicate(self, u: px.UnitView, i: px.UnitIdx, g: Any) -> jax.Array:
+            return jnp.bool_(False)
+
+    prune = px.policies.Prune(unit=Never())
     with pytest.raises(pxl.BuildError, match="1 fault in its policies"):
-        network(two_layers(b={"update": wrong}), update=other).init(KEY)
-    # With the fault fixed, what is left is that the engine cannot run it yet.
+        network(two_layers(b={"update": wrong, "prune": prune})).init(KEY)
+    # With the fault fixed, what is left is that the engine cannot run it.
     with pytest.raises(pxl.BuildError, match="cannot be run yet"):
-        network(two_layers(b={"update": sound}), update=other).init(KEY)
+        network(two_layers(b={"update": sound, "prune": prune})).init(KEY)
     # And a unit update on one layer alone is run.
     network(two_layers(b={"update": sound})).init(KEY)
 

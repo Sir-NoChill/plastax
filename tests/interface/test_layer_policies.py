@@ -348,9 +348,9 @@ def test_a_layer_given_the_networks_own_policy_is_not_an_override() -> None:
 
 
 def test_a_network_with_a_layer_policy_is_refused_naming_layer_and_policies() -> None:
+    # A second forward pass: two connection halves that are not the same object.
     net = network(
-        two_layers(update=px.policies.Update(conn=Decay()), bias=False),
-        optimizer=px.optim.sgd(0.1, GRAD),
+        two_layers(forward=px.policies.Forward(conn=Both()), bias=False),
     )
 
     with pytest.raises(pxl.BuildError) as refused:
@@ -359,8 +359,8 @@ def test_a_network_with_a_layer_policy_is_refused_naming_layer_and_policies() ->
     message = str(refused.value)
     assert "Net cannot be run yet" in message
     assert "middle.weight  (connections)" in message
-    assert "update" in message and "Decay" in message
-    assert "the network has _SGDUpdateConn" in message
+    assert "forward" in message and "Both" in message
+    assert "the network has WeightedSum" in message
     assert "Net.policy_table()" in message
     # The table itself is still there to read.
     assert net.policy_table().overrides()

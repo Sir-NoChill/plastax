@@ -105,8 +105,47 @@ class HalveOnce(Halve):
         )
 
 
-class Quarter(Halve):
-    """A second, different connection update."""
+class Quarter(px.policies.UpdateConnPolicy):
+    """A second, different connection update: every weight is quartered."""
+
+    def incoming(
+        self,
+        u: px.UnitView,
+        dst: px.UnitIdx,
+        src: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> px.ConnWrite:
+        return px.ConnWrite.of((px.WEIGHT, 0.25 * c[px.WEIGHT, cid]))
+
+    def outgoing(
+        self,
+        u: px.UnitView,
+        src: px.UnitIdx,
+        dst: px.UnitIdx,
+        c: px.ConnView,
+        cid: px.ConnIdx,
+        g: None,
+    ) -> px.ConnWrite:
+        return px.ConnWrite.of()
+
+
+class CountTwo(px.policies.UpdateUnitPolicy):
+    def update(self, u: px.UnitView, i: px.UnitIdx, g: None) -> px.UnitWrite:
+        return px.UnitWrite.of((SEEN, u[SEEN, i] + 2.0))
+
+
+class Positive(px.policies.PruneConnPolicy):
+    def predicate(
+        self, u: px.UnitView, c: px.ConnView, cid: px.ConnIdx, g: None
+    ) -> jax.Array:
+        return c[px.WEIGHT, cid] > 0.0
+
+
+class Never(px.policies.PruneUnitPolicy):
+    def predicate(self, u: px.UnitView, i: px.UnitIdx, g: None) -> jax.Array:
+        return jnp.bool_(False)
 
 
 class Count(px.policies.UpdateUnitPolicy):
@@ -246,9 +285,9 @@ def test_a_policy_is_given_each_connections_slot_in_its_bucket(
 def test_a_scope_is_the_runs_of_the_layers_that_have_the_policy() -> None:
     net = network(three_layers(update=px.policies.Update(conn=Halve())))
     built = Built(net)
-    scope = phase_scopes(net, built.static).update_conn
+    (scope,) = phase_scopes(net, built.static).update_conn
 
-    assert scope is not None and scope.spans is not None
+    assert scope.spans is not None
     runs = {
         (run.bucket, run.start, run.stop)
         for path in (("middle", "weight"), ("middle", "bias_weight"))
@@ -267,7 +306,8 @@ def test_a_policy_every_layer_has_covers_the_whole_network() -> None:
     net = network(three_layers(), update=px.policies.Update(conn=Halve()))
     scopes = phase_scopes(net, Built(net).static)
 
-    assert scopes.update_conn is not None and scopes.update_conn.spans is None
+    (only,) = scopes.update_conn
+    assert only.spans is None
     assert scopes.whole
 
 
@@ -356,25 +396,125 @@ def test_pruning_on_some_layers_is_not_fused_into_the_forward_sweep() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# What is still refused
+# Two policies in one phase, each on its own layers
 # --------------------------------------------------------------------------- #
-def test_two_different_updates_are_refused_naming_the_layer_and_both() -> None:
+@pytest.mark.parametrize("batch", [None, 2])
+@pytest.mark.parametrize("rule", [Halve(), HalveOnce()])
+def test_two_connection_updates_each_change_their_own_layers(
+    rule: Any, batch: int | None
+) -> None:
+    """The network's rule beside a layer's own, as SGD beside DeepR would be."""
+    net = network(
+        three_layers(update=px.policies.Update(conn=Quarter())),
+        update=px.policies.Update(conn=rule),
+    )
+    before = Built(net)
+    after = Built(net).step(batch)
+
+    # A batched plain update averages each sample's change, which rounds in the
+    # last bit.
+    for path in (("middle", "weight"), ("middle", "bias_weight")):
+        np.testing.assert_allclose(
+            after.conns(*path), 0.25 * before.conns(*path), rtol=1e-6
+        )
+    for path in after.others("middle"):
+        np.testing.assert_allclose(
+            after.conns(*path), 0.5 * before.conns(*path), rtol=1e-6
+        )
+
+
+def test_two_connection_updates_have_disjoint_scopes() -> None:
     net = network(
         three_layers(update=px.policies.Update(conn=Quarter())),
         update=px.policies.Update(conn=Halve()),
     )
+    built = Built(net)
+    scopes = phase_scopes(net, built.static).update_conn
 
-    with pytest.raises(BuildError) as refused:
-        net.build(KEY)
+    assert sorted(type(scope.policy).__name__ for scope in scopes) == [
+        "Halve",
+        "Quarter",
+    ]
+    slots = [
+        {
+            (bucket, slot)
+            for bucket, runs in enumerate(scope.spans or ())
+            for start, stop in runs
+            for slot in range(start, stop)
+        }
+        for scope in scopes
+    ]
+    assert slots[0] and slots[1] and not slots[0] & slots[1]
+    # Between them, every connection of the network.
+    assert len(slots[0] | slots[1]) == sum(
+        run.stop - run.start for runs in built.layout.conn_runs for run in runs
+    )
 
-    message = str(refused.value)
-    assert "Net cannot be run yet" in message
-    assert "middle.weight  (connections)" in message
-    assert "Quarter" in message and "the network has Halve" in message
-    assert "Two different policies in one phase" in message
-    assert "first" not in message  # a layer that says nothing is not listed
+
+@pytest.mark.parametrize("batch", [None, 2])
+def test_two_unit_updates_each_run_for_their_own_units(batch: int | None) -> None:
+    net = network(
+        three_layers(update=px.policies.Update(unit=CountTwo())),
+        update=px.policies.Update(unit=Count()),
+    )
+    built = Built(net).step(batch)
+    seen = np.asarray(built.state.units["seen"])
+
+    np.testing.assert_array_equal(built.units("middle", "units", column="seen"), 2.0)
+    assert seen.sum() == (seen.size - 3) + 2.0 * 3  # every other unit counted once
 
 
+@pytest.mark.parametrize("batch", [None, 2])
+def test_two_connection_prunings_each_test_their_own_layers(
+    batch: int | None,
+) -> None:
+    net = network(
+        three_layers(prune=px.policies.Prune(conn=Positive())),
+        prune=px.policies.Prune(conn=Negative()),
+    )
+    before = Built(net)
+    after = Built(net).step(batch)
+
+    middle = before.conns("middle", "weight")
+    np.testing.assert_array_equal(after.conns("middle", "weight"), middle[middle <= 0])
+    for path in (("first", "weight"), ("head", "weight")):
+        kept = before.conns(*path)
+        np.testing.assert_array_equal(after.conns(*path), kept[kept >= 0])
+
+
+def test_two_unit_prunings_each_test_their_own_units() -> None:
+    net = network(
+        three_layers(prune=px.policies.Prune(unit=Every())),
+        prune=px.policies.Prune(unit=Never()),
+        unit_capacity=32,
+    )
+    built = Built(net).step()
+
+    assert built.units("middle", "units", column="pruned").all()
+    assert not built.units("first", "units", column="pruned").any()
+    assert built.conns("first", "weight").size == 20
+
+
+@pytest.mark.parametrize("batch", [None, 2])
+def test_two_instances_of_one_policy_give_what_one_instance_gives(
+    batch: int | None,
+) -> None:
+    """Two `Halve()` are two policies to the engine, each run on its own layers."""
+    twice = network(
+        three_layers(update=px.policies.Update(conn=Halve())),
+        update=px.policies.Update(conn=Halve()),
+    )
+    once = network(three_layers(), update=px.policies.Update(conn=Halve()))
+
+    assert len(phase_scopes(twice, Built(twice).static).update_conn) == 2
+    a, b = Built(twice).step(batch), Built(once).step(batch)
+    for path in a.table.conn_paths:
+        np.testing.assert_array_equal(a.conns(*path), b.conns(*path))
+
+
+# --------------------------------------------------------------------------- #
+# What is still refused
+# --------------------------------------------------------------------------- #
 def test_the_same_update_on_the_network_and_on_a_layer_is_one_policy() -> None:
     # One object given twice. Two `Halve()` are two policies until a policy is
     # compared by value (`@px.policy`, card `fields-and-hyperparameters`).
@@ -580,7 +720,7 @@ def test_a_different_backward_pass_on_one_layer_is_refused() -> None:
     message = str(refused.value)
     assert "middle.weight  (connections)" in message
     assert "backward" in message and "the network has SendGrad" in message
-    assert "Two different policies in one phase" in message
+    assert "two different backward passes" in message
 
 
 # --------------------------------------------------------------------------- #

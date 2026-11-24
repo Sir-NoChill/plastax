@@ -27,6 +27,9 @@ type ScopedPhase = Literal["forward", "backward", "update", "prune"]
 
 # The phases a layer may differ from its network in, so far: all but growth.
 SCOPED_PHASES: tuple[ScopedPhase, ...] = ("forward", "backward", "update", "prune")
+# Those of them that still take one policy, or none: the two passes. An update
+# or a pruning may have several, each on its own layers.
+SINGLE_PHASES: tuple[ScopedPhase, ...] = ("forward", "backward")
 
 
 @dataclass(frozen=True)
@@ -61,7 +64,12 @@ class ConnScope:
 
 @dataclass(frozen=True)
 class Scopes:
-    """The scope of each phase a layer may differ in, or None for a phase no one has.
+    """The scope of each policy of each phase a layer may differ in.
+
+    A pass has one policy for each kind of element, or none (None). An update
+    or a pruning may have several policies, each on its own layers: one scope
+    for each, over disjoint elements, and none (an empty tuple) for a phase no
+    element has.
 
     Attributes:
         forward_unit: The unit half of the forward pass: the units that reduce
@@ -71,35 +79,34 @@ class Scopes:
         backward_unit: The unit half of the backward pass.
         backward_conn: The connection half of the backward pass: the
             connections that send a value to their source.
-        update_unit: The unit update.
-        update_conn: The connection update.
-        prune_unit: The unit pruning.
-        prune_conn: The connection pruning.
+        update_unit: The unit updates.
+        update_conn: The connection updates.
+        prune_unit: The unit prunings.
+        prune_conn: The connection prunings.
     """
 
     forward_unit: UnitScope | None
     forward_conn: ConnScope | None
     backward_unit: UnitScope | None
     backward_conn: ConnScope | None
-    update_unit: UnitScope | None
-    update_conn: ConnScope | None
-    prune_unit: UnitScope | None
-    prune_conn: ConnScope | None
+    update_unit: tuple[UnitScope, ...]
+    update_conn: tuple[ConnScope, ...]
+    prune_unit: tuple[UnitScope, ...]
+    prune_conn: tuple[ConnScope, ...]
 
     @property
     def whole(self) -> bool:
         """Whether every policy applies to the whole network."""
-        cells = (
+        passes = (
             self.forward_unit,
             self.forward_conn,
             self.backward_unit,
             self.backward_conn,
-            self.update_unit,
-            self.update_conn,
-            self.prune_unit,
-            self.prune_conn,
         )
-        return all(scope is None or scope.spans is None for scope in cells)
+        several = (self.update_unit, self.update_conn, self.prune_unit, self.prune_conn)
+        return all(scope is None or scope.spans is None for scope in passes) and all(
+            scope.spans is None for scopes_ in several for scope in scopes_
+        )
 
 
 def _distinct(cells: list[object]) -> list[object]:
@@ -112,18 +119,20 @@ def _distinct(cells: list[object]) -> list[object]:
 
 
 def clashes(table: PolicyTable) -> list[Override]:
-    """The cells of a table that put two different policies in one phase.
+    """The cells of a table that put two different policies in one pass.
 
-    A phase may have one policy on some layers and none on the others. Where
-    the layers and the network have two or more different policies between
-    them, every layer whose policy is not the network's is returned.
+    The forward and the backward pass may each have one policy on some layers
+    and none on the others. Where the layers and the network have two or more
+    different policies between them, every layer whose policy is not the
+    network's is returned. An update or a pruning may have several policies and
+    never clashes.
 
     Args:
         table: The resolved policies.
 
     Returns:
-        The overriding cells of every phase but growth that has more than one
-        policy, in the order of `PolicyTable.overrides`.
+        The overriding cells of every pass that has more than one policy, in
+        the order of `PolicyTable.overrides`.
     """
     crowded: set[tuple[str, str]] = set()
     rows: tuple[tuple[str, Any, tuple[Any, ...]], ...] = (
@@ -131,7 +140,7 @@ def clashes(table: PolicyTable) -> list[Override]:
         ("units", table.network_units, table.units),
     )
     for kind, network, blocks in rows:
-        for phase in SCOPED_PHASES:
+        for phase in SINGLE_PHASES:
             cells = [getattr(network, phase), *(getattr(b, phase) for b in blocks)]
             if len(_distinct(cells)) > 1:
                 crowded.add((kind, phase))
@@ -163,8 +172,8 @@ def _one(phase: str, network: object, blocks: list[object]) -> object | None:
     if len(found) > 1:
         names = " and ".join(type(policy).__name__ for policy in found)
         raise BuildError(
-            f"the {phase} phase has more than one policy ({names}); two "
-            f"different policies in one phase are not run yet (layer policies, "
+            f"the {phase} pass has more than one policy ({names}); two "
+            f"different policies in one pass are not run yet (layer policies, "
             f"stage 4)"
         )
     return found[0] if found else None
@@ -195,7 +204,7 @@ def scopes(net: type[Network[Any]], static: NetworkStatic) -> Scopes:
         The scope of each phase.
 
     Raises:
-        BuildError: If a phase has two different policies, or `static` was not
+        BuildError: If a pass has two different policies, or `static` was not
             built from this network's topology.
     """
     layout = static.layout
@@ -212,15 +221,20 @@ def scopes(net: type[Network[Any]], static: NetworkStatic) -> Scopes:
         ) -> S | None:
             return None if policy is None else kind(policy, None)
 
+        def each[S: (UnitScope, ConnScope)](
+            kind: type[S], policy: object
+        ) -> tuple[S, ...]:
+            return () if policy is None else (kind(policy, None),)
+
         return Scopes(
             forward_unit=everywhere(UnitScope, forward_unit),
             forward_conn=everywhere(ConnScope, forward_conn),
             backward_unit=everywhere(UnitScope, backward_unit),
             backward_conn=everywhere(ConnScope, backward_conn),
-            update_unit=everywhere(UnitScope, resolved.update_unit),
-            update_conn=everywhere(ConnScope, resolved.update_conn),
-            prune_unit=everywhere(UnitScope, resolved.prune_unit),
-            prune_conn=everywhere(ConnScope, resolved.prune_conn),
+            update_unit=each(UnitScope, resolved.update_unit),
+            update_conn=each(ConnScope, resolved.update_conn),
+            prune_unit=each(UnitScope, resolved.prune_unit),
+            prune_conn=each(ConnScope, resolved.prune_conn),
         )
 
     record = net._trace()
@@ -241,32 +255,40 @@ def scopes(net: type[Network[Any]], static: NetworkStatic) -> Scopes:
     outside = [(edges[k], edges[k + 1]) for k in range(0, len(edges), 2)]
     num_buckets = len(static.level_capacities)
 
-    def units(phase: ScopedPhase) -> UnitScope | None:
-        network = getattr(table.network_units, phase)
-        blocks = [getattr(block, phase) for block in table.units]
-        policy = _one(f"unit {phase}", network, blocks)
-        if policy is None:
-            return None
+    def unit_cells(phase: ScopedPhase) -> tuple[object, list[object]]:
+        return (
+            getattr(table.network_units, phase),
+            [getattr(block, phase) for block in table.units],
+        )
+
+    def conn_cells(phase: ScopedPhase) -> tuple[object, list[object]]:
+        return (
+            getattr(table.network_conns, phase),
+            [getattr(block, phase) for block in table.conns],
+        )
+
+    def units_of(policy: object, network: object, blocks: list[object]) -> UnitScope:
+        """The units that have one policy: its layers', and the network's if it is."""
         spans = [
             run
             for run, mine in zip(layout.unit_runs, blocks, strict=True)
-            if mine is not None
+            if mine is not None and _same(mine, policy)
         ]
-        if network is not None:
+        if network is not None and _same(network, policy):
             spans += outside
         joined = _joined(spans)
         everything = joined == ((0, static.num_units),) or static.num_units == 0
         return UnitScope(policy, None if everything else joined)
 
-    def conns(
-        phase: ScopedPhase, received_by: tuple[UnitScope | None, str] | None = None
-    ) -> ConnScope | None:
-        network = getattr(table.network_conns, phase)
-        blocks = [getattr(block, phase) for block in table.conns]
-        policy = _one(f"connection {phase}", network, blocks)
-        if policy is None:
-            return None
-        sends = [mine is not None for mine in blocks]
+    def conns_of(
+        policy: object,
+        network: object,
+        blocks: list[object],
+        received_by: tuple[UnitScope | None, str] | None = None,
+    ) -> ConnScope:
+        """The connections that have one policy, as runs in each bucket."""
+        mine = network is not None and _same(network, policy)
+        sends = [block is not None and _same(block, policy) for block in blocks]
         if received_by is not None:
             # A pass: drop the blocks none of whose receiving units reduces.
             receivers, end = received_by
@@ -278,7 +300,7 @@ def scopes(net: type[Network[Any]], static: NetworkStatic) -> Scopes:
                 send and bool(reduces[getattr(block, end)].any())
                 for send, block in zip(sends, record.blocks, strict=True)
             ]
-        if network is not None and all(sends):
+        if mine and all(sends):
             return ConnScope(policy, None)
         per_bucket: list[list[Span]] = [[] for _ in range(num_buckets)]
         for runs, send in zip(layout.conn_runs, sends, strict=True):
@@ -287,14 +309,42 @@ def scopes(net: type[Network[Any]], static: NetworkStatic) -> Scopes:
                     per_bucket[run.bucket].append((run.start, run.stop))
         return ConnScope(policy, tuple(_joined(spans) for spans in per_bucket))
 
-    forward_units, backward_units = units("forward"), units("backward")
+    def one_unit(phase: ScopedPhase) -> UnitScope | None:
+        network, blocks = unit_cells(phase)
+        policy = _one(f"unit {phase}", network, blocks)
+        return None if policy is None else units_of(policy, network, blocks)
+
+    def one_conn(
+        phase: ScopedPhase, received_by: tuple[UnitScope | None, str]
+    ) -> ConnScope | None:
+        network, blocks = conn_cells(phase)
+        policy = _one(f"connection {phase}", network, blocks)
+        if policy is None:
+            return None
+        return conns_of(policy, network, blocks, received_by)
+
+    def each_unit(phase: ScopedPhase) -> tuple[UnitScope, ...]:
+        network, blocks = unit_cells(phase)
+        return tuple(
+            units_of(policy, network, blocks)
+            for policy in _distinct([network, *blocks])
+        )
+
+    def each_conn(phase: ScopedPhase) -> tuple[ConnScope, ...]:
+        network, blocks = conn_cells(phase)
+        return tuple(
+            conns_of(policy, network, blocks)
+            for policy in _distinct([network, *blocks])
+        )
+
+    forward_units, backward_units = one_unit("forward"), one_unit("backward")
     return Scopes(
         forward_unit=forward_units,
-        forward_conn=conns("forward", (forward_units, "dst")),
+        forward_conn=one_conn("forward", (forward_units, "dst")),
         backward_unit=backward_units,
-        backward_conn=conns("backward", (backward_units, "src")),
-        update_unit=units("update"),
-        update_conn=conns("update"),
-        prune_unit=units("prune"),
-        prune_conn=conns("prune"),
+        backward_conn=one_conn("backward", (backward_units, "src")),
+        update_unit=each_unit("update"),
+        update_conn=each_conn("update"),
+        prune_unit=each_unit("prune"),
+        prune_conn=each_conn("prune"),
     )

@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+import plastax as px
 import plastax.layers as pxl
 from plastax.layers import (
     BuildError,
@@ -173,6 +174,34 @@ def test_tracing_twice_gives_the_same_blocks() -> None:
         np.testing.assert_array_equal(a.src, b.src)
         np.testing.assert_array_equal(a.dst, b.dst)
     np.testing.assert_array_equal(first.constants, second.constants)
+
+
+# --------------------------------------------------------------------------- #
+# Capacity
+# --------------------------------------------------------------------------- #
+def test_a_capacity_goes_to_the_weights_and_never_to_the_bias() -> None:
+    record, _, _ = traced(Dense(3, capacity=40), (4,))
+    blocks = {block.path[-1]: block for block in record.blocks}
+
+    assert blocks["weight"].src.size == 12
+    assert blocks["weight"].capacity == 40
+    assert blocks["bias_weight"].capacity is px.Capacity.INITIAL
+
+
+def test_a_dense_layer_given_no_capacity_has_exactly_what_it_starts_with() -> None:
+    record, _, _ = traced(Dense(3), (4,))
+
+    assert all(block.capacity is px.Capacity.INITIAL for block in record.blocks)
+
+
+def test_a_dense_capacity_below_its_weights_is_refused_naming_the_layer() -> None:
+    with pytest.raises(BuildError, match=r"fc\.weight creates 12 .* capacity=5"):
+        traced(Dense(3, capacity=5), (4,))
+
+
+def test_a_negative_dense_capacity_is_refused_where_it_is_written() -> None:
+    with pytest.raises(BuildError, match=r"Dense\(capacity=\.\.\.\).*negative"):
+        Dense(3, capacity=-1)
 
 
 # --------------------------------------------------------------------------- #

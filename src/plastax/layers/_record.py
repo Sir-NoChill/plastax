@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from plastax._types import Capacity
 from plastax.init import Initializer
 from plastax.layers._module import BuildError, Module, setup_tree
 from plastax.layers._policies import ConnPolicies, UnitPolicies
@@ -63,6 +64,9 @@ class ConnBlock:
             or None for the default. Stored here and not called while tracing.
         policies: The policies the layer was given for these connections, as
             given: a phase the layer did not name is `INHERIT`.
+        capacity: How many connection slots the layer asked for, as given: a
+            number that is at least the block's size, or `Capacity.INITIAL` for
+            exactly its size.
     """
 
     path: tuple[str, ...]
@@ -71,6 +75,7 @@ class ConnBlock:
     shape: tuple[int, ...]
     init: Initializer | None = None
     policies: ConnPolicies = ConnPolicies()
+    capacity: int | Capacity = Capacity.INITIAL
 
 
 @dataclass(eq=False)

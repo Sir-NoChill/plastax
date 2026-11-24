@@ -9,6 +9,7 @@ from plastax._types import (
     PRUNED,
     TO_ID,
     WEIGHT,
+    Capacity,
     ConnIdx,
     FieldSpec,
     Propagation,
@@ -31,6 +32,7 @@ from plastax.views import ConnView, ConnWrite, UnitView, UnitWrite
 
 __all__ = [
     "ACTIVATION",
+    "Capacity",
     "ConnIdx",
     "ConnView",
     "ConnWrite",

@@ -15,8 +15,9 @@ from typing import Any
 
 import numpy as np
 
+from plastax._types import Capacity
 from plastax.init import Initializer
-from plastax.layers._module import BuildError, Module
+from plastax.layers._module import BuildError, Module, _show
 from plastax.layers._policies import Given, conn_policies, unit_policies
 from plastax.layers._record import ConnBlock
 from plastax.layers._units import ShapeError, Units
@@ -34,6 +35,36 @@ from plastax.policies import (
     UpdateConnPolicy,
     UpdateUnitPolicy,
 )
+
+
+def check_capacity(layer: str, capacity: object) -> int | Capacity:
+    """Check a `capacity=` keyword where it is written.
+
+    Args:
+        layer: The layer's class name, for the message.
+        capacity: What the layer was given.
+
+    Returns:
+        The capacity: a number of connection slots, or a `plastax.Capacity`.
+
+    Raises:
+        BuildError: If it is neither a `plastax.Capacity` nor a non-negative
+            integer.
+    """
+    if isinstance(capacity, Capacity):
+        return capacity
+    if isinstance(capacity, bool) or not isinstance(capacity, int | np.integer):
+        raise BuildError(
+            f"{layer}(capacity=...) takes a number of connection slots as an "
+            f"integer, or px.Capacity.INITIAL for exactly as many as the layer "
+            f"starts with; got {capacity!r}"
+        )
+    if capacity < 0:
+        raise BuildError(
+            f"{layer}(capacity=...) takes a number of connection slots, which "
+            f"cannot be negative; got {int(capacity)}"
+        )
+    return int(capacity)
 
 
 class CreateUnits(Module):
@@ -157,6 +188,9 @@ class CreateConnections(Module):
         init: How the block's weights get their first values: an initializer of
             `plastax.init`, or any function `(key, fans) -> weights`. None for the
             default.
+        capacity: How many connection slots the block is given: a number, or
+            `plastax.Capacity.INITIAL` (the default) for exactly as many as it
+            has connections. A number above that leaves room for growth.
         forward: The policy that maps each connection to a value for its
             destination (a `ForwardConnPolicy`). Like each of the four below: None
             for no policy, and not given to take the network's.
@@ -167,13 +201,15 @@ class CreateConnections(Module):
             `ProposeAddConnPolicy`).
 
     A `TypeError` is raised if a policy keyword is not a connection policy of its
-    phase.
+    phase, and a `BuildError` if `capacity` is neither a `plastax.Capacity` nor a
+    non-negative integer.
     """
 
     def __init__(
         self,
         *,
         init: Initializer | None = None,
+        capacity: int | Capacity = Capacity.INITIAL,
         forward: Given[ForwardConnPolicy[Any, Any]] = INHERIT,
         backward: Given[BackwardConnPolicy[Any, Any]] = INHERIT,
         update: Given[UpdateConnPolicy[Any]] = INHERIT,
@@ -181,6 +217,7 @@ class CreateConnections(Module):
         grow: Given[ScoreAddConnPolicy[Any] | ProposeAddConnPolicy[Any]] = INHERIT,
     ) -> None:
         self.init = init
+        self.capacity = check_capacity(type(self).__name__, capacity)
         self.policies = conn_policies(
             type(self).__name__,
             forward=forward,
@@ -200,7 +237,8 @@ class CreateConnections(Module):
 
         Raises:
             TypeError: If `src` or `dst` is not a handle.
-            BuildError: If the two handles come from different traces.
+            BuildError: If the two handles come from different traces, or the
+                call creates more connections than the layer's capacity.
             ShapeError: If the two handles do not broadcast against each other.
             ValueError: If the same source and destination are paired twice.
         """
@@ -233,6 +271,21 @@ class CreateConnections(Module):
             )
 
         path = record._claim(self)
+        if not isinstance(self.capacity, Capacity) and self.capacity < sources.size:
+            raise BuildError(
+                f"{_show(path)} creates {sources.size} connections and was given "
+                f"capacity={self.capacity}. A capacity is the number of slots the "
+                f"layer has, so it is at least the number it starts with; "
+                f"px.Capacity.INITIAL gives exactly that many"
+            )
         record._add_block(
-            ConnBlock(path, sources, destinations, shape, self.init, self.policies)
+            ConnBlock(
+                path,
+                sources,
+                destinations,
+                shape,
+                self.init,
+                self.policies,
+                self.capacity,
+            )
         )

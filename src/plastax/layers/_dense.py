@@ -10,10 +10,15 @@ from typing import Any
 import numpy as np
 
 from plastax import init as px_init
+from plastax._types import Capacity
 from plastax.init import Initializer
 from plastax.layers._module import Module
 from plastax.layers._policies import Given, split_pairs
-from plastax.layers._primitives import CreateConnections, CreateUnits
+from plastax.layers._primitives import (
+    CreateConnections,
+    CreateUnits,
+    check_capacity,
+)
 from plastax.layers._units import ShapeError, Units
 from plastax.policies import (
     INHERIT,
@@ -52,6 +57,10 @@ class Dense(Module):
         init: How the weights get their first values (see `plastax.init`), or None
             for the default.
         bias_init: The same for the bias weights. None starts them at 0.
+        capacity: How many connection slots `weight` is given: a number, or
+            `plastax.Capacity.INITIAL` (the default) for exactly as many as it
+            has connections. The bias always has exactly as many as it starts
+            with.
         forward: The layer's forward pass, a `plastax.policies.Forward`, or one
             object with `map`, `combine` and `apply`. Like each of the four below:
             a half the pair does not give is the network's, None says the layer
@@ -67,6 +76,9 @@ class Dense(Module):
     bias connections take the `conn` halves of `forward`, `backward` and `update`,
     and are never pruned or regrown.
 
+    A `BuildError` is raised if `capacity` is neither a `plastax.Capacity` nor a
+    non-negative integer.
+
     Raises:
         TypeError: If `features` is not an integer, or a policy keyword is not a
             pair of its phase.
@@ -80,6 +92,7 @@ class Dense(Module):
         bias: bool = True,
         init: Initializer | None = None,
         bias_init: Initializer | None = None,
+        capacity: int | Capacity = Capacity.INITIAL,
         forward: Given[Forward[Any] | ForwardConnPolicy[Any, Any]] = INHERIT,
         backward: Given[Backward[Any] | BackwardConnPolicy[Any, Any]] = INHERIT,
         update: Given[Update[Any]] = INHERIT,
@@ -99,6 +112,7 @@ class Dense(Module):
         self.bias = bias
         self.init = init
         self.bias_init = bias_init
+        self.capacity = check_capacity(type(self).__name__, capacity)
         self.conn_policies, self.unit_policies = split_pairs(
             type(self).__name__,
             forward=forward,
@@ -120,6 +134,7 @@ class Dense(Module):
         )
         self.weight = CreateConnections(
             init=self.init,
+            capacity=self.capacity,
             forward=conn.forward,
             backward=conn.backward,
             update=conn.update,

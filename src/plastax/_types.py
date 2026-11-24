@@ -43,6 +43,20 @@ class Propagation(enum.Enum):
     PIPELINE = "pipeline"
 
 
+class Capacity(enum.Enum):
+    """How many slots a block of connections is given, where a count is not.
+
+    A block's capacity is a number of slots, or one of these.
+
+    Attributes:
+        INITIAL: Exactly as many slots as the block has connections when the
+            network is built. A slot freed by pruning can be filled again; the
+            block never holds more connections than it started with.
+    """
+
+    INITIAL = "initial"
+
+
 @dataclasses.dataclass(frozen=True)
 class ShardSpec:
     """Scheme-A sharding config: connections split over a device-mesh axis.

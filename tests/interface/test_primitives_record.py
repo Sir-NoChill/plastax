@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+import plastax as px
 import plastax.init as init
 import plastax.layers as pxl
 from plastax.layers import (
@@ -23,6 +24,7 @@ from plastax.layers import (
     ShapeError,
     Units,
 )
+from plastax.layers._primitives import check_capacity
 
 
 def traced(
@@ -128,8 +130,12 @@ def connected(
     arrange: Callable[[Units, Units], tuple[Units, Units]],
     x_shape: tuple[int, ...],
     y_shape: tuple[int, ...],
+    conn: CreateConnections | None = None,
 ) -> tuple[Record, np.ndarray, np.ndarray, list[Any]]:
-    """Connect input `x` to new units `y`, arranged by `arrange(x, y)`."""
+    """Connect input `x` to new units `y`, arranged by `arrange(x, y)`.
+
+    The connections are made by `conn`, or by a `CreateConnections()` given nothing.
+    """
     returned: list[Any] = []
 
     def call(m: Any, x: Units) -> Units:
@@ -137,7 +143,9 @@ def connected(
         returned.append(m.conn(*arrange(x, y)))
         return y
 
-    record, _ = traced(call, x_shape, units=CreateUnits(), conn=CreateConnections())
+    record, _ = traced(
+        call, x_shape, units=CreateUnits(), conn=conn or CreateConnections()
+    )
     return record, record.inputs["x"], record.outputs[0], returned
 
 
@@ -194,6 +202,61 @@ def test_listed_pairs_are_the_only_connections_in_the_order_given() -> None:
     assert block.shape == (5,)
     np.testing.assert_array_equal(block.src, x[src])
     np.testing.assert_array_equal(block.dst, y[dst])
+
+
+# --------------------------------------------------------------------------- #
+# Capacity: how many slots a block of connections is given
+# --------------------------------------------------------------------------- #
+def test_a_block_given_no_capacity_has_exactly_what_it_starts_with() -> None:
+    record, *_ = connected(lambda x, y: (x[None, :], y[:, None]), (4,), (3,))
+
+    assert record.blocks[0].capacity is px.Capacity.INITIAL
+
+
+def test_a_capacity_is_recorded_as_given() -> None:
+    record, *_ = connected(
+        lambda x, y: (x[None, :], y[:, None]),
+        (4,),
+        (3,),
+        conn=CreateConnections(capacity=20),
+    )
+
+    assert record.blocks[0].src.size == 12  # the capacity creates no connection
+    assert record.blocks[0].capacity == 20
+
+
+def test_a_capacity_may_be_exactly_the_size_of_the_block() -> None:
+    record, *_ = connected(
+        lambda x, y: (x[None, :], y[:, None]),
+        (4,),
+        (3,),
+        conn=CreateConnections(capacity=12),
+    )
+
+    assert record.blocks[0].capacity == 12
+
+
+def test_a_capacity_below_the_size_of_the_block_is_refused_naming_the_layer() -> None:
+    with pytest.raises(BuildError, match=r"conn creates 12 .* capacity=11"):
+        connected(
+            lambda x, y: (x[None, :], y[:, None]),
+            (4,),
+            (3,),
+            conn=CreateConnections(capacity=11),
+        )
+
+
+def test_a_negative_capacity_is_refused_where_it_is_written() -> None:
+    with pytest.raises(BuildError, match="cannot be negative"):
+        CreateConnections(capacity=-1)
+
+
+# The check is called directly: the test run type-checks plastax's arguments
+# (jaxtyping), and that check raises its own TypeError before the layer's.
+@pytest.mark.parametrize("capacity", [1.5, True, "initial", None])
+def test_a_capacity_is_a_count_or_a_px_capacity(capacity: object) -> None:
+    with pytest.raises(BuildError, match=r"integer, or px\.Capacity\.INITIAL"):
+        check_capacity("CreateConnections", capacity)
 
 
 # --------------------------------------------------------------------------- #

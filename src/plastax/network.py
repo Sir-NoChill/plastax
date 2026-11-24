@@ -222,12 +222,17 @@ class Network[GS]:
                     )
                 halves[half] = policy
         prune, grow = cls.prune, cls.grow
+        # Narrowed here and not through `_on_network`: mypy joins the two growth
+        # protocols to `object` when it solves that function's type variable.
+        grow_conn = (
+            None if grow is None or isinstance(grow.conn, Inherit) else grow.conn
+        )
         return Resolved(
             update_conn=halves["conn"],
             update_unit=halves["unit"],
             prune_conn=None if prune is None else _on_network(prune.conn),
             prune_unit=None if prune is None else _on_network(prune.unit),
-            grow_conn=None if grow is None else _on_network(grow.conn),
+            grow_conn=grow_conn,
             grow_unit=None if grow is None else _on_network(grow.unit),
             unit_fields=(
                 *cls.extra_unit_fields,

@@ -30,7 +30,7 @@ point, not an inefficiency to apologize for.
 The mental model in one line:
 
 ```
-Network subclass (traits.py)  ──build_phases──▶  ordered pure phases (phases.py)
+Network subclass (network.py) ──build_phases──▶  ordered pure phases (phases.py)
                                     │
                               make_step (step.py): scatter inputs, run phases,
                               wrap in shard_map? then jax.jit(donate_argnums=0)
@@ -86,7 +86,8 @@ These are design decisions already made. Violating one is a failed change
 | `monoid.py` | `monoid` | `Monoid[Acc]` + `MonoidTree`; named `sum/prod/max/min` lowered to `segment_*`, `combine_pairwise`, `collective` (all-reduce). Arena-agnostic pure algebra. |
 | `state.py` | `state` | Two-tier state: `NetworkStatic` (hashable jit cache key) + `NetworkState[GS]` (mutable SoA pytree). `make_empty_state`, `live_conn_count`, `grow_bucket`. |
 | `views.py` | `views` | `UnitView`/`ConnView` (read, indexed by `(FieldSpec, Idx)`) and `UnitWrite`/`ConnWrite` (write records). Deliberately **not** pytree-registered. |
-| `traits.py` | `traits` | `Network` base class + policy `Protocol`s (`ForwardPass`, `BackwardPass`, `Loss`, `UpdateUnit`, `UpdateConn`, `PruneUnit`, `PruneConn`, `AddUnit`, `ScoreAddConn`, `ProposeAddConn`, `ResetGlobal`) + `predicate_add_conn`; `__init_subclass__` validation. The **declarative surface**. |
+| `network.py` | `network` | `Network` base class: the phase fields (`forward`, `backward`, `loss`, `update`, `optimizer`, `prune`, `grow`, `reset_global`), `__init_subclass__` validation, `Network.resolved()`. For a network with a `topology`: `build` and `init` (trace, resolve, check, refuse what the engine cannot run, materialize), `policy_table()` and `faults()`. The **declarative surface**. |
+| `policies/` | `policies` | The policy `Protocol`s, each ending in `Policy` (`ForwardConnPolicy`, `ForwardUnitPolicy`, `BackwardConnPolicy`, `BackwardUnitPolicy`, `UpdateConnPolicy`, `UpdateUnitPolicy`, `PruneConnPolicy`, `PruneUnitPolicy`, `AddUnitPolicy`, `ScoreAddConnPolicy`, `ProposeAddConnPolicy`, `LossPolicy`, `ResetGlobalPolicy`, `BatchReductionPolicy`) + `predicate_add_conn`, and the phase pairs (`Forward`, `Backward`, `Update`, `Prune`, `Grow`). Reachable only as `px.policies.*`. |
 | `sweep.py` | `sweep` | Primitive gather → vmapped map → `segment_reduce` → masked apply, one bucket at a time; conn-update sweeps. The low-level engine. |
 | `phases.py` | `phases` | `build_phases`: compiles declared traits into the ordered phase tuple (forward → loss → backward → update_unit → update_conn → prune_unit → prune_conn → add_unit → add_conn → reset_global), eliding absent slots. `StepInputs`. |
 | `topo.py` | `topo` | Level assignment (`initial_levels`, `recompute_levels`), `resort` (rebucket after structural change), `capacity_policy`. |
@@ -95,9 +96,10 @@ These are design decisions already made. Violating one is a failed change
 | `driver.py` | `driver` | Host control loop: retrace/overflow/resort protocol around one jitted step, or around a device-side chunk loop (`Driver.scan`). |
 | `topology.py` | `topology` | Host-side topology DSL: `dense`, `conv2d` (unrolled per-edge), `input_units`, `sequential`, `Block`/`EdgeSet`/`Topology`. |
 | `shard.py` | `shard`* | Scheme-B band-partition math (`balanced_level_cut`). Pure numpy. (*commit under `topo`/`step` per `docs/development/scopes.md` — `shard` has no dedicated scope; ask if unsure.) |
-| `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = an `UpdateConn` policy + per-connection `state_fields` (`opt/…` columns). |
+| `layers/` | `layers` | Declaring a network's structure: `Module`, handles (`Units`), the two primitives `CreateUnits` and `CreateConnections`, `Dense`, the build record (`trace`, `Record`), `materialize`. A layer may be given policies of its own: `resolve` gives each block's against the network's (`PolicyTable`), and `check` traces every policy with abstract values and returns the faults (`Fault`). |
+| `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = `conn_fields` and `unit_fields` (`opt/…` columns) + `update()`, an `Update` pair. |
 
-**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (48
+**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (38
 names). Breaking any of them is a `type(scope)!:` change with a
 `BREAKING CHANGE:` footer and a changelog entry (`docs/changelog.md`).
 Names reachable only via submodule import (`plastax.topo.*`, `plastax.shard.*`,
@@ -134,7 +136,11 @@ semi-internal but tests reach into them — renaming still has blast radius.
   signature, never duplicated in the docstring. Public dataclass fields go in
   `Attributes:`; PEP 695 type params in `Type Args:`. `__init__` docstrings are
   intentionally omitted (documented on the class; `D107` ignored, `DOC301`
-  enforced). Tests and examples are exempt.
+  enforced). Tests and examples are exempt. pydoclint accepts a `Raises:` entry
+  only for an exception the function's own body raises (`DOC502`, `DOC503`): an
+  error that comes from a callee is described in the prose of the docstring
+  ("A `BuildError` is raised if ..."), as `layers.materialize` does, and an
+  error is raised where it is documented, not returned from a helper.
 - **Lint/format: ruff** (`E/F/I/UP/B/ANN/D`), autofix + `ruff-format`. `F722`
   is disabled repo-wide — do not add `# noqa: F722` on jaxtyping string
   annotations.
@@ -143,6 +149,23 @@ semi-internal but tests reach into them — renaming still has blast radius.
   silence it with a rule-scoped ignore and explain why in a comment —
   never weaken the mypy gate.
 - Full toolchain reference: `docs/development/tooling.md`.
+
+---
+
+## Errors
+
+- **Every error plastax raises derives from `PlastaxError`** (owner, 2026-11-23), so a user
+  can tell a framework error from a Python error. New code does not raise a bare
+  `TypeError`, `ValueError` or `RuntimeError` at a user.
+- **This is in progress.** The base class and the taxonomy do not exist yet: the proposal
+  is `plans/20261123T151705Z-error-taxonomy.md` at the workspace root (card
+  `error-taxonomy`). Until it lands, raise the nearest existing family (`BuildError`,
+  `ShapeError`, `UnsupportedMonoidError`) and do not invent a new class.
+- **A message says** what cannot be done, where (the layer's path, the network's name),
+  what was given against what was expected, and what to do. It names what the user wrote,
+  never an internal (a bucket, a column, a phase builder).
+- **Refuse, never run wrong.** A network the engine cannot run as declared is refused when
+  it is built, by name. It is not run with different policies.
 
 ---
 

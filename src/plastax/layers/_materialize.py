@@ -275,12 +275,6 @@ def materialize[GS](
     block of units. A network that grows connections of its own is the exception: it
     is stored as one sorted bucket per level and has no layout.
 
-    A `BuildError` is raised if a connection leads into a constant unit, if the
-    connections close a cycle and `check_cycle` is on, if an initializer cannot be
-    called or does not return weights of its block's shape, or if a layer is given a
-    number as its capacity and it cannot be honoured: the network grows connections
-    of its own, the layer has no connections, or its sources are on several levels.
-
     Args:
         record: The traced topology.
         net: The network class, as today's builder takes it: its policies and fields.
@@ -297,6 +291,14 @@ def materialize[GS](
 
     Returns:
         The `(static, state)` pair, as `NetworkBuilder.from_edges` returns it.
+
+    Raises:
+        BuildError: If a connection leads into a constant unit, if the connections
+            close a cycle and `check_cycle` is on, if an initializer cannot be
+            called or does not return weights of its block's shape, or if a layer
+            is given a number as its capacity and it cannot be honoured: the
+            network grows connections of its own, the layer has no connections, or
+            its sources are on several levels.
     """
     if record.blocks:
         src = np.concatenate([block.src for block in record.blocks])

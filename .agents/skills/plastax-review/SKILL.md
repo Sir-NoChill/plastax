@@ -67,7 +67,8 @@ uv run ruff check .            # lint (E/F/I/UP/B/ANN/D)
 uv run ruff format --check .   # format
 uv run pydoclint --style=google --arg-type-hints-in-docstring=False \
   --check-return-types=False --check-class-attributes=True \
-  --skip-checking-private-functions=True src/plastax   # Google-docstring contract
+  --skip-checking-private-functions=True --skip-checking-raises=True \
+  src/plastax                    # Google-docstring contract
 uv run ty check src            # fast type pass
 uv run mypy --strict src       # authoritative type gate (pre-push)
 uv run pytest -m "not slow" -q # fast suite (pre-push); add the full suite if oracles are in scope

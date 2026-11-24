@@ -76,13 +76,12 @@ class Dense(Module):
     bias connections take the `conn` halves of `forward`, `backward` and `update`,
     and are never pruned or regrown.
 
-    A `BuildError` is raised if `capacity` is neither a `plastax.Capacity` nor a
-    non-negative integer.
-
     Raises:
         TypeError: If `features` is not an integer, or a policy keyword is not a
             pair of its phase.
         ValueError: If `features` is less than 1.
+        BuildError: If `capacity` is neither a `plastax.Capacity` nor a
+            non-negative integer.
     """
 
     def __init__(

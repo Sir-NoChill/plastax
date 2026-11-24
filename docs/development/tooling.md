@@ -95,15 +95,25 @@ tools enforce this, both wired into pre-commit:
   shape. Scoped to `src/plastax` via `per-file-ignores` (tests and examples
   are exempt). `D107` is ignored: `__init__` docstrings are intentionally
   omitted — constructors are documented on the class.
-- **pydoclint** (`--style=google`) — checks that `Args:`/`Returns:`/`Raises:`
-  match the actual signature. Types stay in the signature, never duplicated in
-  the docstring, so it runs with `--arg-type-hints-in-docstring=False
+- **pydoclint** (`--style=google`) — checks that `Args:`/`Returns:` match the
+  actual signature. Types stay in the signature, never duplicated in the
+  docstring, so it runs with `--arg-type-hints-in-docstring=False
   --check-return-types=False`; `--check-class-attributes=True` guards
   `Attributes:` completeness; `--skip-checking-private-functions=True` limits
-  the contract to the public surface (so a private validator may document a
-  delegated exception without tripping DOC503). pydoclint's default `DOC301`
-  is kept, which forbids a redundant `__init__` docstring — the other half of
-  the D107 decision above.
+  the contract to the public surface. `--skip-checking-raises=True` turns its
+  raise checking off (`DOC501`–`DOC503`): pydoclint only sees the `raise`
+  statements in a function's own body and has no per-function switch, so it
+  cannot check a curated `Raises:` section (below). pydoclint's default
+  `DOC301` is kept, which forbids a redundant `__init__` docstring — the other
+  half of the D107 decision above.
+
+`Raises:` is curated, not a mirror of the `raise` statements in the body. It
+lists the exceptions that are part of the function's interface, including those
+raised by functions it calls. An exception raised only when the documented
+contract is violated need not be listed. Wrap and re-raise
+(`raise X(...) from error`) only where the caller adds context such as the
+layer's path or the network's name. No tool checks this section; it is a review
+condition.
 
 Conventions in the docstrings themselves: PEP 695 type parameters go in a
 `Type Args:` section; public dataclass fields go in `Attributes:` (description
@@ -113,7 +123,8 @@ signature). Run the pydoclint check directly with:
 ```
 uv run pydoclint --style=google --arg-type-hints-in-docstring=False \
   --check-return-types=False --check-class-attributes=True \
-  --skip-checking-private-functions=True src/plastax
+  --skip-checking-private-functions=True --skip-checking-raises=True \
+  src/plastax
 ```
 
 ## Types: ty first, mypy strict as fallback
@@ -229,7 +240,8 @@ uv sync && uv run ruff check src tests examples \
   && uv run ruff format --check src tests examples \
   && uv run pydoclint --style=google --arg-type-hints-in-docstring=False \
        --check-return-types=False --check-class-attributes=True \
-       --skip-checking-private-functions=True src/plastax \
+       --skip-checking-private-functions=True --skip-checking-raises=True \
+       src/plastax \
   && uv run ty check src && uv run mypy --strict src \
   && uv run pytest \
   && uv run python scripts/parity/emit.py --check \

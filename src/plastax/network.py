@@ -351,13 +351,14 @@ class Network[GS]:
         it is written to. Nothing is materialized, so it needs no key. `build`
         runs the same checks and raises on the first non-empty result.
 
-        A `BuildError` is raised if the class has no `topology` or no
-        `input_shape`, the topology does not take exactly one handle, or the
-        class's `globals` are not a pytree of numbers and arrays. Also whatever
-        `trace` raises.
-
         Returns:
             The faults, empty when the policies are sound.
+
+        Raises:
+            BuildError: if the class has no `topology` or no `input_shape`, the
+                topology does not take exactly one handle, or the class's
+                `globals` are not a pytree of numbers and arrays. Also whatever
+                `trace` raises.
         """
         # Imported here: plastax.layers imports this module.
         from plastax.layers import check, resolve
@@ -402,12 +403,13 @@ class Network[GS]:
         network the engine cannot run yet. `print(Net.policy_table())` gives a
         Markdown table.
 
-        A `BuildError` is raised if the class has no `topology` or no
-        `input_shape`, or the topology does not take exactly one handle. Also
-        whatever `trace` raises.
-
         Returns:
             The resolved table.
+
+        Raises:
+            BuildError: if the class has no `topology` or no `input_shape`, or
+                the topology does not take exactly one handle. Also whatever
+                `trace` raises.
         """
         # Imported here: plastax.layers imports this module.
         from plastax.layers import resolve

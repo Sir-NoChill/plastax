@@ -200,9 +200,10 @@ class CreateConnections(Module):
         grow: The connection growth policy (a `ScoreAddConnPolicy` or a
             `ProposeAddConnPolicy`).
 
-    A `TypeError` is raised if a policy keyword is not a connection policy of its
-    phase, and a `BuildError` if `capacity` is neither a `plastax.Capacity` nor a
-    non-negative integer.
+    Raises:
+        TypeError: If a policy keyword is not a connection policy of its phase.
+        BuildError: If `capacity` is neither a `plastax.Capacity` nor a
+            non-negative integer.
     """
 
     def __init__(

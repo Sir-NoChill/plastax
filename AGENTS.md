@@ -99,7 +99,7 @@ These are design decisions already made. Violating one is a failed change
 | `layers/` | `layers` | Declaring a network's structure: `Module`, handles (`Units`), the two primitives `CreateUnits` and `CreateConnections`, `Dense`, the build record (`trace`, `Record`), `materialize`. A layer may be given policies of its own: `resolve` gives each block's against the network's (`PolicyTable`), and `check` traces every policy with abstract values and returns the faults (`Fault`). |
 | `optim/` | `optim` | Optimizer *bundles*: `sgd`, `momentum`, `adam`, `adamw`, `rmsprop`. Each = `conn_fields` and `unit_fields` (`opt/…` columns) + `update()`, an `Update` pair. |
 
-**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (38
+**Public API stability boundary** = `src/plastax/__init__.py`'s `__all__` (39
 names). Breaking any of them is a `type(scope)!:` change with a
 `BREAKING CHANGE:` footer and a changelog entry (`docs/changelog.md`).
 Names reachable only via submodule import (`plastax.topo.*`, `plastax.shard.*`,
@@ -136,11 +136,13 @@ semi-internal but tests reach into them — renaming still has blast radius.
   signature, never duplicated in the docstring. Public dataclass fields go in
   `Attributes:`; PEP 695 type params in `Type Args:`. `__init__` docstrings are
   intentionally omitted (documented on the class; `D107` ignored, `DOC301`
-  enforced). Tests and examples are exempt. pydoclint accepts a `Raises:` entry
-  only for an exception the function's own body raises (`DOC502`, `DOC503`): an
-  error that comes from a callee is described in the prose of the docstring
-  ("A `BuildError` is raised if ..."), as `layers.materialize` does, and an
-  error is raised where it is documented, not returned from a helper.
+  enforced). Tests and examples are exempt. `Raises:` is curated: it lists the
+  exceptions that are part of the function's interface, including those raised
+  by functions it calls. pydoclint's raise checking is off
+  (`--skip-checking-raises=True`) because it only sees the function's own
+  body. An exception raised only when the documented contract is violated need
+  not be listed. Wrap and re-raise (`raise X(...) from error`) only where the
+  caller adds context such as the layer's path or the network's name.
 - **Lint/format: ruff** (`E/F/I/UP/B/ANN/D`), autofix + `ruff-format`. `F722`
   is disabled repo-wide — do not add `# noqa: F722` on jaxtyping string
   annotations.

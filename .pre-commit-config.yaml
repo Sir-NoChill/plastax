@@ -37,6 +37,7 @@ repos:
           - --check-return-types=False
           - --check-class-attributes=True
           - --skip-checking-private-functions=True
+          - --skip-checking-raises=True
 
       # The two type checkers are given the tracked files under src/, not the
       # directory: pre-commit sets aside unstaged changes to tracked files but

@@ -356,7 +356,7 @@ def uniform(low: float | int, high: float | int) -> Initializer:
     """Build an initializer that draws uniformly from `[low, high)`.
 
     Both bounds are given. `jax.nn.initializers.uniform(scale)` is `uniform(0, scale)`
-    here. A `ValueError` is raised if `low` is not below `high`.
+    here.
 
     Args:
         low: The lower bound.
@@ -364,6 +364,9 @@ def uniform(low: float | int, high: float | int) -> Initializer:
 
     Returns:
         The initializer.
+
+    Raises:
+        ValueError: If `low` is not below `high`.
     """
     return Uniform(low, high)
 
@@ -376,8 +379,7 @@ def variance_scaling(
     The fan is counted per connection (see `Fans`). PyTorch's initializers with a
     gain are written with this: a gain `g` is a scale of `g**2`. The default of
     `torch.nn.Linear`, uniform within `1 / sqrt(fan_in)`, is a scale of `1 / 3` with
-    `FanMode.FAN_IN` and `Distribution.UNIFORM`. A `ValueError` is raised if `scale` is
-    not positive.
+    `FanMode.FAN_IN` and `Distribution.UNIFORM`.
 
     Args:
         scale: The numerator of the variance.
@@ -386,6 +388,9 @@ def variance_scaling(
 
     Returns:
         The initializer.
+
+    Raises:
+        ValueError: If `scale` is not positive.
     """
     return VarianceScaling(scale, mode, distribution)
 

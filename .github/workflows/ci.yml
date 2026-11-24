@@ -45,7 +45,8 @@ jobs:
         run: >-
           uv run pydoclint --style=google --arg-type-hints-in-docstring=False
           --check-return-types=False --check-class-attributes=True
-          --skip-checking-private-functions=True src/plastax
+          --skip-checking-private-functions=True --skip-checking-raises=True
+          src/plastax
 
       - name: ty (fast type check)
         run: uv run ty check src

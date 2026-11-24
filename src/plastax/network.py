@@ -56,7 +56,7 @@ from plastax.policies._batch import _STRUCTURAL_UNIT_FIELDS
 
 if TYPE_CHECKING:
     from plastax.driver import Driver
-    from plastax.layers import Module, PolicyTable, Record
+    from plastax.layers import Fault, Module, PolicyTable, Record
     from plastax.state import NetworkState, NetworkStatic
 
 
@@ -258,22 +258,22 @@ class Network[GS]:
             globals: the value the global state starts from, in place of the
                 class's `globals`. None uses the class's.
 
-        A `BuildError` is raised if the class has no `topology` or no
-        `input_shape`, if the topology does not take exactly one handle, if a
-        layer is given policies of its own (which the engine cannot run yet),
-        or if the globals are not a pytree of numbers and arrays. Also
-        whatever `trace` and `materialize` raise.
-
         Returns:
             The `(static, state)` pair. `static.input_shape` and
             `static.output_shape` hold the shapes a step's inputs and targets
             are given in.
 
         Raises:
+            BuildError: if the class has no `topology` or no `input_shape`, if
+                the topology does not take exactly one handle, if the policies
+                have a fault (see `faults`), if a layer is given policies of
+                its own (which the engine cannot run yet), or if the globals
+                are not a pytree of numbers and arrays. Also whatever `trace`
+                and `materialize` raise.
             NotImplementedError: if the topology returns more than one handle.
         """
         # Imported here: plastax.layers imports this module.
-        from plastax.layers import materialize, resolve
+        from plastax.layers import BuildError, check, materialize, resolve
 
         name = cls.__name__
         record = cls._trace()
@@ -284,8 +284,41 @@ class Network[GS]:
             )
         on_device = cls._globals_on_device(globals)
         table = resolve(cls, record)
+        # What can be fixed is reported before what cannot be run yet.
+        faults = check(cls, record, table, on_device)
+        if faults:
+            count = "1 fault" if len(faults) == 1 else f"{len(faults)} faults"
+            raise BuildError(
+                f"{name} has {count} in its policies.\n\n"
+                + "\n\n".join(str(fault) for fault in faults)
+                + f"\n\n`{name}.faults()` returns these as a list."
+            )
         _refuse_layer_policies(cls, table)
         return materialize(record, cls, key, globals_=on_device)
+
+    @classmethod
+    def faults(cls) -> list[Fault]:
+        """Every fault in the network's policies, found without building it.
+
+        Traces the topology, resolves each layer's policies against the
+        network's, and traces every policy once with abstract values: a `map`
+        against the `combine` that reduces it, and every write against the field
+        it is written to. Nothing is materialized, so it needs no key. `build`
+        runs the same checks and raises on the first non-empty result.
+
+        A `BuildError` is raised if the class has no `topology` or no
+        `input_shape`, the topology does not take exactly one handle, or the
+        class's `globals` are not a pytree of numbers and arrays. Also whatever
+        `trace` raises.
+
+        Returns:
+            The faults, empty when the policies are sound.
+        """
+        # Imported here: plastax.layers imports this module.
+        from plastax.layers import check, resolve
+
+        record = cls._trace()
+        return check(cls, record, resolve(cls, record), cls._globals_on_device(None))
 
     @classmethod
     def _globals_on_device(cls, globals: GS | None) -> Any:

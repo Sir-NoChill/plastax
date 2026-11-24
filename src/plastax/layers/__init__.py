@@ -8,6 +8,7 @@ Weights are drawn by the initializers of `plastax.init`. A layer may be given
 policies of its own; `resolve` works out each block's against the network's.
 """
 
+from plastax.layers._check import Fault, check
 from plastax.layers._dense import Dense
 from plastax.layers._draw import draw
 from plastax.layers._materialize import materialize
@@ -25,6 +26,7 @@ __all__ = [
     "CreateConnections",
     "CreateUnits",
     "Dense",
+    "Fault",
     "Module",
     "Override",
     "PolicyTable",
@@ -33,6 +35,7 @@ __all__ = [
     "UnitBlock",
     "UnitPolicies",
     "Units",
+    "check",
     "draw",
     "materialize",
     "resolve",

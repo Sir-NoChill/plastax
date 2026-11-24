@@ -927,13 +927,11 @@ def build_csr_backward[GS](
     Returns:
         `(state, batched_units) -> batched_units` after the backward.
     """
-    backward = net.backward
-    assert backward is not None  # only built when the net has one
-    bc, bu = backward.halves()
+    declared = net.backward
+    assert declared is not None  # only built when the net has one
+    bc, bu = declared.halves()
     field = linear_input_field(bc, bu)
-    assert (
-        bc is not None and bu is not None and field is not None
-    )  # only built when linear
+    assert field is not None  # only built when linear
     num_units = static.num_units
     num_levels = len(static.level_capacities)
     apply = build_backward_apply(bu, num_units=num_units)
